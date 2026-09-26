@@ -73,12 +73,7 @@ function statusLabel(s: SessionSummary): string {
   if (s.status === "orphaned") return "orphan";
   const loud = loudTag(s);
   if (loud) return loud.level;
-  if (s.status === "running") return "run";
   return s.status;
-}
-
-function isIdle(s: SessionSummary): boolean {
-  return s.branch.tags.some((t) => t.key === "idle");
 }
 
 // --- Topic tree --------------------------------------------------------------
@@ -428,7 +423,16 @@ async function archiveRow(id: string) {
             <span class="name">{{
               row.session.branch.name || row.session.id
             }}</span>
-            <span class="badge" :class="statusClass(row.session)">{{
+            <!-- A running thread shows a spinner instead of a text badge;
+                 idle marks stay quiet (the resting state speaks for itself). -->
+            <span
+              v-if="row.session.status === 'running'"
+              class="spinner mini"
+              :class="statusClass(row.session)"
+              :title="statusLabel(row.session)"
+              aria-hidden="true"
+            ></span>
+            <span v-else class="badge" :class="statusClass(row.session)">{{
               row.session.status === "archived" ? "done" : statusLabel(row.session)
             }}</span>
             <span
@@ -438,7 +442,6 @@ async function archiveRow(id: string) {
             >
               {{ row.childCount }}
             </span>
-            <span v-if="isIdle(row.session)" class="badge idle">idle</span>
             <button
               v-if="row.session.status !== 'archived'"
               class="row-archive"
