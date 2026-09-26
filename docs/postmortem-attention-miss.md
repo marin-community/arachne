@@ -33,7 +33,7 @@ Nothing in the stack infers it:
   `working` CLEARS attention and sets running, `idle` sets the quiet
   idle mark; the only automatic attention writer is a turn-budget cap
   on automation-class sessions, which never applies to interactive
-  workstreams).
+  topics).
 - The session's orientation note says exactly when to use it: "use
   `attention` or `blocked` when a person must act". I asked a question
   at the end of a turn and ended the turn without ever running the

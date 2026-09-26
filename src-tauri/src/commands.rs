@@ -83,8 +83,8 @@ impl ChatSnapshot {
 }
 
 /// The dashboard snapshot the fleet poller pushes: the session summaries plus
-/// the workstream layout, so the sidebar can group by workstream and nest
-/// children under parents in one coherent render.
+/// the topic layout, so the sidebar can nest children under their topic's
+/// leader chat in one coherent render.
 #[derive(Debug, Clone, Serialize)]
 pub struct FleetSnapshot {
     pub sessions: Vec<SessionSummaryView>,
@@ -395,10 +395,16 @@ pub async fn launch_session(
             repo: Some(repo),
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
-            parent_branch,
+            parent_branch: parent_branch.clone(),
             ..Default::default()
         })
         .await?;
+    // A top-level launch IS a topic: stamp the durable marker so the sidebar
+    // keeps its shape even if every child finishes and archives. (Delegations
+    // are stamped by `delegate_task` on the parent, not the child.)
+    if parent_branch.is_none() {
+        let _ = client.set_tag(&view.id, "topic", "true").await;
+    }
     // Selection/activation is the frontend's job: it routes the new
     // session through open_session (chat forwarder + live streaming) via
     // the returned view. Delegations stay on the parent thread — the child
@@ -434,6 +440,9 @@ pub async fn delegate_task(
             ..Default::default()
         })
         .await?;
+    // Self-heal the parent's topic marker: leaders launched from the CLI (or
+    // before this marker existed) should still hold their shape.
+    let _ = client.set_tag(&parent_id, "topic", "true").await;
     Ok(view)
 }
 
@@ -482,9 +491,10 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
     Ok(FleetSnapshot { sessions, layout })
 }
 
-/// Delete a workstream lane; its sessions move to the destination group first.
+/// Delete a lane (placement group); its sessions move to the destination
+/// group first. Lanes are just filing — they are not topics.
 #[tauri::command]
-pub async fn delete_workstream(
+pub async fn delete_group(
     state: State<'_, LoomState>,
     group_id: String,
     destination_group_id: String,
@@ -498,7 +508,7 @@ pub async fn delete_workstream(
 
 /// Move sessions into a lane (placement group).
 #[tauri::command]
-pub async fn move_to_workstream(
+pub async fn move_to_group(
     state: State<'_, LoomState>,
     session_ids: Vec<String>,
     group_id: String,
@@ -508,7 +518,7 @@ pub async fn move_to_workstream(
     client.move_sessions(&refs, &group_id).await.map_err(Into::into)
 }
 
-/// Re-parent a session under another (its workstream's top-level chat), or
+/// Re-parent a session under another (its topic's top-level chat), or
 /// detach it to top level. The session follows the parent's placement group.
 #[tauri::command]
 pub async fn reparent_session(
@@ -520,5 +530,9 @@ pub async fn reparent_session(
     client
         .reparent_session(&session_id, parent_id.as_deref().filter(|p| !p.is_empty()))
         .await?;
+    // Joining a parent makes that parent a topic — stamp the durable marker.
+    if let Some(parent) = parent_id.as_deref().filter(|p| !p.is_empty()) {
+        let _ = client.set_tag(parent, "topic", "true").await;
+    }
     Ok(())
 }

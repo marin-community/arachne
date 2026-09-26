@@ -186,7 +186,7 @@ async function launchTask(task: string, repo: string) {
   launching.value = true;
   try {
     const view = await invoke<SessionView>("launch_session", { repo, task });
-    // A new workstream activates immediately: route through selectSession
+    // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.
     await selectSession(view.id);
@@ -202,7 +202,7 @@ async function delegateFromThread(parentId: string, task: string) {
   try {
     const view = await invoke<SessionView>("delegate_task", { parentId, task });
     // Stay on the parent thread — the child appears nested under it in the
-    // sidebar (and inherits the parent's workstream) via the layout events.
+    // sidebar (and inherits the parent's topic) via the layout events.
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   } finally {
@@ -220,7 +220,7 @@ async function reparentSession(
     // Filing into a lane with no parent: also move the placement group so
     // the chat shows up under that lane header.
     if (!parentId && laneId) {
-      await invoke("move_to_workstream", {
+      await invoke("move_to_group", {
         sessionIds: [sessionId],
         groupId: laneId,
       });
@@ -238,7 +238,7 @@ async function deleteLane(laneId: string) {
       connError.value = "no Inbox lane found to move chats into";
       return;
     }
-    await invoke("delete_workstream", {
+    await invoke("delete_group", {
       groupId: laneId,
       destinationGroupId: inbox,
     });
@@ -264,7 +264,7 @@ function onArchived(id: string) {
   }
   // Keep the archived row in the fleet: the sidebar shows archived children
   // dimmed under their leader, so a finished worker stays visible as part of
-  // its workstream's shape. The next fleet snapshot re-syncs status.
+  // its topic's shape. The next fleet snapshot re-syncs status.
   for (const s of fleet.value) {
     if (s.id === id) s.status = "archived";
   }

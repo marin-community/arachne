@@ -174,7 +174,7 @@ const progressAge = computed(() =>
 );
 
 // Delegation: spawn a child session under this one. The child lands in the
-// same workstream (loom inherits the parent's placement group) and nests
+// same topic (loom inherits the parent's placement group) and nests
 // under this row in the sidebar.
 const showDelegate = ref(false);
 const delegateTask = ref("");

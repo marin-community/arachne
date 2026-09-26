@@ -127,10 +127,10 @@ pub struct SessionView {
 }
 
 // ---------------------------------------------------------------------------
-// Session layout (workstreams)
+// Session layout (lanes — filing, not topics)
 // ---------------------------------------------------------------------------
 
-/// `session_layout.get` — spaces, groups (workstreams in Arachne's UI), and
+/// `session_layout.get` — spaces, groups (lanes in Arachne's UI), and
 /// placement defaults. Groups carry `session_ids` including archived rows;
 /// the fleet summary is the authority on which sessions are active.
 #[derive(Debug, Clone, Serialize, Deserialize)]

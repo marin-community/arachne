@@ -7,7 +7,7 @@
 The near-term goal is not to build a general multi-agent framework. It is to build something that feels as immediate as Codex Desktop for day-to-day coding, but with a better model for:
 
 - many concurrent workers;
-- persistent long-lived workstreams;
+- persistent long-lived topics;
 - local versus remote execution;
 - multiple inference providers/accounts;
 - worktrees and pull requests as navigable resources;
@@ -99,7 +99,7 @@ Especially relevant:
 
 https://github.com/asheshgoplani/agent-deck/tree/main/docs/conductor
 
-The Conductor is conceptually close to Arachne's longer-term **workstream coordinator**: a persistent logical agent supervising workers and escalating only what it cannot resolve.
+The Conductor is conceptually close to Arachne's longer-term **topic coordinator**: a persistent logical agent supervising workers and escalating only what it cannot resolve.
 
 Do not necessarily adopt its heartbeat/polling implementation. Arachne should prefer real events wherever possible.
 
@@ -148,7 +148,7 @@ Arachne should not expose Loom's entire control-plane vocabulary directly.
 
 The user-facing model is approximately:
 
-**Workstreams → Threads/Workers → Resources → Events → Attention**
+**Topics → Threads/Workers → Resources → Events → Attention**
 
 Loom implements much of the machinery underneath.
 
@@ -166,7 +166,7 @@ The lower-level runtime/control plane.
 
 Loom runs sessions, manages worktrees/runtimes, stores durable state, receives events, tracks GitHub state, etc.
 
-## Workstream
+## Topic
 
 A durable unit of intent.
 
@@ -178,7 +178,7 @@ Examples:
 - “Science After Reproducibility”
 - “Personal automation”
 
-A workstream may last hours, days, or months.
+A topic may last hours, days, or months.
 
 It can:
 
@@ -192,7 +192,7 @@ It can:
 - wake later;
 - escalate something to human attention.
 
-A workstream is **not a worktree** and is **not necessarily a continuously running model process**.
+A topic is **not a worktree** and is **not necessarily a continuously running model process**.
 
 Long term, think of it as a durable actor with a mailbox that occasionally invokes an LLM.
 
@@ -202,11 +202,11 @@ The conversation/UI surface through which the user interacts with one execution 
 
 Initially, a Thread can map closely to a Loom session.
 
-A workstream's coordinator has a thread. Workers also have threads.
+A topic's coordinator has a thread. Workers also have threads.
 
 ## Worker
 
-An execution acting on behalf of a parent thread/workstream.
+An execution acting on behalf of a parent thread/topic.
 
 “Worker” describes hierarchy, not intelligence.
 
@@ -237,7 +237,7 @@ Resources should have identity independent of the session that happened to creat
 
 ## Event
 
-Something delivered into a workstream/thread mailbox.
+Something delivered into a topic/thread mailbox.
 
 Examples:
 
@@ -308,7 +308,7 @@ The Mac eventually becomes a runner and local-resource gateway, not another auth
 This avoids distributed-state/replication problems around:
 
 - conversations;
-- workstream state;
+- topic state;
 - attention;
 - worker ancestry;
 - resource bindings;
@@ -452,7 +452,7 @@ Roughly:
 ┌─────────────────┬───────────────────────────────┬────────────────────┐
 │ ATTENTION       │                               │ RESOURCES / DIFF   │
 │                 │         THREAD                │                    │
-│ WORKSTREAMS     │                               │ PR                 │
+│ TOPICS     │                               │ PR                 │
 │                 │      conversation             │ Worktree           │
 │ QUICK TASKS     │                               │ Files              │
 │                 │                               │                    │
@@ -598,7 +598,7 @@ external
 ```
 
 - **ephemeral**: worker-owned; safe to remove when done;
-- **attached**: explicitly retained by a workstream;
+- **attached**: explicitly retained by a topic;
 - **external**: existing checkout Loom did not create.
 
 ## Pull request
@@ -679,7 +679,7 @@ Keep worktree
 
 or equivalent.
 
-It is then attached to the workstream as a durable Resource.
+It is then attached to the topic as a durable Resource.
 
 Also track which worker is using a resource.
 
@@ -698,12 +698,12 @@ When another writer wants the same state, prefer creating another worktree.
 
 ---
 
-# Workstreams and workers
+# Topics and workers
 
-A workstream can contain a coordinating thread and workers:
+A topic can contain a coordinating thread and workers:
 
 ```text
-Implication reader                   Workstream
+Implication reader                   Topic
 │
 ├── coordinator                      Thread
 │
@@ -748,9 +748,9 @@ Loom's existing channels/results can be the initial transport. Do not block boot
 
 ---
 
-# Workstreams should sleep
+# Topics should sleep
 
-Long-term, a workstream should not require a continuously-running LLM.
+Long-term, a topic should not require a continuously-running LLM.
 
 Think:
 
@@ -794,7 +794,7 @@ Instead:
 GitHub event
 → Loom
 → relevant mailbox
-→ wake relevant thread/workstream
+→ wake relevant thread/topic
 ```
 
 Likewise:
@@ -823,27 +823,27 @@ Extend these toward the event model instead of creating a parallel scheduler.
 
 # Automations
 
-An automation should eventually be understood mostly as a **subscription that sends events to a workstream**, not as a completely separate class of thing.
+An automation should eventually be understood mostly as a **subscription that sends events to a topic**, not as a completely separate class of thing.
 
 Examples:
 
 ```text
 Every morning
-→ personal workstream
+→ personal topic
 → scan inbox
 → update Obsidian todos
 ```
 
 ```text
 PR review submitted
-→ Arachne workstream
+→ Arachne topic
 → cheap worker handles obvious comments
 → escalate difficult comments to coordinator
 ```
 
 ```text
 W&B run alerts
-→ research workstream
+→ research topic
 → inspect failure
 ```
 
@@ -1045,7 +1045,7 @@ Agents must not spawn unbounded workers.
 
 Limits may exist per:
 
-- workstream;
+- topic;
 - runner;
 - inference account;
 - provider.
@@ -1107,7 +1107,7 @@ Explicit non-priorities for bootstrap:
 - sophisticated provider scheduler;
 - public webhook ingress;
 - elaborate swarm visualization;
-- generalized workstream memory system.
+- generalized topic memory system.
 
 Use the simplest version compatible with future extension.
 
@@ -1147,7 +1147,7 @@ Add:
 - resource strip;
 - PR resources;
 - reliable “open the code” behavior;
-- basic Workstreams;
+- basic Topics;
 - resource attachment;
 - design-document resources;
 - keep/attach worktree;
@@ -1206,7 +1206,7 @@ Use Arachne for real work first.
 
 The architecture after Phase 0 should be informed by actual recurring friction, especially around:
 
-- workstream creation;
+- topic creation;
 - worktree persistence;
 - attention;
 - worker delegation;

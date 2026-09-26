@@ -2,10 +2,10 @@
 import { ref, computed } from "vue";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 
-// MODEL: a workstream is a chat with a leader agent. The leader is the
+// MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
 // (loom sessions launch / the Delegate button) nest under it. Lanes below
-// (layout groups) are only filing — they are NOT workstreams.
+// (layout groups) are only filing — they are NOT topics.
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -80,11 +80,19 @@ function isIdle(s: SessionSummary): boolean {
   return s.branch.tags.some((t) => t.key === "idle");
 }
 
-// --- Workstream tree --------------------------------------------------------
+// --- Topic tree --------------------------------------------------------------
 
 interface TreeNode {
   session: SessionSummary;
   children: TreeNode[];
+}
+
+// The durable marker: a leader chat stamped with the quiet `topic` tag
+// (by arachne, at launch/delegate/reparent). Topic-ness never depended on
+// live children — the tag survives archive and restarts. The childCount
+// fallback keeps pre-marker leaders rendering as topics.
+function isTopic(s: SessionSummary): boolean {
+  return s.branch.tags.some((t) => t.key === "topic");
 }
 
 interface Lane {
@@ -96,7 +104,7 @@ interface Lane {
 }
 
 function buildLanes(): Lane[] {
-  // Archived children stay in the tree (dimmed) — a workstream's finished
+  // Archived children stay in the tree (dimmed) — a topic's finished
   // work is part of its shape; only archived ROOTS are dropped from the
   // lanes. Without this, archiving every child makes a leader look like a
   // plain chat.
@@ -267,7 +275,7 @@ const userInboxId = computed(() => {
 
 // --- Drag & drop ------------------------------------------------------------
 //
-// Drag a chat onto a LEADER row → it joins that leader's workstream
+// Drag a chat onto a LEADER row → it joins that leader's topic
 // (reparent under it; the server also follows its lane).
 // Drag onto a lane header → file as a top-level chat in that lane.
 
@@ -315,7 +323,7 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
     <div class="new-task">
       <input
         v-model="task"
-        placeholder="New workstream — describe the goal…"
+        placeholder="New topic — describe the goal…"
         @keydown.enter.prevent="submit"
       />
       <button
@@ -364,7 +372,7 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
           class="session-item"
           :class="{
             selected: row.session.id === selectedId,
-            workstream: row.depth === 0,
+            topic: row.depth === 0 && (isTopic(row.session) || row.childCount > 0),
             child: row.depth > 0,
             archived: row.session.status === 'archived',
             'drop-hint':
@@ -386,7 +394,7 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
           @click="emit('select', row.session.id)"
           :title="
             row.depth === 0 && dragging
-              ? 'drop here to join this workstream'
+              ? 'drop here to join this topic'
               : undefined
           "
         >
@@ -421,7 +429,7 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
         class="session-item"
         style="color: var(--text-dim)"
       >
-        No workstreams yet — launch one above.
+        No topics yet — launch one above.
       </div>
     </div>
   </aside>

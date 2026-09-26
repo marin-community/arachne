@@ -129,9 +129,9 @@ impl LoomClient {
     /// `sessions.summary.list` — the fleet.
     ///
     /// `archived: true` so finished children still show (dimmed) under their
-    /// leader — a workstream's history is part of its identity, and the UI
+    /// leader — a topic's history is part of its identity, and the UI
     /// filters placement rows anyway. Without it, archiving a child erases
-    /// the leader's workstream shape.
+    /// the leader's topic shape.
     pub async fn list_sessions(&self) -> Result<Vec<crate::loom::SessionSummaryView>, LoomError> {
         self.op(
             "/api/sessions/summary/list",
@@ -140,13 +140,13 @@ impl LoomClient {
         .await
     }
 
-    /// `session_layout.get` — workstream spaces/groups.
+    /// `session_layout.get` — lane spaces/groups.
     pub async fn session_layout(&self) -> Result<crate::loom::SessionLayoutView, LoomError> {
         self.op("/api/session_layout/get", &serde_json::json!({}))
             .await
     }
 
-    /// `session_layout.groups.create` — new workstream in a space.
+    /// `session_layout.groups.create` — new lane in a space.
     pub async fn create_group(
         &self,
         space_id: &str,
@@ -159,7 +159,7 @@ impl LoomClient {
         .await
     }
 
-    /// `session_layout.move` — move sessions into a workstream.
+    /// `session_layout.move` — move sessions into a lane.
     pub async fn move_sessions(
         &self,
         session_ids: &[&str],
@@ -175,7 +175,7 @@ impl LoomClient {
         .await
     }
 
-    /// `session_layout.groups.delete` — remove a workstream; its sessions
+    /// `session_layout.groups.delete` — remove a lane; its sessions
     /// must move somewhere first (loom never orphans them).
     pub async fn delete_group(
         &self,
@@ -266,6 +266,28 @@ impl LoomClient {
             &serde_json::json!({ "session": session, "parent": parent }),
         )
         .await
+    }
+
+    /// `sessions.tags.set` — stamp a quiet tag on a session. Used to mark a
+    /// leader chat as a durable `topic` (survives archive and restarts).
+    pub async fn set_tag(
+        &self,
+        session: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), LoomError> {
+        let _: serde_json::Value = self
+            .op(
+                "/api/sessions/tags/set",
+                &serde_json::json!({
+                    "session": session,
+                    "key": key,
+                    "value": value,
+                    "by": "arachne",
+                }),
+            )
+            .await?;
+        Ok(())
     }
 
     /// `sessions.archive` — tear down terminal + worktree, keep the branch.
