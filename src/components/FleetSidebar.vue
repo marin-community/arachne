@@ -16,7 +16,18 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
-  (e: "launch", task: string, repo: string): void;
+  (
+    e: "launch",
+    task: string,
+    repo: string,
+    meta?: { title?: string; description?: string },
+  ): void;
+  (
+    e: "update-topic",
+    id: string,
+    fields: { title?: string; description?: string },
+    expected?: { title: string; provenance: string },
+  ): void;
   (
     e: "reparent",
     sessionId: string,
@@ -274,6 +285,106 @@ const userInboxId = computed(() => {
   return undefined;
 });
 
+// --- Tabs --------------------------------------------------------------------
+
+// The sidebar's two surfaces: the Inbox (the filing lanes + delegation tree)
+// and Topics (the per-topic card list with title/description/config).
+const tab = ref<"inbox" | "topics">("inbox");
+
+// --- Topics tab --------------------------------------------------------------
+
+// A topic card's list entry: the leader session plus its delegated count.
+interface TopicEntry {
+  session: SessionSummary;
+  childCount: number;
+}
+
+// Top-level leaders (durable `topic` marker, or delegated children as the
+// pre-marker fallback), newest activity first. Archived leaders stay listed
+// (dimmed) — topic-ness survives archive by design; children file under their
+// leader, so they never appear here.
+const topics = computed<TopicEntry[]>(() => {
+  const byId = new Map(props.fleet.map((s) => [s.id, s]));
+  const parentOf = (s: SessionSummary) =>
+    s.parent_session_id
+      ? byId.get(s.parent_session_id)
+      : s.parent_id
+        ? props.fleet.find((c) => c.branch.id === s.parent_id)
+        : undefined;
+  const childCount = new Map<string, number>();
+  for (const s of props.fleet) {
+    const p = parentOf(s);
+    if (p && p.id !== s.id)
+      childCount.set(p.id, (childCount.get(p.id) ?? 0) + 1);
+  }
+  return props.fleet
+    .filter((s) => {
+      const p = parentOf(s);
+      const topLevel = !p || p.id === s.id;
+      return topLevel && (isTopic(s) || (childCount.get(s.id) ?? 0) > 0);
+    })
+    .map((s) => ({ session: s, childCount: childCount.get(s.id) ?? 0 }))
+    .sort((a, b) =>
+      a.session.last_activity_at < b.session.last_activity_at ? 1 : -1,
+    );
+});
+
+// New-topic form state. Title is the short card label; description is the
+// longer what-this-is-for text (also the branch description shown in the
+// inbox rows); the goal sent to the agent falls back to the title.
+const newTitle = ref("");
+const newDesc = ref("");
+
+function submitTopic() {
+  const title = newTitle.value.trim();
+  if (!title) return;
+  const desc = newDesc.value.trim();
+  emit("launch", desc || title, repo.value.trim(), {
+    title,
+    description: desc,
+  });
+  newTitle.value = "";
+  newDesc.value = "";
+}
+
+// Inline card editing: title edits are compare-and-swap fenced server-side,
+// so the save passes the values the card last rendered as `expected`.
+const editingId = ref<string | null>(null);
+const editTitle = ref("");
+const editDesc = ref("");
+
+function startEdit(s: SessionSummary) {
+  editingId.value = s.id;
+  editTitle.value = s.branch.title;
+  editDesc.value = s.branch.description;
+}
+
+function cancelEdit() {
+  editingId.value = null;
+}
+
+function saveEdit(s: SessionSummary) {
+  const fields: { title?: string; description?: string } = {};
+  const title = editTitle.value.trim();
+  // An emptied title is ignored (loom rejects empty labels); only changed
+  // fields ride the update so the CAS fence is never tripped needlessly.
+  if (title && title !== s.branch.title) fields.title = title;
+  if (editDesc.value !== s.branch.description)
+    fields.description = editDesc.value;
+  if (fields.title)
+    emit(
+      "update-topic",
+      s.id,
+      fields,
+      {
+        title: s.branch.title,
+        provenance: s.branch.title_provenance || "user",
+      },
+    );
+  else if (fields.description) emit("update-topic", s.id, fields);
+  editingId.value = null;
+}
+
 // --- Drag & drop ------------------------------------------------------------
 //
 // Drag a chat onto a LEADER row → it joins that leader's topic
@@ -339,130 +450,271 @@ async function archiveRow(id: string) {
 
 <template>
   <aside class="sidebar">
-    <div class="new-task">
-      <input
-        v-model="task"
-        placeholder="New topic — describe the goal…"
-        @keydown.enter.prevent="submit"
-      />
+    <div class="tab-bar" role="tablist">
       <button
-        class="primary"
-        :disabled="!task.trim() || props.launching"
-        @click="submit"
+        class="tab"
+        :class="{ active: tab === 'inbox' }"
+        role="tab"
+        :aria-selected="tab === 'inbox'"
+        @click="tab = 'inbox'"
       >
-        {{ props.launching ? "…" : "Launch" }}
+        Inbox
+      </button>
+      <button
+        class="tab"
+        :class="{ active: tab === 'topics' }"
+        role="tab"
+        :aria-selected="tab === 'topics'"
+        @click="tab = 'topics'"
+      >
+        Topics
       </button>
     </div>
-    <div class="new-task" style="margin-top: -4px">
-      <input
-        v-model="repo"
-        placeholder="owner/name"
-        spellcheck="false"
-        style="font-family: var(--mono); font-size: 11px"
-      />
-    </div>
 
-    <div class="session-list">
-      <template v-for="{ lane, rows } in laneRows" :key="lane.id">
-        <div
-          class="group-header"
-          :class="{ 'drop-hint': dropTarget === `lane-${lane.id}` }"
-          @dragover="onDragOver(`lane-${lane.id}`, $event)"
-          @dragleave="onDragLeave(`lane-${lane.id}`)"
-          @drop="onDropLane(lane.id, `lane-${lane.id}`, $event)"
-          :title="
-            dragging ? 'drop here to file as a top-level chat' : lane.name
-          "
+    <!-- Inbox tab: the filing lanes + delegation tree (unchanged behavior) -->
+    <template v-if="tab === 'inbox'">
+      <div class="new-task">
+        <input
+          v-model="task"
+          placeholder="New topic — describe the goal…"
+          @keydown.enter.prevent="submit"
+        />
+        <button
+          class="primary"
+          :disabled="!task.trim() || props.launching"
+          @click="submit"
         >
-          <span class="group-name">{{ lane.name }}</span>
-          <span class="group-count">{{ lane.count }}</span>
-          <button
-            v-if="!lane.system && lane.id !== 'unfiled'"
-            class="link stream-delete"
-            title="delete lane (chats move to Inbox)"
-            @click.stop="emit('delete-lane', lane.id)"
+          {{ props.launching ? "…" : "Launch" }}
+        </button>
+      </div>
+      <div class="new-task" style="margin-top: -4px">
+        <input
+          v-model="repo"
+          placeholder="owner/name"
+          spellcheck="false"
+          style="font-family: var(--mono); font-size: 11px"
+        />
+      </div>
+
+      <div class="session-list">
+        <template v-for="{ lane, rows } in laneRows" :key="lane.id">
+          <div
+            class="group-header"
+            :class="{ 'drop-hint': dropTarget === `lane-${lane.id}` }"
+            @dragover="onDragOver(`lane-${lane.id}`, $event)"
+            @dragleave="onDragLeave(`lane-${lane.id}`)"
+            @drop="onDropLane(lane.id, `lane-${lane.id}`, $event)"
+            :title="
+              dragging ? 'drop here to file as a top-level chat' : lane.name
+            "
           >
-            ✕
-          </button>
-        </div>
-        <div
-          v-for="row in rows"
-          :key="row.session.id"
-          class="session-item"
-          :class="{
-            selected: row.session.id === selectedId,
-            topic: row.depth === 0 && (isTopic(row.session) || row.childCount > 0),
-            child: row.depth > 0,
-            archived: row.session.status === 'archived',
-            'drop-hint':
-              row.depth === 0 && dropTarget === `ws-${row.session.id}`,
-          }"
-          :style="
-            row.depth > 0 ? { marginLeft: `${12 + row.depth * 14}px` } : {}
-          "
-          draggable="true"
-          @dragstart="onDragStart(row.session.id, $event)"
-          @dragover="
-            row.depth === 0 && onDragOver(`ws-${row.session.id}`, $event)
-          "
-          @dragleave="onDragLeave(`ws-${row.session.id}`)"
-          @drop.stop="
-            row.depth === 0 &&
-            onDropLeader(row.session.id, `ws-${row.session.id}`, $event)
-          "
-          @click="emit('select', row.session.id)"
-          :title="
-            row.depth === 0 && dragging
-              ? 'drop here to join this topic'
-              : undefined
-          "
-        >
-          <div class="row1">
-            <span
-              v-if="row.childCount > 0"
-              class="chevron"
-              @click.stop="toggle(row.session.id)"
-            >
-              {{ row.isCollapsed ? "▸" : "▾" }}
-            </span>
-            <span class="name">{{
-              row.session.branch.name || row.session.id
-            }}</span>
-            <span class="badge" :class="statusClass(row.session)">{{
-              row.session.status === "archived" ? "done" : statusLabel(row.session)
-            }}</span>
-            <span
-              v-if="row.childCount > 0"
-              class="badge dim"
-              :title="`${row.childCount} delegated children`"
-            >
-              {{ row.childCount }}
-            </span>
-            <span v-if="isIdle(row.session)" class="badge idle">idle</span>
+            <span class="group-name">{{ lane.name }}</span>
+            <span class="group-count">{{ lane.count }}</span>
             <button
-              v-if="row.session.status !== 'archived'"
-              class="row-archive"
-              :class="{ confirm: confirmId === row.session.id }"
-              :title="
-                confirmId === row.session.id
-                  ? 'click again to archive — tears down worktree, keeps branch'
-                  : 'archive this session'
-              "
-              @click.stop="archiveRow(row.session.id)"
+              v-if="!lane.system && lane.id !== 'unfiled'"
+              class="link stream-delete"
+              title="delete lane (chats move to Inbox)"
+              @click.stop="emit('delete-lane', lane.id)"
             >
-              {{ confirmId === row.session.id ? "archive?" : "✕" }}
+              ✕
             </button>
           </div>
-          <div class="title">{{ subtitle(row.session) }}</div>
+          <div
+            v-for="row in rows"
+            :key="row.session.id"
+            class="session-item"
+            :class="{
+              selected: row.session.id === selectedId,
+              topic:
+                row.depth === 0 &&
+                (isTopic(row.session) || row.childCount > 0),
+              child: row.depth > 0,
+              archived: row.session.status === 'archived',
+              'drop-hint':
+                row.depth === 0 && dropTarget === `ws-${row.session.id}`,
+            }"
+            :style="
+              row.depth > 0 ? { marginLeft: `${12 + row.depth * 14}px` } : {}
+            "
+            draggable="true"
+            @dragstart="onDragStart(row.session.id, $event)"
+            @dragover="
+              row.depth === 0 && onDragOver(`ws-${row.session.id}`, $event)
+            "
+            @dragleave="onDragLeave(`ws-${row.session.id}`)"
+            @drop.stop="
+              row.depth === 0 &&
+              onDropLeader(row.session.id, `ws-${row.session.id}`, $event)
+            "
+            @click="emit('select', row.session.id)"
+            :title="
+              row.depth === 0 && dragging
+                ? 'drop here to join this topic'
+                : undefined
+            "
+          >
+            <div class="row1">
+              <span
+                v-if="row.childCount > 0"
+                class="chevron"
+                @click.stop="toggle(row.session.id)"
+              >
+                {{ row.isCollapsed ? "▸" : "▾" }}
+              </span>
+              <span class="name">{{
+                row.session.branch.name || row.session.id
+              }}</span>
+              <span class="badge" :class="statusClass(row.session)">{{
+                row.session.status === "archived"
+                  ? "done"
+                  : statusLabel(row.session)
+              }}</span>
+              <span
+                v-if="row.childCount > 0"
+                class="badge dim"
+                :title="`${row.childCount} delegated children`"
+              >
+                {{ row.childCount }}
+              </span>
+              <span v-if="isIdle(row.session)" class="badge idle">idle</span>
+              <button
+                v-if="row.session.status !== 'archived'"
+                class="row-archive"
+                :class="{ confirm: confirmId === row.session.id }"
+                :title="
+                  confirmId === row.session.id
+                    ? 'click again to archive — tears down worktree, keeps branch'
+                    : 'archive this session'
+                "
+                @click.stop="archiveRow(row.session.id)"
+              >
+                {{ confirmId === row.session.id ? "archive?" : "✕" }}
+              </button>
+            </div>
+            <div class="title">{{ subtitle(row.session) }}</div>
+          </div>
+        </template>
+        <div
+          v-if="lanes.length === 0"
+          class="session-item"
+          style="color: var(--text-dim)"
+        >
+          No topics yet — launch one above.
         </div>
-      </template>
-      <div
-        v-if="lanes.length === 0"
-        class="session-item"
-        style="color: var(--text-dim)"
-      >
-        No topics yet — launch one above.
       </div>
-    </div>
+    </template>
+
+    <!-- Topics tab: one card per topic (leader chat) with title, description,
+         and a config placeholder. -->
+    <template v-else>
+      <div class="new-topic-card">
+        <input
+          v-model="newTitle"
+          placeholder="New topic title…"
+          @keydown.enter.prevent="submitTopic"
+        />
+        <textarea
+          v-model="newDesc"
+          rows="2"
+          placeholder="What is this topic for? (description)"
+        ></textarea>
+        <div class="new-topic-foot">
+          <input
+            v-model="repo"
+            placeholder="owner/name"
+            spellcheck="false"
+            style="font-family: var(--mono); font-size: 11px"
+          />
+          <button
+            class="primary"
+            :disabled="!newTitle.trim() || props.launching"
+            @click="submitTopic"
+          >
+            {{ props.launching ? "…" : "Create topic" }}
+          </button>
+        </div>
+      </div>
+
+      <div class="topic-list">
+        <div
+          v-for="t in topics"
+          :key="t.session.id"
+          class="topic-card"
+          :class="{
+            selected: t.session.id === selectedId,
+            archived: t.session.status === 'archived',
+          }"
+          @click="emit('select', t.session.id)"
+        >
+          <template v-if="editingId === t.session.id">
+            <input
+              v-model="editTitle"
+              class="topic-edit-title"
+              placeholder="title"
+              @keydown.enter.prevent="saveEdit(t.session)"
+              @keydown.esc.stop="cancelEdit"
+              @click.stop
+            />
+            <textarea
+              v-model="editDesc"
+              class="topic-edit-desc"
+              rows="3"
+              placeholder="description"
+              @keydown.esc.stop="cancelEdit"
+              @click.stop
+            ></textarea>
+            <div class="topic-edit-foot">
+              <button
+                class="primary"
+                @click.stop="saveEdit(t.session)"
+              >
+                Save
+              </button>
+              <button @click.stop="cancelEdit">Cancel</button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="topic-head">
+              <span class="topic-title">{{
+                t.session.branch.title || t.session.branch.name
+              }}</span>
+              <span class="badge" :class="statusClass(t.session)">{{
+                t.session.status === "archived"
+                  ? "done"
+                  : statusLabel(t.session)
+              }}</span>
+            </div>
+            <div class="topic-desc">{{
+              t.session.branch.description ||
+              t.session.branch.goal ||
+              "no description yet"
+            }}</div>
+            <div class="topic-foot">
+              <span class="badge dim" v-if="t.childCount > 0" :title="`${t.childCount} delegated children`">{{
+                t.childCount
+              }}</span>
+              <span class="topic-branch">{{
+                t.session.branch.name || t.session.branch.branch
+              }}</span>
+              <button
+                class="topic-edit-btn"
+                title="edit title and description"
+                @click.stop="startEdit(t.session)"
+              >
+                edit
+              </button>
+              <!-- TODO: topic config (agent, model, repo defaults, automation
+                   triggers) — the settings surface this stub grows into. -->
+              <span class="topic-config-soon" title="topic config — coming soon"
+                >config ⚙</span
+              >
+            </div>
+          </template>
+        </div>
+        <div v-if="topics.length === 0" class="topic-empty">
+          No topics yet — create one above.
+        </div>
+      </div>
+    </template>
   </aside>
 </template>

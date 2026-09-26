@@ -25,6 +25,7 @@ interface BranchSummary {
   goal: string;
   repo_root: string;
   tags: TagView[];
+  title_provenance?: string;
 }
 interface Placement {
   space_id: string | null;
@@ -182,10 +183,19 @@ async function selectSession(id: string) {
   }
 }
 
-async function launchTask(task: string, repo: string) {
+async function launchTask(
+  task: string,
+  repo: string,
+  meta?: { title?: string; description?: string },
+) {
   launching.value = true;
   try {
-    const view = await invoke<SessionView>("launch_session", { repo, task });
+    const view = await invoke<SessionView>("launch_session", {
+      repo,
+      task,
+      title: meta?.title ?? null,
+      description: meta?.description ?? null,
+    });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.
@@ -194,6 +204,28 @@ async function launchTask(task: string, repo: string) {
     connError.value = e?.message ?? String(e);
   } finally {
     launching.value = false;
+  }
+}
+
+// Edit a topic's card: title (CAS-fenced against the value the card last
+// rendered), goal, and description. The command re-emits the fleet
+// snapshot itself — loom publishes no SSE event for these fields.
+async function updateTopic(
+  id: string,
+  fields: { title?: string; goal?: string; description?: string },
+  expected?: { title: string; provenance: string },
+) {
+  try {
+    await invoke("update_session", {
+      session: id,
+      title: fields.title ?? null,
+      goal: fields.goal ?? null,
+      description: fields.description ?? null,
+      expectedTitle: expected?.title ?? null,
+      expectedTitleProvenance: expected?.provenance ?? null,
+    });
+  } catch (e: any) {
+    connError.value = e?.message ?? String(e);
   }
 }
 
@@ -310,6 +342,7 @@ const connClass = computed(() =>
       :launching="launching"
       @select="selectSession"
       @launch="launchTask"
+      @update-topic="updateTopic"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
       @archive="onArchived"
