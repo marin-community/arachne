@@ -226,7 +226,7 @@ const groups = computed(() => buildGroups());
           <span class="group-name">{{ g.name }}</span>
           <span class="group-count">{{ g.activeCount }}</span>
           <button
-            v-if="!g.system"
+            v-if="!g.system && g.id !== 'inbox'"
             class="link stream-delete"
             title="delete workstream (sessions move to Inbox)"
             @click.stop="emit('move-session', `__delete__:${g.id}`)"
