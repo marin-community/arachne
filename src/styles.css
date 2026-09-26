@@ -398,8 +398,6 @@ button.accent { border-color: var(--accent); color: var(--accent); }
   border-width: 1.5px;
   flex-shrink: 0;
 }
-.spinner.mini.attention { border-color: var(--border); border-top-color: var(--attention); }
-.spinner.mini.error { border-color: var(--border); border-top-color: var(--blocked); }
 .working-label { color: var(--text-dim); }
 .working-meta {
   font-family: var(--mono);
@@ -417,8 +415,6 @@ button.accent { border-color: var(--accent); color: var(--accent); }
     line-height: 1;
   }
   .spinner.mini::after { font-size: 9px; }
-  .spinner.mini.attention::after { color: var(--attention); }
-  .spinner.mini.error::after { color: var(--blocked); }
 }
 
 /* --- Modal (settings) --------------------------------------------- */
