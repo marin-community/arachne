@@ -43,6 +43,45 @@ pub async fn chat_older_cursor(
     Ok(state.older_cursor.read().await.clone())
 }
 
+/// `fetch_chat`'s reply: the journal page plus the live-turn signals the
+/// thread view needs to show its working indicator. `live_turn` is set while
+/// an ACP turn is in flight (loom's durable `acp_inflight` state — it survives
+/// a reload of the app, unlike an in-memory flag); `pending_prompt` is a
+/// message queued behind the running turn, waiting to start its own. The two
+/// timestamps restore the elapsed clock after a reload: the live turn's
+/// opening user message is the turn start, the newest block of that turn is
+/// the last server-observed progress (mirrors loom SPA's `restoreLiveTiming`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatSnapshot {
+    pub blocks: Vec<crate::blocks::DisplayBlock>,
+    pub live_turn: Option<i64>,
+    pub pending_prompt: Option<String>,
+    pub live_started_at: Option<String>,
+    pub live_progress_at: Option<String>,
+}
+
+impl ChatSnapshot {
+    /// Derive the live turn's timing from the journal page: the opening
+    /// block's `created_at` (the user message the turn was spawned from) and
+    /// the newest block's `created_at`.
+    pub fn live_timing(chat: &crate::loom::SessionChatView) -> (Option<String>, Option<String>) {
+        let Some(turn) = chat.live_turn else {
+            return (None, None);
+        };
+        // The turn's opening block is its start (the user message the turn
+        // was spawned from); the newest block is the last observed progress.
+        let mut started = None;
+        let mut progress = None;
+        for block in chat.blocks.iter().filter(|b| b.turn == turn) {
+            if started.is_none() {
+                started = Some(block.created_at.clone());
+            }
+            progress = Some(block.created_at.clone());
+        }
+        (started, progress)
+    }
+}
+
 /// The dashboard snapshot the fleet poller pushes: the session summaries plus
 /// the workstream layout, so the sidebar can group by workstream and nest
 /// children under parents in one coherent render.
@@ -277,24 +316,35 @@ fn spawn_chat_forwarder(
     });
 }
 
-/// Fetch the chat journal, narrowed for display. Pass `before_turn`/
-/// `before_seq` (the previous page's older_cursor) to page backward;
-/// omit for the newest tail.
+/// Fetch the chat journal, narrowed for display, plus the live-turn state.
+/// Pass `before_turn`/`before_seq` (the previous page's older_cursor) to page
+/// backward; omit for the newest tail.
 #[tauri::command]
 pub async fn fetch_chat(
     state: State<'_, LoomState>,
     id: String,
     before_turn: Option<i64>,
     before_seq: Option<i64>,
-) -> Result<Vec<crate::blocks::DisplayBlock>, UiError> {
+) -> Result<ChatSnapshot, UiError> {
     let client = state_client(&state).await?;
     let before = match (before_turn, before_seq) {
         (Some(turn), Some(seq)) => Some(crate::loom::ChatCursorView { turn, seq }),
         _ => None,
     };
     let chat = client.session_chat(&id, before.as_ref()).await?;
+    let (live_started_at, live_progress_at) = ChatSnapshot::live_timing(&chat);
     *state.older_cursor.write().await = chat.older_cursor;
-    Ok(chat.blocks.iter().map(crate::blocks::DisplayBlock::from_view).collect())
+    Ok(ChatSnapshot {
+        blocks: chat
+            .blocks
+            .iter()
+            .map(crate::blocks::DisplayBlock::from_view)
+            .collect(),
+        live_turn: chat.live_turn,
+        pending_prompt: chat.pending_prompt,
+        live_started_at,
+        live_progress_at,
+    })
 }
 
 /// Send input to a session: ACP prompt (agents) or terminal text (raw).

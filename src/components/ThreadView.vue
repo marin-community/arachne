@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick, watch } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionView } from "../App.vue";
@@ -35,6 +35,28 @@ interface Cursor {
   seq: number;
 }
 
+// fetch_chat's reply: the journal page plus the live-turn signals behind
+// the working indicator. `live_turn` is set while an ACP turn is in
+// flight; `pending_prompt` is a message queued behind it, waiting to start
+// its own turn; the two timestamps restore the elapsed clock after a
+// reload (the turn's opening message = start, newest block = progress).
+interface ChatSnapshot {
+  blocks: DisplayBlock[];
+  live_turn: number | null;
+  pending_prompt: string | null;
+  live_started_at: string | null;
+  live_progress_at: string | null;
+}
+
+// One `loom://chat-event` frame: {topic, event, data}. On the chat topic
+// loom emits turn / block / delta / tool / queue (and resync when a
+// bounded broadcast drops frames); on the session topic, status/tag kinds.
+interface ChatEventFrame {
+  topic: string;
+  event: string;
+  data?: any;
+}
+
 const props = defineProps<{ session: SessionView }>();
 const emit = defineEmits<{
   (e: "error", msg: string): void;
@@ -49,6 +71,107 @@ const loadingOlder = ref(false);
 const hasOlder = ref(true);
 const convEl = ref<HTMLElement | null>(null);
 const unlisteners: UnlistenFn[] = [];
+
+// --- Live-turn state (the working spinner) ---------------------------------
+//
+// A turn is live from the `turn started` SSE frame (or a snapshot with
+// `live_turn` set — it's durable, so it survives an app reload) until the
+// `turn ended` frame. `clock` ticks once a second to keep the elapsed
+// label moving; `sseTurnAt` remembers when the last turn event arrived so a
+// reload that raced a turn boundary never clobbers fresher SSE truth.
+const turnLive = ref(false);
+const turnStartedAt = ref<number | null>(null);
+const lastProgressAt = ref<number | null>(null);
+const pendingPrompt = ref<string | null>(null);
+const clock = ref(Date.now());
+let ticker: ReturnType<typeof setInterval> | null = null;
+let sseTurnAt = 0;
+
+function markProgress(at?: number) {
+  const t = at ?? Date.now();
+  lastProgressAt.value = Math.max(lastProgressAt.value ?? 0, t);
+  if (turnStartedAt.value == null) turnStartedAt.value = t;
+}
+
+function turnStarted() {
+  turnLive.value = true;
+  turnStartedAt.value = Date.now();
+  lastProgressAt.value = Date.now();
+  pendingPrompt.value = null;
+  sseTurnAt = Date.now();
+  if (atBottom()) scrollToBottom();
+}
+
+function turnEnded() {
+  turnLive.value = false;
+  turnStartedAt.value = null;
+  lastProgressAt.value = null;
+  sseTurnAt = Date.now();
+}
+
+// Apply a snapshot's live-turn signals. A snapshot fetched before a turn
+// boundary (mid-flight during `send`, or racing an SSE turn event) must not
+// downgrade liveness an event newer than the fetch already established —
+// compare `sseTurnAt` against when the fetch began.
+function applyLive(snap: ChatSnapshot, fetchedAt: number) {
+  pendingPrompt.value = (snap.pending_prompt ?? "").trim() || null;
+  const sseIsNewer = sseTurnAt >= fetchedAt;
+  if (snap.live_turn != null) {
+    turnLive.value = true;
+    // Restore the elapsed clock from the journal, never regressing what
+    // streaming already observed (mirrors loom SPA's preserve semantics).
+    if (snap.live_started_at) {
+      const restored = Date.parse(snap.live_started_at);
+      if (!Number.isNaN(restored)) {
+        turnStartedAt.value = Math.min(turnStartedAt.value ?? Infinity, restored);
+      }
+    } else if (turnStartedAt.value == null) {
+      turnStartedAt.value = Date.now();
+    }
+    if (snap.live_progress_at) {
+      const restored = Date.parse(snap.live_progress_at);
+      if (!Number.isNaN(restored)) markProgress(restored);
+    }
+  } else if (!sseIsNewer) {
+    turnLive.value = false;
+    turnStartedAt.value = null;
+    lastProgressAt.value = null;
+  }
+}
+
+function onChatFrame(frame: ChatEventFrame) {
+  const d = frame.data ?? {};
+  switch (frame.event) {
+    case "turn":
+      if (d.state === "started") turnStarted();
+      else turnEnded();
+      break;
+    case "delta":
+    case "tool":
+      // Only stream mid-turn; they are proof of life.
+      turnLive.value = true;
+      markProgress();
+      break;
+    case "block":
+      if (turnLive.value) markProgress();
+      break;
+    case "queue":
+      pendingPrompt.value = (d.pending_prompt ?? "").trim() || null;
+      break;
+  }
+  scheduleReload();
+}
+
+const elapsedLabel = computed(() => {
+  if (turnStartedAt.value == null) return "";
+  const s = Math.max(0, Math.floor((clock.value - turnStartedAt.value) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+});
+const progressAge = computed(() =>
+  lastProgressAt.value == null
+    ? 0
+    : Math.max(0, Math.floor((clock.value - lastProgressAt.value) / 1000)),
+);
 
 // Delegation: spawn a child session under this one. The child lands in the
 // same workstream (loom inherits the parent's placement group) and nests
@@ -93,10 +216,13 @@ function scheduleReload() {
 
 async function reload() {
   const stick = atBottom();
+  const fetchedAt = Date.now();
   try {
-    blocks.value = await invoke<DisplayBlock[]>("fetch_chat", {
+    const snap = await invoke<ChatSnapshot>("fetch_chat", {
       id: props.session.id,
     });
+    blocks.value = snap.blocks;
+    applyLive(snap, fetchedAt);
     const cursor = await invoke<Cursor | null>("chat_older_cursor");
     hasOlder.value = cursor !== null;
     if (stick) scrollToBottom();
@@ -116,11 +242,15 @@ async function loadOlder() {
   }
   loadingOlder.value = true;
   try {
-    const older = await invoke<DisplayBlock[]>("fetch_chat", {
-      id: props.session.id,
-      beforeTurn: cursor.turn,
-      beforeSeq: cursor.seq,
-    });
+    // An older page carries its own (stale-tail) liveness fields; only the
+    // blocks are wanted here — applyLive runs on newest-tail reloads only.
+    const older = (
+      await invoke<ChatSnapshot>("fetch_chat", {
+        id: props.session.id,
+        beforeTurn: cursor.turn,
+        beforeSeq: cursor.seq,
+      })
+    ).blocks;
     if (older.length === 0) {
       hasOlder.value = false;
     } else {
@@ -143,16 +273,17 @@ async function loadOlder() {
 const collapsed = ref<Record<number, boolean>>({});
 
 onMounted(async () => {
+  ticker = setInterval(() => (clock.value = Date.now()), 1000);
   await reload();
   scrollToBottom();
   unlisteners.push(
     await listen("loom://chat-event", (event) => {
-      const frame = event.payload as { topic: string; event: string };
+      const frame = event.payload as ChatEventFrame;
       if (
         frame.topic.startsWith("chat:") ||
         frame.topic.startsWith("session:")
       ) {
-        scheduleReload();
+        onChatFrame(frame);
       }
     }),
   );
@@ -169,6 +300,11 @@ watch(
       collapsed.value = {};
       hasOlder.value = true;
       blocks.value = [];
+      turnLive.value = false;
+      turnStartedAt.value = null;
+      lastProgressAt.value = null;
+      pendingPrompt.value = null;
+      sseTurnAt = 0;
       await reload();
       scrollToBottom();
     }
@@ -178,6 +314,7 @@ watch(
 onUnmounted(() => {
   unlisteners.forEach((u) => u());
   if (reloadTimer) clearTimeout(reloadTimer);
+  if (ticker) clearInterval(ticker);
 });
 
 async function send() {
@@ -357,6 +494,27 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
         </div>
         <!-- usage / turn_end / unknown: no visual block -->
       </template>
+      <!-- Working indicator: shown while an ACP turn is live or a prompt is
+           queued behind it. Sits at the tail of the log so it reads as the
+           agent's next message being composed. -->
+      <div v-if="turnLive || pendingPrompt" class="block working">
+        <div class="who">{{ session.agent_kind }}</div>
+        <div class="body working-body">
+          <span class="spinner" aria-hidden="true"></span>
+          <span class="working-label">{{
+            pendingPrompt ? "working — message queued…" : "working…"
+          }}</span>
+          <span v-if="turnLive && elapsedLabel" class="working-meta">{{
+            `${elapsedLabel} elapsed`
+          }}</span>
+          <span
+            v-if="turnLive && progressAge >= 15"
+            class="working-meta quiet"
+            title="No visible output for a while — the model may be reasoning without streaming."
+            >no updates for {{ progressAge }}s</span
+          >
+        </div>
+      </div>
       <div v-if="blocks.length === 0" style="color: var(--text-dim)">
         No conversation yet.
       </div>
@@ -364,11 +522,15 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
     <div class="composer">
       <textarea
         v-model="draft"
-        placeholder="Message the agent…"
+        :placeholder="
+          turnLive
+            ? 'Agent is working — your message will queue behind the current turn…'
+            : 'Message the agent…'
+        "
         @keydown.enter.exact.prevent="send"
       ></textarea>
       <button class="primary" :disabled="!draft.trim() || busy" @click="send">
-        Send
+        {{ busy ? "…" : "Send" }}
       </button>
     </div>
   </section>

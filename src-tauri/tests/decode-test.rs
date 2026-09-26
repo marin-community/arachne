@@ -34,3 +34,35 @@ fn decode_chat() {
     let v: SessionChatView = serde_json::from_str(sample).expect("chat decode");
     assert_eq!(v.blocks[0].kind, "user_message");
 }
+
+#[test]
+fn chat_snapshot_live_timing_from_journal() {
+    // A live turn's elapsed clock is rebuilt from the journal: the turn's
+    // opening block is the start, the newest block of that turn is the last
+    // observed progress. Older turns (paging) and other kinds are ignored.
+    use arachne_lib::commands::ChatSnapshot;
+    let sample = r#"{"blocks":[
+        {"created_at":"2026-09-26T05:00:00.000Z","kind":"usage","payload":{},"seq":0,"turn":0},
+        {"created_at":"2026-09-26T05:00:01.000Z","kind":"user_message","payload":{},"seq":1,"turn":3},
+        {"created_at":"2026-09-26T05:00:02.000Z","kind":"thought","payload":{},"seq":2,"turn":3},
+        {"created_at":"2026-09-26T05:00:03.000Z","kind":"tool_call","payload":{},"seq":3,"turn":3}
+    ],"effective_mode":null,"live_turn":3,"metadata":{},"older_cursor":null,"pending_prompt":"queued behind"}"#;
+    let chat: SessionChatView = serde_json::from_str(sample).expect("chat decode");
+    let (started, progress) = ChatSnapshot::live_timing(&chat);
+    assert_eq!(started.as_deref(), Some("2026-09-26T05:00:01.000Z"));
+    assert_eq!(progress.as_deref(), Some("2026-09-26T05:00:03.000Z"));
+
+    // No live turn: no timing.
+    let idle = serde_json::json!({
+        "blocks": [],
+        "effective_mode": null,
+        "live_turn": null,
+        "metadata": {},
+        "older_cursor": null,
+        "pending_prompt": null
+    });
+    let chat: SessionChatView = serde_json::from_value(idle).expect("idle decode");
+    let (started, progress) = ChatSnapshot::live_timing(&chat);
+    assert_eq!(started, None);
+    assert_eq!(progress, None);
+}
