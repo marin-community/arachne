@@ -402,33 +402,18 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
     Ok(FleetSnapshot { sessions, layout })
 }
 
-/// Create a workstream (layout group) in a space.
+/// Delete a workstream lane; its sessions move to the destination group first.
 #[tauri::command]
-pub async fn create_workstream(
+pub async fn delete_workstream(
     state: State<'_, LoomState>,
-    name: String,
-    space_id: Option<String>,
+    group_id: String,
+    destination_group_id: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
     let client = state_client(&state).await?;
-    // Default to the user space's Inbox space if not specified — Arachne's
-    // workstreams live in the human's primary space.
-    let space = match space_id {
-        Some(id) => id,
-        None => {
-            let layout = client.session_layout().await?;
-            layout
-                .spaces
-                .iter()
-                .find(|s| s.system_key.as_deref() == Some("inbox") || s.name.eq_ignore_ascii_case("user"))
-                .or_else(|| layout.spaces.first())
-                .map(|s| s.id.clone())
-                .ok_or_else(|| UiError {
-                    message: "no space found for workstream".into(),
-                    unreachable: false,
-                })?
-        }
-    };
-    client.create_group(&space, &name).await.map_err(Into::into)
+    client
+        .delete_group(&group_id, &destination_group_id)
+        .await
+        .map_err(Into::into)
 }
 
 /// Move sessions into a lane (placement group).

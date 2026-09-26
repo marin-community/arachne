@@ -30,9 +30,9 @@ pub fn run() {
             commands::archive_session,
             commands::open_in_zed,
             commands::refresh_fleet,
-            commands::create_workstream,
             commands::reparent_session,
             commands::move_to_workstream,
+            commands::delete_workstream,
         ])
         .run(tauri::generate_context!())
         .expect("error while running arachne");

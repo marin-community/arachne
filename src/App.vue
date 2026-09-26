@@ -199,14 +199,6 @@ async function delegateFromThread(parentId: string, task: string) {
   }
 }
 
-async function createWorkstream(name: string) {
-  try {
-    await invoke("create_workstream", { name });
-  } catch (e: any) {
-    connError.value = e?.message ?? String(e);
-  }
-}
-
 async function reparentSession(
   sessionId: string,
   parentId: string | null,
@@ -225,6 +217,33 @@ async function reparentSession(
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   }
+}
+
+async function deleteLane(laneId: string) {
+  try {
+    // Delete a user lane; its chats move back to the user-space Inbox.
+    const inbox = userInboxId();
+    if (!inbox) {
+      connError.value = "no Inbox lane found to move chats into";
+      return;
+    }
+    await invoke("delete_workstream", {
+      groupId: laneId,
+      destinationGroupId: inbox,
+    });
+  } catch (e: any) {
+    connError.value = e?.message ?? String(e);
+  }
+}
+
+function userInboxId(): string | undefined {
+  for (const sp of layout.value?.spaces ?? []) {
+    if (sp.system_key === "user" || sp.name === "User") {
+      const g = sp.groups.find((g) => g.system_key === "inbox");
+      if (g) return g.id;
+    }
+  }
+  return undefined;
 }
 
 function onArchived(id: string) {
@@ -267,8 +286,8 @@ const connClass = computed(() =>
       :launching="launching"
       @select="selectSession"
       @launch="launchTask"
-      @create-workstream="createWorkstream"
       @reparent="reparentSession"
+      @delete-lane="deleteLane"
     />
     <ThreadView
       v-if="selectedId && selectedView"
