@@ -271,6 +271,66 @@ impl LoomClient {
         .await
     }
 
+    /// Branch-scoped versioned artifact. A missing manifest is a normal empty
+    /// topic; callers distinguish its 404 from other Loom failures.
+    pub async fn branch_artifact(
+        &self,
+        branch: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, LoomError> {
+        self.op(
+            "/api/artifacts/get",
+            &serde_json::json!({ "branch": branch, "name": name, "repo": false }),
+        ).await
+    }
+
+    pub async fn write_branch_artifact(
+        &self,
+        branch: &str,
+        name: &str,
+        content: &str,
+        base_rev: i64,
+    ) -> Result<serde_json::Value, LoomError> {
+        self.op(
+            "/api/artifacts/write",
+            &serde_json::json!({
+                "branch": branch, "name": name, "content": content,
+                "title": "Arachne topic resources", "kind": "json",
+                "base_rev": base_rev, "repo": false,
+            }),
+        ).await
+    }
+
+    /// Read text from Loom's server-side worktree. Never interpret the path
+    /// as a Mac-local filename, including when Loom runs on this machine.
+    pub async fn worktree_text(&self, session: &str, path: &str) -> Result<String, LoomError> {
+        let mut url = self.base.join("/api/sessions/raw")
+            .map_err(|e| LoomError::Connection(format!("joining /api/sessions/raw: {e}")))?;
+        url.query_pairs_mut().append_pair("session", session).append_pair("path", path);
+        let mut req = self.http.get(url);
+        if let Some(token) = &self.token { req = req.bearer_auth(token); }
+        let mut resp = req.timeout(Duration::from_secs(30)).send().await
+            .map_err(|e| LoomError::Connection(e.to_string()))?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            return Err(LoomError::Api {
+                status, method: "GET", path: "/api/sessions/raw".into(),
+                message: resp.text().await.unwrap_or_default(),
+            });
+        }
+        const MAX_BYTES: usize = 512 * 1024;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| LoomError::Connection(e.to_string()))? {
+            if bytes.len() + chunk.len() > MAX_BYTES {
+                return Err(LoomError::Decode { path: "/api/sessions/raw".into(), detail: "file exceeds 512 KiB preview limit".into() });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        String::from_utf8(bytes).map_err(|e| LoomError::Decode {
+            path: "/api/sessions/raw".into(), detail: format!("file is not UTF-8 text: {e}"),
+        })
+    }
+
     /// `branches.list` — every branch loom tracks, including its base ref.
     /// The Land action uses that recorded ref as its default upstream.
     pub async fn list_branches(

@@ -5,6 +5,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
 import SplitButton from "./SplitButton.vue";
+import ChangeReview from "./ChangeReview.vue";
 
 // DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
 // { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
@@ -510,6 +511,7 @@ function messageAuthor(block: DisplayBlock): string {
 
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
 const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id));
+const lastIntegration = computed(() => currentSummary.value?.branch.tags.find((tag) => tag.key === "integration_result"));
 const integrationTarget = computed(() => {
   let current = currentSummary.value;
   let nearest: SessionSummary | null = null;
@@ -562,8 +564,10 @@ interface IntegrationTarget {
 const integrating = ref(false);
 const landing = ref(false);
 const integrationNote = ref("");
+const showChanges = ref(false);
 const workSummary = ref<{ files: number; additions: number; deletions: number; has_commits: boolean } | null>(null);
 watch(() => props.session.id, async (id) => {
+  showChanges.value = false;
   workSummary.value = null;
   try {
     const summary = await invoke<{ files: number; additions: number; deletions: number; has_commits: boolean }>("work_summary", { sessionId: id });
@@ -613,6 +617,7 @@ async function onLand(strategy: string) {
         </div>
       </div>
       <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
+      <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
@@ -624,6 +629,9 @@ async function onLand(strategy: string) {
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
     </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
+    <div v-if="isWorker && lastIntegration" class="integrate-note" :title="lastIntegration.note">
+      Last integrated result: {{ lastIntegration.value }}<span v-if="lastIntegration.note"> · {{ lastIntegration.note }}</span>
+    </div>
     <div v-if="showHandoff" class="handoff-box">
       <div class="handoff-heading">Switch this thread’s runtime</div>
       <div class="handoff-fields">
@@ -700,6 +708,7 @@ async function onLand(strategy: string) {
         <span class="resource-item" title="Diff against the checkout's recorded base branch">{{ workSummary.files }} files · +{{ workSummary.additions }} −{{ workSummary.deletions }}</span>
       </template>
     </div>
+    <ChangeReview v-if="showChanges" :session-id="session.id" />
     <div v-if="showDelegate" class="delegate-box">
       <input
         v-model="delegateTask"

@@ -6,6 +6,7 @@ import FleetSidebar from "./components/FleetSidebar.vue";
 import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
+import ResourcePanel from "./components/ResourcePanel.vue";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
@@ -132,6 +133,7 @@ const launchOptions = ref<LaunchOptions | null>(null);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
 const showSettings = ref(false);
+const showResources = ref(true);
 const settingsError = ref<string | null>(null);
 // URL is not a secret — localStorage is fine. The TOKEN is a credential:
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
@@ -346,10 +348,25 @@ async function onArchived(id: string) {
 const connClass = computed(() =>
   connected.value ? "ok" : connError.value ? "bad" : "warn",
 );
+
+const selectedTopic = computed(() => {
+  let node = fleet.value.find((session) => session.id === selectedId.value);
+  if (!node) return null;
+  const seen = new Set<string>();
+  while (node && !seen.has(node.id)) {
+    seen.add(node.id);
+    const parent: SessionSummary | undefined = fleet.value.find((session) =>
+      session.id === node?.parent_session_id || session.branch.id === node?.parent_id,
+    );
+    if (!parent) break;
+    node = parent;
+  }
+  return node;
+});
 </script>
 
 <template>
-  <div class="app" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': !!selectedView && !!selectedTopic && showResources }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
       <button class="title home-link" title="Show attention overview" @click="selectedId = null; selectedView = null">🕸 Arachne</button>
       <span
@@ -367,6 +384,8 @@ const connClass = computed(() =>
             : (connError ?? "connecting…")
         }}
       </span>
+      <button v-if="selectedView && selectedTopic" class="header-resources" :aria-pressed="showResources"
+        @click="showResources = !showResources">Resources</button>
     </header>
     <FleetSidebar
       :fleet="fleet"
@@ -398,6 +417,8 @@ const connClass = computed(() =>
       :selected-id="selectedId"
       @select="selectSession"
     />
+    <ResourcePanel v-if="selectedView && selectedTopic && showResources" :topic="selectedTopic"
+      @close="showResources = false" @error="connError = $event" />
     <SettingsSheet
       v-if="showSettings"
       :url="loomUrl"

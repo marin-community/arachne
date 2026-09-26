@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
 use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
+use crate::resources::{ResourceDraft, ResourceKind, TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME};
 
 #[derive(Default)]
 pub struct LoomState {
@@ -1019,6 +1020,155 @@ pub async fn work_summary(
         files: changes.totals.files,
         has_commits: changes.head_oid.as_deref() != changes.base.get("oid").and_then(|value| value.as_str()),
     })
+}
+
+/// The complete bounded Loom change set for the review pane.
+#[tauri::command]
+pub async fn work_changes(
+    state: State<'_, LoomState>,
+    session_id: String,
+) -> Result<crate::loom::ChangeSetView, UiError> {
+    let client = state_client(&state).await?;
+    client.session_changes(&session_id).await.map_err(Into::into)
+}
+
+fn resource_error(message: impl Into<String>) -> UiError {
+    UiError { message: message.into(), unreachable: false }
+}
+
+async fn load_topic_resources(client: &LoomClient, branch_id: &str) -> Result<TopicResourcesView, UiError> {
+    let artifact = match client.branch_artifact(branch_id, MANIFEST_NAME).await {
+        Ok(value) => value,
+        Err(LoomError::Api { status: 404, .. }) => return Ok(TopicResourcesView::default()),
+        Err(error) => return Err(error.into()),
+    };
+    if artifact.get("meta").and_then(|v| v.get("branch_id")).and_then(|v| v.as_str()) != Some(branch_id) {
+        return Err(resource_error("resource manifest name is occupied by a repository-shared artifact"));
+    }
+    let content = artifact.get("content").and_then(|v| v.as_str())
+        .ok_or_else(|| resource_error("resource manifest has no content"))?;
+    let mut manifest: TopicResourcesView = serde_json::from_str(content)
+        .map_err(|e| resource_error(format!("invalid resource manifest: {e}")))?;
+    manifest.revision = artifact.get("meta").and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| resource_error("resource manifest has no revision"))?;
+    Ok(manifest)
+}
+
+async fn save_topic_resources(client: &LoomClient, branch_id: &str, manifest: &TopicResourcesView, expected_revision: i64) -> Result<TopicResourcesView, UiError> {
+    let content = serde_json::to_string_pretty(&manifest)
+        .map_err(|e| resource_error(format!("serializing resources: {e}")))?;
+    let artifact = client.write_branch_artifact(branch_id, MANIFEST_NAME, &content, expected_revision).await?;
+    if artifact.get("meta").and_then(|v| v.get("branch_id")).and_then(|v| v.as_str()) != Some(branch_id) {
+        return Err(resource_error("resource manifest was not saved on the topic branch"));
+    }
+    let mut saved = manifest.clone();
+    saved.revision = artifact.get("meta").and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| resource_error("saved resource manifest has no revision"))?;
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn topic_resources(state: State<'_, LoomState>, topic_id: String) -> Result<TopicResourcesView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    load_topic_resources(&client, &topic.branch.id).await
+}
+
+#[tauri::command]
+pub async fn attach_topic_resource(
+    state: State<'_, LoomState>, topic_id: String, resource: ResourceDraft,
+    expected_revision: i64,
+) -> Result<TopicResourcesView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    let resource = resource.validated(&topic.branch.repo_root, &topic.branch.branch)
+        .map_err(resource_error)?;
+    let mut manifest = load_topic_resources(&client, &topic.branch.id).await?;
+    if manifest.revision != expected_revision { return Err(resource_error("resources changed; reload before editing")); }
+    if let Some(existing) = manifest.resources.iter_mut().find(|r| r.id == resource.id) {
+        *existing = resource;
+    } else {
+        manifest.resources.push(resource);
+    }
+    save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await
+}
+
+#[tauri::command]
+pub async fn detach_topic_resource(
+    state: State<'_, LoomState>, topic_id: String, resource_id: String,
+    expected_revision: i64,
+) -> Result<TopicResourcesView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    let mut manifest = load_topic_resources(&client, &topic.branch.id).await?;
+    if manifest.revision != expected_revision { return Err(resource_error("resources changed; reload before editing")); }
+    let before = manifest.resources.len();
+    manifest.resources.retain(|r| r.id != resource_id);
+    if manifest.resources.len() == before { return Err(resource_error("resource not found")); }
+    save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await
+}
+
+async fn resolve_topic_resource(client: &LoomClient, topic_id: &str, resource_id: &str) -> Result<(SessionView, TopicResource), UiError> {
+    let topic = client.get_session(topic_id).await?;
+    let manifest = load_topic_resources(client, &topic.branch.id).await?;
+    let resource = manifest.resources.into_iter().find(|r| r.id == resource_id)
+        .ok_or_else(|| resource_error("resource not found"))?;
+    Ok((topic, resource))
+}
+
+#[tauri::command]
+pub async fn read_topic_resource(
+    state: State<'_, LoomState>, topic_id: String, resource_id: String,
+) -> Result<TopicResourceContent, UiError> {
+    let client = state_client(&state).await?;
+    let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
+    let content = match resource.data.kind {
+        ResourceKind::File | ResourceKind::DesignDocument => {
+            if topic.status == "archived" { return Err(resource_error("topic checkout is archived; recover it to preview this file")); }
+            if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
+                return Err(resource_error("file reference no longer matches the topic branch"));
+            }
+            let path = resource.data.path.as_deref().ok_or_else(|| resource_error("resource has no file path"))?;
+            crate::resources::validate_relative_path(path).map_err(resource_error)?;
+            client.worktree_text(&topic_id, path).await?
+        }
+        ResourceKind::Artifact => {
+            let name = resource.data.path.as_deref().ok_or_else(|| resource_error("resource has no artifact name"))?;
+            client.branch_artifact(&topic.branch.id, name).await?
+                .get("content").and_then(|v| v.as_str()).ok_or_else(|| resource_error("artifact has no content"))?.to_owned()
+        }
+        _ => return Err(resource_error("this resource has no text preview")),
+    };
+    Ok(TopicResourceContent { resource, content })
+}
+
+#[tauri::command]
+pub async fn open_topic_resource_in_zed(
+    state: State<'_, LoomState>, topic_id: String, resource_id: String,
+) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
+    if !matches!(resource.data.kind, ResourceKind::File | ResourceKind::DesignDocument) {
+        return Err(resource_error("only repository files can open in Zed"));
+    }
+    if topic.status == "archived" { return Err(resource_error("topic checkout is archived; recover it before opening a file")); }
+    if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
+        return Err(resource_error("file reference no longer matches the topic branch"));
+    }
+    let path = resource.data.path.as_deref().ok_or_else(|| resource_error("resource has no file path"))?;
+    crate::resources::validate_relative_path(path).map_err(resource_error)?;
+    let host = client.server_host().ok_or_else(|| resource_error("Loom URL has no host"))?;
+    let file = std::path::Path::new(&topic.work_dir).join(path);
+    let target = zed_target(host, &file.to_string_lossy())?;
+    let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
+        "/Applications/Zed.app/Contents/MacOS/cli"
+    } else { "zed" };
+    let status = tokio::process::Command::new(cli).arg(&target).status().await
+        .map_err(|e| resource_error(format!("launching zed: {e}")))?;
+    if !status.success() { return Err(resource_error(format!("zed exited with {status}"))); }
+    Ok(())
 }
 
 #[cfg(test)]

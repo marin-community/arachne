@@ -15,6 +15,7 @@ pub mod blocks;
 pub mod client;
 pub mod commands;
 pub mod loom;
+pub mod resources;
 pub mod secret;
 
 pub fn run() {
@@ -45,6 +46,12 @@ pub fn run() {
             commands::integrate_session,
             commands::land_topic,
             commands::work_summary,
+            commands::work_changes,
+            commands::topic_resources,
+            commands::attach_topic_resource,
+            commands::detach_topic_resource,
+            commands::read_topic_resource,
+            commands::open_topic_resource_in_zed,
         ])
         .run(tauri::generate_context!())
         .expect("error while running arachne");

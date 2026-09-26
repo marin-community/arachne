@@ -71,7 +71,12 @@ state, handling conflicts, running validation, and reporting the result.
    run what exists.
 8. **Update the target branch.** Push if the repository expects it.
 9. **Record resulting commits/PRs** in your report; associate the PR if one
-   was created.
+   was created. For a completed worker integration, stamp the source session
+   with `loom sessions tags set integration_result <commit-or-PR-reference>
+   --session <source_thread> --note "<strategy> into <target branch>"`.
+   Do this only after the target update or PR creation and validation have
+   succeeded. A sent request or failed integration is not a result. If the
+   tag command fails, report that separately; the git result still stands.
 10. **Report a concise outcome** to the requesting thread (the parent
     coordinator, or the user if you are the topic leader): what was
     integrated, where, the commit hash or PR link, and validation results.

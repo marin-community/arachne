@@ -19,6 +19,10 @@ Use the Inbox's task box to choose a repository, agent, inference profile, model
 
 The thread's resource strip shows the checkout and any associated pull request. **Open in Zed** opens a local checkout directly or a remote checkout over SSH, using the active session's path from Loom.
 
+**Review diff** shows Loom's current change set with file hunks and line numbers. Worker threads offer **Integrate** into their topic; topic threads offer **Land** toward upstream. These buttons queue a structured request for the coordinating agent, which must still validate and report the actual Git result.
+
+The **Resources** rail attaches design documents and files to a topic. Arachne stores the binding as a versioned Loom artifact on the topic branch, previews text through Loom's server-side checkout, and opens the exact file in Zed. The attachment survives an archived session; previewing or editing a repo file requires an active topic checkout. [docs/design.md](docs/design.md) is the current Arachne design document.
+
 Codex can use an existing ChatGPT subscription login on the runner. Run `codex login` as the same OS user that runs Loom, then verify with `codex login status`. API-key routes remain available when a key is configured. Arachne's bearer token authenticates to Loom; it is separate from Codex's inference login.
 
 ## Checks
