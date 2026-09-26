@@ -207,9 +207,21 @@ async function createWorkstream(name: string) {
   }
 }
 
-async function reparentSession(sessionId: string, parentId: string | null) {
+async function reparentSession(
+  sessionId: string,
+  parentId: string | null,
+  laneId?: string,
+) {
   try {
     await invoke("reparent_session", { sessionId, parentId });
+    // Filing into a lane with no parent: also move the placement group so
+    // the chat shows up under that lane header.
+    if (!parentId && laneId) {
+      await invoke("move_to_workstream", {
+        sessionIds: [sessionId],
+        groupId: laneId,
+      });
+    }
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   }

@@ -431,6 +431,18 @@ pub async fn create_workstream(
     client.create_group(&space, &name).await.map_err(Into::into)
 }
 
+/// Move sessions into a lane (placement group).
+#[tauri::command]
+pub async fn move_to_workstream(
+    state: State<'_, LoomState>,
+    session_ids: Vec<String>,
+    group_id: String,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let client = state_client(&state).await?;
+    let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
+    client.move_sessions(&refs, &group_id).await.map_err(Into::into)
+}
+
 /// Re-parent a session under another (its workstream's top-level chat), or
 /// detach it to top level. The session follows the parent's placement group.
 #[tauri::command]

@@ -13,7 +13,12 @@ const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "launch", task: string, repo: string): void;
   (e: "create-workstream", name: string): void;
-  (e: "reparent", sessionId: string, parentId: string | null): void;
+  (
+    e: "reparent",
+    sessionId: string,
+    parentId: string | null,
+    laneId?: string,
+  ): void;
 }>();
 
 const task = ref("");
@@ -94,6 +99,7 @@ interface TreeNode {
 interface Lane {
   id: string;
   name: string;
+  system: string | null;
   trees: TreeNode[];
   count: number;
 }
@@ -139,7 +145,10 @@ function buildLanes(): Lane[] {
 
   // File trees into lanes by their ROOT session's placement.
   const laneFor = new Map<string, TreeNode[]>();
-  const laneNames = new Map<string, { name: string; order: number }>();
+  const laneNames = new Map<
+    string,
+    { name: string; order: number; system: string | null }
+  >();
   if (props.layout) {
     for (const space of props.layout.spaces) {
       for (const g of space.groups) {
@@ -147,6 +156,7 @@ function buildLanes(): Lane[] {
         laneNames.set(g.id, {
           name: g.name,
           order: space.rank * 10000 + g.rank,
+          system: g.system_key ?? null,
         });
       }
     }
@@ -162,11 +172,16 @@ function buildLanes(): Lane[] {
   const order = (gid: string) => laneNames.get(gid)?.order ?? 999999;
   for (const gid of [...laneFor.keys()].sort((a, b) => order(a) - order(b))) {
     const trees = laneFor.get(gid)!;
-    if (trees.length === 0) continue;
+    const meta = laneNames.get(gid)!;
+    // System lanes (per-space Inboxes) hide when empty; user-created
+    // workstream lanes always render so an empty one is visible — otherwise
+    // creating a workstream looks like a silent failure.
+    if (trees.length === 0 && meta.system) continue;
     const count = trees.reduce((acc, t) => acc + 1 + countTree(t), 0);
     lanes.push({
       id: gid,
-      name: laneNames.get(gid)?.name ?? gid,
+      name: meta.name,
+      system: meta.system,
       trees,
       count,
     });
@@ -175,6 +190,7 @@ function buildLanes(): Lane[] {
     lanes.push({
       id: "unfiled",
       name: "Inbox",
+      system: null,
       trees: unfiled,
       count: unfiled.length,
     });
@@ -214,6 +230,22 @@ function onDropRoot(parentId: string | null, key: string, e: DragEvent) {
     dragging.value = null;
   }
 }
+
+// Drop on a lane header: file the chat into that lane as a top-level
+// session (detach from any tree, move its placement there).
+function onDropLane(laneId: string, key: string, e: DragEvent) {
+  e.preventDefault();
+  dropTarget.value = null;
+  if (dragging.value) {
+    emit(
+      "reparent",
+      dragging.value,
+      null,
+      laneId === "unfiled" ? undefined : laneId,
+    );
+    dragging.value = null;
+  }
+}
 </script>
 
 <template>
@@ -248,7 +280,7 @@ function onDropRoot(parentId: string | null, key: string, e: DragEvent) {
           :class="{ 'drop-hint': dropTarget === `lane-${lane.id}` }"
           @dragover="onDragOver(`lane-${lane.id}`, $event)"
           @dragleave="onDragLeave(`lane-${lane.id}`)"
-          @drop="onDropRoot(null, `lane-${lane.id}`, $event)"
+          @drop="onDropLane(lane.id, `lane-${lane.id}`, $event)"
           :title="
             dragging ? 'drop here to file as a top-level chat' : lane.name
           "
