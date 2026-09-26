@@ -22,7 +22,8 @@ the intended remote test uses Loom on the DGX over Tailscale.
 
 - **Topic:** durable intent and accepted state. Its coordinating thread may
   sleep, but the topic keeps its branch, documents, and resource bindings.
-  Creation starts with a short title and a body that becomes the agent goal.
+  Creation offers a short title and a body that becomes the agent goal; either
+  can be left blank when the other or an attachment supplies the intent.
 - **Quick one-off:** a single-prompt session in the Inbox. It can stay small
   without becoming a named topic.
 - **Thread/worker:** one Loom session and its conversation. Hierarchy records
@@ -58,6 +59,12 @@ the current manifest when sending and includes the backing locator in the
 agent's prompt. Removing the visible mention removes that resource from the
 send. New topics can cite resources from existing topics before they have
 bindings of their own.
+
+File attachments use Loom Scratch. At launch they seed the new session's
+checkout; in an existing ACP thread, Arachne uploads them to that session and
+passes Loom resource links with the prompt. The composer also accepts dropped
+or pasted files. Scratch files are session inputs, while topic resource
+bindings are durable references to repository files and artifacts.
 
 Later resource types should be added only when a real workflow needs them.
 The next likely additions are a retained integration checkout and a PR that

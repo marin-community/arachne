@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
@@ -394,6 +395,7 @@ pub async fn send_input(
     protocol: String,
     topic_id: Option<String>,
     resource_ids: Option<Vec<String>>,
+    attachments: Option<Vec<crate::loom::ScratchUpload>>,
 ) -> Result<(), UiError> {
     let client = state_client(&state).await?;
     let mut prompt = text;
@@ -403,12 +405,56 @@ pub async fn send_input(
         let mentions = ids.into_iter().map(|resource_id| ResourceMention { topic_id: topic_id.clone(), resource_id }).collect();
         prompt.push_str(&resource_context(&client, mentions).await?);
     }
+    let mut files = Vec::new();
+    for (name, bytes) in decode_attachments(attachments.unwrap_or_default())? {
+        files.push(client.upload_scratch(&id, &name, bytes).await?);
+    }
+    if !files.is_empty() {
+        prompt.push_str("\n\nAttached files in this session's Scratch directory:\n");
+        for path in &files { prompt.push_str(&format!("- {path}\n")); }
+    }
     if protocol == "terminal" {
         client.send_text(&id, &prompt, true).await?;
     } else {
-        client.send_prompt(&id, &prompt).await?;
+        client.send_prompt(&id, &prompt, &files).await?;
     }
     Ok(())
+}
+
+fn decode_attachments(uploads: Vec<crate::loom::ScratchUpload>) -> Result<Vec<(String, Vec<u8>)>, UiError> {
+    if uploads.len() > 20 { return Err(resource_error("attach at most 20 files")); }
+    let mut total = 0usize;
+    let mut names = std::collections::HashSet::new();
+    let mut decoded = Vec::new();
+    for upload in uploads {
+        let name = &upload.name;
+        if name.is_empty() || name.trim() != name || name == "." || name == ".."
+            || name.len() > 240 || name.contains(['/', '\\']) || name.chars().any(char::is_control)
+            || name.eq_ignore_ascii_case(".gitignore") || !names.insert(name.clone()) {
+            return Err(resource_error(format!("invalid or duplicate attachment name: {name}")));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD.decode(&upload.content_base64)
+            .map_err(|e| resource_error(format!("decoding attachment {name}: {e}")))?;
+        if bytes.len() > 25 * 1024 * 1024 { return Err(resource_error(format!("{name} exceeds Loom's 25 MiB file limit"))); }
+        total += bytes.len();
+        if total > 50 * 1024 * 1024 { return Err(resource_error("attachments exceed Loom's 50 MiB total limit")); }
+        decoded.push((name.clone(), bytes));
+    }
+    Ok(decoded)
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::decode_attachments;
+    use crate::loom::ScratchUpload;
+
+    #[test]
+    fn decodes_binary_and_rejects_unsafe_names_before_upload() {
+        let upload = ScratchUpload { name: "image.png".into(), content_base64: "AAECA/8=".into() };
+        assert_eq!(decode_attachments(vec![upload]).unwrap()[0].1, [0, 1, 2, 3, 255]);
+        let bad = ScratchUpload { name: "../image.png".into(), content_base64: "AA==".into() };
+        assert!(decode_attachments(vec![bad]).is_err());
+    }
 }
 
 fn thread_note_body(source_title: &str, source_id: &str, note: &str) -> String {
@@ -497,6 +543,7 @@ pub async fn launch_session(
     description: Option<String>,
     one_off: Option<bool>,
     mentions: Option<Vec<ResourceMention>>,
+    attachments: Option<Vec<crate::loom::ScratchUpload>>,
     profile: Option<String>,
     agent: Option<String>,
     model: Option<String>,
@@ -524,9 +571,20 @@ pub async fn launch_session(
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(String::from);
+    let attachments = attachments.unwrap_or_default();
+    // Reject malformed uploads before Loom creates a branch/session. Loom
+    // validates the same limits again when it writes Scratch on its host.
+    let launch_bytes: usize = decode_attachments(attachments.clone())?.iter().map(|(_, bytes)| bytes.len()).sum();
+    if launch_bytes > 45 * 1024 * 1024 {
+        return Err(resource_error("launch attachments exceed the 45 MiB JSON request limit"));
+    }
     let mut goal = task;
     if let Some(mentions) = mentions {
         goal.push_str(&resource_context(&client, mentions).await?);
+    }
+    if !attachments.is_empty() {
+        goal.push_str("\n\nAttached files in Scratch:\n");
+        for file in &attachments { goal.push_str(&format!("- scratch/{}\n", file.name)); }
     }
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
@@ -538,6 +596,7 @@ pub async fn launch_session(
             agent,
             model,
             effort,
+            scratch: attachments,
             ..Default::default()
         })
         .await?;

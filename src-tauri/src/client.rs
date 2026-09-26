@@ -356,14 +356,37 @@ impl LoomClient {
     }
 
     /// `sessions.prompt.create` — send input to an ACP session's agent.
-    pub async fn send_prompt(&self, id: &str, text: &str) -> Result<(), LoomError> {
+    pub async fn send_prompt(&self, id: &str, text: &str, files: &[String]) -> Result<(), LoomError> {
         let _: serde_json::Value = self
             .op(
                 "/api/sessions/prompt/create",
-                &serde_json::json!({ "session": id, "text": text, "send_now": true }),
+                &serde_json::json!({ "session": id, "text": text, "files": files, "send_now": true }),
             )
             .await?;
         Ok(())
+    }
+
+    /// Raw Scratch upload keeps file bytes on Loom's host, including when
+    /// Arachne is connected over Tailscale to a remote runner.
+    pub async fn upload_scratch(&self, session: &str, name: &str, bytes: Vec<u8>) -> Result<String, LoomError> {
+        let path = "/api/sessions/scratch/write";
+        let mut url = self.base.join(path)
+            .map_err(|e| LoomError::Connection(format!("joining {path}: {e}")))?;
+        url.query_pairs_mut().append_pair("session", session).append_pair("name", name);
+        let mut req = self.http.post(url).header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(token) = &self.token { req = req.bearer_auth(token); }
+        let resp = req.body(bytes).timeout(Duration::from_secs(120)).send().await
+            .map_err(|e| LoomError::Connection(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let message = resp.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
+                .unwrap_or_default();
+            return Err(LoomError::Api { status: status.as_u16(), method: "POST", path: path.into(), message });
+        }
+        let value: serde_json::Value = resp.json().await.map_err(|e| LoomError::Decode { path: path.into(), detail: e.to_string() })?;
+        value.get("path").and_then(|v| v.as_str()).map(String::from)
+            .ok_or_else(|| LoomError::Decode { path: path.into(), detail: "upload response has no path".into() })
     }
 
     /// Queue an ACP request behind the current turn. Integration and landing

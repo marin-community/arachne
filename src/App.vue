@@ -7,6 +7,7 @@ import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
+import type { FileAttachment } from "./attachments";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
@@ -218,7 +219,8 @@ async function selectSession(id: string) {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+  completed?: (success: boolean) => void,
 ) {
   launching.value = true;
   try {
@@ -229,6 +231,7 @@ async function launchTask(
       description: meta?.description ?? null,
       oneOff: meta?.oneOff ?? false,
       mentions: meta?.mentions ?? [],
+      attachments: meta?.attachments?.map(({ name, contentBase64 }) => ({ name, contentBase64 })) ?? [],
       profile: meta?.profile || null,
       agent: meta?.agent || null,
       model: meta?.model || null,
@@ -238,8 +241,10 @@ async function launchTask(
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.
     await selectSession(view.id);
+    completed?.(true);
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
+    completed?.(false);
   } finally {
     launching.value = false;
   }

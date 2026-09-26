@@ -235,6 +235,7 @@ body {
 }
 .new-topic-heading { font-size: 14px; font-weight: 600; }
 .new-topic-card label { color: var(--text-dim); font-size: 11px; font-weight: 600; }
+.new-topic-card .field-optional { font-weight: 400; opacity: .75; }
 .topic-body-wrap { position: relative; }
 .topic-body-wrap textarea { display: block; }
 .new-topic-card input,
@@ -474,6 +475,17 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .mention-menu.topic-body-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
 .sidebar .new-task.quick-task-wrap { position: relative; }
 .mention-menu.quick-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
+.attachment-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-height: 26px; }
+.attachment-pick { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px; cursor: pointer; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+.attachment-pick:hover { border-color: var(--accent); color: var(--text); }
+.attachment-pick input { display: none; }
+.attachment-chip { display: inline-flex; align-items: center; gap: 3px; max-width: 100%; border: 1px solid var(--border); border-radius: 5px; padding: 2px 3px 2px 6px; font-size: 11px; overflow-wrap: anywhere; }
+.attachment-chip button { border: 0; padding: 0 3px; background: transparent; color: var(--text-dim); }
+.attachment-error { color: var(--blocked); font-size: 11px; }
+.attachment-hint { color: var(--text-dim); font-size: 11px; }
+.quick-attachment-row { margin: -4px 10px 6px; }
+.composer-attachments { padding: 6px 16px 0; }
+.composer-attach { min-width: 28px; font-size: 16px; }
 .composer {
   display: flex;
   gap: 8px;

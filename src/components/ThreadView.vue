@@ -6,6 +6,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
 import SplitButton from "./SplitButton.vue";
 import ChangeReview from "./ChangeReview.vue";
+import { addAttachments, type FileAttachment } from "../attachments";
 
 // DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
 // { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
@@ -70,6 +71,25 @@ const emit = defineEmits<{
 
 const blocks = ref<DisplayBlock[]>([]);
 const draft = ref("");
+const attachments = ref<FileAttachment[]>([]);
+const attachmentError = ref("");
+const attachmentLoading = ref(false);
+async function addFiles(files: FileList | File[]) {
+  if (attachmentLoading.value) return;
+  attachmentLoading.value = true;
+  try { attachments.value = await addAttachments(attachments.value, files); attachmentError.value = ""; }
+  catch (error: any) { attachmentError.value = error?.message ?? String(error); }
+  finally { attachmentLoading.value = false; }
+}
+function onFileInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.files) void addFiles(input.files);
+  input.value = "";
+}
+function onComposerPaste(event: ClipboardEvent) {
+  if (!event.clipboardData?.files.length) return;
+  event.preventDefault(); void addFiles(event.clipboardData.files);
+}
 interface MentionResource {
   id: string;
   kind: string;
@@ -499,17 +519,19 @@ async function send() {
     chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
   const text = draft.value.trim();
-  if (!text || busy.value) return;
+  if ((!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
   busy.value = true;
   try {
     await invoke("send_input", {
       id: props.session.id,
-      text,
+      text: text || "Please inspect the attached files.",
       protocol: props.session.protocol,
       topicId: props.topic?.id ?? null,
       resourceIds: selectedMentions.value.filter((mention) => text.includes(mention.token)).map((mention) => mention.id),
+      attachments: attachments.value.map(({ name, contentBase64 }) => ({ name, contentBase64 })),
     });
     draft.value = "";
+    attachments.value = [];
     selectedMentions.value = [];
     mentionRange.value = null;
     await reload();
@@ -916,7 +938,7 @@ async function onLand(strategy: string) {
         No conversation yet.
       </div>
     </div>
-    <div class="composer-wrap">
+    <div class="composer-wrap" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
       <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Topic resources">
         <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
         <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
@@ -928,7 +950,17 @@ async function onLand(strategy: string) {
           <small>{{ resource.path || resource.url || resource.reference || resource.kind }}</small>
         </button>
       </div>
+      <div v-if="attachments.length || attachmentError || attachmentLoading" class="attachment-row composer-attachments">
+        <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
+        </span>
+        <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
+        <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
+      </div>
       <div class="composer">
+      <label class="attachment-pick composer-attach" title="Attach files">+
+        <input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
+      </label>
       <textarea
         ref="composerEl"
         v-model="draft"
@@ -940,8 +972,9 @@ async function onLand(strategy: string) {
         @input="updateMention"
         @click="updateMention"
         @keydown="onComposerKeydown"
+        @paste="onComposerPaste"
       ></textarea>
-      <button class="primary" :disabled="!draft.trim() || busy" @click="send">
+      <button class="primary" :disabled="(!draft.trim() && !attachments.length) || busy || attachmentLoading" @click="send">
         {{ busy ? "…" : "Send" }}
       </button>
       </div>

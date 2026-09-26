@@ -3,6 +3,7 @@ import { ref, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { nextTick } from "vue";
 import type { SessionSummary, SessionLayout, LaunchOptions, ResourceMention } from "../App.vue";
+import { addAttachments, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -23,7 +24,8 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; profile?: string; agent?: string; model?: string; effort?: string },
+    meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+    completed?: (success: boolean) => void,
   ): void;
   (
     e: "update-topic",
@@ -42,6 +44,9 @@ const emit = defineEmits<{
 }>();
 
 const task = ref("");
+const quickAttachments = ref<FileAttachment[]>([]);
+const quickAttachmentError = ref("");
+const quickAttachmentLoading = ref(false);
 const quickInputEl = ref<HTMLInputElement | null>(null);
 const quickMentionRange = ref<{ start: number; end: number; query: string } | null>(null);
 const quickMentionIndex = ref(0);
@@ -80,15 +85,19 @@ function submit() {
     chooseQuickMention(matchingQuickResources.value[quickMentionIndex.value] || matchingQuickResources.value[0]);
   }
   const t = task.value.trim();
-  if (!t || props.launching) return;
-  emit("launch", t, repo.value.trim(), {
+  if ((!t && !quickAttachments.value.length) || props.launching || quickAttachmentLoading.value) return;
+  emit("launch", t || `Review ${quickAttachments.value[0].name}`, repo.value.trim(), {
     ...launchConfig(), oneOff: true,
     mentions: quickMentions.value.filter((mention) => t.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
+    attachments: quickAttachments.value,
+  }, (success) => {
+    if (!success) return;
+    task.value = "";
+    quickAttachments.value = [];
+    quickMentions.value = [];
+    quickMentionRange.value = null;
   });
-  task.value = "";
-  quickMentions.value = [];
-  quickMentionRange.value = null;
 }
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
@@ -377,6 +386,42 @@ const topics = computed<TopicEntry[]>(() => {
 // agent's initial goal and the durable branch description.
 const newTitle = ref("");
 const newBody = ref("");
+const topicAttachments = ref<FileAttachment[]>([]);
+const topicAttachmentError = ref("");
+const topicAttachmentLoading = ref(false);
+
+async function addQuickFiles(files: FileList | File[]) {
+  if (quickAttachmentLoading.value) return;
+  quickAttachmentLoading.value = true;
+  try { quickAttachments.value = await addAttachments(quickAttachments.value, files, MAX_LAUNCH_TOTAL_BYTES); quickAttachmentError.value = ""; }
+  catch (error: any) { quickAttachmentError.value = error?.message ?? String(error); }
+  finally { quickAttachmentLoading.value = false; }
+}
+async function addTopicFiles(files: FileList | File[]) {
+  if (topicAttachmentLoading.value) return;
+  topicAttachmentLoading.value = true;
+  try { topicAttachments.value = await addAttachments(topicAttachments.value, files, MAX_LAUNCH_TOTAL_BYTES); topicAttachmentError.value = ""; }
+  catch (error: any) { topicAttachmentError.value = error?.message ?? String(error); }
+  finally { topicAttachmentLoading.value = false; }
+}
+function onQuickFileInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.files) void addQuickFiles(input.files);
+  input.value = "";
+}
+function onTopicFileInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.files) void addTopicFiles(input.files);
+  input.value = "";
+}
+function onQuickPaste(event: ClipboardEvent) {
+  if (!event.clipboardData?.files.length) return;
+  event.preventDefault(); void addQuickFiles(event.clipboardData.files);
+}
+function onTopicPaste(event: ClipboardEvent) {
+  if (!event.clipboardData?.files.length) return;
+  event.preventDefault(); void addTopicFiles(event.clipboardData.files);
+}
 interface TopicMentionResource {
   topicId: string;
   id: string;
@@ -506,17 +551,21 @@ function onTopicBodyKeydown(event: KeyboardEvent) {
 function submitTopic() {
   const title = newTitle.value.trim();
   const body = newBody.value.trim();
-  if (!title || !body || props.launching) return;
-  emit("launch", body, repo.value.trim(), {
-    title,
-    description: body,
+  if ((!title && !body && !topicAttachments.value.length) || props.launching || topicAttachmentLoading.value) return;
+  emit("launch", body || title || `Review ${topicAttachments.value[0].name}`, repo.value.trim(), {
+    title: title || undefined,
+    description: body || undefined,
     mentions: topicMentions.value.filter((mention) => body.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
+    attachments: topicAttachments.value,
     ...launchConfig(),
+  }, (success) => {
+    if (!success) return;
+    newTitle.value = "";
+    newBody.value = "";
+    topicAttachments.value = [];
+    topicMentions.value = [];
   });
-  newTitle.value = "";
-  newBody.value = "";
-  topicMentions.value = [];
 }
 
 // Inline card editing: title edits are compare-and-swap fenced server-side,
@@ -654,10 +703,11 @@ async function archiveRow(id: string) {
           @input="updateQuickMention"
           @click="updateQuickMention"
           @keydown="onQuickKeydown"
+          @paste="onQuickPaste"
         />
         <button
           class="primary"
-          :disabled="!task.trim() || props.launching"
+          :disabled="(!task.trim() && !quickAttachments.length) || props.launching || quickAttachmentLoading"
           @click="submit"
         >
           {{ props.launching ? "…" : "Run" }}
@@ -673,6 +723,14 @@ async function archiveRow(id: string) {
             <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
           </button>
         </div>
+      </div>
+      <div class="attachment-row quick-attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addQuickFiles($event.dataTransfer.files)">
+        <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="quickAttachmentLoading" aria-label="Attach files to quick task" @change="onQuickFileInput" /></label>
+        <span v-for="(file, index) in quickAttachments" :key="file.name" class="attachment-chip">
+          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="quickAttachments.splice(index, 1)">×</button>
+        </span>
+        <span v-if="quickAttachmentError" class="attachment-error">{{ quickAttachmentError }}</span>
+        <span v-if="quickAttachmentLoading" class="attachment-hint">Reading files…</span>
       </div>
       <div class="new-task" style="margin-top: -4px">
         <input
@@ -841,13 +899,13 @@ async function archiveRow(id: string) {
     <template v-else>
       <div class="new-topic-card">
         <div class="new-topic-heading">New topic</div>
-        <label for="new-topic-title">Title</label>
+        <label for="new-topic-title">Title <span class="field-optional">optional</span></label>
         <input
           id="new-topic-title"
           v-model="newTitle"
           placeholder="What is this work about?"
         />
-        <label for="new-topic-body">Body</label>
+        <label for="new-topic-body">Body <span class="field-optional">optional</span></label>
         <div class="topic-body-wrap">
           <textarea
             id="new-topic-body"
@@ -858,6 +916,7 @@ async function archiveRow(id: string) {
             @input="updateTopicMention"
             @click="updateTopicMention"
             @keydown="onTopicBodyKeydown"
+            @paste="onTopicPaste"
           ></textarea>
           <div v-if="topicMentionRange" class="mention-menu topic-body-mention-menu" role="listbox" aria-label="Existing topic resources">
             <div v-if="topicMentionLoading" class="mention-hint">Loading resources…</div>
@@ -871,6 +930,14 @@ async function archiveRow(id: string) {
             </button>
           </div>
         </div>
+        <div class="attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addTopicFiles($event.dataTransfer.files)">
+          <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="topicAttachmentLoading" aria-label="Attach files to new topic" @change="onTopicFileInput" /></label>
+          <span v-for="(file, index) in topicAttachments" :key="file.name" class="attachment-chip">
+            {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="topicAttachments.splice(index, 1)">×</button>
+          </span>
+          <span v-if="topicAttachmentError" class="attachment-error">{{ topicAttachmentError }}</span>
+          <span v-if="topicAttachmentLoading" class="attachment-hint">Reading files…</span>
+        </div>
         <div class="new-topic-foot">
           <input
             v-model="repo"
@@ -880,7 +947,7 @@ async function archiveRow(id: string) {
           />
           <button
             class="primary"
-            :disabled="!newTitle.trim() || !newBody.trim() || props.launching"
+            :disabled="(!newTitle.trim() && !newBody.trim() && !topicAttachments.length) || props.launching || topicAttachmentLoading"
             @click="submitTopic"
           >
             {{ props.launching ? "…" : "Create topic" }}

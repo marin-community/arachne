@@ -527,10 +527,34 @@ pub struct SessionsLaunchInput {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    #[serde(default)]
+    pub scratch: Vec<ScratchUpload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all(serialize = "snake_case", deserialize = "camelCase"))]
+pub struct ScratchUpload {
+    pub name: String,
+    pub content_base64: String,
+}
+
+#[cfg(test)]
+mod scratch_upload_tests {
+    use super::ScratchUpload;
+
+    #[test]
+    fn webview_and_loom_use_their_respective_field_names() {
+        let upload: ScratchUpload = serde_json::from_value(serde_json::json!({
+            "name": "notes.txt", "contentBase64": "aGk="
+        })).unwrap();
+        assert_eq!(upload.content_base64, "aGk=");
+        let value = serde_json::to_value(upload).unwrap();
+        assert_eq!(value["content_base64"], "aGk=");
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
