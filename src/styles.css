@@ -579,6 +579,12 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 }
 
 button.accent { border-color: var(--accent); color: var(--accent); }
+.integrate-note {
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 12px;
+}
 .delegate-box {
   display: flex;
   gap: 8px;

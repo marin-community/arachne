@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
+import SplitButton from "./SplitButton.vue";
 
 // DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
 // { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
@@ -506,6 +507,99 @@ function messageAuthor(block: DisplayBlock): string {
   if (block.by?.startsWith("channel:")) return `via Loom · ${block.by.slice(8)}`;
   return "you";
 }
+
+const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
+const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id));
+const integrationTarget = computed(() => {
+  let current = currentSummary.value;
+  let nearest: SessionSummary | null = null;
+  const seen = new Set<string>();
+  while (current && !seen.has(current.id)) {
+    seen.add(current.id);
+    const parent: SessionSummary | undefined = props.fleet.find((s) =>
+      s.id === current?.parent_session_id || s.branch.id === current?.parent_id,
+    );
+    if (!parent) break;
+    if (parent.branch.repo_root === props.session.branch.repo_root && parent.status !== "archived") {
+      if (!nearest) nearest = parent;
+      if (parent.branch.tags.some((tag) => tag.key === "topic" && tag.value !== "false")) return parent;
+    }
+    current = parent;
+  }
+  return nearest;
+});
+const isTopic = computed(() =>
+  !isWorker.value && (
+    props.session.branch.tags.some((tag) => tag.key === "topic" && tag.value !== "false") ||
+    props.fleet.some((s) => s.parent_session_id === props.session.id || s.parent_id === props.session.branch.id)
+  ),
+);
+const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
+const allIntegrateOptions = [
+  { value: "squash", label: "Squash into topic" },
+  { value: "merge", label: "Merge into topic" },
+  { value: "rebase", label: "Rebase onto topic" },
+  { value: "cherry-pick", label: "Cherry-pick commits" },
+  { value: "open-pr", label: "Open PR into topic" },
+  { value: "ask", label: "Ask coordinator to decide" },
+];
+const integrateOptions = computed(() => allIntegrateOptions.filter((option) =>
+  option.value !== "cherry-pick" || workSummary.value?.has_commits === true,
+));
+const landOptions = [
+  { value: "open-pr", label: "Open PR" },
+  { value: "squash", label: "Squash into upstream" },
+  { value: "merge", label: "Merge into upstream" },
+  { value: "rebase", label: "Rebase / fast-forward" },
+  { value: "push", label: "Push topic branch" },
+  { value: "ask", label: "Ask coordinator to decide" },
+];
+interface IntegrationTarget {
+  coordinator_id: string;
+  target_branch: string;
+  coordinator_name: string;
+}
+const integrating = ref(false);
+const landing = ref(false);
+const integrationNote = ref("");
+const workSummary = ref<{ files: number; additions: number; deletions: number; has_commits: boolean } | null>(null);
+watch(() => props.session.id, async (id) => {
+  workSummary.value = null;
+  try {
+    const summary = await invoke<{ files: number; additions: number; deletions: number; has_commits: boolean }>("work_summary", { sessionId: id });
+    if (props.session.id === id) workSummary.value = summary;
+  } catch {
+    // A checkout may have been archived; integration can still use its branch.
+  }
+}, { immediate: true });
+async function onIntegrate(strategy: string) {
+  if (integrating.value) return;
+  integrating.value = true;
+  integrationNote.value = "";
+  try {
+    const target = await invoke<IntegrationTarget>("integrate_session", { sessionId: props.session.id, strategy });
+    localStorage.setItem(`arachne:strategy:integrate:${sessionRepo.value}`, strategy);
+    integrationNote.value = `Sent to ${target.coordinator_name} (${target.target_branch}). Follow the integration in that thread.`;
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    integrating.value = false;
+  }
+}
+async function onLand(strategy: string) {
+  if (landing.value) return;
+  landing.value = true;
+  integrationNote.value = "";
+  try {
+    await invoke("land_topic", { sessionId: props.session.id, strategy });
+    localStorage.setItem(`arachne:strategy:land:${sessionRepo.value}`, strategy);
+    integrationNote.value = "Landing request sent. Follow the result in this thread.";
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    landing.value = false;
+  }
+}
 </script>
 
 <template>
@@ -519,6 +613,7 @@ function messageAuthor(block: DisplayBlock): string {
         </div>
       </div>
       <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
+      <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate = !showDelegate">
@@ -526,7 +621,9 @@ function messageAuthor(block: DisplayBlock): string {
       </button>
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
       <button v-if="session.protocol === 'acp'" :disabled="!handoffAllowed" title="Switch runtime when the session is idle" @click="showHandoff = !showHandoff">Switch model…</button>
+      <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
     </div>
+    <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
     <div v-if="showHandoff" class="handoff-box">
       <div class="handoff-heading">Switch this thread’s runtime</div>
       <div class="handoff-fields">
@@ -594,6 +691,14 @@ function messageAuthor(block: DisplayBlock): string {
       <span class="resource-item" :title="session.work_dir">{{ session.branch.branch || "No branch" }}</span>
       <span class="resource-separator">·</span>
       <span class="resource-item path" :title="session.work_dir">{{ session.work_dir || "No active checkout" }}</span>
+      <template v-if="isWorker && integrationTarget">
+        <span class="resource-separator">·</span>
+        <span class="resource-item" :title="`Integration target: ${integrationTarget.branch.repo_root} / ${integrationTarget.branch.branch}`">→ {{ integrationTarget.branch.branch }}</span>
+      </template>
+      <template v-if="workSummary">
+        <span class="resource-separator">·</span>
+        <span class="resource-item" title="Diff against the checkout's recorded base branch">{{ workSummary.files }} files · +{{ workSummary.additions }} −{{ workSummary.deletions }}</span>
+      </template>
     </div>
     <div v-if="showDelegate" class="delegate-box">
       <input

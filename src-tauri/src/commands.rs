@@ -569,10 +569,17 @@ pub async fn delegate_task(
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent = client.get_session(&parent_id).await?;
+    let fleet = client.list_sessions().await?;
+    // Conversation ancestry is independent of git ancestry. A child of a
+    // worker starts from the topic's accepted branch when one exists.
+    let base = resolve_integration_target(&fleet, &parent_id)
+        .map(|target| target.target_branch)
+        .unwrap_or_else(|| parent.branch.branch.clone());
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: parent.github_repo.clone(),
             cwd: parent.work_dir.clone(),
+            base: Some(base),
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
             parent_branch: Some(parent.branch.id),
@@ -783,4 +790,277 @@ pub async fn reparent_session(
         let _ = client.set_tag(parent, "topic", "true").await;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Integration (spec: docs/integration-and-landing.md)
+// ---------------------------------------------------------------------------
+
+/// The resolved coordinator for an integration: where the structured request
+/// lands, and the branch the work integrates toward.
+#[derive(Debug, Clone, Serialize)]
+pub struct IntegrationTarget {
+    /// The coordinator session id receiving the request ("wake the appropriate
+    /// coordinating Thread and invoke an integration skill").
+    pub coordinator_id: String,
+    /// The topic's canonical branch resource for the relevant repository —
+    /// the nearest ancestor scope that has one, else the topic leader itself.
+    pub target_branch: String,
+    /// Human label of the coordinator, for the confirmation UI.
+    pub coordinator_name: String,
+}
+
+/// Resolve where a worker's integration request goes.
+///
+/// Spec ("Integration target"): do not assume thread ancestry equals git
+/// ancestry — default to the nearest ancestor scope with a writable canonical
+/// Resource for the relevant repository; if none, the Topic's canonical
+/// Resource for that repository.
+///
+/// Walk conversation ancestors, selecting the topic leader for the same
+/// repository when available, otherwise the nearest live parent in that
+/// repository. A thread cannot integrate into itself.
+pub fn resolve_integration_target(
+    fleet: &[SessionSummaryView],
+    session_id: &str,
+) -> Option<IntegrationTarget> {
+    let by_id: std::collections::HashMap<&str, &SessionSummaryView> =
+        fleet.iter().map(|s| (s.id.as_str(), s)).collect();
+    let by_branch: std::collections::HashMap<&str, &SessionSummaryView> =
+        fleet.iter().map(|s| (s.branch.id.as_str(), s)).collect();
+
+    let source = by_id.get(session_id).copied()?;
+    let repo = &source.branch.repo_root;
+    let mut cur = source;
+    let mut seen = std::collections::HashSet::new();
+    let mut nearest = None;
+    for _ in 0..32 {
+        if !seen.insert(cur.id.as_str()) { break; }
+        let parent = cur
+            .parent_session_id
+            .as_deref()
+            .and_then(|id| by_id.get(id).copied())
+            .or_else(|| {
+                cur.parent_id
+                    .as_deref()
+                    .and_then(|bid| by_branch.get(bid).copied())
+            });
+        let Some(p) = parent else { break; };
+        if p.branch.repo_root == *repo && p.status != "archived" && !p.branch.branch.is_empty() {
+            let target = IntegrationTarget {
+                coordinator_id: p.id.clone(),
+                target_branch: p.branch.branch.clone(),
+                coordinator_name: p.branch.name.clone(),
+            };
+            if nearest.is_none() { nearest = Some(target.clone()); }
+            if p.branch.tags.iter().any(|t| t.key == "topic" && t.value != "false") {
+                return Some(target);
+            }
+        }
+        cur = p;
+    }
+    nearest
+}
+
+/// Send a structured integration request for a completed worker to its
+/// coordinator, with the chosen strategy. The button and the sentence are
+/// the same operation (spec: "Integration is an LLM/skill operation").
+#[tauri::command]
+pub async fn integrate_session(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    session_id: String,
+    strategy: String,
+) -> Result<IntegrationTarget, UiError> {
+    let client = state_client(&state).await?;
+    let strategy = crate::loom::IntegrationStrategy::parse(&strategy).ok_or_else(|| UiError {
+        message: format!("unknown integration strategy {strategy:?}"),
+        unreachable: false,
+    })?;
+    if strategy == crate::loom::IntegrationStrategy::Push {
+        return Err(UiError { message: "push is a landing strategy".into(), unreachable: false });
+    }
+    let fleet = client.list_sessions().await?;
+    let target =
+        resolve_integration_target(&fleet, &session_id).ok_or_else(|| UiError {
+            message: "no coordinator found for this session — it has no topic to integrate into".into(),
+            unreachable: false,
+        })?;
+    let view = client.get_session(&session_id).await?;
+    let coordinator = client.get_session(&target.coordinator_id).await?;
+    if view.branch.repo_root != coordinator.branch.repo_root {
+        return Err(UiError {
+            message: "source and target are in different repositories; choose a coordinator for this repository".into(),
+            unreachable: false,
+        });
+    }
+    if view.branch.branch == target.target_branch {
+        return Err(UiError { message: "source and target already use the same branch".into(), unreachable: false });
+    }
+    if coordinator.status == "archived" {
+        return Err(UiError { message: "the coordinator thread is archived; reopen it before integrating".into(), unreachable: false });
+    }
+    let request = crate::loom::IntegrationRequest {
+        action: "integrate",
+        source_session: view.id.clone(),
+        source_branch: view.branch.branch.clone(),
+        source_work_dir: view.work_dir.clone(),
+        repo_root: view.branch.repo_root.clone(),
+        target_session: target.coordinator_id.clone(),
+        target_branch: target.target_branch.clone(),
+        strategy,
+        requested_by: "user",
+    };
+    let topic_name = coordinator.branch.name.clone();
+    let prompt = request.to_prompt(&topic_name);
+    // Queue the structured request behind any active ACP turn. Terminal
+    // sessions get the text directly because Loom has no terminal prompt queue.
+    if coordinator.protocol == "terminal" {
+        client
+            .send_text(&target.coordinator_id, &prompt, true)
+            .await?;
+    } else {
+        client
+            .queue_prompt(&target.coordinator_id, &prompt)
+            .await?;
+    }
+    // A sent request is not a successful integration. The coordinator's
+    // durable conversation records the result after git and validation.
+    let _ = app.emit("loom://integration-sent", &target);
+    Ok(target)
+}
+
+/// Land a topic: send a landing request to the topic leader (the topic's
+/// coordinator thread), moving accepted state toward the upstream target.
+#[tauri::command]
+pub async fn land_topic(
+    state: State<'_, LoomState>,
+    session_id: String,
+    strategy: String,
+    upstream: Option<String>,
+) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    let strategy = crate::loom::IntegrationStrategy::parse(&strategy).ok_or_else(|| UiError {
+        message: format!("unknown landing strategy {strategy:?}"),
+        unreachable: false,
+    })?;
+    if strategy == crate::loom::IntegrationStrategy::CherryPick {
+        return Err(UiError { message: "cherry-pick is an integration strategy".into(), unreachable: false });
+    }
+    let view = client.get_session(&session_id).await?;
+    if view.status == "archived" {
+        return Err(UiError { message: "the topic thread is archived; reopen it before landing".into(), unreachable: false });
+    }
+    let fleet = client.list_sessions().await?;
+    let summary = fleet.iter().find(|session| session.id == session_id).ok_or_else(|| UiError {
+        message: "topic is no longer in the fleet".into(), unreachable: false,
+    })?;
+    if summary.parent_session_id.is_some() || summary.parent_id.is_some() {
+        return Err(UiError { message: "landing belongs to a topic; integrate this worker first".into(), unreachable: false });
+    }
+    let branches = client.list_branches().await?;
+    // The upstream target defaults to the branch's recorded base — the
+    // branch loom forked it from, which is the natural upstream.
+    let upstream = upstream
+        .or_else(|| branches_list_base(&branches, &view.branch.branch))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| UiError { message: "no upstream branch is recorded for this topic".into(), unreachable: false })?;
+    let request = crate::loom::LandingRequest {
+        action: "land",
+        source_branch: view.branch.branch.clone(),
+        target_upstream: upstream.clone(),
+        strategy,
+        requested_by: "user",
+    };
+    let prompt = request.to_prompt(&view.branch.name);
+    if view.protocol == "terminal" {
+        client.send_text(&view.id, &prompt, true).await?;
+    } else {
+        client.queue_prompt(&view.id, &prompt).await?;
+    }
+    // Do not mark the topic landed before the coordinator reports success.
+    Ok(())
+}
+
+/// Diff totals against Loom's recorded base ref for this checkout. The
+/// endpoint includes committed and uncommitted changes.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkSummary {
+    pub additions: u32,
+    pub deletions: u32,
+    pub files: u32,
+    pub has_commits: bool,
+}
+
+/// Find a branch's recorded base branch from `branches.list` rows.
+/// The DTO carries `base_branch` per branch (BranchView).
+fn branches_list_base(
+    branches: &[serde_json::Value],
+    branch: &str,
+) -> Option<String> {
+    branches
+        .iter()
+        .find(|b| b.get("branch").and_then(|v| v.as_str()) == Some(branch))
+        .and_then(|b| b.get("base_branch"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+#[tauri::command]
+pub async fn work_summary(
+    state: State<'_, LoomState>,
+    session_id: String,
+) -> Result<WorkSummary, UiError> {
+    let client = state_client(&state).await?;
+    let changes = client.session_changes(&session_id).await?;
+    Ok(WorkSummary {
+        additions: changes.totals.additions,
+        deletions: changes.totals.deletions,
+        files: changes.totals.files,
+        has_commits: changes.head_oid.as_deref() != changes.base.get("oid").and_then(|value| value.as_str()),
+    })
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::resolve_integration_target;
+    use crate::loom::SessionSummaryView;
+
+    fn session(id: &str, branch: &str, repo: &str, parent: Option<&str>, topic: bool) -> SessionSummaryView {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "status": "running", "profile": "default", "class": "interactive",
+            "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
+            "last_activity_at": "2026-01-01T00:00:00Z", "placement": null,
+            "github_repo": null, "parent_id": null, "parent_session_id": parent,
+            "branch": { "id": id, "branch": branch, "name": id, "title": id,
+                "repo_root": repo, "tags": if topic { serde_json::json!([{
+                    "key":"topic", "value":"true", "note":"", "set_at":"", "set_by":"arachne"
+                }]) } else { serde_json::json!([]) }
+            }
+        })).unwrap()
+    }
+
+    #[test]
+    fn nested_worker_integrates_to_same_repo_topic() {
+        let fleet = vec![
+            session("topic", "topic-branch", "/repo", None, true),
+            session("parent", "parent-branch", "/repo", Some("topic"), false),
+            session("child", "child-branch", "/repo", Some("parent"), false),
+        ];
+        let target = resolve_integration_target(&fleet, "child").unwrap();
+        assert_eq!(target.coordinator_id, "topic");
+        assert_eq!(target.target_branch, "topic-branch");
+        assert!(resolve_integration_target(&fleet, "topic").is_none());
+    }
+
+    #[test]
+    fn cross_repo_topic_uses_nearest_same_repo_parent() {
+        let fleet = vec![
+            session("topic", "other-topic", "/other", None, true),
+            session("parent", "parent-branch", "/repo", Some("topic"), false),
+            session("child", "child-branch", "/repo", Some("parent"), false),
+        ];
+        assert_eq!(resolve_integration_target(&fleet, "child").unwrap().target_branch, "parent-branch");
+        assert!(resolve_integration_target(&fleet, "parent").is_none());
+    }
 }

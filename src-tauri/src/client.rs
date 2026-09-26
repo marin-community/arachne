@@ -258,6 +258,28 @@ impl LoomClient {
         .await
     }
 
+    /// `sessions.changes` — committed and uncommitted changes against the
+    /// session's recorded base ref. Feeds the Integrate diff summary.
+    pub async fn session_changes(
+        &self,
+        id: &str,
+    ) -> Result<crate::loom::ChangeSetView, LoomError> {
+        self.op(
+            "/api/sessions/changes",
+            &serde_json::json!({ "session": id }),
+        )
+        .await
+    }
+
+    /// `branches.list` — every branch loom tracks, including its base ref.
+    /// The Land action uses that recorded ref as its default upstream.
+    pub async fn list_branches(
+        &self,
+    ) -> Result<Vec<serde_json::Value>, LoomError> {
+        self.op("/api/branches/list", &serde_json::json!({}))
+            .await
+    }
+
     /// `sessions.chat` — the conversation journal. `before` pages older
     /// turns (from the previous page's `older_cursor`); None = newest tail.
     pub async fn session_chat(
@@ -279,6 +301,18 @@ impl LoomClient {
             .op(
                 "/api/sessions/prompt/create",
                 &serde_json::json!({ "session": id, "text": text, "send_now": true }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Queue an ACP request behind the current turn. Integration and landing
+    /// must not interrupt work already in progress in a coordinator thread.
+    pub async fn queue_prompt(&self, id: &str, text: &str) -> Result<(), LoomError> {
+        let _: serde_json::Value = self
+            .op(
+                "/api/sessions/prompt/create",
+                &serde_json::json!({ "session": id, "text": text, "send_now": false }),
             )
             .await?;
         Ok(())

@@ -42,6 +42,9 @@ pub fn run() {
             commands::reparent_session,
             commands::move_to_group,
             commands::delete_group,
+            commands::integrate_session,
+            commands::land_topic,
+            commands::work_summary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running arachne");
