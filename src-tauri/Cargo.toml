@@ -23,6 +23,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 thiserror = "2"
+# macOS Keychain storage for the loom bearer token (spec: credentials never
+# persist in frontend localStorage). Blocking ops run via spawn_blocking.
+keyring = { version = "3", features = ["apple-native"] }
 
 [profile.release]
 codegen-units = 1

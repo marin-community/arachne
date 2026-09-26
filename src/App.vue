@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FleetSidebar from "./components/FleetSidebar.vue";
 import ThreadView from "./components/ThreadView.vue";
+import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
@@ -109,12 +110,23 @@ const layout = ref<SessionLayout | null>(null);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
 const showSettings = ref(false);
+// URL is not a secret — localStorage is fine. The TOKEN is a credential:
+// it lives in the macOS Keychain behind Tauri commands, never here (spec:
+// "do not store sensitive credentials in frontend localStorage"). It's
+// read once at boot into memory for the settings sheet's prefilled value.
 const loomUrl = ref(localStorage.getItem("loomUrl") ?? DEFAULT_URL);
-const loomToken = ref(localStorage.getItem("loomToken") ?? "");
+const loomToken = ref("");
 
 // --- Boot: connect to loom (URL from settings) ------------------------------
 
 onMounted(async () => {
+  // Prefill the in-memory token from the Keychain (migration note: an old
+  // build's localStorage token, if any, is stale and ignored).
+  try {
+    loomToken.value = (await invoke<string | null>("load_token")) ?? "";
+  } catch {
+    // Keychain unavailable (rare); connect can still proceed tokenless.
+  }
   // Register listeners BEFORE connecting, so the initial fleet snapshot
   // emitted right after connect is never missed.
   await listen<FleetSnapshot>("loom://fleet", (event) => {
@@ -147,7 +159,9 @@ function saveSettings(url: string, token: string) {
   loomUrl.value = url;
   loomToken.value = token;
   localStorage.setItem("loomUrl", url);
-  localStorage.setItem("loomToken", token);
+  // Persist the token to the Keychain (fire-and-forget: connect proceeds
+  // on the in-memory copy; a failed save surfaces on next boot at worst).
+  invoke("save_token", { token }).catch(() => {});
   showSettings.value = false;
   connect(url, token || null);
 }
@@ -248,7 +262,12 @@ function onArchived(id: string) {
     selectedId.value = null;
     selectedView.value = null;
   }
-  fleet.value = fleet.value.filter((s) => s.id !== id);
+  // Keep the archived row in the fleet: the sidebar shows archived children
+  // dimmed under their leader, so a finished worker stays visible as part of
+  // its workstream's shape. The next fleet snapshot re-syncs status.
+  for (const s of fleet.value) {
+    if (s.id === id) s.status = "archived";
+  }
 }
 
 const connClass = computed(() =>
@@ -294,18 +313,12 @@ const connClass = computed(() =>
       @archive="onArchived"
       @delegate="delegateFromThread"
     />
-    <div v-else-if="selectedId" class="main">
-      <div class="empty">
-        <div class="big">🕸</div>
-        <div>opening session…</div>
-      </div>
-    </div>
-    <div v-else class="main">
-      <div class="empty">
-        <div class="big">🕸</div>
-        <div>Select a session, or launch a new task from the sidebar.</div>
-      </div>
-    </div>
+    <HomeView
+      v-else
+      :fleet="fleet"
+      :selected-id="selectedId"
+      @select="selectSession"
+    />
     <SettingsSheet
       v-if="showSettings"
       :url="loomUrl"

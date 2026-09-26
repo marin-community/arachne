@@ -112,6 +112,11 @@ pub struct SessionView {
     pub protocol: String,
     pub work_dir: String,
     pub term_session: String,
+    /// The managed `owner/name` slug when the session launched against a
+    /// managed repo (delegation's source of truth). `null` for cwd-forked
+    /// sessions — delegation then forks from the parent's checkout.
+    #[serde(default)]
+    pub github_repo: Option<String>,
     pub turn_count: i64,
     pub created_by: Option<String>,
     pub created_at: String,
@@ -197,14 +202,16 @@ pub struct ChatCursorView {
 // Launch
 // ---------------------------------------------------------------------------
 
-/// Request for `POST /api/sessions/launch`. `cwd` is required on the wire
-/// (an empty string means "fork from the repo's default") — always a String,
-/// never null, or loom rejects the whole launch with a 400.
+/// Request for `POST /api/sessions/launch`. `cwd` is a server-side path;
+/// the server ignores it whenever `repo` is present — passing both lets
+/// delegation work whether or not the parent launched against a managed
+/// repo.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionsLaunchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// Filled from the parent session's work_dir on delegation.
     #[serde(default)]
     pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
