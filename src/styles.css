@@ -137,7 +137,6 @@ body {
 .badge.error { color: var(--blocked); background: rgba(248,81,73,.12); }
 .badge.attention { color: var(--attention); background: rgba(210,153,34,.12); }
 .badge.blocked { color: var(--blocked); background: rgba(248,81,73,.18); }
-.badge.idle { color: var(--text-dim); background: var(--bg-hover); }
 .badge.orphaned { color: var(--text-dim); background: var(--bg-hover); }
 
 /* --- Main / thread -------------------------------------------------- */
@@ -391,6 +390,16 @@ button.accent { border-color: var(--accent); color: var(--accent); }
 @keyframes arachne-spin {
   to { transform: rotate(360deg); }
 }
+/* Sidebar row spinner: running threads spin instead of showing a RUN badge.
+   Loud (attention/blocked) running threads keep their colored badge tone. */
+.spinner.mini {
+  width: 9px;
+  height: 9px;
+  border-width: 1.5px;
+  flex-shrink: 0;
+}
+.spinner.mini.attention { border-color: var(--border); border-top-color: var(--attention); }
+.spinner.mini.error { border-color: var(--border); border-top-color: var(--blocked); }
 .working-label { color: var(--text-dim); }
 .working-meta {
   font-family: var(--mono);
@@ -407,6 +416,9 @@ button.accent { border-color: var(--accent); color: var(--accent); }
     font-size: 11px;
     line-height: 1;
   }
+  .spinner.mini::after { font-size: 9px; }
+  .spinner.mini.attention::after { color: var(--attention); }
+  .spinner.mini.error::after { color: var(--blocked); }
 }
 
 /* --- Modal (settings) --------------------------------------------- */
