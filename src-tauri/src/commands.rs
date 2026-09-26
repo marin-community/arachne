@@ -43,6 +43,15 @@ pub async fn chat_older_cursor(
     Ok(state.older_cursor.read().await.clone())
 }
 
+/// The dashboard snapshot the fleet poller pushes: the session summaries plus
+/// the workstream layout, so the sidebar can group by workstream and nest
+/// children under parents in one coherent render.
+#[derive(Debug, Clone, Serialize)]
+pub struct FleetSnapshot {
+    pub sessions: Vec<SessionSummaryView>,
+    pub layout: crate::loom::SessionLayoutView,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct UiError {
     pub message: String,
@@ -101,6 +110,22 @@ pub async fn connect(
     Ok(())
 }
 
+/// Fetch summaries + layout together and push them as a fleet snapshot.
+async fn emit_fleet(app: &AppHandle, client: &Arc<LoomClient>, mut sessions: Vec<SessionSummaryView>) {
+    let layout = match client.session_layout().await {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = app.emit("loom://error", UiError::from(e));
+            return;
+        }
+    };
+    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+    let _ = app.emit(
+        "loom://fleet",
+        &FleetSnapshot { sessions, layout },
+    );
+}
+
 fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: CancellationToken) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -109,6 +134,17 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
             }
             let mut sessions = match client.list_sessions().await {
                 Ok(s) => s,
+                Err(e) => {
+                    let _ = app.emit("loom://error", UiError::from(e));
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                    }
+                    continue;
+                }
+            };
+            let layout = match client.session_layout().await {
+                Ok(l) => l,
                 Err(e) => {
                     let _ = app.emit("loom://error", UiError::from(e));
                     tokio::select! {
@@ -131,7 +167,7 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
                     .take(63),
             );
             sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-            let _ = app.emit("loom://fleet", &sessions);
+            emit_fleet(&app, &client, sessions).await;
             match client.subscribe(&topics).await {
                 Ok(mut rx) => loop {
                     tokio::select! {
@@ -143,9 +179,7 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
                             // not on `layout`).
                             match client.list_sessions().await {
                                 Ok(list) => {
-                                    let mut list = list;
-                                    list.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-                                    let _ = app.emit("loom://fleet", &list);
+                                    emit_fleet(&app, &client, list).await;
                                 }
                                 Err(e) => {
                                     let _ = app.emit("loom://error", UiError::from(e));
@@ -267,25 +301,65 @@ pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), Ui
     client.interrupt(&id).await.map_err(Into::into)
 }
 
-/// Launch a new session (worktree + agent, seeded with a task).
+/// Launch a session. When `parent_id` is set this is a delegation: the
+/// child records the parent's branch as `parent_branch`, getting origin=agent
+/// and nesting under the parent in the sidebar.
 #[tauri::command]
 pub async fn launch_session(
     app: AppHandle,
     state: State<'_, LoomState>,
     repo: String,
     task: String,
+    parent_id: Option<String>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
+    let parent_branch = match parent_id {
+        Some(id) if !id.is_empty() => {
+            // Resolve the parent session to its branch id for the link.
+            let parent = client.get_session(&id).await?;
+            Some(parent.branch.id)
+        }
+        _ => None,
+    };
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
+            parent_branch,
             ..Default::default()
         })
         .await?;
     let _ = app.emit("loom://launched", &view);
     Ok(view)
+}
+
+/// Create a child session delegated to the given parent: same repo as the
+/// parent, linked via `parent_branch` so it nests + inherits placement.
+#[tauri::command]
+pub async fn delegate_task(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    parent_id: String,
+    task: String,
+) -> Result<SessionView, UiError> {
+    let client = state_client(&state).await?;
+    let parent = client.get_session(&parent_id).await?;
+    // repo_root is ~/.weaver/repos/<owner>/<name> — the launch input wants
+    // the `owner/name` slug.
+    let slug_parts: Vec<&str> = parent
+        .branch
+        .repo_root
+        .trim_end_matches('/')
+        .rsplit('/')
+        .take(2)
+        .collect();
+    let repo = if slug_parts.len() == 2 {
+        format!("{}/{}", slug_parts[1], slug_parts[0])
+    } else {
+        "marin-community/arachne".to_string()
+    };
+    launch_session(app, state, repo, task, Some(parent_id)).await
 }
 
 /// Archive a session: tear down its terminal + worktree, keep the branch.
@@ -325,7 +399,65 @@ pub async fn open_in_zed(work_dir: String) -> Result<(), UiError> {
 
 /// Manual fleet refresh.
 #[tauri::command]
-pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<Vec<SessionSummaryView>, UiError> {
+pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot, UiError> {
     let client = state_client(&state).await?;
-    client.list_sessions().await.map_err(Into::into)
+    let mut sessions = client.list_sessions().await?;
+    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+    let layout = client.session_layout().await?;
+    Ok(FleetSnapshot { sessions, layout })
+}
+
+/// Create a workstream (layout group) in a space.
+#[tauri::command]
+pub async fn create_workstream(
+    state: State<'_, LoomState>,
+    name: String,
+    space_id: Option<String>,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let client = state_client(&state).await?;
+    // Default to the user space's Inbox space if not specified — Arachne's
+    // workstreams live in the human's primary space.
+    let space = match space_id {
+        Some(id) => id,
+        None => {
+            let layout = client.session_layout().await?;
+            layout
+                .spaces
+                .iter()
+                .find(|s| s.system_key.as_deref() == Some("inbox") || s.name.eq_ignore_ascii_case("user"))
+                .or_else(|| layout.spaces.first())
+                .map(|s| s.id.clone())
+                .ok_or_else(|| UiError {
+                    message: "no space found for workstream".into(),
+                    unreachable: false,
+                })?
+        }
+    };
+    client.create_group(&space, &name).await.map_err(Into::into)
+}
+
+/// Move sessions into a workstream.
+#[tauri::command]
+pub async fn move_to_workstream(
+    state: State<'_, LoomState>,
+    session_ids: Vec<String>,
+    group_id: String,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let client = state_client(&state).await?;
+    let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
+    client.move_sessions(&refs, &group_id).await.map_err(Into::into)
+}
+
+/// Delete a workstream; its sessions move to the destination group first.
+#[tauri::command]
+pub async fn delete_workstream(
+    state: State<'_, LoomState>,
+    group_id: String,
+    destination_group_id: String,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let client = state_client(&state).await?;
+    client
+        .delete_group(&group_id, &destination_group_id)
+        .await
+        .map_err(Into::into)
 }

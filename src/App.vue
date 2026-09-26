@@ -8,28 +8,94 @@ import SettingsSheet from "./components/SettingsSheet.vue";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
-interface TagView { key: string; note: string; value: string; set_at: string; set_by: string }
+interface TagView {
+  key: string;
+  note: string;
+  value: string;
+  set_at: string;
+  set_by: string;
+}
 interface BranchSummary {
-  id: string; branch: string; name: string; title: string;
-  description: string; goal: string; repo_root: string; tags: TagView[];
+  id: string;
+  branch: string;
+  name: string;
+  title: string;
+  description: string;
+  goal: string;
+  repo_root: string;
+  tags: TagView[];
 }
 interface Placement {
-  space_id: string | null; space_name: string | null;
-  group_id: string | null; group_name: string | null;
-  group_system_key: string | null; rank: number | null; session_id: string | null;
+  space_id: string | null;
+  space_name: string | null;
+  group_id: string | null;
+  group_name: string | null;
+  group_system_key: string | null;
+  rank: number | null;
+  session_id: string | null;
 }
 export interface SessionSummary {
-  id: string; status: string; profile: string; class: string; origin: string;
-  created_by: string | null; created_at: string; last_activity_at: string;
-  branch: BranchSummary; placement: Placement | null;
-  github_repo: string | null; parent_id: string | null; parent_session_id: string | null;
+  id: string;
+  status: string;
+  profile: string;
+  class: string;
+  origin: string;
+  created_by: string | null;
+  created_at: string;
+  last_activity_at: string;
+  branch: BranchSummary;
+  placement: Placement | null;
+  github_repo: string | null;
+  parent_id: string | null;
+  parent_session_id: string | null;
 }
 export interface SessionView {
-  id: string; status: string; profile: string; class: string; origin: string;
-  agent_kind: string; model: string; effort: string; protocol: string;
-  work_dir: string; term_session: string; turn_count: number;
-  created_by: string | null; created_at: string; last_activity_at: string;
-  branch: BranchSummary; placement: Placement | null;
+  id: string;
+  status: string;
+  profile: string;
+  class: string;
+  origin: string;
+  agent_kind: string;
+  model: string;
+  effort: string;
+  protocol: string;
+  work_dir: string;
+  term_session: string;
+  turn_count: number;
+  created_by: string | null;
+  created_at: string;
+  last_activity_at: string;
+  branch: BranchSummary;
+  placement: Placement | null;
+}
+export interface SessionGroup {
+  id: string;
+  space_id: string;
+  name: string;
+  rank: number;
+  system_key: string | null;
+  collapsed: boolean;
+  session_ids: string[];
+}
+export interface SessionSpace {
+  id: string;
+  name: string;
+  rank: number;
+  system_key: string | null;
+  groups: SessionGroup[];
+}
+export interface SessionLayout {
+  revision: number;
+  spaces: SessionSpace[];
+  defaults: {
+    selector_kind: string;
+    selector_value: string;
+    group_id: string;
+  }[];
+}
+interface FleetSnapshot {
+  sessions: SessionSummary[];
+  layout: SessionLayout;
 }
 
 // --- State ----------------------------------------------------------------
@@ -39,6 +105,7 @@ const connected = ref(false);
 const connError = ref<string | null>(null);
 const launching = ref(false);
 const fleet = ref<SessionSummary[]>([]);
+const layout = ref<SessionLayout | null>(null);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
 const showSettings = ref(false);
@@ -50,8 +117,9 @@ const loomToken = ref(localStorage.getItem("loomToken") ?? "");
 onMounted(async () => {
   // Register listeners BEFORE connecting, so the initial fleet snapshot
   // emitted right after connect is never missed.
-  await listen<SessionSummary[]>("loom://fleet", (event) => {
-    fleet.value = event.payload;
+  await listen<FleetSnapshot>("loom://fleet", (event) => {
+    fleet.value = event.payload.sessions;
+    layout.value = event.payload.layout;
   });
   await listen("loom://launched", (event) => {
     const view = event.payload as SessionView;
@@ -105,17 +173,84 @@ async function selectSession(id: string) {
   }
 }
 
-async function launchTask(task: string, repo: string) {
+async function launchTask(task: string, repo: string, groupId?: string) {
   launching.value = true;
   try {
     const view = await invoke<SessionView>("launch_session", { repo, task });
     selectedId.value = view.id;
     selectedView.value = view;
+    // If launched into a workstream, move it there once it exists. The
+    // fleet refresh will follow from the layout event.
+    if (groupId && groupId !== "inbox") {
+      try {
+        await invoke("move_to_workstream", { sessionIds: [view.id], groupId });
+      } catch (e: any) {
+        connError.value = e?.message ?? String(e);
+      }
+    }
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   } finally {
     launching.value = false;
   }
+}
+
+async function delegateFromThread(parentId: string, task: string) {
+  launching.value = true;
+  try {
+    const view = await invoke<SessionView>("delegate_task", { parentId, task });
+    // Stay on the parent thread — the child appears nested under it in the
+    // sidebar (and inherits the parent's workstream) via the layout events.
+  } catch (e: any) {
+    connError.value = e?.message ?? String(e);
+  } finally {
+    launching.value = false;
+  }
+}
+
+async function createWorkstream(name: string) {
+  try {
+    await invoke("create_workstream", { name });
+  } catch (e: any) {
+    connError.value = e?.message ?? String(e);
+  }
+}
+
+async function onSidebarAction(payload: string) {
+  // "__delete__:<group_id>" = delete workstream; otherwise move a session.
+  if (payload.startsWith("__delete__:")) {
+    const groupId = payload.slice("__delete__:".length);
+    // Sessions move back to the user Inbox group.
+    const inbox =
+      layout.value?.spaces
+        .flatMap((s) => s.groups)
+        .find(
+          (g) =>
+            g.system_key === "inbox" && g.space_id.startsWith("space-user"),
+        ) ??
+      layout.value?.spaces
+        .flatMap((s) => s.groups)
+        .find((g) => g.system_key === "inbox");
+    if (!inbox) return;
+    try {
+      await invoke("delete_workstream", {
+        groupId,
+        destinationGroupId: inbox.id,
+      });
+    } catch (e: any) {
+      connError.value = e?.message ?? String(e);
+    }
+    return;
+  }
+  await onMoveSession(payload);
+}
+
+async function onMoveSession(sessionId: string) {
+  // Prompt-less placeholder: moving a single session requires choosing a
+  // target workstream; for now surface it via the workstream delete flow.
+  // (Full drag-and-drop move is a later increment.)
+  connError.value =
+    "Moving single sessions: pick a workstream header first (coming soon)";
 }
 
 function onArchived(id: string) {
@@ -127,7 +262,7 @@ function onArchived(id: string) {
 }
 
 const connClass = computed(() =>
-  connected.value ? "ok" : connError.value ? "bad" : "warn"
+  connected.value ? "ok" : connError.value ? "bad" : "warn",
 );
 </script>
 
@@ -135,17 +270,31 @@ const connClass = computed(() =>
   <div class="app" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
       <span class="title">🕸 Arachne</span>
-      <span class="conn" :class="{ clickable: true }" @click="showSettings = true" title="Connection settings">
+      <span
+        class="conn"
+        :class="{ clickable: true }"
+        @click="showSettings = true"
+        title="Connection settings"
+      >
         <span class="dot" :class="connClass"></span>
-        {{ connected ? (connError ? connError : `loom · ${loomUrl.replace("http://", "")}`) : connError ?? "connecting…" }}
+        {{
+          connected
+            ? connError
+              ? connError
+              : `loom · ${loomUrl.replace("http://", "")}`
+            : (connError ?? "connecting…")
+        }}
       </span>
     </header>
     <FleetSidebar
       :fleet="fleet"
+      :layout="layout"
       :selected-id="selectedId"
       :launching="launching"
       @select="selectSession"
       @launch="launchTask"
+      @create-workstream="createWorkstream"
+      @move-session="onSidebarAction"
     />
     <ThreadView
       v-if="selectedId && selectedView"
@@ -153,9 +302,13 @@ const connClass = computed(() =>
       :session="selectedView"
       @error="connError = $event"
       @archive="onArchived"
+      @delegate="delegateFromThread"
     />
     <div v-else-if="selectedId" class="main">
-      <div class="empty"><div class="big">🕸</div><div>opening session…</div></div>
+      <div class="empty">
+        <div class="big">🕸</div>
+        <div>opening session…</div>
+      </div>
     </div>
     <div v-else class="main">
       <div class="empty">

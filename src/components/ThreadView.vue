@@ -7,7 +7,15 @@ import type { SessionView } from "../App.vue";
 // DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
 // { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
 interface DisplayBlock {
-  kind: "user_message" | "agent_message" | "thought" | "tool_call" | "plan" | "usage" | "turn_end" | "other";
+  kind:
+    | "user_message"
+    | "agent_message"
+    | "thought"
+    | "tool_call"
+    | "plan"
+    | "usage"
+    | "turn_end"
+    | "other";
   text?: string;
   by?: string | null;
   tool_kind?: string;
@@ -22,12 +30,16 @@ interface DisplayBlock {
   payload?: string;
 }
 
-interface Cursor { turn: number; seq: number }
+interface Cursor {
+  turn: number;
+  seq: number;
+}
 
 const props = defineProps<{ session: SessionView }>();
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
+  (e: "delegate", parentId: string, task: string): void;
 }>();
 
 const blocks = ref<DisplayBlock[]>([]);
@@ -37,6 +49,23 @@ const loadingOlder = ref(false);
 const hasOlder = ref(true);
 const convEl = ref<HTMLElement | null>(null);
 const unlisteners: UnlistenFn[] = [];
+
+// Delegation: spawn a child session under this one. The child lands in the
+// same workstream (loom inherits the parent's placement group) and nests
+// under this row in the sidebar.
+const showDelegate = ref(false);
+const delegateTask = ref("");
+const delegating = ref(false);
+
+function submitDelegate() {
+  const t = delegateTask.value.trim();
+  if (!t || delegating.value) return;
+  delegating.value = true;
+  emit("delegate", props.session.id, t);
+  delegateTask.value = "";
+  showDelegate.value = false;
+  delegating.value = false;
+}
 
 // Auto-scroll only when the user is already at (or near) the bottom — never
 // yank someone who has scrolled up to read.
@@ -65,7 +94,9 @@ function scheduleReload() {
 async function reload() {
   const stick = atBottom();
   try {
-    blocks.value = await invoke<DisplayBlock[]>("fetch_chat", { id: props.session.id });
+    blocks.value = await invoke<DisplayBlock[]>("fetch_chat", {
+      id: props.session.id,
+    });
     const cursor = await invoke<Cursor | null>("chat_older_cursor");
     hasOlder.value = cursor !== null;
     if (stick) scrollToBottom();
@@ -117,10 +148,13 @@ onMounted(async () => {
   unlisteners.push(
     await listen("loom://chat-event", (event) => {
       const frame = event.payload as { topic: string; event: string };
-      if (frame.topic.startsWith("chat:") || frame.topic.startsWith("session:")) {
+      if (
+        frame.topic.startsWith("chat:") ||
+        frame.topic.startsWith("session:")
+      ) {
         scheduleReload();
       }
-    })
+    }),
   );
 });
 
@@ -138,7 +172,7 @@ watch(
       await reload();
       scrollToBottom();
     }
-  }
+  },
 );
 
 onUnmounted(() => {
@@ -206,13 +240,32 @@ function toggle(i: number) {
       <div class="meta">
         <div class="name">{{ session.branch.name || session.id }}</div>
         <div class="sub">
-          {{ session.agent_kind }} · {{ session.model || "auto" }} · turn {{ session.turn_count }} ·
+          {{ session.agent_kind }} · {{ session.model || "auto" }} · turn
+          {{ session.turn_count }} ·
           {{ session.work_dir }}
         </div>
       </div>
       <button @click="openInZed">Open in Zed</button>
       <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
+      <button class="accent" @click="showDelegate = !showDelegate">
+        Delegate
+      </button>
+    </div>
+    <div v-if="showDelegate" class="delegate-box">
+      <input
+        v-model="delegateTask"
+        placeholder="child task… e.g. “run the tests and report failures”"
+        @keydown.enter.prevent="submitDelegate"
+        @keydown.esc="showDelegate = false"
+      />
+      <button
+        class="primary"
+        :disabled="!delegateTask.trim()"
+        @click="submitDelegate"
+      >
+        Spawn child
+      </button>
     </div>
     <div class="conversation" ref="convEl">
       <div v-if="hasOlder" class="load-older">
@@ -224,9 +277,13 @@ function toggle(i: number) {
         <!-- Tool calls: collapsed one-liner by default, expandable -->
         <div v-if="b.kind === 'tool_call'" class="block tool">
           <div class="tool-line" @click="toggle(i)">
-            <span class="status" :class="{ running: b.status === 'running' }">{{ b.status }}</span>
+            <span class="status" :class="{ running: b.status === 'running' }">{{
+              b.status
+            }}</span>
             <span class="tool-title">{{ b.title }}</span>
-            <span v-if="b.summary" class="tool-summary">{{ b.summary.slice(0, 200) }}</span>
+            <span v-if="b.summary" class="tool-summary">{{
+              b.summary.slice(0, 200)
+            }}</span>
             <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
           </div>
           <div v-if="!isCollapsed(i)" class="tool-detail">{{ b.summary }}</div>
@@ -238,22 +295,31 @@ function toggle(i: number) {
             <span class="tool-summary">{{ (b.text ?? "").slice(0, 160) }}</span>
             <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
           </div>
-          <div v-if="!isCollapsed(i)" class="body thought-body">{{ b.text }}</div>
+          <div v-if="!isCollapsed(i)" class="body thought-body">
+            {{ b.text }}
+          </div>
         </div>
         <!-- Plans -->
         <div v-else-if="b.kind === 'plan'" class="block">
           <div class="who">plan</div>
           <div class="body">
-            <div v-for="(entry, j) in b.entries" :key="j">[{{ entry[1] }}] {{ entry[0] }}</div>
+            <div v-for="(entry, j) in b.entries" :key="j">
+              [{{ entry[1] }}] {{ entry[0] }}
+            </div>
           </div>
         </div>
         <!-- User / agent messages -->
         <div
           v-else-if="b.kind === 'user_message' || b.kind === 'agent_message'"
           class="block"
-          :class="{ user: b.kind === 'user_message', agent: b.kind === 'agent_message' }"
+          :class="{
+            user: b.kind === 'user_message',
+            agent: b.kind === 'agent_message',
+          }"
         >
-          <div class="who">{{ b.kind === "user_message" ? "you" : session.agent_kind }}</div>
+          <div class="who">
+            {{ b.kind === "user_message" ? "you" : session.agent_kind }}
+          </div>
           <div class="body">{{ b.text }}</div>
         </div>
         <!-- usage / turn_end / unknown: no visual block -->
@@ -268,7 +334,9 @@ function toggle(i: number) {
         placeholder="Message the agent…"
         @keydown.enter.exact.prevent="send"
       ></textarea>
-      <button class="primary" :disabled="!draft.trim() || busy" @click="send">Send</button>
+      <button class="primary" :disabled="!draft.trim() || busy" @click="send">
+        Send
+      </button>
     </div>
   </section>
 </template>

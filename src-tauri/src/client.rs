@@ -132,6 +132,55 @@ impl LoomClient {
             .await
     }
 
+    /// `session_layout.get` — workstream spaces/groups.
+    pub async fn session_layout(&self) -> Result<crate::loom::SessionLayoutView, LoomError> {
+        self.op("/api/session_layout/get", &serde_json::json!({}))
+            .await
+    }
+
+    /// `session_layout.groups.create` — new workstream in a space.
+    pub async fn create_group(
+        &self,
+        space_id: &str,
+        name: &str,
+    ) -> Result<crate::loom::SessionLayoutView, LoomError> {
+        self.op(
+            "/api/session_layout/groups/create",
+            &serde_json::json!({ "space_id": space_id, "name": name }),
+        )
+        .await
+    }
+
+    /// `session_layout.move` — move sessions into a workstream.
+    pub async fn move_sessions(
+        &self,
+        session_ids: &[&str],
+        destination_group_id: &str,
+    ) -> Result<crate::loom::SessionLayoutView, LoomError> {
+        self.op(
+            "/api/session_layout/move",
+            &serde_json::json!({
+                "session_ids": session_ids,
+                "destination_group_id": destination_group_id,
+            }),
+        )
+        .await
+    }
+
+    /// `session_layout.groups.delete` — remove a workstream; its sessions
+    /// must move somewhere first (loom never orphans them).
+    pub async fn delete_group(
+        &self,
+        id: &str,
+        destination_group_id: &str,
+    ) -> Result<crate::loom::SessionLayoutView, LoomError> {
+        self.op(
+            "/api/session_layout/groups/delete",
+            &serde_json::json!({ "id": id, "destination_group_id": destination_group_id }),
+        )
+        .await
+    }
+
     /// `sessions.get` — one session, including `work_dir` for Open-in-Zed.
     pub async fn get_session(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
         self.op(

@@ -240,6 +240,84 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 }
 .empty .big { font-size: 40px; }
 
+/* --- Workstream groups in the sidebar ------------------------------ */
+
+.group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.group-header:hover .group-name { color: var(--text); }
+.group-name {
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.group-count {
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.group-header .stream-delete { opacity: 0; margin-left: auto; }
+.group-header:hover .stream-delete { opacity: 1; }
+.session-item.child { border-left: 1px solid var(--border); font-size: 12px; }
+.session-item.child .name { font-size: 12px; }
+.launch-target {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  color: var(--accent);
+  padding: 2px 12px 0;
+}
+button.link {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+button.link:hover { color: var(--text); }
+.new-stream-btn { width: 100%; text-align: left; padding: 6px 12px; }
+.new-stream { padding: 4px 10px; }
+.new-stream input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  outline: none;
+}
+
+button.accent { border-color: var(--accent); color: var(--accent); }
+.delegate-box {
+  display: flex;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-hover);
+}
+.delegate-box input {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 13px;
+  outline: none;
+}
+
 /* --- Modal (settings) --------------------------------------------- */
 
 .modal-backdrop {

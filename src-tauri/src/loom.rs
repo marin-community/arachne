@@ -122,6 +122,47 @@ pub struct SessionView {
 }
 
 // ---------------------------------------------------------------------------
+// Session layout (workstreams)
+// ---------------------------------------------------------------------------
+
+/// `session_layout.get` — spaces, groups (workstreams in Arachne's UI), and
+/// placement defaults. Groups carry `session_ids` including archived rows;
+/// the fleet summary is the authority on which sessions are active.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionLayoutView {
+    pub revision: i64,
+    pub spaces: Vec<SessionSpaceView>,
+    #[serde(default)]
+    pub defaults: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionSpaceView {
+    pub id: String,
+    pub name: String,
+    pub rank: i64,
+    pub system_key: Option<String>,
+    #[serde(default)]
+    pub groups: Vec<SessionGroupView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionGroupView {
+    pub id: String,
+    pub space_id: String,
+    pub name: String,
+    pub rank: i64,
+    pub system_key: Option<String>,
+    #[serde(default)]
+    pub collapsed: bool,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Chat journal
 // ---------------------------------------------------------------------------
 
@@ -172,6 +213,11 @@ pub struct SessionsLaunchInput {
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub goal: Option<String>,
+    /// The parent session's branch id, for dashboard-launched delegation.
+    /// Sets origin=agent + parent_session_id so the child nests under the
+    /// parent in the sidebar and inherits its placement group.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
