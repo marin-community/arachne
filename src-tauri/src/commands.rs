@@ -80,6 +80,37 @@ async fn state_client(state: &LoomState) -> Result<Arc<LoomClient>, UiError> {
         })
 }
 
+/// Persist the loom bearer token to the macOS Keychain. An empty token
+/// removes the stored credential.
+#[tauri::command]
+pub async fn save_token(token: String) -> Result<(), UiError> {
+    tokio::task::spawn_blocking(move || crate::secret::save(&token))
+        .await
+        .map_err(|e| UiError {
+            message: format!("saving token: {e}"),
+            unreachable: false,
+        })?
+        .map_err(|e| UiError {
+            message: e,
+            unreachable: false,
+        })
+}
+
+/// Read the stored loom bearer token; `None` when nothing is stored.
+#[tauri::command]
+pub async fn load_token() -> Result<Option<String>, UiError> {
+    tokio::task::spawn_blocking(crate::secret::load)
+        .await
+        .map_err(|e| UiError {
+            message: format!("loading token: {e}"),
+            unreachable: false,
+        })?
+        .map_err(|e| UiError {
+            message: e,
+            unreachable: false,
+        })
+}
+
 /// Connect to a loom server. Loopback needs no token; remote accepts a bearer
 /// token for later (DGX over Tailscale). Verifies health, then starts the
 /// fleet poller (snapshot + layout SSE → `loom://fleet` emits).
@@ -325,8 +356,16 @@ pub async fn launch_session(
     Ok(view)
 }
 
-/// Create a child session delegated to the given parent: same repo as the
-/// parent, linked via `parent_branch` so it nests + inherits placement.
+/// Create a child session delegated to the given parent.
+///
+/// The child targets the parent's repository using only server-side truth:
+/// - `repo`: the parent's managed `owner/name` slug when it launched against
+///   a managed repo;
+/// - `cwd`: the parent's worktree path (a path on the *server's* filesystem,
+///   valid whether loom runs locally or on the DGX) — the server ignores
+///   `cwd` whenever `repo` is present, so both can be passed unconditionally.
+///
+/// No hardcoded slug, no Mac-shaped path parsing, no client-side git.
 #[tauri::command]
 pub async fn delegate_task(
     state: State<'_, LoomState>,
@@ -335,21 +374,17 @@ pub async fn delegate_task(
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent = client.get_session(&parent_id).await?;
-    // repo_root is ~/.weaver/repos/<owner>/<name> — the launch input wants
-    // the `owner/name` slug.
-    let slug_parts: Vec<&str> = parent
-        .branch
-        .repo_root
-        .trim_end_matches('/')
-        .rsplit('/')
-        .take(2)
-        .collect();
-    let repo = if slug_parts.len() == 2 {
-        format!("{}/{}", slug_parts[1], slug_parts[0])
-    } else {
-        "marin-community/arachne".to_string()
-    };
-    launch_session(state, repo, task, Some(parent_id)).await
+    let view = client
+        .launch(&crate::loom::SessionsLaunchInput {
+            repo: parent.github_repo.clone(),
+            cwd: parent.work_dir.clone(),
+            title: Some(task.chars().take(80).collect()),
+            goal: Some(task),
+            parent_branch: Some(parent.branch.id),
+            ..Default::default()
+        })
+        .await?;
+    Ok(view)
 }
 
 /// Archive a session: tear down its terminal + worktree, keep the branch.

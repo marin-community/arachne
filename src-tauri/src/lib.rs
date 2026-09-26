@@ -6,6 +6,8 @@
 //! interaction. That keeps auth (loopback now, bearer token later for the
 //! DGX) and reconnection logic in one place, and sidesteps the browser's
 //! EventSource limitations (no headers, 6-connection cap).
+//!
+//! The bearer token is stored in the macOS Keychain (never localStorage).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -13,6 +15,7 @@ pub mod blocks;
 pub mod client;
 pub mod commands;
 pub mod loom;
+pub mod secret;
 
 pub fn run() {
     tauri::Builder::default()
@@ -20,6 +23,8 @@ pub fn run() {
         .manage(commands::LoomState::default())
         .invoke_handler(tauri::generate_handler![
             commands::connect,
+            commands::save_token,
+            commands::load_token,
             commands::open_session,
             commands::chat_older_cursor,
             commands::fetch_chat,
