@@ -22,6 +22,9 @@ the intended remote test uses Loom on the DGX over Tailscale.
 
 - **Topic:** durable intent and accepted state. Its coordinating thread may
   sleep, but the topic keeps its branch, documents, and resource bindings.
+  Creation starts with a short title and a body that becomes the agent goal.
+- **Quick one-off:** a single-prompt session in the Inbox. It can stay small
+  without becoming a named topic.
 - **Thread/worker:** one Loom session and its conversation. Hierarchy records
   responsibility; it does not determine Git ancestry.
 - **Resource:** a repository, checkout, PR, document, file, or artifact with a

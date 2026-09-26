@@ -21,7 +21,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; profile?: string; agent?: string; model?: string; effort?: string },
+    meta?: { title?: string; description?: string; oneOff?: boolean; profile?: string; agent?: string; model?: string; effort?: string },
   ): void;
   (
     e: "update-topic",
@@ -71,8 +71,8 @@ const dropTarget = ref<string | null>(null);
 
 function submit() {
   const t = task.value.trim();
-  if (!t) return;
-  emit("launch", t, repo.value.trim(), launchConfig());
+  if (!t || props.launching) return;
+  emit("launch", t, repo.value.trim(), { ...launchConfig(), oneOff: true });
   task.value = "";
 }
 
@@ -358,23 +358,22 @@ const topics = computed<TopicEntry[]>(() => {
     );
 });
 
-// New-topic form state. Title is the short card label; description is the
-// longer what-this-is-for text (also the branch description shown in the
-// inbox rows); the goal sent to the agent falls back to the title.
+// A topic has a short title and a substantive body. The body is both the
+// agent's initial goal and the durable branch description.
 const newTitle = ref("");
-const newDesc = ref("");
+const newBody = ref("");
 
 function submitTopic() {
   const title = newTitle.value.trim();
-  if (!title) return;
-  const desc = newDesc.value.trim();
-  emit("launch", desc || title, repo.value.trim(), {
+  const body = newBody.value.trim();
+  if (!title || !body || props.launching) return;
+  emit("launch", body, repo.value.trim(), {
     title,
-    description: desc,
+    description: body,
     ...launchConfig(),
   });
   newTitle.value = "";
-  newDesc.value = "";
+  newBody.value = "";
 }
 
 // Inline card editing: title edits are compare-and-swap fenced server-side,
@@ -501,12 +500,13 @@ async function archiveRow(id: string) {
       </button>
     </div>
 
-    <!-- Inbox tab: the filing lanes + delegation tree (unchanged behavior) -->
+    <!-- Inbox tab: filing lanes, delegation tree, and a fast one-off launch. -->
     <template v-if="tab === 'inbox'">
       <div class="new-task">
         <input
           v-model="task"
-          placeholder="New topic — describe the goal…"
+          placeholder="Quick one-off task…"
+          aria-label="Quick one-off task"
           @keydown.enter.prevent="submit"
         />
         <button
@@ -514,7 +514,7 @@ async function archiveRow(id: string) {
           :disabled="!task.trim() || props.launching"
           @click="submit"
         >
-          {{ props.launching ? "…" : "Launch" }}
+          {{ props.launching ? "…" : "Run" }}
         </button>
       </div>
       <div class="new-task" style="margin-top: -4px">
@@ -683,15 +683,19 @@ async function archiveRow(id: string) {
          and a config placeholder. -->
     <template v-else>
       <div class="new-topic-card">
+        <div class="new-topic-heading">New topic</div>
+        <label for="new-topic-title">Title</label>
         <input
+          id="new-topic-title"
           v-model="newTitle"
-          placeholder="New topic title…"
-          @keydown.enter.prevent="submitTopic"
+          placeholder="What is this work about?"
         />
+        <label for="new-topic-body">Body</label>
         <textarea
-          v-model="newDesc"
-          rows="2"
-          placeholder="What is this topic for? (description)"
+          id="new-topic-body"
+          v-model="newBody"
+          rows="6"
+          placeholder="Describe the goal, context, and what a good result looks like…"
         ></textarea>
         <div class="new-topic-foot">
           <input
@@ -702,7 +706,7 @@ async function archiveRow(id: string) {
           />
           <button
             class="primary"
-            :disabled="!newTitle.trim() || props.launching"
+            :disabled="!newTitle.trim() || !newBody.trim() || props.launching"
             @click="submitTopic"
           >
             {{ props.launching ? "…" : "Create topic" }}

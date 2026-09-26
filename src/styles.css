@@ -231,8 +231,10 @@ body {
   margin: 10px 10px 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
 }
+.new-topic-heading { font-size: 14px; font-weight: 600; }
+.new-topic-card label { color: var(--text-dim); font-size: 11px; font-weight: 600; }
 .new-topic-card input,
 .new-topic-card textarea,
 .topic-edit-title,
@@ -252,6 +254,7 @@ body {
   font: 12px/1.4 inherit;
   min-height: 44px;
 }
+.new-topic-card textarea { min-height: 112px; }
 .new-topic-card input:focus,
 .new-topic-card textarea:focus,
 .topic-edit-title:focus,

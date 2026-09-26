@@ -479,12 +479,14 @@ pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), Ui
 /// and nesting under the parent in the sidebar.
 #[tauri::command]
 pub async fn launch_session(
+    app: AppHandle,
     state: State<'_, LoomState>,
     repo: String,
     task: String,
     parent_id: Option<String>,
     title: Option<String>,
     description: Option<String>,
+    one_off: Option<bool>,
     profile: Option<String>,
     agent: Option<String>,
     model: Option<String>,
@@ -499,9 +501,8 @@ pub async fn launch_session(
         }
         _ => None,
     };
-    // The sidebar's composer sends only `task` (title falls back to it, like
-    // the CLI); the topic card sends an explicit short `title` plus a longer
-    // `description`.
+    // Quick one-offs send only `task` (title falls back to it, like the CLI);
+    // the topic card sends an explicit short title and longer body.
     let label = title
         .as_deref()
         .map(str::trim)
@@ -539,12 +540,17 @@ pub async fn launch_session(
             })
             .await;
     }
-    // A top-level launch IS a topic: stamp the durable marker so the sidebar
-    // keeps its shape even if every child finishes and archives. (Delegations
-    // are stamped by `delegate_task` on the parent, not the child.)
-    if parent_branch.is_none() {
+    // A named topic retains its durable marker even after its children
+    // archive. Quick one-offs stay in the inbox without becoming topics.
+    if parent_branch.is_none() && !one_off.unwrap_or(false) {
         let _ = client.set_tag(&view.id, "topic", "true").await;
     }
+    // Loom does not publish a fleet event for description updates. Publish
+    // the final launch state so the new topic card has its body immediately.
+    if let Ok(list) = client.list_sessions().await {
+        emit_fleet(&app, &client, list).await;
+    }
+    let view = client.get_session(&view.id).await.unwrap_or(view);
     // Selection/activation is the frontend's job: it routes the new
     // session through open_session (chat forwarder + live streaming) via
     // the returned view. Delegations stay on the parent thread — the child

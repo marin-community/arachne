@@ -217,7 +217,7 @@ async function selectSession(id: string) {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; oneOff?: boolean; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launching.value = true;
   try {
@@ -226,6 +226,7 @@ async function launchTask(
       task,
       title: meta?.title ?? null,
       description: meta?.description ?? null,
+      oneOff: meta?.oneOff ?? false,
       profile: meta?.profile || null,
       agent: meta?.agent || null,
       model: meta?.model || null,
