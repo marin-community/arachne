@@ -60,6 +60,7 @@ export interface SessionSummary {
   parent_id: string | null;
   parent_session_id: string | null;
 }
+export interface ResourceMention { topicId: string; resourceId: string }
 export interface SessionView {
   id: string;
   status: string;
@@ -217,7 +218,7 @@ async function selectSession(id: string) {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; oneOff?: boolean; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launching.value = true;
   try {
@@ -227,6 +228,7 @@ async function launchTask(
       title: meta?.title ?? null,
       description: meta?.description ?? null,
       oneOff: meta?.oneOff ?? false,
+      mentions: meta?.mentions ?? [],
       profile: meta?.profile || null,
       agent: meta?.agent || null,
       model: meta?.model || null,
@@ -405,6 +407,7 @@ const selectedTopic = computed(() => {
       v-if="selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
+      :topic="selectedTopic"
       :fleet="fleet"
       :launch-options="launchOptions"
       @error="connError = $event"

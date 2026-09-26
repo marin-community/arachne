@@ -60,7 +60,7 @@ interface ChatEventFrame {
   data?: any;
 }
 
-const props = defineProps<{ session: SessionView; fleet: SessionSummary[]; launchOptions: LaunchOptions | null }>();
+const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null }>();
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
@@ -70,6 +70,91 @@ const emit = defineEmits<{
 
 const blocks = ref<DisplayBlock[]>([]);
 const draft = ref("");
+interface MentionResource {
+  id: string;
+  kind: string;
+  title: string;
+  path: string | null;
+  url: string | null;
+  reference: string | null;
+}
+const composerEl = ref<HTMLTextAreaElement | null>(null);
+const mentionResources = ref<MentionResource[]>([]);
+const mentionLoading = ref(false);
+const mentionError = ref("");
+const mentionRange = ref<{ start: number; end: number; query: string } | null>(null);
+const mentionIndex = ref(0);
+const selectedMentions = ref<{ id: string; token: string }[]>([]);
+const matchingResources = computed(() => {
+  const query = mentionRange.value?.query.trim().toLowerCase() ?? "";
+  return mentionResources.value.filter((resource) =>
+    !query || [resource.title, resource.kind, resource.path, resource.url, resource.reference]
+      .some((value) => value?.toLowerCase().includes(query)),
+  ).slice(0, 8);
+});
+
+async function loadMentionResources() {
+  const topicId = props.topic?.id;
+  if (!topicId) return;
+  mentionLoading.value = true;
+  mentionError.value = "";
+  try {
+    const view = await invoke<{ resources: MentionResource[] }>("topic_resources", { topicId });
+    if (props.topic?.id === topicId) mentionResources.value = view.resources ?? [];
+  } catch (error: any) {
+    if (props.topic?.id === topicId) mentionError.value = error?.message ?? String(error);
+  } finally {
+    mentionLoading.value = false;
+  }
+}
+
+function updateMention() {
+  const caret = composerEl.value?.selectionStart ?? draft.value.length;
+  const before = draft.value.slice(0, caret);
+  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(before);
+  const wasOpen = !!mentionRange.value;
+  mentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
+  mentionIndex.value = 0;
+  if (mentionRange.value && !wasOpen) void loadMentionResources();
+}
+
+function chooseMention(resource: MentionResource) {
+  const range = mentionRange.value;
+  if (!range) return;
+  const duplicateTitle = mentionResources.value.some((other) => other.id !== resource.id && other.title === resource.title);
+  const label = duplicateTitle ? `${resource.title} (${resource.path || resource.url || resource.reference || resource.kind})` : resource.title;
+  const token = `@{${label}}`;
+  draft.value = draft.value.slice(0, range.start) + token + " " + draft.value.slice(range.end);
+  selectedMentions.value.push({ id: resource.id, token });
+  mentionRange.value = null;
+  nextTick(() => {
+    const caret = range.start + token.length + 1;
+    composerEl.value?.focus();
+    composerEl.value?.setSelectionRange(caret, caret);
+  });
+}
+
+function onComposerKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+    event.preventDefault();
+    if (mentionRange.value && matchingResources.value.length) chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
+    else void send();
+    return;
+  }
+  if (!mentionRange.value) return;
+  if (event.key === "Escape") { event.preventDefault(); mentionRange.value = null; }
+  else if (event.key === "ArrowDown" && matchingResources.value.length) {
+    event.preventDefault(); mentionIndex.value = (mentionIndex.value + 1) % matchingResources.value.length;
+  } else if (event.key === "ArrowUp" && matchingResources.value.length) {
+    event.preventDefault(); mentionIndex.value = (mentionIndex.value - 1 + matchingResources.value.length) % matchingResources.value.length;
+  }
+}
+
+watch(() => props.topic?.id, () => {
+  mentionResources.value = [];
+  mentionRange.value = null;
+  selectedMentions.value = [];
+});
 const busy = ref(false);
 const loadingOlder = ref(false);
 const hasOlder = ref(true);
@@ -410,6 +495,9 @@ onUnmounted(() => {
 });
 
 async function send() {
+  if (mentionRange.value && matchingResources.value.length) {
+    chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
+  }
   const text = draft.value.trim();
   if (!text || busy.value) return;
   busy.value = true;
@@ -418,8 +506,12 @@ async function send() {
       id: props.session.id,
       text,
       protocol: props.session.protocol,
+      topicId: props.topic?.id ?? null,
+      resourceIds: selectedMentions.value.filter((mention) => text.includes(mention.token)).map((mention) => mention.id),
     });
     draft.value = "";
+    selectedMentions.value = [];
+    mentionRange.value = null;
     await reload();
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
@@ -824,19 +916,35 @@ async function onLand(strategy: string) {
         No conversation yet.
       </div>
     </div>
-    <div class="composer">
+    <div class="composer-wrap">
+      <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Topic resources">
+        <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
+        <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
+        <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
+        <button v-for="(resource, index) in matchingResources" :key="resource.id" role="option"
+          :aria-selected="index === mentionIndex" :class="{ selected: index === mentionIndex }"
+          @mousedown.prevent="chooseMention(resource)">
+          <strong>{{ resource.title }}</strong>
+          <small>{{ resource.path || resource.url || resource.reference || resource.kind }}</small>
+        </button>
+      </div>
+      <div class="composer">
       <textarea
+        ref="composerEl"
         v-model="draft"
         :placeholder="
           turnLive
             ? 'Agent is working — your message will queue behind the current turn…'
             : 'Message the agent…'
         "
-        @keydown.enter.exact.prevent="send"
+        @input="updateMention"
+        @click="updateMention"
+        @keydown="onComposerKeydown"
       ></textarea>
       <button class="primary" :disabled="!draft.trim() || busy" @click="send">
         {{ busy ? "…" : "Send" }}
       </button>
+      </div>
     </div>
   </section>
 </template>

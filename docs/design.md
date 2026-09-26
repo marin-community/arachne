@@ -51,6 +51,14 @@ same file in Zed. The binding survives session archive, although preview and
 editing require an active checkout. Loom artifacts remain appropriate for
 agent-authored reports and standalone versioned documents.
 
+Typing `@` in a thread message, a new topic body, or a quick task offers
+attached resources.
+The visible mention is readable, while Arachne resolves its stable ID against
+the current manifest when sending and includes the backing locator in the
+agent's prompt. Removing the visible mention removes that resource from the
+send. New topics can cite resources from existing topics before they have
+bindings of their own.
+
 Later resource types should be added only when a real workflow needs them.
 The next likely additions are a retained integration checkout and a PR that
 outlives its checkout. One active writer per mutable checkout remains the

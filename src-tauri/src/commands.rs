@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
 use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
-use crate::resources::{ResourceDraft, ResourceKind, TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME};
+use crate::resources::{ResourceDraft, ResourceKind, ResourceMention, TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME};
 
 #[derive(Default)]
 pub struct LoomState {
@@ -392,12 +392,21 @@ pub async fn send_input(
     id: String,
     text: String,
     protocol: String,
+    topic_id: Option<String>,
+    resource_ids: Option<Vec<String>>,
 ) -> Result<(), UiError> {
     let client = state_client(&state).await?;
+    let mut prompt = text;
+    let ids = resource_ids.unwrap_or_default();
+    if !ids.is_empty() {
+        let topic_id = topic_id.ok_or_else(|| resource_error("resource mentions require a topic"))?;
+        let mentions = ids.into_iter().map(|resource_id| ResourceMention { topic_id: topic_id.clone(), resource_id }).collect();
+        prompt.push_str(&resource_context(&client, mentions).await?);
+    }
     if protocol == "terminal" {
-        client.send_text(&id, &text, true).await?;
+        client.send_text(&id, &prompt, true).await?;
     } else {
-        client.send_prompt(&id, &text).await?;
+        client.send_prompt(&id, &prompt).await?;
     }
     Ok(())
 }
@@ -487,6 +496,7 @@ pub async fn launch_session(
     title: Option<String>,
     description: Option<String>,
     one_off: Option<bool>,
+    mentions: Option<Vec<ResourceMention>>,
     profile: Option<String>,
     agent: Option<String>,
     model: Option<String>,
@@ -514,11 +524,15 @@ pub async fn launch_session(
         .map(str::trim)
         .filter(|d| !d.is_empty())
         .map(String::from);
+    let mut goal = task;
+    if let Some(mentions) = mentions {
+        goal.push_str(&resource_context(&client, mentions).await?);
+    }
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
             title: Some(label),
-            goal: Some(task),
+            goal: Some(goal),
             parent_branch: parent_branch.clone(),
             profile,
             agent,
@@ -1059,6 +1073,27 @@ async fn load_topic_resources(client: &LoomClient, branch_id: &str) -> Result<To
         .and_then(|v| v.as_i64())
         .ok_or_else(|| resource_error("resource manifest has no revision"))?;
     Ok(manifest)
+}
+
+async fn resource_context(
+    client: &LoomClient,
+    mentions: Vec<ResourceMention>,
+) -> Result<String, UiError> {
+    if mentions.len() > 12 { return Err(resource_error("at most 12 resources can be mentioned in one message")); }
+    let mut seen = std::collections::HashSet::new();
+    let mut resolved = Vec::new();
+    for mention in mentions {
+        if !seen.insert((mention.topic_id.clone(), mention.resource_id.clone())) { continue; }
+        let topic = client.get_session(&mention.topic_id).await?;
+        let manifest = load_topic_resources(client, &topic.branch.id).await?;
+        let resource = manifest.resources.into_iter().find(|resource| resource.id == mention.resource_id)
+            .ok_or_else(|| resource_error(format!("mentioned resource no longer exists: {}", mention.resource_id)))?;
+        resolved.push(serde_json::json!({ "source_topic": mention.topic_id, "resource": resource }));
+    }
+    if resolved.is_empty() { return Ok(String::new()); }
+    let content = serde_json::to_string_pretty(&resolved)
+        .map_err(|e| resource_error(format!("serializing resource mentions: {e}")))?;
+    Ok(format!("\n\nReferenced topic resources (current Arachne bindings; use these locators to inspect the resources):\n{content}"))
 }
 
 async fn save_topic_resources(client: &LoomClient, branch_id: &str, manifest: &TopicResourcesView, expected_revision: i64) -> Result<TopicResourcesView, UiError> {

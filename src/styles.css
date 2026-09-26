@@ -235,6 +235,8 @@ body {
 }
 .new-topic-heading { font-size: 14px; font-weight: 600; }
 .new-topic-card label { color: var(--text-dim); font-size: 11px; font-weight: 600; }
+.topic-body-wrap { position: relative; }
+.topic-body-wrap textarea { display: block; }
 .new-topic-card input,
 .new-topic-card textarea,
 .topic-edit-title,
@@ -450,6 +452,28 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .block.tool .status { color: var(--ok); }
 .block.tool .status.running { color: var(--running); }
 
+.composer-wrap { position: relative; }
+.mention-menu {
+  position: absolute;
+  z-index: 30;
+  left: 16px;
+  bottom: calc(100% - 12px);
+  width: min(420px, calc(100% - 32px));
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 5px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .4);
+}
+.mention-menu button { display: flex; width: 100%; flex-direction: column; align-items: flex-start; gap: 2px; border: 0; background: transparent; text-align: left; }
+.mention-menu button.selected, .mention-menu button:hover { background: var(--bg-hover); }
+.mention-menu small, .mention-hint { color: var(--text-dim); font-size: 11px; }
+.mention-hint { padding: 7px 8px; }
+.mention-menu.topic-body-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
+.sidebar .new-task.quick-task-wrap { position: relative; }
+.mention-menu.quick-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
 .composer {
   display: flex;
   gap: 8px;

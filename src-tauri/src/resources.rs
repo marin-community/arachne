@@ -68,6 +68,13 @@ pub struct TopicResourceContent {
     pub content: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResourceMention {
+    pub topic_id: String,
+    pub resource_id: String,
+}
+
 impl ResourceDraft {
     pub fn validated(
         mut self,
@@ -200,5 +207,14 @@ mod tests {
         assert!(value.get("data").is_none());
         let decoded: TopicResource = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.id, resource.id);
+    }
+
+    #[test]
+    fn mention_accepts_webview_field_names() {
+        let mention: ResourceMention = serde_json::from_value(serde_json::json!({
+            "topicId": "topic", "resourceId": "design_document:docs/design.md"
+        })).unwrap();
+        assert_eq!(mention.topic_id, "topic");
+        assert_eq!(mention.resource_id, "design_document:docs/design.md");
     }
 }

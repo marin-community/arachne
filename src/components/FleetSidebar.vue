@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SessionSummary, SessionLayout, LaunchOptions } from "../App.vue";
+import { invoke } from "@tauri-apps/api/core";
+import { nextTick } from "vue";
+import type { SessionSummary, SessionLayout, LaunchOptions, ResourceMention } from "../App.vue";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -21,7 +23,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; oneOff?: boolean; profile?: string; agent?: string; model?: string; effort?: string },
+    meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; profile?: string; agent?: string; model?: string; effort?: string },
   ): void;
   (
     e: "update-topic",
@@ -40,6 +42,10 @@ const emit = defineEmits<{
 }>();
 
 const task = ref("");
+const quickInputEl = ref<HTMLInputElement | null>(null);
+const quickMentionRange = ref<{ start: number; end: number; query: string } | null>(null);
+const quickMentionIndex = ref(0);
+const quickMentions = ref<{ token: string; topicId: string; resourceId: string }[]>([]);
 const repo = ref("marin-community/arachne");
 const profile = ref("default");
 const agent = ref("");
@@ -70,10 +76,19 @@ const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
 
 function submit() {
+  if (quickMentionRange.value && matchingQuickResources.value.length) {
+    chooseQuickMention(matchingQuickResources.value[quickMentionIndex.value] || matchingQuickResources.value[0]);
+  }
   const t = task.value.trim();
   if (!t || props.launching) return;
-  emit("launch", t, repo.value.trim(), { ...launchConfig(), oneOff: true });
+  emit("launch", t, repo.value.trim(), {
+    ...launchConfig(), oneOff: true,
+    mentions: quickMentions.value.filter((mention) => t.includes(mention.token))
+      .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
+  });
   task.value = "";
+  quickMentions.value = [];
+  quickMentionRange.value = null;
 }
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
@@ -362,6 +377,131 @@ const topics = computed<TopicEntry[]>(() => {
 // agent's initial goal and the durable branch description.
 const newTitle = ref("");
 const newBody = ref("");
+interface TopicMentionResource {
+  topicId: string;
+  id: string;
+  title: string;
+  kind: string;
+  path: string | null;
+  url: string | null;
+  repository: string;
+}
+const topicBodyEl = ref<HTMLTextAreaElement | null>(null);
+const topicMentionRange = ref<{ start: number; end: number; query: string } | null>(null);
+const topicMentionIndex = ref(0);
+const topicMentionResources = ref<TopicMentionResource[]>([]);
+const topicMentionLoading = ref(false);
+const topicMentionError = ref("");
+const topicMentions = ref<{ token: string; topicId: string; resourceId: string }[]>([]);
+const matchingTopicResources = computed(() => {
+  const query = topicMentionRange.value?.query.trim().toLowerCase() ?? "";
+  return topicMentionResources.value.filter((resource) =>
+    !query || [resource.title, resource.kind, resource.path, resource.url, resource.repository]
+      .some((value) => value?.toLowerCase().includes(query)),
+  ).slice(0, 8);
+});
+const matchingQuickResources = computed(() => {
+  const query = quickMentionRange.value?.query.trim().toLowerCase() ?? "";
+  return topicMentionResources.value.filter((resource) =>
+    !query || [resource.title, resource.kind, resource.path, resource.url, resource.repository]
+      .some((value) => value?.toLowerCase().includes(query)),
+  ).slice(0, 8);
+});
+
+async function loadTopicMentionResources() {
+  topicMentionLoading.value = true;
+  topicMentionError.value = "";
+  try {
+    const views = await Promise.allSettled(topics.value.slice(0, 24).map(async ({ session }) => {
+      const view = await invoke<{ resources: Omit<TopicMentionResource, "topicId">[] }>("topic_resources", { topicId: session.id });
+      return (view.resources ?? []).map((resource) => ({ ...resource, topicId: session.id }));
+    }));
+    topicMentionResources.value = views.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+    if (views.length && views.every((result) => result.status === "rejected")) {
+      topicMentionError.value = "Could not load topic resources";
+    }
+  } finally {
+    topicMentionLoading.value = false;
+  }
+}
+
+function updateTopicMention() {
+  const caret = topicBodyEl.value?.selectionStart ?? newBody.value.length;
+  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(newBody.value.slice(0, caret));
+  const wasOpen = !!topicMentionRange.value;
+  topicMentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
+  topicMentionIndex.value = 0;
+  if (topicMentionRange.value && !wasOpen) void loadTopicMentionResources();
+}
+
+function updateQuickMention() {
+  const caret = quickInputEl.value?.selectionStart ?? task.value.length;
+  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(task.value.slice(0, caret));
+  const wasOpen = !!quickMentionRange.value;
+  quickMentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
+  quickMentionIndex.value = 0;
+  if (quickMentionRange.value && !wasOpen) void loadTopicMentionResources();
+}
+
+function chooseQuickMention(resource: TopicMentionResource) {
+  const range = quickMentionRange.value;
+  if (!range) return;
+  const duplicate = topicMentionResources.value.some((other) => other.id !== resource.id && other.title === resource.title);
+  const label = duplicate ? `${resource.title} (${resource.path || resource.url || resource.repository})` : resource.title;
+  const token = `@{${label}}`;
+  task.value = task.value.slice(0, range.start) + token + " " + task.value.slice(range.end);
+  quickMentions.value.push({ token, topicId: resource.topicId, resourceId: resource.id });
+  quickMentionRange.value = null;
+  nextTick(() => {
+    const caret = range.start + token.length + 1;
+    quickInputEl.value?.focus();
+    quickInputEl.value?.setSelectionRange(caret, caret);
+  });
+}
+
+function onQuickKeydown(event: KeyboardEvent) {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    if (quickMentionRange.value && matchingQuickResources.value.length) chooseQuickMention(matchingQuickResources.value[quickMentionIndex.value] || matchingQuickResources.value[0]);
+    else submit();
+    return;
+  }
+  if (!quickMentionRange.value) return;
+  if (event.key === "Escape") { event.preventDefault(); quickMentionRange.value = null; }
+  else if (event.key === "ArrowDown" && matchingQuickResources.value.length) {
+    event.preventDefault(); quickMentionIndex.value = (quickMentionIndex.value + 1) % matchingQuickResources.value.length;
+  } else if (event.key === "ArrowUp" && matchingQuickResources.value.length) {
+    event.preventDefault(); quickMentionIndex.value = (quickMentionIndex.value - 1 + matchingQuickResources.value.length) % matchingQuickResources.value.length;
+  }
+}
+
+function chooseTopicMention(resource: TopicMentionResource) {
+  const range = topicMentionRange.value;
+  if (!range) return;
+  const duplicate = topicMentionResources.value.some((other) => other.id !== resource.id && other.title === resource.title);
+  const label = duplicate ? `${resource.title} (${resource.path || resource.url || resource.repository})` : resource.title;
+  const token = `@{${label}}`;
+  newBody.value = newBody.value.slice(0, range.start) + token + " " + newBody.value.slice(range.end);
+  topicMentions.value.push({ token, topicId: resource.topicId, resourceId: resource.id });
+  topicMentionRange.value = null;
+  nextTick(() => {
+    const caret = range.start + token.length + 1;
+    topicBodyEl.value?.focus();
+    topicBodyEl.value?.setSelectionRange(caret, caret);
+  });
+}
+
+function onTopicBodyKeydown(event: KeyboardEvent) {
+  if (!topicMentionRange.value) return;
+  if (event.key === "Escape") { event.preventDefault(); topicMentionRange.value = null; }
+  else if (event.key === "ArrowDown" && matchingTopicResources.value.length) {
+    event.preventDefault(); topicMentionIndex.value = (topicMentionIndex.value + 1) % matchingTopicResources.value.length;
+  } else if (event.key === "ArrowUp" && matchingTopicResources.value.length) {
+    event.preventDefault(); topicMentionIndex.value = (topicMentionIndex.value - 1 + matchingTopicResources.value.length) % matchingTopicResources.value.length;
+  } else if (event.key === "Enter" && matchingTopicResources.value.length && !event.shiftKey) {
+    event.preventDefault(); chooseTopicMention(matchingTopicResources.value[topicMentionIndex.value] || matchingTopicResources.value[0]);
+  }
+}
 
 function submitTopic() {
   const title = newTitle.value.trim();
@@ -370,10 +510,13 @@ function submitTopic() {
   emit("launch", body, repo.value.trim(), {
     title,
     description: body,
+    mentions: topicMentions.value.filter((mention) => body.includes(mention.token))
+      .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     ...launchConfig(),
   });
   newTitle.value = "";
   newBody.value = "";
+  topicMentions.value = [];
 }
 
 // Inline card editing: title edits are compare-and-swap fenced server-side,
@@ -502,12 +645,15 @@ async function archiveRow(id: string) {
 
     <!-- Inbox tab: filing lanes, delegation tree, and a fast one-off launch. -->
     <template v-if="tab === 'inbox'">
-      <div class="new-task">
+      <div class="new-task quick-task-wrap">
         <input
+          ref="quickInputEl"
           v-model="task"
-          placeholder="Quick one-off task…"
+          placeholder="Quick one-off task… Use @ for resources"
           aria-label="Quick one-off task"
-          @keydown.enter.prevent="submit"
+          @input="updateQuickMention"
+          @click="updateQuickMention"
+          @keydown="onQuickKeydown"
         />
         <button
           class="primary"
@@ -516,6 +662,17 @@ async function archiveRow(id: string) {
         >
           {{ props.launching ? "…" : "Run" }}
         </button>
+        <div v-if="quickMentionRange" class="mention-menu quick-mention-menu" role="listbox" aria-label="Existing resources for quick task">
+          <div v-if="topicMentionLoading" class="mention-hint">Loading resources…</div>
+          <div v-else-if="topicMentionError" class="mention-hint">{{ topicMentionError }}</div>
+          <div v-else-if="!matchingQuickResources.length" class="mention-hint">No matching attached resources</div>
+          <button v-for="(resource, index) in matchingQuickResources" :key="`${resource.topicId}:${resource.id}`"
+            role="option" :aria-selected="index === quickMentionIndex" :class="{ selected: index === quickMentionIndex }"
+            @mousedown.prevent="chooseQuickMention(resource)">
+            <strong>{{ resource.title }}</strong>
+            <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
+          </button>
+        </div>
       </div>
       <div class="new-task" style="margin-top: -4px">
         <input
@@ -691,12 +848,29 @@ async function archiveRow(id: string) {
           placeholder="What is this work about?"
         />
         <label for="new-topic-body">Body</label>
-        <textarea
-          id="new-topic-body"
-          v-model="newBody"
-          rows="6"
-          placeholder="Describe the goal, context, and what a good result looks like…"
-        ></textarea>
+        <div class="topic-body-wrap">
+          <textarea
+            id="new-topic-body"
+            ref="topicBodyEl"
+            v-model="newBody"
+            rows="6"
+            placeholder="Describe the goal, context, and what a good result looks like… Use @ to mention an existing resource."
+            @input="updateTopicMention"
+            @click="updateTopicMention"
+            @keydown="onTopicBodyKeydown"
+          ></textarea>
+          <div v-if="topicMentionRange" class="mention-menu topic-body-mention-menu" role="listbox" aria-label="Existing topic resources">
+            <div v-if="topicMentionLoading" class="mention-hint">Loading resources…</div>
+            <div v-else-if="topicMentionError" class="mention-hint">{{ topicMentionError }}</div>
+            <div v-else-if="!matchingTopicResources.length" class="mention-hint">No matching attached resources</div>
+            <button v-for="(resource, index) in matchingTopicResources" :key="`${resource.topicId}:${resource.id}`"
+              role="option" :aria-selected="index === topicMentionIndex" :class="{ selected: index === topicMentionIndex }"
+              @mousedown.prevent="chooseTopicMention(resource)">
+              <strong>{{ resource.title }}</strong>
+              <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
+            </button>
+          </div>
+        </div>
         <div class="new-topic-foot">
           <input
             v-model="repo"
