@@ -5,11 +5,11 @@
 #
 # Strategy (deliberately NOT deploy/standalone's Docker+Caddy+domain stack —
 # that exists for internet-facing team deploys with GitHub OAuth/App):
-#   - loom is two self-contained binaries: `loom` + `tapestry`.
-#   - Cross-compile on the Mac (arm64 → aarch64-linux), copy binaries over,
-#     run under systemd. The Mac is faster than the DGX, and this keeps
-#     worktrees as plain host paths under ~dlwh — which is exactly what Zed
-#     remote development opens over SSH (Arachne's "Open in Zed" button).
+#   - BUILD ON THE DGX. Cross-compiling on the Mac (arm64 → aarch64-linux)
+#     needs a Linux C toolchain/linker that macOS clang cannot provide; we
+#     tried, it fails at the link step. The GB10 builds loom in a few
+#     minutes, and building on-target also validates the binary runs.
+#   - loom is two self-contained binaries: `loom` + `tapestry` + the SPA dist.
 #   - LOOM_RUNNER=local (the default): session supervisors run as processes on
 #     the host, worktrees under ~/.weaver/repos. No Docker socket games.
 #   - GitHub auth without a GitHub App/OAuth app:
@@ -24,10 +24,15 @@
 # Idempotent: safe to re-run. Re-deploys swap binaries and restart; state
 # (~/.weaver: sqlite db, repos, worktrees, agent logins) survives.
 #
+# Prereqs (one-time, on the DGX):
+#   sudo apt-get install -y git git-lfs gh node npm jq build-essential pkg-config libssl-dev
+#   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+#   (agent: pi-acp — an executable `pi-acp` on PATH; see ~/.pi/agent/)
+#
 # Usage:
-#   ./deploy-loom-dgx.sh                 # full build + install + configure
-#   ./deploy-loom-dgx.sh --restart-only # just restart the remote service
-#   DGX_GITHUB_LOGIN=... ./...           # override seeded owner login
+#   ./deploy-loom-dgx.sh                  # full build + install + configure
+#   ./deploy-loom-dgx.sh --restart-only  # just restart the remote service
+#   DGX_GITHUB_LOGIN=... ./...            # override seeded owner login
 set -euo pipefail
 
 DGX="${DGX:-100.121.8.110}"
@@ -35,6 +40,7 @@ DGX_USER="${DGX_USER:-$USER}"
 DGX_GITHUB_LOGIN="${DGX_GITHUB_LOGIN:-dlwh}"
 REMOTE="${DGX_USER}@${DGX}"
 LOOM_SRC="${LOOM_SRC:-$HOME/src/loom}"
+REMOTE_SRC="\$HOME/src/loom"                # loom checkout on the DGX
 LOOM_ROOT="/opt/loom"                       # binaries; versioned releases + 'current' symlink
 SERVICE_NAME="loom.service"
 # Bind on the Tailscale IP only (not 0.0.0.0): this box also sits on cluster
@@ -56,33 +62,50 @@ restart_only() {
 # ---------------------------------------------------------------------------
 command -v ssh >/dev/null || die "ssh not found"
 [ -d "$LOOM_SRC" ] || die "loom checkout not found at $LOOM_SRC (set LOOM_SRC=)"
-command -v cargo >/dev/null || die "cargo not found"
-rustup target list --installed 2>/dev/null | grep -q aarch64-unknown-linux-gnu \
-  || die "missing cross target. Run: rustup target add aarch64-unknown-linux-gnu"
-# The loom build needs a C linker for aarch64; on macOS Xcode's clang handles it.
-# (If the link step fails with a missing linker, install llvm via brew and
-# export CC_aarch64_unknown_linux_gnu / AR_* accordingly.)
 
 ssh -o ConnectTimeout=5 "$REMOTE" true 2>/dev/null || die "cannot ssh to ${REMOTE}"
 
-REV="$(git -C "$LOOM_SRC" rev-parse --short HEAD)"
-log "target ${REMOTE} (aarch64 linux) · loom rev ${REV} · bind ${BIND_ADDR}:7878"
+# The branch we deploy is the local checkout's branch; it must be pushed so
+# the DGX can fetch it from origin.
+LOOM_BRANCH="$(git -C "$LOOM_SRC" rev-parse --abbrev-ref HEAD)"
+if git -C "$LOOM_SRC" status --porcelain | grep -q .; then
+  die "loom checkout at $LOOM_SRC has uncommitted changes — commit + push ${LOOM_BRANCH} first"
+fi
+if ! git -C "$LOOM_SRC" ls-remote --heads origin "$LOOM_BRANCH" | grep -q .; then
+  die "branch ${LOOM_BRANCH} is not on origin — push it first (git -C $LOOM_SRC push -u origin ${LOOM_BRANCH})"
+fi
+
+log "target ${REMOTE} (aarch64 linux) · loom ${LOOM_BRANCH} · bind ${BIND_ADDR}:7878"
 
 # ---------------------------------------------------------------------------
-# 1. Cross-compile loom + tapestry (aarch64-unknown-linux-gnu)
+# 1. Sync source to the DGX and build there
 #
-# loom's build.rs builds the Vue SPA (npm/rspack) when frontend sources change;
-# that output is static files, then bundled below via WEAVER_STATIC_DIR.
+# The DGX clones (or updates) the loom repo from GitHub and builds natively.
+# Re-runs fetch + rebuild. loom's build.rs builds the Vue SPA (npm/rspack)
+# when frontend sources change; the dist is bundled via WEAVER_STATIC_DIR.
 # ---------------------------------------------------------------------------
-log "cross-compiling loom + tapestry (release, aarch64-unknown-linux-gnu)…"
-(
-  cd "$LOOM_SRC"
-  cargo build --release -p loom -p tapestry --target aarch64-unknown-linux-gnu
-)
-for b in loom tapestry; do
-  [ -f "$LOOM_SRC/target/aarch64-unknown-linux-gnu/release/$b" ] \
-    || die "build did not produce $b"
-done
+log "syncing loom source (${LOOM_BRANCH}) to ${REMOTE}:${REMOTE_SRC}"
+ssh "$REMOTE" "set -e
+  if [ ! -d ${REMOTE_SRC} ]; then
+    mkdir -p \$(dirname ${REMOTE_SRC})
+    git clone git@github.com:marin-community/loom.git ${REMOTE_SRC} 2>/dev/null \
+      || git clone https://github.com/marin-community/loom.git ${REMOTE_SRC}
+  fi
+  cd ${REMOTE_SRC}
+  git fetch origin --prune
+  git checkout ${LOOM_BRANCH}
+  git pull --ff-only
+"
+
+log "building loom + tapestry on the DGX (release)… this takes a few minutes"
+ssh "$REMOTE" "set -e
+  cd ${REMOTE_SRC}
+  CARGO=\$HOME/.cargo/bin/cargo
+  [ -x \$CARGO ] || { echo 'cargo not found on DGX — see prereqs in the script header'; exit 1; }
+  \$CARGO build --release -p loom -p tapestry
+"
+REV="$(ssh "$REMOTE" "git -C ${REMOTE_SRC} rev-parse --short HEAD")"
+log "built loom rev ${REV}"
 
 # ---------------------------------------------------------------------------
 # 2. Install binaries + SPA dist on the DGX
@@ -91,22 +114,15 @@ log "installing into ${LOOM_ROOT}/releases/${REV}/ on ${REMOTE}"
 ssh "$REMOTE" "set -e
   sudo mkdir -p ${LOOM_ROOT}/releases/${REV}
   sudo chown -R \$(id -un):\$(id -gn) ${LOOM_ROOT}
+  cp ${REMOTE_SRC}/target/release/loom ${REMOTE_SRC}/target/release/tapestry ${LOOM_ROOT}/releases/${REV}/
+  cp -r ${REMOTE_SRC}/crates/loom/static/dist ${LOOM_ROOT}/releases/${REV}/dist
 "
-scp -q \
-  "$LOOM_SRC/target/aarch64-unknown-linux-gnu/release/loom" \
-  "$LOOM_SRC/target/aarch64-unknown-linux-gnu/release/tapestry" \
-  "$REMOTE:${LOOM_ROOT}/releases/${REV}/"
-ssh "$REMOTE" "mkdir -p ${LOOM_ROOT}/releases/${REV}/dist"
-scp -q -r \
-  "$LOOM_SRC/crates/loom/static/dist/." \
-  "$REMOTE:${LOOM_ROOT}/releases/${REV}/dist/"
 
 # ---------------------------------------------------------------------------
 # 3. Runtime prerequisites on the DGX (idempotent)
 #
-# loom shells out to: git, gh, node/npm (agents), jq. claude/codex CLIs are
-# installed per-session by loom on first launch (no action needed). gh is
-# already installed and logged in as ${DGX_GITHUB_LOGIN} on this box.
+# loom shells out to: git, gh, node/npm (agents), jq. claude/codex/pi agent
+# binaries are expected on PATH for the sessions' agents.
 # ---------------------------------------------------------------------------
 log "checking runtime prerequisites on ${REMOTE}"
 ssh "$REMOTE" "set -e
@@ -118,11 +134,6 @@ ssh "$REMOTE" "set -e
     sudo apt-get install -y -qq \$need
   fi
   git lfs version >/dev/null 2>&1 || sudo apt-get install -y -qq git-lfs
-  # Unprivileged user namespaces: needed by claude/codex sandboxing (bwrap).
-  if [ \"\$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo 1)\" = 0 ]; then
-    echo kernel.unprivileged_userns_clone=1 | sudo tee /etc/sysctl.d/99-loom-userns.conf >/dev/null
-    sudo sysctl -p /etc/sysctl.d/99-loom-userns.conf
-  fi
   true
 "
 
@@ -181,13 +192,13 @@ UNIT
 # ---------------------------------------------------------------------------
 # 6. Start and wait for health
 #
-# Readiness probes are public (no auth): /api/health, /api/ready. We probe over
-# loopback from the box itself.
+# The health probe is public (no auth). We probe over loopback from the box
+# itself.
 # ---------------------------------------------------------------------------
 log "starting ${SERVICE_NAME}"
 ssh "$REMOTE" "set -e
   sudo systemctl restart ${SERVICE_NAME}
-  for i in \$(seq 1 30); do
+  for i in \$(seq 1 60); do
     if curl -fsS -m 2 http://127.0.0.1:7878/api/health >/dev/null 2>&1; then
       echo 'loom is healthy'
       exit 0
@@ -218,7 +229,7 @@ ssh "$REMOTE" "set -e
     gh auth token | loom auth github-token set - || echo 'WARN: could not seed Account PAT (sessions will lack git push until set)'
   fi
   # Managed repos (clone allowlist) — add more here as needed
-  loom repos register dlwh/arachne 2>/dev/null || true
+  loom repos register marin-community/arachne 2>/dev/null || true
   loom repos register marin-community/marin 2>/dev/null || true
   loom repos list
   # Personal API token for the Mac
@@ -236,10 +247,9 @@ ssh "$REMOTE" "set -e
   echo
   printf '   %s\n' \"\$(cat \"\$TOKEN_FILE\")\"
   echo
-  echo ' From the Mac:'
-  echo '   export WEAVER_API=http://${DGX}:7878'
-  echo '   export LOOM_TOKEN=<token above>'
-  echo '   # or: loom login dgx --url http://${DGX}:7878   (paste token)'
+  echo ' From the Mac, point Arachne at the DGX (settings sheet in the header):'
+  echo '   URL:   http://${DGX}:7878'
+  echo '   Token: the value above'
   echo '================================================================'
 "
 
