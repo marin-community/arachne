@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FleetSidebar from "./components/FleetSidebar.vue";
 import ThreadView from "./components/ThreadView.vue";
+import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
@@ -307,18 +308,12 @@ const connClass = computed(() =>
       @archive="onArchived"
       @delegate="delegateFromThread"
     />
-    <div v-else-if="selectedId" class="main">
-      <div class="empty">
-        <div class="big">🕸</div>
-        <div>opening session…</div>
-      </div>
-    </div>
-    <div v-else class="main">
-      <div class="empty">
-        <div class="big">🕸</div>
-        <div>Select a session, or launch a new task from the sidebar.</div>
-      </div>
-    </div>
+    <HomeView
+      v-else
+      :fleet="fleet"
+      :selected-id="selectedId"
+      @select="selectSession"
+    />
     <SettingsSheet
       v-if="showSettings"
       :url="loomUrl"
