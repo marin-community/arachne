@@ -60,19 +60,20 @@ function subtitle(s: SessionSummary): string {
 
 function statusClass(s: SessionSummary): string {
   if (s.status === "orphaned") return "orphaned";
-  if (s.status === "running") {
-    const loud = loudTag(s);
-    if (loud?.level === "blocked") return "error";
-    if (loud?.level === "attention") return "attention";
-    return "running";
-  }
+  const loud = loudTag(s);
+  if (loud?.level === "blocked") return "error";
+  if (loud?.level === "attention") return "attention";
   return "done";
 }
 
-function statusLabel(s: SessionSummary): string {
+// The text badge for a row, or null when it should stay quiet: a working
+// thread spins instead, a resting one (running + idle mark) shows nothing.
+function badgeLabel(s: SessionSummary): string | null {
+  if (s.status === "archived") return "done";
   if (s.status === "orphaned") return "orphan";
   const loud = loudTag(s);
   if (loud) return loud.level;
+  if (s.status === "running") return null;
   return s.status;
 }
 
@@ -89,6 +90,14 @@ interface TreeNode {
 // fallback keeps pre-marker leaders rendering as topics.
 function isTopic(s: SessionSummary): boolean {
   return s.branch.tags.some((t) => t.key === "topic");
+}
+
+// The quiet `idle` mark loom stamps when an agent finishes its turn: the
+// process stays `running` between turns, so "running" alone means "alive",
+// not "working". (Mirrors loom's own idleTag: a resting agent is idle, a
+// working one has no idle mark.)
+function isIdle(s: SessionSummary): boolean {
+  return s.branch.tags.some((t) => t.key === "idle");
 }
 
 interface Lane {
@@ -423,18 +432,26 @@ async function archiveRow(id: string) {
             <span class="name">{{
               row.session.branch.name || row.session.id
             }}</span>
-            <!-- A running thread shows a spinner instead of a text badge;
-                 idle marks stay quiet (the resting state speaks for itself). -->
+            <!-- A genuinely-working thread (running, mid-turn) shows a
+                 spinner; a resting one (finished turn → quiet idle mark) and
+                 terminal rows stay quiet. Loud-tag threads keep their text
+                 badge so attention/blocked never reads as ordinary progress. -->
             <span
-              v-if="row.session.status === 'running'"
+              v-if="
+                row.session.status === 'running' &&
+                !isIdle(row.session) &&
+                !loudTag(row.session)
+              "
               class="spinner mini"
-              :class="statusClass(row.session)"
-              :title="statusLabel(row.session)"
+              title="working"
               aria-hidden="true"
             ></span>
-            <span v-else class="badge" :class="statusClass(row.session)">{{
-              row.session.status === "archived" ? "done" : statusLabel(row.session)
-            }}</span>
+            <span
+              v-else-if="badgeLabel(row.session)"
+              class="badge"
+              :class="statusClass(row.session)"
+              >{{ badgeLabel(row.session) }}</span
+            >
             <span
               v-if="row.childCount > 0"
               class="badge dim"
