@@ -232,6 +232,21 @@ function isCollapsed(i: number): boolean {
 function toggle(i: number) {
   collapsed.value[i] = !isCollapsed(i);
 }
+
+// Loom appends an orientation note to the launch goal
+// (loom-launch/provision.rs `entrance_note`, joined by a blank line —
+// build_launch_prompt parts.join("\n\n")). Split the goal from the note so
+// the goal leads and the boilerplate can collapse. Older or hand-typed
+// messages without the marker return the whole text as the goal.
+const ENTRANCE_MARKER = "You are working in a Loom session.";
+function splitEntrance(text: string): { goal: string; entrance: string | null } {
+  const idx = text.indexOf(ENTRANCE_MARKER);
+  if (idx === -1) return { goal: text, entrance: null };
+  return {
+    goal: text.slice(0, idx).replace(/\s+$/, ""),
+    entrance: text.slice(idx).replace(/^\s+/, ""),
+  };
+}
 </script>
 
 <template>
@@ -320,7 +335,25 @@ function toggle(i: number) {
           <div class="who">
             {{ b.kind === "user_message" ? "you" : session.agent_kind }}
           </div>
-          <div class="body">{{ b.text }}</div>
+          <!-- Loom's orientation note (goal + "You are working in a Loom
+               session…") is real prompt text the agent saw — keep it in the
+               transcript, but collapse the boilerplate behind a disclosure
+               so the goal leads. -->
+          <template v-if="b.kind === 'user_message' && splitEntrance(b.text ?? '').entrance">
+            <div v-if="splitEntrance(b.text ?? '').goal" class="body">
+              {{ splitEntrance(b.text ?? "").goal }}
+            </div>
+            <div class="entrance">
+              <div class="entrance-line" @click="toggle(i)">
+                <span class="tool-summary">loom orientation</span>
+                <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
+              </div>
+              <div v-if="!isCollapsed(i)" class="body entrance-body">
+                {{ splitEntrance(b.text ?? "").entrance }}
+              </div>
+            </div>
+          </template>
+          <div v-else class="body">{{ b.text }}</div>
         </div>
         <!-- usage / turn_end / unknown: no visual block -->
       </template>
