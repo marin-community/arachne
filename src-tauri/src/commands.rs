@@ -330,7 +330,12 @@ pub async fn launch_session(
             ..Default::default()
         })
         .await?;
-    let _ = app.emit("loom://launched", &view);
+    // Only dashboard-originated launches yank selection to the new session;
+    // delegations keep the user on the parent thread (the child appears
+    // nested in the sidebar instead).
+    if parent_branch.is_none() {
+        let _ = app.emit("loom://launched", &view);
+    }
     Ok(view)
 }
 
