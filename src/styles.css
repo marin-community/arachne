@@ -311,6 +311,16 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   margin: 2px 0 0 8px;
 }
 .thought-body { margin-top: 4px; }
+.load-older { text-align: center; padding: 6px 0; }
+.load-older button {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline dotted;
+}
+.load-older button:hover { color: var(--text); }
 button.danger { color: var(--blocked); }
 button.danger:hover { border-color: var(--blocked); }
 .header .conn.clickable { cursor: pointer; }

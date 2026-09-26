@@ -29,6 +29,18 @@ pub struct LoomState {
     fleet_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
     /// Cancels the open session's chat forwarder so a switch can replace it.
     chat_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
+    /// The open session's next-older cursor from the last fetch_chat —
+    /// `None` once history is exhausted.
+    older_cursor: tokio::sync::RwLock<Option<crate::loom::ChatCursorView>>,
+}
+
+/// The open session's older cursor, for the UI's "load older" button.
+/// `None` means history is exhausted (or no session open).
+#[tauri::command]
+pub async fn chat_older_cursor(
+    state: State<'_, LoomState>,
+) -> Result<Option<crate::loom::ChatCursorView>, UiError> {
+    Ok(state.older_cursor.read().await.clone())
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -157,7 +169,8 @@ pub async fn open_session(
     }
     let cancel = CancellationToken::new();
     *state.chat_cancel.write().await = Some(cancel.clone());
-    spawn_chat_forwarder(app, client, id, cancel);
+    spawn_chat_forwarder(app, client.clone(), id.clone(), cancel);
+    state.older_cursor.write().await.take();
     Ok(view)
 }
 
@@ -194,14 +207,23 @@ fn spawn_chat_forwarder(
     });
 }
 
-/// Fetch the chat journal, narrowed for display.
+/// Fetch the chat journal, narrowed for display. Pass `before_turn`/
+/// `before_seq` (the previous page's older_cursor) to page backward;
+/// omit for the newest tail.
 #[tauri::command]
 pub async fn fetch_chat(
     state: State<'_, LoomState>,
     id: String,
+    before_turn: Option<i64>,
+    before_seq: Option<i64>,
 ) -> Result<Vec<crate::blocks::DisplayBlock>, UiError> {
     let client = state_client(&state).await?;
-    let chat = client.session_chat(&id).await?;
+    let before = match (before_turn, before_seq) {
+        (Some(turn), Some(seq)) => Some(crate::loom::ChatCursorView { turn, seq }),
+        _ => None,
+    };
+    let chat = client.session_chat(&id, before.as_ref()).await?;
+    *state.older_cursor.write().await = chat.older_cursor;
     Ok(chat.blocks.iter().map(crate::blocks::DisplayBlock::from_view).collect())
 }
 

@@ -22,6 +22,8 @@ interface DisplayBlock {
   payload?: string;
 }
 
+interface Cursor { turn: number; seq: number }
+
 const props = defineProps<{ session: SessionView }>();
 const emit = defineEmits<{
   (e: "error", msg: string): void;
@@ -31,6 +33,8 @@ const emit = defineEmits<{
 const blocks = ref<DisplayBlock[]>([]);
 const draft = ref("");
 const busy = ref(false);
+const loadingOlder = ref(false);
+const hasOlder = ref(true);
 const convEl = ref<HTMLElement | null>(null);
 const unlisteners: UnlistenFn[] = [];
 
@@ -62,9 +66,45 @@ async function reload() {
   const stick = atBottom();
   try {
     blocks.value = await invoke<DisplayBlock[]>("fetch_chat", { id: props.session.id });
+    const cursor = await invoke<Cursor | null>("chat_older_cursor");
+    hasOlder.value = cursor !== null;
     if (stick) scrollToBottom();
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
+  }
+}
+
+// Prepend the previous page of history, keeping the scroll anchored to
+// where the user is (loading older shouldn't jump the viewport).
+async function loadOlder() {
+  if (loadingOlder.value || !hasOlder.value) return;
+  const cursor = await invoke<Cursor | null>("chat_older_cursor");
+  if (!cursor) {
+    hasOlder.value = false;
+    return;
+  }
+  loadingOlder.value = true;
+  try {
+    const older = await invoke<DisplayBlock[]>("fetch_chat", {
+      id: props.session.id,
+      beforeTurn: cursor.turn,
+      beforeSeq: cursor.seq,
+    });
+    if (older.length === 0) {
+      hasOlder.value = false;
+    } else {
+      const el = convEl.value;
+      const beforeHeight = el?.scrollHeight ?? 0;
+      blocks.value = [...older, ...blocks.value];
+      await nextTick();
+      if (el) el.scrollTop += el.scrollHeight - beforeHeight;
+    }
+    const next = await invoke<Cursor | null>("chat_older_cursor");
+    hasOlder.value = next !== null;
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    loadingOlder.value = false;
   }
 }
 
@@ -158,6 +198,11 @@ function toggle(i: number) {
       <button class="danger" @click="archive">Archive</button>
     </div>
     <div class="conversation" ref="convEl">
+      <div v-if="hasOlder" class="load-older">
+        <button :disabled="loadingOlder" @click="loadOlder">
+          {{ loadingOlder ? "loading…" : "load older" }}
+        </button>
+      </div>
       <template v-for="(b, i) in blocks" :key="i">
         <!-- Tool calls: collapsed one-liner by default, expandable -->
         <div v-if="b.kind === 'tool_call'" class="block tool">

@@ -21,6 +21,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::connect,
             commands::open_session,
+            commands::chat_older_cursor,
             commands::fetch_chat,
             commands::send_input,
             commands::interrupt,

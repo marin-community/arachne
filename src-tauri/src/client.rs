@@ -141,13 +141,19 @@ impl LoomClient {
         .await
     }
 
-    /// `sessions.chat` — the conversation journal.
-    pub async fn session_chat(&self, id: &str) -> Result<crate::loom::SessionChatView, LoomError> {
-        self.op(
-            "/api/sessions/chat",
-            &serde_json::json!({ "session": id }),
-        )
-        .await
+    /// `sessions.chat` — the conversation journal. `before` pages older
+    /// turns (from the previous page's `older_cursor`); None = newest tail.
+    pub async fn session_chat(
+        &self,
+        id: &str,
+        before: Option<&crate::loom::ChatCursorView>,
+    ) -> Result<crate::loom::SessionChatView, LoomError> {
+        let mut body = serde_json::json!({ "session": id });
+        if let Some(c) = before {
+            body["before_turn"] = serde_json::json!(c.turn);
+            body["before_seq"] = serde_json::json!(c.seq);
+        }
+        self.op("/api/sessions/chat", &body).await
     }
 
     /// `sessions.prompt.create` — send input to an ACP session's agent.
