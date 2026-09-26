@@ -33,6 +33,7 @@ pub fn run() {
             commands::launch_session,
             commands::delegate_task,
             commands::archive_session,
+            commands::update_session,
             commands::open_in_zed,
             commands::refresh_fleet,
             commands::reparent_session,

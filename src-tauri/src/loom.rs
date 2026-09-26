@@ -39,6 +39,11 @@ pub struct BranchSummaryView {
     pub goal: String,
     #[serde(default)]
     pub description: String,
+    /// Title ownership for compare-and-swap renames via `sessions.update`
+    /// (`user`/`agent`/`derived`/…). Always present on loom's wire; the
+    /// default only keeps older payloads decoding.
+    #[serde(default)]
+    pub title_provenance: String,
     pub repo_root: String,
     #[serde(default)]
     pub tags: Vec<TagView>,
@@ -165,6 +170,33 @@ pub struct SessionGroupView {
     pub collapsed: bool,
     #[serde(default)]
     pub session_ids: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Update (topic metadata: title / goal / description)
+// ---------------------------------------------------------------------------
+
+/// Request for `POST /api/sessions/update`. `title` renames require the
+/// compare-and-swap fence (`expected_title` + `expected_title_provenance`)
+/// observed by the caller, so concurrent edits are rejected rather than
+/// silently overwritten. `description` is the agent's current-state message
+/// shown beside the attention level — for the topic card it's the durable
+/// short description a human writes.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionsUpdateInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title_provenance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
