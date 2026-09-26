@@ -352,13 +352,10 @@ async function openInZed() {
   }
 }
 
+// Archive lives in App.vue (single shared path with the sidebar row
+// button): this component just forwards the request.
 async function archive() {
-  try {
-    await invoke("archive_session", { id: props.session.id });
-    emit("archive", props.session.id);
-  } catch (e: any) {
-    emit("error", e?.message ?? String(e));
-  }
+  emit("archive", props.session.id);
 }
 
 // Thoughts and tool calls start collapsed; the header always shows the

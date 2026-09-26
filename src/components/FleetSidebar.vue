@@ -24,6 +24,7 @@ const emit = defineEmits<{
     laneId?: string,
   ): void;
   (e: "delete-lane", laneId: string): void;
+  (e: "archive", id: string): void;
 }>();
 
 const task = ref("");
@@ -316,6 +317,24 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
     dragging.value = null;
   }
 }
+
+// Row hover archive: reuse the app-wide onArchived state update. Confirm
+// first because the row disappears from the lanes when archived —
+// a misclick on a topic you meant to select shouldn't vanish it.
+const confirmId = ref<string | null>(null);
+
+async function archiveRow(id: string) {
+  if (confirmId.value === id) {
+    emit("archive", id);
+    confirmId.value = null;
+    return;
+  }
+  confirmId.value = id;
+  // Reset the confirm state if the user doesn't click again.
+  setTimeout(() => {
+    if (confirmId.value === id) confirmId.value = null;
+  }, 2500);
+}
 </script>
 
 <template>
@@ -420,6 +439,19 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
               {{ row.childCount }}
             </span>
             <span v-if="isIdle(row.session)" class="badge idle">idle</span>
+            <button
+              v-if="row.session.status !== 'archived'"
+              class="row-archive"
+              :class="{ confirm: confirmId === row.session.id }"
+              :title="
+                confirmId === row.session.id
+                  ? 'click again to archive — tears down worktree, keeps branch'
+                  : 'archive this session'
+              "
+              @click.stop="archiveRow(row.session.id)"
+            >
+              {{ confirmId === row.session.id ? "archive?" : "✕" }}
+            </button>
           </div>
           <div class="title">{{ subtitle(row.session) }}</div>
         </div>

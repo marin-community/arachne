@@ -257,7 +257,15 @@ function userInboxId(): string | undefined {
   return undefined;
 }
 
-function onArchived(id: string) {
+async function onArchived(id: string) {
+  // The backend call lives here (not in the emitting component) so both
+  // the thread header and the sidebar row hover button share one path.
+  try {
+    await invoke("archive_session", { id });
+  } catch (e: any) {
+    connError.value = e?.message ?? String(e);
+    return;
+  }
   if (selectedId.value === id) {
     selectedId.value = null;
     selectedView.value = null;
@@ -304,6 +312,7 @@ const connClass = computed(() =>
       @launch="launchTask"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
+      @archive="onArchived"
     />
     <ThreadView
       v-if="selectedId && selectedView"

@@ -288,6 +288,42 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 }
 .session-item.archived .badge { color: var(--text-dim); }
 .badge.dim { color: var(--text-dim); background: var(--bg-hover); }
+
+/* Row hover archive: hidden until the row is hovered so the sidebar stays
+   calm. position:absolute keeps it from reflowing the name/badges when it
+   appears; the row's padding-right reserve keeps it off the badges. */
+.session-item { position: relative; }
+.session-item .row-archive {
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--bg-raised);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 16px;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.session-item:hover .row-archive {
+  opacity: 1;
+  pointer-events: auto;
+}
+.session-item .row-archive:hover {
+  color: var(--blocked);
+  border-color: var(--blocked);
+}
+.session-item .row-archive.confirm {
+  color: var(--blocked);
+  border-color: var(--blocked);
+  opacity: 1;
+  pointer-events: auto;
+}
 .new-stream-btn {
   background: none;
   color: var(--text-dim);
