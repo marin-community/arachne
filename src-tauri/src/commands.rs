@@ -143,17 +143,6 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
                     continue;
                 }
             };
-            let layout = match client.session_layout().await {
-                Ok(l) => l,
-                Err(e) => {
-                    let _ = app.emit("loom://error", UiError::from(e));
-                    tokio::select! {
-                        _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
-                    }
-                    continue;
-                }
-            };
             // "layout" covers layout mutations, but attention/tag changes
             // only publish on each session's own topic — so subscribe to the
             // live sessions too (loom caps a multiplexed stream at 64 topics:
@@ -321,6 +310,7 @@ pub async fn launch_session(
         }
         _ => None,
     };
+    let is_delegation = parent_branch.is_some();
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
@@ -333,7 +323,7 @@ pub async fn launch_session(
     // Only dashboard-originated launches yank selection to the new session;
     // delegations keep the user on the parent thread (the child appears
     // nested in the sidebar instead).
-    if parent_branch.is_none() {
+    if !is_delegation {
         let _ = app.emit("loom://launched", &view);
     }
     Ok(view)
