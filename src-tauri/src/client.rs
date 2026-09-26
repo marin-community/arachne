@@ -45,6 +45,13 @@ pub struct LoomClient {
 }
 
 impl LoomClient {
+    /// Host of the authoritative Loom server. For the bootstrap deployment
+    /// this is also the runner's SSH host; no host-side path is ever treated
+    /// as a local Mac path when the connection is remote.
+    pub fn server_host(&self) -> Option<&str> {
+        self.base.host_str()
+    }
+
     pub fn new(base_url: &str, token: Option<String>) -> Result<Self, LoomError> {
         let base = reqwest::Url::parse(base_url)
             .map_err(|e| LoomError::Connection(format!("invalid base URL {base_url:?}: {e}")))?;
@@ -124,6 +131,59 @@ impl LoomClient {
             });
         }
         Ok(())
+    }
+
+    /// Launch controls come from the connected Loom host, including its
+    /// installed Codex model catalogue and account-specific profiles.
+    pub async fn launch_options(&self) -> Result<crate::loom::LaunchOptionsView, LoomError> {
+        let profiles = self
+            .op("/api/profiles/list", &serde_json::json!({}))
+            .await?;
+        let agents: crate::loom::AgentsView = self
+            .op("/api/agents/list", &serde_json::json!({}))
+            .await?;
+        Ok(crate::loom::LaunchOptionsView {
+            profiles,
+            agents: agents.agents,
+            default_agent: agents.default_agent,
+        })
+    }
+
+    /// Validate a profile/model change against the live resolver, then apply
+    /// the same selection with optimistic revision guards. Loom permits this
+    /// only for an idle ACP session and preserves the session identity.
+    pub async fn handoff_session(
+        &self,
+        id: &str,
+        profile: &str,
+        agent: Option<&str>,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> Result<crate::loom::SessionView, LoomError> {
+        let selection = serde_json::json!({
+            "profile": profile,
+            "overrides": { "agent": agent, "model": model, "effort": effort }
+        });
+        let path = "/api/sessions/handoff/resolve";
+        let preview: serde_json::Value = self
+            .op(path, &serde_json::json!({ "session": id, "selection": selection }))
+            .await?;
+        if preview.get("valid").and_then(|v| v.as_bool()) != Some(true) {
+            let errors = preview.get("errors")
+                .and_then(|v| v.as_array())
+                .map(|v| v.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join("; "))
+                .unwrap_or_else(|| "selection is invalid".to_string());
+            return Err(LoomError::Api { status: 400, method: "POST", path: path.into(), message: errors });
+        }
+        self.op(
+            "/api/sessions/handoff",
+            &serde_json::json!({
+                "session": id,
+                "selection": selection,
+                "expected_profile_revision": preview["profile_revision"],
+                "expected_resolver_revision": preview["resolver_revision"],
+            }),
+        ).await
     }
 
     /// `sessions.summary.list` — the fleet.
@@ -222,6 +282,30 @@ impl LoomClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// A durable inbox item on the destination session's channel. Loom
+    /// delivers message-kind items to that session and records the author;
+    /// the structured payload lets the UI retain source provenance.
+    pub async fn send_to_thread(
+        &self,
+        destination_id: &str,
+        body: &str,
+        payload: serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value, LoomError> {
+        self.op(
+            "/api/channels/messages/create",
+            &serde_json::json!({
+                "channel": destination_id,
+                "body": body,
+                "kind": "message",
+                "urgency": "normal",
+                "payload": payload,
+                "idempotency_key": idempotency_key,
+            }),
+        )
+        .await
     }
 
     /// `sessions.send` — text input to a terminal session; `submit` presses enter.

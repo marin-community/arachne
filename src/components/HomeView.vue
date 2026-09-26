@@ -139,7 +139,12 @@ function classFor(row: HomeRow): string {
           :key="row.s.id"
           class="home-row"
           :class="[classFor(row), level(row.s)]"
+          role="button"
+          tabindex="0"
+          :aria-label="`Open ${row.s.branch.name}: ${row.why}`"
           @click="emit('select', row.s.id)"
+          @keydown.enter.prevent="emit('select', row.s.id)"
+          @keydown.space.prevent="emit('select', row.s.id)"
         >
           <span class="level-dot" :class="level(row.s)"></span>
           <div class="row-main">
@@ -161,7 +166,12 @@ function classFor(row: HomeRow): string {
           :key="row.s.id"
           class="home-row"
           :class="classFor(row)"
+          role="button"
+          tabindex="0"
+          :aria-label="`Open ${row.s.branch.name}`"
           @click="emit('select', row.s.id)"
+          @keydown.enter.prevent="emit('select', row.s.id)"
+          @keydown.space.prevent="emit('select', row.s.id)"
         >
           <span class="level-dot ok"></span>
           <div class="row-main">
@@ -179,7 +189,12 @@ function classFor(row: HomeRow): string {
           :key="row.s.id"
           class="home-row dim"
           :class="classFor(row)"
+          role="button"
+          tabindex="0"
+          :aria-label="`Open ${row.s.branch.name}`"
           @click="emit('select', row.s.id)"
+          @keydown.enter.prevent="emit('select', row.s.id)"
+          @keydown.space.prevent="emit('select', row.s.id)"
         >
           <span class="level-dot dim"></span>
           <div class="row-main">

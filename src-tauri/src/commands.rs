@@ -20,7 +20,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
-use crate::loom::{SessionSummaryView, SessionView};
+use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
 
 #[derive(Default)]
 pub struct LoomState {
@@ -162,6 +162,10 @@ pub async fn connect(
 ) -> Result<(), UiError> {
     let client = Arc::new(LoomClient::new(&base_url, token)?);
     client.health().await?;
+    // Health is public; prove the supplied credential can read the fleet
+    // before showing a green connection indicator.
+    client.list_sessions().await?;
+    client.session_layout().await?;
 
     // Replace any previous fleet poller (reconnect to a different loom).
     if let Some(old) = state.fleet_cancel.write().await.take() {
@@ -178,6 +182,30 @@ pub async fn connect(
     *state.fleet_cancel.write().await = Some(cancel.clone());
     spawn_fleet_poller(app, client, cancel);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn launch_options(state: State<'_, LoomState>) -> Result<LaunchOptionsView, UiError> {
+    let client = state_client(&state).await?;
+    client.launch_options().await.map_err(Into::into)
+}
+
+/// Change the runtime selection of an idle ACP session. The Loom server
+/// rejects active turns; Arachne never interrupts one to force a handoff.
+#[tauri::command]
+pub async fn handoff_session(
+    state: State<'_, LoomState>,
+    id: String,
+    profile: String,
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Result<SessionView, UiError> {
+    let client = state_client(&state).await?;
+    client
+        .handoff_session(&id, &profile, agent.as_deref(), model.as_deref(), effort.as_deref())
+        .await
+        .map_err(Into::into)
 }
 
 /// Fetch summaries + layout together and push them as a fleet snapshot.
@@ -217,14 +245,7 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
             // only publish on each session's own topic — so subscribe to the
             // live sessions too (loom caps a multiplexed stream at 64 topics:
             // layout + 63 newest sessions).
-            let mut topics: Vec<String> = vec!["layout".into()];
-            topics.extend(
-                sessions
-                    .iter()
-                    .filter(|s| s.status != "archived")
-                    .map(|s| format!("session:{}", s.id))
-                    .take(63),
-            );
+            let topics = fleet_topics(&sessions);
             sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
             emit_fleet(&app, &client, sessions).await;
             match client.subscribe(&topics).await {
@@ -238,7 +259,12 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
                             // not on `layout`).
                             match client.list_sessions().await {
                                 Ok(list) => {
+                                    let changed_topics = fleet_topics(&list) != topics;
                                     emit_fleet(&app, &client, list).await;
+                                    // A launch/archive can change the set of session
+                                    // event topics. Reconnect immediately so the new
+                                    // session's attention changes are live as well.
+                                    if changed_topics { break; }
                                 }
                                 Err(e) => {
                                     let _ = app.emit("loom://error", UiError::from(e));
@@ -258,6 +284,17 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
             }
         }
     });
+}
+
+fn fleet_topics(sessions: &[SessionSummaryView]) -> Vec<String> {
+    let mut live: Vec<&SessionSummaryView> = sessions
+        .iter()
+        .filter(|session| session.status != "archived")
+        .collect();
+    live.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+    let mut topics = vec!["layout".to_owned()];
+    topics.extend(live.into_iter().take(63).map(|session| format!("session:{}", session.id)));
+    topics
 }
 
 /// Open a session: fetch its view, emit it, and start (replacing any previous)
@@ -364,6 +401,71 @@ pub async fn send_input(
     Ok(())
 }
 
+fn thread_note_body(source_title: &str, source_id: &str, note: &str) -> String {
+    format!(
+        "From Arachne thread: {} ({})\n\n{}",
+        source_title.trim(),
+        source_id,
+        note.trim()
+    )
+}
+
+/// Send a human-written note to another session's durable Loom channel.
+/// The source identity is resolved by Loom (never accepted as display text
+/// from the webview), and also included in the channel's structured payload.
+#[tauri::command]
+pub async fn send_to_thread(
+    state: State<'_, LoomState>,
+    source_id: String,
+    destination_id: String,
+    note: String,
+    idempotency_key: String,
+) -> Result<(), UiError> {
+    if source_id == destination_id {
+        return Err(UiError {
+            message: "choose a different destination thread".into(),
+            unreachable: false,
+        });
+    }
+    if note.trim().is_empty() || idempotency_key.trim().is_empty() {
+        return Err(UiError {
+            message: "note and delivery key are required".into(),
+            unreachable: false,
+        });
+    }
+    let client = state_client(&state).await?;
+    let source = client.get_session(&source_id).await?;
+    let destination = client.get_session(&destination_id).await?;
+    if destination.status == "archived" {
+        return Err(UiError {
+            message: "the destination thread is archived".into(),
+            unreachable: false,
+        });
+    }
+    let title = if source.branch.title.trim().is_empty() {
+        source.branch.name.as_str()
+    } else {
+        source.branch.title.as_str()
+    };
+    let body = thread_note_body(title, &source.id, &note);
+    client
+        .send_to_thread(
+            &destination.id,
+            &body,
+            serde_json::json!({
+                "arachne": {
+                    "kind": "thread_note",
+                    "source_session_id": source.id,
+                    "source_branch_id": source.branch.id,
+                    "source_title": title,
+                }
+            }),
+            &idempotency_key,
+        )
+        .await?;
+    Ok(())
+}
+
 /// Interrupt the current turn.
 #[tauri::command]
 pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), UiError> {
@@ -382,6 +484,10 @@ pub async fn launch_session(
     parent_id: Option<String>,
     title: Option<String>,
     description: Option<String>,
+    profile: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent_branch = match parent_id {
@@ -412,6 +518,10 @@ pub async fn launch_session(
             title: Some(label),
             goal: Some(task),
             parent_branch: parent_branch.clone(),
+            profile,
+            agent,
+            model,
+            effort,
             ..Default::default()
         })
         .await?;
@@ -524,11 +634,55 @@ pub async fn update_session(
     Ok(view)
 }
 
-/// Open the session's worktree in Zed.
+/// Build a Zed target from the authoritative Loom host and the session's
+/// server-side checkout path. The bootstrap control plane runs its sessions
+/// on the same host; a future multi-runner Loom view should supply the
+/// runner's SSH identity explicitly instead of using this host fallback.
+fn zed_target(host: &str, work_dir: &str) -> Result<String, UiError> {
+    if !work_dir.starts_with('/') || work_dir.contains('\0') {
+        return Err(UiError {
+            message: "session has no absolute checkout path to open".into(),
+            unreachable: false,
+        });
+    }
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return Ok(work_dir.to_string());
+    }
+    // URL path segments must be encoded (notably spaces and `#`), while
+    // slashes remain separators. Zed accepts the resulting ssh:// URL.
+    let mut url = reqwest::Url::parse(&format!("ssh://{host}")).map_err(|e| UiError {
+        message: format!("invalid Loom host for Zed: {e}"),
+        unreachable: false,
+    })?;
+    url.set_path(work_dir);
+    Ok(url.to_string())
+}
+
+/// Open the exact session checkout in Zed, using SSH for remote Loom.
 #[tauri::command]
-pub async fn open_in_zed(work_dir: String) -> Result<(), UiError> {
-    let status = tokio::process::Command::new("zed")
-        .arg(&work_dir)
+pub async fn open_in_zed(state: State<'_, LoomState>, id: String) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    let view = client.get_session(&id).await?;
+    if view.status == "archived" {
+        return Err(UiError {
+            message: "this session is archived and its checkout is no longer active".into(),
+            unreachable: false,
+        });
+    }
+    let host = client.server_host().ok_or_else(|| UiError {
+        message: "Loom URL has no host".into(),
+        unreachable: false,
+    })?;
+    let target = zed_target(host, &view.work_dir)?;
+    // GUI apps often inherit a minimal PATH without /usr/local/bin, where
+    // Zed installs its CLI symlink. Prefer the app-bundled CLI on macOS.
+    let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
+        "/Applications/Zed.app/Contents/MacOS/cli"
+    } else {
+        "zed"
+    };
+    let status = tokio::process::Command::new(cli)
+        .arg(&target)
         .status()
         .await
         .map_err(|e| UiError {
@@ -542,6 +696,37 @@ pub async fn open_in_zed(work_dir: String) -> Result<(), UiError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod zed_tests {
+    use super::{thread_note_body, zed_target};
+
+    #[test]
+    fn local_checkout_is_a_path() {
+        assert_eq!(zed_target("127.0.0.1", "/tmp/a b").unwrap(), "/tmp/a b");
+    }
+
+    #[test]
+    fn remote_checkout_uses_ssh_and_encodes_path() {
+        assert_eq!(
+            zed_target("100.121.8.110", "/home/dlwh/worktrees/a b#1").unwrap(),
+            "ssh://100.121.8.110/home/dlwh/worktrees/a%20b%231"
+        );
+    }
+
+    #[test]
+    fn missing_checkout_is_rejected() {
+        assert!(zed_target("100.121.8.110", "relative/path").is_err());
+    }
+
+    #[test]
+    fn delivered_note_names_its_source_for_the_agent() {
+        assert_eq!(
+            thread_note_body(" Source topic ", "session-1", " Check the PR "),
+            "From Arachne thread: Source topic (session-1)\n\nCheck the PR"
+        );
+    }
 }
 
 /// Manual fleet refresh.

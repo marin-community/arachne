@@ -24,6 +24,14 @@ interface BranchSummary {
   description: string;
   goal: string;
   repo_root: string;
+  github?: {
+    pr_number: number;
+    pr_url: string;
+    pr_state: string;
+    checks: string | null;
+    review_decision: string | null;
+  } | null;
+  github_pr?: number | null;
   tags: TagView[];
   title_provenance?: string;
 }
@@ -62,6 +70,7 @@ export interface SessionView {
   effort: string;
   protocol: string;
   work_dir: string;
+  github_repo: string | null;
   term_session: string;
   turn_count: number;
   created_by: string | null;
@@ -99,6 +108,17 @@ interface FleetSnapshot {
   sessions: SessionSummary[];
   layout: SessionLayout;
 }
+export interface LaunchOptions {
+  profiles: { name: string; description: string; agent_kind: string; model: string; effort: string; class: string }[];
+  agents: {
+    kind: string;
+    label: string;
+    models: { id: string; label: string }[];
+    efforts: { id: string; label: string }[];
+    accepts_raw_model: boolean;
+  }[];
+  default_agent: string;
+}
 
 // --- State ----------------------------------------------------------------
 
@@ -108,9 +128,11 @@ const connError = ref<string | null>(null);
 const launching = ref(false);
 const fleet = ref<SessionSummary[]>([]);
 const layout = ref<SessionLayout | null>(null);
+const launchOptions = ref<LaunchOptions | null>(null);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
 const showSettings = ref(false);
+const settingsError = ref<string | null>(null);
 // URL is not a secret — localStorage is fine. The TOKEN is a credential:
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
 // "do not store sensitive credentials in frontend localStorage"). It's
@@ -150,21 +172,28 @@ async function connect(url: string, token: string | null) {
     await invoke("connect", { baseUrl: url, token });
     connected.value = true;
     connError.value = null;
+    launchOptions.value = await invoke<LaunchOptions>("launch_options").catch(() => null);
   } catch (e: any) {
     connected.value = false;
     connError.value = e?.message ?? String(e);
+    launchOptions.value = null;
   }
 }
 
-function saveSettings(url: string, token: string) {
+async function saveSettings(url: string, token: string) {
+  settingsError.value = null;
+  try {
+    await invoke("save_token", { token });
+  } catch (e: any) {
+    settingsError.value = `Could not save the token in Keychain: ${e?.message ?? String(e)}`;
+    return;
+  }
   loomUrl.value = url;
   loomToken.value = token;
   localStorage.setItem("loomUrl", url);
-  // Persist the token to the Keychain (fire-and-forget: connect proceeds
-  // on the in-memory copy; a failed save surfaces on next boot at worst).
-  invoke("save_token", { token }).catch(() => {});
-  showSettings.value = false;
-  connect(url, token || null);
+  await connect(url, token || null);
+  if (connected.value) showSettings.value = false;
+  else settingsError.value = connError.value;
 }
 
 // --- Actions ----------------------------------------------------------------
@@ -186,7 +215,7 @@ async function selectSession(id: string) {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string },
+  meta?: { title?: string; description?: string; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launching.value = true;
   try {
@@ -195,6 +224,10 @@ async function launchTask(
       task,
       title: meta?.title ?? null,
       description: meta?.description ?? null,
+      profile: meta?.profile || null,
+      agent: meta?.agent || null,
+      model: meta?.model || null,
+      effort: meta?.effort || null,
     });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
@@ -318,7 +351,7 @@ const connClass = computed(() =>
 <template>
   <div class="app" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
-      <span class="title">🕸 Arachne</span>
+      <button class="title home-link" title="Show attention overview" @click="selectedId = null; selectedView = null">🕸 Arachne</button>
       <span
         class="conn"
         :class="{ clickable: true }"
@@ -340,6 +373,7 @@ const connClass = computed(() =>
       :layout="layout"
       :selected-id="selectedId"
       :launching="launching"
+      :launch-options="launchOptions"
       @select="selectSession"
       @launch="launchTask"
       @update-topic="updateTopic"
@@ -351,9 +385,12 @@ const connClass = computed(() =>
       v-if="selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
+      :fleet="fleet"
+      :launch-options="launchOptions"
       @error="connError = $event"
       @archive="onArchived"
       @delegate="delegateFromThread"
+      @handoff="selectSession"
     />
     <HomeView
       v-else
@@ -366,6 +403,7 @@ const connClass = computed(() =>
       :url="loomUrl"
       :token="loomToken"
       :connected="connected"
+      :error="settingsError"
       @close="showSettings = false"
       @save="saveSettings"
     />

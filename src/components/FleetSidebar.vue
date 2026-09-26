@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed } from "vue";
-import type { SessionSummary, SessionLayout } from "../App.vue";
+import type { SessionSummary, SessionLayout, LaunchOptions } from "../App.vue";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -12,6 +12,7 @@ const props = defineProps<{
   layout: SessionLayout | null;
   selectedId: string | null;
   launching?: boolean;
+  launchOptions: LaunchOptions | null;
 }>();
 
 const emit = defineEmits<{
@@ -20,7 +21,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string },
+    meta?: { title?: string; description?: string; profile?: string; agent?: string; model?: string; effort?: string },
   ): void;
   (
     e: "update-topic",
@@ -40,6 +41,30 @@ const emit = defineEmits<{
 
 const task = ref("");
 const repo = ref("marin-community/arachne");
+const profile = ref("default");
+const agent = ref("");
+const model = ref("");
+const effort = ref("");
+const profiles = computed(() => props.launchOptions?.profiles.filter((p) => p.class === "interactive") ?? []);
+const selectedProfile = computed(() => profiles.value.find((p) => p.name === profile.value));
+const selectedAgent = computed(() => props.launchOptions?.agents.find((a) => a.kind === (agent.value || selectedProfile.value?.agent_kind || props.launchOptions?.default_agent)));
+const modelChoices = computed(() => selectedAgent.value?.models ?? []);
+const effortChoices = computed(() => selectedAgent.value?.efforts ?? []);
+const launchConfig = () => ({
+  profile: profile.value === "default" ? undefined : profile.value,
+  agent: agent.value || undefined,
+  model: model.value.trim() || undefined,
+  effort: effort.value || undefined,
+});
+function onProfileChange() {
+  agent.value = "";
+  model.value = "";
+  effort.value = "";
+}
+function onAgentChange() {
+  model.value = "";
+  effort.value = "";
+}
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
@@ -47,7 +72,7 @@ const dropTarget = ref<string | null>(null);
 function submit() {
   const t = task.value.trim();
   if (!t) return;
-  emit("launch", t, repo.value.trim());
+  emit("launch", t, repo.value.trim(), launchConfig());
   task.value = "";
 }
 
@@ -346,6 +371,7 @@ function submitTopic() {
   emit("launch", desc || title, repo.value.trim(), {
     title,
     description: desc,
+    ...launchConfig(),
   });
   newTitle.value = "";
   newDesc.value = "";
@@ -499,6 +525,37 @@ async function archiveRow(id: string) {
           style="font-family: var(--mono); font-size: 11px"
         />
       </div>
+      <div class="new-task launch-controls" style="margin-top: -4px">
+        <select v-model="profile" aria-label="Inference profile" @change="onProfileChange">
+          <option v-if="!profiles.some((p) => p.name === 'default')" value="default">Default route</option>
+          <option v-for="p in profiles" :key="p.name" :value="p.name">
+            {{ p.name }} · {{ p.agent_kind }}
+          </option>
+        </select>
+        <select v-model="agent" aria-label="Agent runtime" @change="onAgentChange">
+          <option value="">{{ selectedProfile?.agent_kind || launchOptions?.default_agent || 'Default agent' }}</option>
+          <option v-for="choice in launchOptions?.agents ?? []" :key="choice.kind" :value="choice.kind">{{ choice.label }}</option>
+        </select>
+        <select v-if="modelChoices.length && !selectedAgent?.accepts_raw_model" v-model="model" aria-label="Model">
+          <option value="">{{ agent ? 'Runtime default model' : (selectedProfile?.model || 'Runtime default model') }}</option>
+          <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+        </select>
+        <input v-else
+          v-model="model"
+          list="launch-models"
+          :placeholder="agent ? 'Model · runtime default' : (selectedProfile?.model || 'Model · runtime default')"
+          aria-label="Model override"
+          spellcheck="false"
+          style="font-family: var(--mono)"
+        />
+        <datalist id="launch-models">
+          <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+        </datalist>
+        <select v-model="effort" aria-label="Reasoning effort">
+          <option value="">{{ agent ? 'Default effort' : (selectedProfile?.effort || 'Default effort') }}</option>
+          <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+        </select>
+      </div>
 
       <div class="session-list">
         <template v-for="{ lane, rows } in laneRows" :key="lane.id">
@@ -651,6 +708,28 @@ async function archiveRow(id: string) {
             {{ props.launching ? "…" : "Create topic" }}
           </button>
         </div>
+        <div class="launch-controls" style="margin-top: 8px">
+          <select v-model="profile" aria-label="Inference profile" @change="onProfileChange">
+            <option v-if="!profiles.some((p) => p.name === 'default')" value="default">Default route</option>
+            <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.name }} · {{ p.agent_kind }}</option>
+          </select>
+          <select v-model="agent" aria-label="Agent runtime" @change="onAgentChange">
+            <option value="">{{ selectedProfile?.agent_kind || launchOptions?.default_agent || 'Default agent' }}</option>
+            <option v-for="choice in launchOptions?.agents ?? []" :key="choice.kind" :value="choice.kind">{{ choice.label }}</option>
+          </select>
+          <select v-if="modelChoices.length && !selectedAgent?.accepts_raw_model" v-model="model" aria-label="Model">
+            <option value="">{{ agent ? 'Runtime default model' : (selectedProfile?.model || 'Runtime default model') }}</option>
+            <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+          </select>
+          <input v-else v-model="model" list="launch-models-topic" :placeholder="agent ? 'Model · runtime default' : (selectedProfile?.model || 'Model · runtime default')" aria-label="Model override" spellcheck="false" />
+          <datalist id="launch-models-topic">
+            <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+          </datalist>
+          <select v-model="effort" aria-label="Reasoning effort">
+            <option value="">{{ agent ? 'Default effort' : (selectedProfile?.effort || 'Default effort') }}</option>
+            <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+          </select>
+        </div>
       </div>
 
       <div class="topic-list">
@@ -749,3 +828,28 @@ async function archiveRow(id: string) {
     </template>
   </aside>
 </template>
+
+<style scoped>
+.launch-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.launch-controls select,
+.launch-controls input {
+  box-sizing: border-box;
+  flex: 1 1 118px;
+  min-width: 0;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  padding: 6px 8px;
+  font: 11px var(--mono);
+}
+.launch-controls select:focus,
+.launch-controls input:focus {
+  outline: 1px solid var(--accent);
+}
+</style>

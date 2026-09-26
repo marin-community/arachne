@@ -46,7 +46,22 @@ pub struct BranchSummaryView {
     pub title_provenance: String,
     pub repo_root: String,
     #[serde(default)]
+    pub github: Option<GithubStatusView>,
+    #[serde(default)]
+    pub github_pr: Option<i64>,
+    #[serde(default)]
     pub tags: Vec<TagView>,
+}
+
+/// The small part of Loom's cached PR snapshot the resource strip needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GithubStatusView {
+    pub pr_number: i64,
+    pub pr_url: String,
+    pub pr_state: String,
+    pub checks: Option<String>,
+    pub review_decision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,9 +281,49 @@ pub struct SessionsLaunchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchProfileView {
+    pub name: String,
+    pub description: String,
+    pub agent_kind: String,
+    pub model: String,
+    pub effort: String,
+    pub class: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChoiceView {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMetadataView {
+    pub kind: String,
+    pub label: String,
+    pub models: Vec<AgentChoiceView>,
+    pub efforts: Vec<AgentChoiceView>,
+    pub accepts_raw_model: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsView {
+    pub agents: Vec<AgentMetadataView>,
+    pub default_agent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchOptionsView {
+    pub profiles: Vec<LaunchProfileView>,
+    pub agents: Vec<AgentMetadataView>,
+    pub default_agent: String,
 }
 
 // ---------------------------------------------------------------------------

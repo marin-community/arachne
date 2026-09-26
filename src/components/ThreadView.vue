@@ -2,7 +2,8 @@
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { SessionView } from "../App.vue";
+import { open } from "@tauri-apps/plugin-shell";
+import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
 
 // DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
 // { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
@@ -57,11 +58,12 @@ interface ChatEventFrame {
   data?: any;
 }
 
-const props = defineProps<{ session: SessionView }>();
+const props = defineProps<{ session: SessionView; fleet: SessionSummary[]; launchOptions: LaunchOptions | null }>();
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
   (e: "delegate", parentId: string, task: string): void;
+  (e: "handoff", id: string): void;
 }>();
 
 const blocks = ref<DisplayBlock[]>([]);
@@ -179,6 +181,94 @@ const progressAge = computed(() =>
 const showDelegate = ref(false);
 const delegateTask = ref("");
 const delegating = ref(false);
+
+const showSendToThread = ref(false);
+const sendDestination = ref("");
+const sendNote = ref("");
+const sendingToThread = ref(false);
+const deliveryKey = ref(crypto.randomUUID());
+const destinations = computed(() =>
+  props.fleet
+    .filter((s) => s.id !== props.session.id && s.status !== "archived")
+    .sort((a, b) => b.last_activity_at.localeCompare(a.last_activity_at)),
+);
+
+const showHandoff = ref(false);
+const handoffProfile = ref(props.session.profile || "default");
+const handoffAgent = ref(props.session.agent_kind || "");
+const handoffModel = ref(props.session.model || "");
+const handoffEffort = ref(props.session.effort || "");
+const handingOff = ref(false);
+const profileAgent = computed(() =>
+  props.launchOptions?.profiles.find((p) => p.name === handoffProfile.value)?.agent_kind ||
+  props.launchOptions?.default_agent || "",
+);
+const handoffAgentChoice = computed(() =>
+  props.launchOptions?.agents.find((a) => a.kind === (handoffAgent.value || profileAgent.value)),
+);
+const handoffAllowed = computed(() => {
+  const current = props.fleet.find((s) => s.id === props.session.id);
+  return props.session.protocol === "acp" &&
+    current?.status === "running" &&
+    current.branch.tags.some((tag) => tag.key === "idle") && !turnLive.value;
+});
+
+function chooseHandoffProfile() {
+  // A new profile supplies its own agent/model/effort defaults.
+  handoffAgent.value = "";
+  handoffModel.value = "";
+  handoffEffort.value = "";
+}
+
+function chooseHandoffAgent() {
+  handoffModel.value = "";
+  handoffEffort.value = "";
+}
+
+async function handoff() {
+  if (!handoffAllowed.value || handingOff.value) return;
+  handingOff.value = true;
+  try {
+    await invoke("handoff_session", {
+      id: props.session.id,
+      profile: handoffProfile.value || "default",
+      agent: handoffAgent.value || null,
+      model: handoffModel.value.trim() || null,
+      effort: handoffEffort.value || null,
+    });
+    showHandoff.value = false;
+    emit("handoff", props.session.id);
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    handingOff.value = false;
+  }
+}
+
+watch([sendDestination, sendNote], () => {
+  deliveryKey.value = crypto.randomUUID();
+});
+
+async function sendThreadNote() {
+  const note = sendNote.value.trim();
+  if (!note || !sendDestination.value || sendingToThread.value) return;
+  sendingToThread.value = true;
+  try {
+    await invoke("send_to_thread", {
+      sourceId: props.session.id,
+      destinationId: sendDestination.value,
+      note,
+      idempotencyKey: deliveryKey.value,
+    });
+    sendNote.value = "";
+    sendDestination.value = "";
+    showSendToThread.value = false;
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    sendingToThread.value = false;
+  }
+}
 
 function submitDelegate() {
   const t = delegateTask.value.trim();
@@ -346,7 +436,36 @@ async function interrupt() {
 
 async function openInZed() {
   try {
-    await invoke("open_in_zed", { workDir: props.session.work_dir });
+    await invoke("open_in_zed", { id: props.session.id });
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  }
+}
+
+const repoUrl = computed(() => {
+  const slug = props.session.github_repo;
+  return slug && /^[\w.-]+\/[\w.-]+$/.test(slug)
+    ? `https://github.com/${slug}`
+    : null;
+});
+
+const prUrl = computed(() => {
+  const cached = props.session.branch.github?.pr_url;
+  if (cached) {
+    try {
+      const url = new URL(cached);
+      if (url.protocol === "https:" && url.hostname === "github.com") return url.href;
+    } catch { /* fall through to mapped number */ }
+  }
+  const number = props.session.branch.github_pr;
+  return repoUrl.value && number && number > 0
+    ? `${repoUrl.value}/pull/${number}`
+    : null;
+});
+
+async function openResource(url: string) {
+  try {
+    await open(url);
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   }
@@ -381,6 +500,12 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
     entrance: text.slice(idx).replace(/^\s+/, ""),
   };
 }
+
+function messageAuthor(block: DisplayBlock): string {
+  if (block.kind !== "user_message") return props.session.agent_kind;
+  if (block.by?.startsWith("channel:")) return `via Loom · ${block.by.slice(8)}`;
+  return "you";
+}
 </script>
 
 <template>
@@ -390,16 +515,85 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
         <div class="name">{{ session.branch.name || session.id }}</div>
         <div class="sub">
           {{ session.agent_kind }} · {{ session.model || "auto" }} · turn
-          {{ session.turn_count }} ·
-          {{ session.work_dir }}
+          {{ session.turn_count }}
         </div>
       </div>
-      <button @click="openInZed">Open in Zed</button>
+      <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
       <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate = !showDelegate">
         Delegate
       </button>
+      <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
+      <button v-if="session.protocol === 'acp'" :disabled="!handoffAllowed" title="Switch runtime when the session is idle" @click="showHandoff = !showHandoff">Switch model…</button>
+    </div>
+    <div v-if="showHandoff" class="handoff-box">
+      <div class="handoff-heading">Switch this thread’s runtime</div>
+      <div class="handoff-fields">
+        <label>Profile
+          <select v-model="handoffProfile" @change="chooseHandoffProfile">
+            <option v-for="p in launchOptions?.profiles ?? []" :key="p.name" :value="p.name">{{ p.name }}</option>
+          </select>
+        </label>
+        <label>Agent
+          <select v-model="handoffAgent" @change="chooseHandoffAgent">
+            <option value="">Profile default</option>
+            <option v-for="a in launchOptions?.agents ?? []" :key="a.kind" :value="a.kind">{{ a.label }}</option>
+          </select>
+        </label>
+        <label>Model
+          <select v-if="handoffAgentChoice && !handoffAgentChoice.accepts_raw_model && handoffAgentChoice.models.length" v-model="handoffModel">
+            <option value="">Agent default</option>
+            <option v-for="m in handoffAgentChoice.models" :key="m.id" :value="m.id">{{ m.label }}</option>
+          </select>
+          <input v-else v-model="handoffModel" placeholder="Agent default" spellcheck="false" />
+        </label>
+        <label>Effort
+          <select v-model="handoffEffort">
+            <option value="">Profile default</option>
+            <option v-for="e in handoffAgentChoice?.efforts ?? []" :key="e.id" :value="e.id">{{ e.label }}</option>
+          </select>
+        </label>
+      </div>
+      <div class="handoff-actions">
+        <span>Switching restarts the agent while keeping this thread and checkout.</span>
+        <button @click="showHandoff = false">Cancel</button>
+        <button class="primary" :disabled="!handoffAllowed || handingOff" @click="handoff">{{ handingOff ? "Switching…" : "Switch" }}</button>
+      </div>
+    </div>
+    <div v-if="showSendToThread" class="send-thread-box">
+      <label>
+        <span>Destination</span>
+        <select v-model="sendDestination">
+          <option value="" disabled>Choose a thread</option>
+          <option v-for="s in destinations" :key="s.id" :value="s.id">
+            {{ s.branch.title || s.branch.name }}
+          </option>
+        </select>
+      </label>
+      <textarea v-model="sendNote" placeholder="Note to deliver with this thread as the source…" />
+      <div class="send-thread-actions">
+        <button @click="showSendToThread = false">Cancel</button>
+        <button class="primary" :disabled="!sendDestination || !sendNote.trim() || sendingToThread" @click="sendThreadNote">
+          {{ sendingToThread ? "Sending…" : "Send note" }}
+        </button>
+      </div>
+    </div>
+    <div class="resource-strip" aria-label="Thread resources">
+      <button v-if="repoUrl" class="resource-link" @click="openResource(repoUrl)">
+        {{ session.github_repo }}
+      </button>
+      <span v-else class="resource-item">{{ session.branch.repo_root || "Repository unavailable" }}</span>
+      <span class="resource-separator">·</span>
+      <button v-if="prUrl" class="resource-link" @click="openResource(prUrl)">
+        PR #{{ session.branch.github?.pr_number || session.branch.github_pr }}
+        <span v-if="session.branch.github?.checks">{{ session.branch.github.checks }}</span>
+      </button>
+      <span v-else class="resource-item">No PR linked</span>
+      <span class="resource-separator">·</span>
+      <span class="resource-item" :title="session.work_dir">{{ session.branch.branch || "No branch" }}</span>
+      <span class="resource-separator">·</span>
+      <span class="resource-item path" :title="session.work_dir">{{ session.work_dir || "No active checkout" }}</span>
     </div>
     <div v-if="showDelegate" class="delegate-box">
       <input
@@ -467,7 +661,7 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
           }"
         >
           <div class="who">
-            {{ b.kind === "user_message" ? "you" : session.agent_kind }}
+            {{ messageAuthor(b) }}
           </div>
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
