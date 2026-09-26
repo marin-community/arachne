@@ -35,6 +35,7 @@ export interface SessionView {
 
 const connected = ref(false);
 const connError = ref<string | null>(null);
+const launching = ref(false);
 const fleet = ref<SessionSummary[]>([]);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
@@ -84,12 +85,15 @@ async function selectSession(id: string) {
 }
 
 async function launchTask(task: string, repo: string) {
+  launching.value = true;
   try {
     const view = await invoke<SessionView>("launch_session", { repo, task });
     selectedId.value = view.id;
     selectedView.value = view;
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
+  } finally {
+    launching.value = false;
   }
 }
 
@@ -104,12 +108,13 @@ const connClass = computed(() =>
       <span class="title">🕸 Arachne</span>
       <span class="conn">
         <span class="dot" :class="connClass"></span>
-        {{ connected ? "loom · 127.0.0.1:7878" : connError ?? "connecting…" }}
+        {{ connected ? (connError ? connError : "loom · 127.0.0.1:7878") : connError ?? "connecting…" }}
       </span>
     </header>
     <FleetSidebar
       :fleet="fleet"
       :selected-id="selectedId"
+      :launching="launching"
       @select="selectSession"
       @launch="launchTask"
     />

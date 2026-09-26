@@ -9,10 +9,10 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod blocks;
-mod client;
-mod commands;
-mod loom;
+pub mod blocks;
+pub mod client;
+pub mod commands;
+pub mod loom;
 
 pub fn run() {
     tauri::Builder::default()

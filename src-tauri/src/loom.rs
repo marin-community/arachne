@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// A branch tag. The well-known key `attention` carries the session's
 /// attention level (`ok | attention | blocked`); absence means calm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct TagView {
     pub key: String,
     pub note: String,
@@ -29,7 +29,7 @@ pub struct TagView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct BranchSummaryView {
     pub id: String,
     pub branch: String,
@@ -45,7 +45,7 @@ pub struct BranchSummaryView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct SessionPlacementView {
     pub space_id: Option<String>,
     pub space_name: Option<String>,
@@ -57,7 +57,7 @@ pub struct SessionPlacementView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct SessionSummaryView {
     pub id: String,
     pub status: String,
@@ -99,7 +99,7 @@ impl SessionSummaryView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct SessionView {
     pub id: String,
     pub status: String,
@@ -126,7 +126,7 @@ pub struct SessionView {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ChatBlockView {
     pub seq: i64,
     pub turn: i64,
@@ -137,7 +137,7 @@ pub struct ChatBlockView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct SessionChatView {
     pub blocks: Vec<ChatBlockView>,
     pub live_turn: Option<i64>,
@@ -146,7 +146,7 @@ pub struct SessionChatView {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct ChatCursorView {
     pub seq: i64,
     pub turn: i64,
@@ -156,15 +156,16 @@ pub struct ChatCursorView {
 // Launch
 // ---------------------------------------------------------------------------
 
-/// Request for `POST /api/sessions/launch`. All fields optional; a minimal
-/// launch is `{ repo, title }`. Note `cwd` on the wire is a required string
-/// (empty string ok) — we always send it to keep the JSON shape stable.
+/// Request for `POST /api/sessions/launch`. `cwd` is required on the wire
+/// (an empty string means "fork from the repo's default") — always a String,
+/// never null, or loom rejects the whole launch with a 400.
 #[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 pub struct SessionsLaunchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
-    pub cwd: Option<String>,
+    #[serde(default)]
+    pub cwd: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -201,7 +202,7 @@ pub struct EventFrame {
 
 /// The `layout` topic's `session_layout` event payload: the full fleet list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "snake_case")]
 #[allow(dead_code)]
 pub struct LayoutSnapshot {
     pub spaces: Vec<serde_json::Value>,

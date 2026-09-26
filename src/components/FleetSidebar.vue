@@ -5,6 +5,7 @@ import type { SessionSummary } from "../App.vue";
 const props = defineProps<{
   fleet: SessionSummary[];
   selectedId: string | null;
+  launching?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -32,7 +33,9 @@ function submit() {
   <aside class="sidebar">
     <div class="new-task">
       <input v-model="task" placeholder="New task…" @keydown.enter.prevent="submit" />
-      <button class="primary" :disabled="!task.trim()" @click="submit">Launch</button>
+      <button class="primary" :disabled="!task.trim() || props.launching" @click="submit">
+        {{ props.launching ? "…" : "Launch" }}
+      </button>
     </div>
     <div class="new-task" style="margin-top: -4px">
       <input v-model="repo" placeholder="owner/name" spellcheck="false" style="font-family: var(--mono); font-size: 11px" />
