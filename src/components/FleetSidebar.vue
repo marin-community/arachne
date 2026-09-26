@@ -11,24 +11,23 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
-  (e: "launch", task: string, repo: string, groupId?: string): void;
+  (e: "launch", task: string, repo: string): void;
   (e: "create-workstream", name: string): void;
-  (e: "move-session", sessionId: string): void;
+  (e: "reparent", sessionId: string, parentId: string | null): void;
 }>();
 
 const task = ref("");
 const repo = ref("marin-community/arachne");
 const newStreamName = ref("");
 const showNewStream = ref(false);
-
-// Which workstream a newly launched task should land in: the group currently
-// in "launch focus", set when the user clicks inside a workstream's header.
-const launchGroupId = ref<string | null>(null);
+// Session being dragged into a workstream (by id), or the delete-workstream
+// action (handled through reparent with a sentinel).
+const dragging = ref<string | null>(null);
 
 function submit() {
   const t = task.value.trim();
   if (!t) return;
-  emit("launch", t, repo.value.trim(), launchGroupId.value ?? undefined);
+  emit("launch", t, repo.value.trim());
   task.value = "";
 }
 
@@ -44,13 +43,11 @@ function submitNewStream() {
 // (agent self-report) and `triage` (outside assessment) carry values
 // `attention` | `blocked`; absence is the calm/default state. `idle` is a
 // quiet resting mark. Prose status lives on branch.description.
-type Attention = { level: "attention" | "blocked"; source: string } | null;
-
-function loudTag(s: SessionSummary): Attention {
+function loudTag(s: SessionSummary): { level: "attention" | "blocked" } | null {
   for (const key of ["attention", "triage"]) {
     const tag = s.branch.tags.find((t) => t.key === key);
     if (tag && (tag.value === "attention" || tag.value === "blocked")) {
-      return { level: tag.value, source: tag.set_by };
+      return { level: tag.value };
     }
   }
   return null;
@@ -79,112 +76,144 @@ function statusLabel(s: SessionSummary): string {
   return s.status;
 }
 
-function isChild(s: SessionSummary): boolean {
-  return !!s.parent_session_id || !!s.parent_id;
-}
-
-// --- Workstream grouping ---------------------------------------------------
+// --- Workstream tree --------------------------------------------------------
 //
-// The layout view (spaces → groups) owns placement; summaries own status.
-// A session appears in its placement group (falling back to "Inbox" when
-// unplaced). Children nest under their parent session row; parents sort by
-// last activity, newest first.
+// A workstream IS a top-level chat: sessions with no parent. Children nest
+// under their parent (parent_session_id, or parent_id = parent branch id as
+// a fallback). The layout group is only the lane a tree lives in — Inbox
+// by default, or a named group the operator filed the tree under. So:
+//   sidebar = [lane headers] → [top-level sessions] → [nested children]
+// and "move a chat into a workstream" = reparent it under that top-level
+// session (which also follows into the parent's lane, server-side).
 
-interface Row {
+interface TreeNode {
   session: SessionSummary;
-  depth: number; // 0 = top-level, 1+ = nested child
+  children: TreeNode[];
 }
 
-interface Group {
+interface Lane {
   id: string;
   name: string;
-  system: string | null;
-  rows: Row[];
-  activeCount: number;
+  trees: TreeNode[];
+  count: number;
 }
 
-function buildGroups(): Group[] {
-  const byId = new Map(props.fleet.map((s) => [s.id, s]));
+function isChild(s: SessionSummary): boolean {
+  return !!(s.parent_session_id || s.parent_id);
+}
 
-  // group_id -> session summaries placed there
-  const inGroup = new Map<string, SessionSummary[]>();
-  const unplaced: SessionSummary[] = [];
-  for (const s of props.fleet) {
-    if (s.status === "archived") continue;
-    const gid = s.placement?.group_id;
-    if (gid) {
-      const list = inGroup.get(gid) ?? [];
-      list.push(s);
-      inGroup.set(gid, list);
+function buildLanes(): Lane[] {
+  const live = props.fleet.filter((s) => s.status !== "archived");
+  const byId = new Map(live.map((s) => [s.id, s]));
+  const nodes = new Map<string, TreeNode>();
+  for (const s of live) nodes.set(s.id, { session: s, children: [] });
+
+  const roots: TreeNode[] = [];
+  for (const s of live) {
+    const node = nodes.get(s.id)!;
+    const parentKey = s.parent_session_id
+      ? byId.get(s.parent_session_id)
+      : s.parent_id
+        ? [...byId.values()].find((c) => c.branch.id === s.parent_id)
+        : undefined;
+    if (parentKey && parentKey.id !== s.id) {
+      nodes.get(parentKey.id)!.children.push(node);
     } else {
-      unplaced.push(s);
+      roots.push(node);
     }
   }
-
-  const groups: Group[] = [];
-  const seen = new Set<string>();
-  const addGroup = (
-    id: string,
-    name: string,
-    system: string | null,
-    members: SessionSummary[],
-  ) => {
-    if (seen.has(id)) return;
-    seen.add(id);
-    // Nest children under parents; order parents by activity desc.
-    const parents = members
-      .filter((s) => !isChild(s))
-      .sort((a, b) =>
-        a.last_activity_at < b.last_activity_at
+  const byActivity = (a: TreeNode, b: TreeNode) =>
+    a.session.last_activity_at < b.session.last_activity_at
+      ? 1
+      : a.session.last_activity_at === b.session.last_activity_at
+        ? a.session.id < b.session.id
           ? 1
-          : a.last_activity_at === b.last_activity_at
-            ? a.id < b.id
-              ? 1
-              : -1
-            : -1,
-      );
-    const children = members.filter(isChild);
-    const rows: Row[] = [];
-    for (const p of parents) {
-      rows.push({ session: p, depth: 0 });
-      // children whose parent_session_id matches, else children by branch parent
-      for (const c of children.filter(
-        (c) => c.parent_session_id === p.id || c.parent_id === p.branch.id,
-      )) {
-        rows.push({ session: c, depth: 1 });
-      }
-    }
-    // Orphaned children (parent archived or elsewhere) render flat.
-    const claimed = new Set(rows.map((r) => r.session.id));
-    for (const c of children.filter((c) => !claimed.has(c.id))) {
-      rows.push({ session: c, depth: 0 });
-    }
-    groups.push({ id, name, system, rows, activeCount: rows.length });
+          : -1
+        : -1;
+  const sortTree = (n: TreeNode) => {
+    n.children.sort(byActivity);
+    n.children.forEach(sortTree);
   };
+  roots.sort(byActivity);
+  roots.forEach(sortTree);
 
+  // File trees into lanes by their ROOT session's placement.
+  const laneFor = new Map<string, TreeNode[]>();
+  const laneNames = new Map<string, { name: string; order: number }>();
   if (props.layout) {
     for (const space of props.layout.spaces) {
       for (const g of space.groups) {
-        const members = inGroup.get(g.id) ?? [];
-        addGroup(g.id, g.name, g.system_key ?? null, members);
+        laneFor.set(g.id, []);
+        laneNames.set(g.id, {
+          name: g.name,
+          order: space.rank * 10000 + g.rank,
+        });
       }
     }
   }
-  // Sessions whose placement group isn't in the layout (stale cache) or none.
-  const placedElsewhere = props.fleet.filter(
-    (s) =>
-      s.status !== "archived" &&
-      s.placement !== null &&
-      s.placement.group_id !== null &&
-      !seen.has(s.placement.group_id),
-  );
-  if (unplaced.length > 0 || placedElsewhere.length > 0) {
-    addGroup("inbox", "Inbox", null, [...unplaced, ...placedElsewhere]);
+  const unfiled: TreeNode[] = [];
+  for (const root of roots) {
+    const gid = root.session.placement?.group_id ?? null;
+    if (gid && laneFor.has(gid)) laneFor.get(gid)!.push(root);
+    else unfiled.push(root);
   }
-  return groups;
+
+  const lanes: Lane[] = [];
+  const order = (gid: string) => laneNames.get(gid)?.order ?? 999999;
+  for (const gid of [...laneFor.keys()].sort((a, b) => order(a) - order(b))) {
+    const trees = laneFor.get(gid)!;
+    if (trees.length === 0) continue;
+    const count = trees.reduce((acc, t) => acc + 1 + countTree(t), 0);
+    lanes.push({
+      id: gid,
+      name: laneNames.get(gid)?.name ?? gid,
+      trees,
+      count,
+    });
+  }
+  if (unfiled.length > 0) {
+    lanes.push({
+      id: "unfiled",
+      name: "Inbox",
+      trees: unfiled,
+      count: unfiled.length,
+    });
+  }
+  return lanes;
 }
 
-const groups = computed(() => buildGroups());
+function countTree(n: TreeNode): number {
+  return n.children.reduce((acc, c) => acc + 1 + countTree(c), 0);
+}
+
+const lanes = computed(() => buildLanes());
+
+function onDragStart(id: string, e: DragEvent) {
+  dragging.value = id;
+  if (e.dataTransfer) {
+    e.dataTransfer.setData("text/plain", id);
+    e.dataTransfer.effectAllowed = "move";
+  }
+}
+
+const dropTarget = ref<string | null>(null);
+function onDragOver(key: string, e: DragEvent) {
+  if (!dragging.value) return;
+  e.preventDefault();
+  e.dataTransfer && (e.dataTransfer.dropEffect = "move");
+  dropTarget.value = key;
+}
+function onDragLeave(key: string) {
+  if (dropTarget.value === key) dropTarget.value = null;
+}
+function onDropRoot(parentId: string | null, key: string, e: DragEvent) {
+  e.preventDefault();
+  dropTarget.value = null;
+  if (dragging.value && dragging.value !== parentId) {
+    emit("reparent", dragging.value, parentId);
+    dragging.value = null;
+  }
+}
 </script>
 
 <template>
@@ -211,60 +240,100 @@ const groups = computed(() => buildGroups());
         style="font-family: var(--mono); font-size: 11px"
       />
     </div>
-    <div v-if="launchGroupId" class="launch-target">
-      launching into: {{ groups.find((g) => g.id === launchGroupId)?.name }}
-      <button class="link" @click="launchGroupId = null">✕</button>
-    </div>
 
     <div class="session-list">
-      <template v-for="g in groups" :key="g.id">
+      <template v-for="lane in lanes" :key="lane.id">
         <div
-          v-if="g.activeCount > 0 || !g.system"
           class="group-header"
-          @click="launchGroupId = g.id === launchGroupId ? null : g.id"
-        >
-          <span class="group-name">{{ g.name }}</span>
-          <span class="group-count">{{ g.activeCount }}</span>
-          <button
-            v-if="!g.system && g.id !== 'inbox'"
-            class="link stream-delete"
-            title="delete workstream (sessions move to Inbox)"
-            @click.stop="emit('move-session', `__delete__:${g.id}`)"
-          >
-            ✕
-          </button>
-        </div>
-        <div
-          v-for="row in g.rows"
-          :key="row.session.id"
-          class="session-item"
-          :class="{
-            selected: row.session.id === selectedId,
-            child: row.depth > 0,
-          }"
-          :style="
-            row.depth > 0 ? { paddingLeft: `${12 + row.depth * 14}px` } : {}
+          :class="{ 'drop-hint': dropTarget === `lane-${lane.id}` }"
+          @dragover="onDragOver(`lane-${lane.id}`, $event)"
+          @dragleave="onDragLeave(`lane-${lane.id}`)"
+          @drop="onDropRoot(null, `lane-${lane.id}`, $event)"
+          :title="
+            dragging ? 'drop here to file as a top-level chat' : lane.name
           "
-          @click="emit('select', row.session.id)"
         >
-          <div class="row1">
-            <span class="name">{{
-              row.session.branch.name || row.session.id
-            }}</span>
-            <span class="badge" :class="statusClass(row.session)">{{
-              statusLabel(row.session)
-            }}</span>
-            <span
-              v-if="row.session.branch.tags.some((t) => t.key === 'idle')"
-              class="badge idle"
-              >idle</span
-            >
-          </div>
-          <div class="title">{{ subtitle(row.session) }}</div>
+          <span class="group-name">{{ lane.name }}</span>
+          <span class="group-count">{{ lane.count }}</span>
         </div>
+        <template v-for="node in lane.trees" :key="node.session.id">
+          <!-- A workstream: its root chat + nested children -->
+          <div
+            class="session-item workstream"
+            :class="{
+              selected: node.session.id === selectedId,
+              'drop-hint': dropTarget === `ws-${node.session.id}`,
+            }"
+            draggable="true"
+            @dragstart="onDragStart(node.session.id, $event)"
+            @dragover="onDragOver(`ws-${node.session.id}`, $event)"
+            @dragleave="onDragLeave(`ws-${node.session.id}`)"
+            @drop.stop="
+              onDropRoot(node.session.id, `ws-${node.session.id}`, $event)
+            "
+            @click="emit('select', node.session.id)"
+            :title="dragging ? 'drop here to join this workstream' : undefined"
+          >
+            <div class="row1">
+              <span class="name">{{
+                node.session.branch.name || node.session.id
+              }}</span>
+              <span class="badge" :class="statusClass(node.session)">{{
+                statusLabel(node.session)
+              }}</span>
+              <span v-if="node.children.length" class="badge dim"
+                >{{ node.children.length
+                }}<template v-if="node.children.some((c) => c.children.length)"
+                  >+</template
+                ></span
+              >
+              <span
+                v-if="node.session.branch.tags.some((t) => t.key === 'idle')"
+                class="badge idle"
+                >idle</span
+              >
+            </div>
+            <div class="title">{{ subtitle(node.session) }}</div>
+          </div>
+          <template v-for="child in node.children" :key="child.session.id">
+            <div
+              class="session-item child"
+              :class="{ selected: child.session.id === selectedId }"
+              draggable="true"
+              @dragstart="onDragStart(child.session.id, $event)"
+              @click="emit('select', child.session.id)"
+            >
+              <div class="row1">
+                <span class="name">{{
+                  child.session.branch.name || child.session.id
+                }}</span>
+                <span class="badge" :class="statusClass(child.session)">{{
+                  statusLabel(child.session)
+                }}</span>
+              </div>
+              <div class="title">{{ subtitle(child.session) }}</div>
+            </div>
+            <div
+              v-for="gc in child.children"
+              :key="gc.session.id"
+              class="session-item child grandchild"
+              :class="{ selected: gc.session.id === selectedId }"
+              @click="emit('select', gc.session.id)"
+            >
+              <div class="row1">
+                <span class="name">{{
+                  gc.session.branch.name || gc.session.id
+                }}</span>
+                <span class="badge" :class="statusClass(gc.session)">{{
+                  statusLabel(gc.session)
+                }}</span>
+              </div>
+            </div>
+          </template>
+        </template>
       </template>
       <div
-        v-if="groups.length === 0"
+        v-if="lanes.length === 0"
         class="session-item"
         style="color: var(--text-dim)"
       >

@@ -173,21 +173,12 @@ async function selectSession(id: string) {
   }
 }
 
-async function launchTask(task: string, repo: string, groupId?: string) {
+async function launchTask(task: string, repo: string) {
   launching.value = true;
   try {
     const view = await invoke<SessionView>("launch_session", { repo, task });
     selectedId.value = view.id;
     selectedView.value = view;
-    // If launched into a workstream, move it there once it exists. The
-    // fleet refresh will follow from the layout event.
-    if (groupId && groupId !== "inbox") {
-      try {
-        await invoke("move_to_workstream", { sessionIds: [view.id], groupId });
-      } catch (e: any) {
-        connError.value = e?.message ?? String(e);
-      }
-    }
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   } finally {
@@ -216,41 +207,12 @@ async function createWorkstream(name: string) {
   }
 }
 
-async function onSidebarAction(payload: string) {
-  // "__delete__:<group_id>" = delete workstream; otherwise move a session.
-  if (payload.startsWith("__delete__:")) {
-    const groupId = payload.slice("__delete__:".length);
-    // Sessions move back to the user Inbox group.
-    const inbox =
-      layout.value?.spaces
-        .flatMap((s) => s.groups)
-        .find(
-          (g) =>
-            g.system_key === "inbox" && g.space_id.startsWith("space-user"),
-        ) ??
-      layout.value?.spaces
-        .flatMap((s) => s.groups)
-        .find((g) => g.system_key === "inbox");
-    if (!inbox) return;
-    try {
-      await invoke("delete_workstream", {
-        groupId,
-        destinationGroupId: inbox.id,
-      });
-    } catch (e: any) {
-      connError.value = e?.message ?? String(e);
-    }
-    return;
+async function reparentSession(sessionId: string, parentId: string | null) {
+  try {
+    await invoke("reparent_session", { sessionId, parentId });
+  } catch (e: any) {
+    connError.value = e?.message ?? String(e);
   }
-  await onMoveSession(payload);
-}
-
-async function onMoveSession(sessionId: string) {
-  // Prompt-less placeholder: moving a single session requires choosing a
-  // target workstream; for now surface it via the workstream delete flow.
-  // (Full drag-and-drop move is a later increment.)
-  connError.value =
-    "Moving single sessions: pick a workstream header first (coming soon)";
 }
 
 function onArchived(id: string) {
@@ -294,7 +256,7 @@ const connClass = computed(() =>
       @select="selectSession"
       @launch="launchTask"
       @create-workstream="createWorkstream"
-      @move-session="onSidebarAction"
+      @reparent="reparentSession"
     />
     <ThreadView
       v-if="selectedId && selectedView"

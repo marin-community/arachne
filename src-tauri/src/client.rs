@@ -246,6 +246,20 @@ impl LoomClient {
         self.op("/api/sessions/launch", input).await
     }
 
+    /// `sessions.reparent` — re-parent a session under another (or detach),
+    /// following the parent into its placement group. Returns the fresh summary.
+    pub async fn reparent_session(
+        &self,
+        session: &str,
+        parent: Option<&str>,
+    ) -> Result<crate::loom::SessionSummaryView, LoomError> {
+        self.op(
+            "/api/sessions/reparent",
+            &serde_json::json!({ "session": session, "parent": parent }),
+        )
+        .await
+    }
+
     /// `sessions.archive` — tear down terminal + worktree, keep the branch.
     /// Not yet surfaced in the UI; kept for the next iteration.
     #[allow(dead_code)]

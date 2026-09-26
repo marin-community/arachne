@@ -431,28 +431,17 @@ pub async fn create_workstream(
     client.create_group(&space, &name).await.map_err(Into::into)
 }
 
-/// Move sessions into a workstream.
+/// Re-parent a session under another (its workstream's top-level chat), or
+/// detach it to top level. The session follows the parent's placement group.
 #[tauri::command]
-pub async fn move_to_workstream(
+pub async fn reparent_session(
     state: State<'_, LoomState>,
-    session_ids: Vec<String>,
-    group_id: String,
-) -> Result<crate::loom::SessionLayoutView, UiError> {
-    let client = state_client(&state).await?;
-    let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
-    client.move_sessions(&refs, &group_id).await.map_err(Into::into)
-}
-
-/// Delete a workstream; its sessions move to the destination group first.
-#[tauri::command]
-pub async fn delete_workstream(
-    state: State<'_, LoomState>,
-    group_id: String,
-    destination_group_id: String,
-) -> Result<crate::loom::SessionLayoutView, UiError> {
+    session_id: String,
+    parent_id: Option<String>,
+) -> Result<(), UiError> {
     let client = state_client(&state).await?;
     client
-        .delete_group(&group_id, &destination_group_id)
-        .await
-        .map_err(Into::into)
+        .reparent_session(&session_id, parent_id.as_deref().filter(|p| !p.is_empty()))
+        .await?;
+    Ok(())
 }
