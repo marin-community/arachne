@@ -107,29 +107,45 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
             if cancel.is_cancelled() {
                 return;
             }
-            match client.list_sessions().await {
-                Ok(sessions) => {
-                    let _ = app.emit("loom://fleet", &sessions);
-                }
+            let mut sessions = match client.list_sessions().await {
+                Ok(s) => s,
                 Err(e) => {
                     let _ = app.emit("loom://error", UiError::from(e));
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                    }
+                    continue;
                 }
-            }
-            // Subscribe to layout SSE; each event means the fleet changed.
-            // The subscription's own task ends when cancelled (receiver
-            // dropped) or the stream drops; poller then pauses and retries.
-            let sub_cancel = cancel.clone();
-            let topics = vec!["layout".to_string()];
-            let subscribe = client.subscribe(&topics);
-            match subscribe.await {
+            };
+            // "layout" covers layout mutations, but attention/tag changes
+            // only publish on each session's own topic — so subscribe to the
+            // live sessions too (loom caps a multiplexed stream at 64 topics:
+            // layout + 63 newest sessions).
+            let mut topics: Vec<String> = vec!["layout".into()];
+            topics.extend(
+                sessions
+                    .iter()
+                    .filter(|s| s.status != "archived")
+                    .map(|s| format!("session:{}", s.id))
+                    .take(63),
+            );
+            sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+            let _ = app.emit("loom://fleet", &sessions);
+            match client.subscribe(&topics).await {
                 Ok(mut rx) => loop {
                     tokio::select! {
-                        _ = sub_cancel.cancelled() => return,
+                        _ = cancel.cancelled() => return,
                         frame = rx.recv() => {
                             let Some(_frame) = frame else { break };
+                            // Any tag/status/layout change re-snapshots the
+                            // fleet (tags publish on each session's own topic,
+                            // not on `layout`).
                             match client.list_sessions().await {
-                                Ok(sessions) => {
-                                    let _ = app.emit("loom://fleet", &sessions);
+                                Ok(list) => {
+                                    let mut list = list;
+                                    list.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+                                    let _ = app.emit("loom://fleet", &list);
                                 }
                                 Err(e) => {
                                     let _ = app.emit("loom://error", UiError::from(e));
