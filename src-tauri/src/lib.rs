@@ -25,6 +25,7 @@ pub fn run() {
             commands::send_input,
             commands::interrupt,
             commands::launch_session,
+            commands::archive_session,
             commands::open_in_zed,
             commands::refresh_fleet,
         ])

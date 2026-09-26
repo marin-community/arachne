@@ -23,7 +23,10 @@ interface DisplayBlock {
 }
 
 const props = defineProps<{ session: SessionView }>();
-const emit = defineEmits<{ (e: "error", msg: string): void }>();
+const emit = defineEmits<{
+  (e: "error", msg: string): void;
+  (e: "archive", id: string): void;
+}>();
 
 const blocks = ref<DisplayBlock[]>([]);
 const draft = ref("");
@@ -31,44 +34,60 @@ const busy = ref(false);
 const convEl = ref<HTMLElement | null>(null);
 const unlisteners: UnlistenFn[] = [];
 
+// Auto-scroll only when the user is already at (or near) the bottom — never
+// yank someone who has scrolled up to read.
+function atBottom(): boolean {
+  if (!convEl.value) return true;
+  const el = convEl.value;
+  return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+}
 function scrollToBottom() {
   nextTick(() => {
     if (convEl.value) convEl.value.scrollTop = convEl.value.scrollHeight;
   });
 }
 
+// Debounced reload: SSE events arrive in bursts (one turn journals many
+// blocks); re-fetching per event hammers loom and re-renders constantly.
+let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+function scheduleReload() {
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(async () => {
+    reloadTimer = null;
+    await reload();
+  }, 300);
+}
+
 async function reload() {
+  const stick = atBottom();
   try {
     blocks.value = await invoke<DisplayBlock[]>("fetch_chat", { id: props.session.id });
-    scrollToBottom();
+    if (stick) scrollToBottom();
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   }
 }
 
+// Collapsible sections (thoughts, tool runs): expanded state per block index.
+const collapsed = ref<Record<number, boolean>>({});
+
 onMounted(async () => {
   await reload();
-  // Live updates: every chat/session event for the open session triggers a
-  // journal re-fetch (the journal is the source of truth; deltas are an
-  // optimization for later). `resync` semantics from loom's SSE make this the
-  // correct, simple baseline.
+  scrollToBottom();
   unlisteners.push(
-    await listen("loom://chat-event", async (event) => {
+    await listen("loom://chat-event", (event) => {
       const frame = event.payload as { topic: string; event: string };
       if (frame.topic.startsWith("chat:") || frame.topic.startsWith("session:")) {
-        await reload();
+        scheduleReload();
       }
-    })
-  );
-  unlisteners.push(
-    await listen("loom://fleet", () => {
-      // Status/attention badges change; the view's own status refreshes via
-      // re-open. Lightweight: re-fetch view occasionally.
     })
   );
 });
 
-onUnmounted(() => unlisteners.forEach((u) => u()));
+onUnmounted(() => {
+  unlisteners.forEach((u) => u());
+  if (reloadTimer) clearTimeout(reloadTimer);
+});
 
 async function send() {
   const text = draft.value.trim();
@@ -105,11 +124,22 @@ async function openInZed() {
   }
 }
 
-function kindOf(b: DisplayBlock): string {
-  return b.kind;
+async function archive() {
+  try {
+    await invoke("archive_session", { id: props.session.id });
+    emit("archive", props.session.id);
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  }
 }
-function payloadOf(b: DisplayBlock): any {
-  return b;
+
+// Thoughts and tool calls start collapsed; the header always shows the
+// one-line summary so nothing is hidden.
+function isCollapsed(i: number): boolean {
+  return collapsed.value[i] ?? true;
+}
+function toggle(i: number) {
+  collapsed.value[i] = !isCollapsed(i);
 }
 </script>
 
@@ -125,41 +155,47 @@ function payloadOf(b: DisplayBlock): any {
       </div>
       <button @click="openInZed">Open in Zed</button>
       <button @click="interrupt">Interrupt</button>
+      <button class="danger" @click="archive">Archive</button>
     </div>
     <div class="conversation" ref="convEl">
-      <div
-        v-for="(b, i) in blocks"
-        :key="i"
-        class="block"
-        :class="{
-          user: b.kind === 'user_message',
-          agent: b.kind === 'agent_message',
-          thought: b.kind === 'thought',
-          tool: b.kind === 'tool_call',
-        }"
-      >
-        <div class="who" v-if="b.kind === 'user_message'">you</div>
-        <div class="who" v-else-if="b.kind === 'agent_message'">{{ session.agent_kind }}</div>
-        <div class="who" v-else-if="b.kind === 'thought'">thinking</div>
-        <div class="who" v-else-if="b.kind === 'tool_call'">tool</div>
-        <div class="body" v-if="b.kind === 'tool_call'">
-          <span class="status" :class="{ running: b.status === 'running' }">
-            {{ b.status }}
-          </span>
-          · {{ b.title }}
-          <span v-if="b.summary" style="color: var(--text-dim)">
-            — {{ b.summary.slice(0, 300) }}
-          </span>
+      <template v-for="(b, i) in blocks" :key="i">
+        <!-- Tool calls: collapsed one-liner by default, expandable -->
+        <div v-if="b.kind === 'tool_call'" class="block tool">
+          <div class="tool-line" @click="toggle(i)">
+            <span class="status" :class="{ running: b.status === 'running' }">{{ b.status }}</span>
+            <span class="tool-title">{{ b.title }}</span>
+            <span v-if="b.summary" class="tool-summary">{{ b.summary.slice(0, 200) }}</span>
+            <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
+          </div>
+          <div v-if="!isCollapsed(i)" class="tool-detail">{{ b.summary }}</div>
         </div>
-        <div class="body" v-else-if="b.kind === 'plan'">
-          <div v-for="(entry, j) in b.entries" :key="j">
-            [{{ entry[1] }}] {{ entry[0] }}
+        <!-- Thoughts: collapsed italic one-liner, expandable -->
+        <div v-else-if="b.kind === 'thought'" class="block thought">
+          <div class="tool-line" @click="toggle(i)">
+            <span class="tool-title">thinking</span>
+            <span class="tool-summary">{{ (b.text ?? "").slice(0, 160) }}</span>
+            <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
+          </div>
+          <div v-if="!isCollapsed(i)" class="body thought-body">{{ b.text }}</div>
+        </div>
+        <!-- Plans -->
+        <div v-else-if="b.kind === 'plan'" class="block">
+          <div class="who">plan</div>
+          <div class="body">
+            <div v-for="(entry, j) in b.entries" :key="j">[{{ entry[1] }}] {{ entry[0] }}</div>
           </div>
         </div>
-        <div class="body" v-else-if="b.kind === 'usage'" v-show="false"></div>
-        <div class="body" v-else-if="b.kind === 'turn_end'" v-show="false"></div>
-        <div class="body" v-else>{{ b.text ?? b.payload ?? "" }}</div>
-      </div>
+        <!-- User / agent messages -->
+        <div
+          v-else-if="b.kind === 'user_message' || b.kind === 'agent_message'"
+          class="block"
+          :class="{ user: b.kind === 'user_message', agent: b.kind === 'agent_message' }"
+        >
+          <div class="who">{{ b.kind === "user_message" ? "you" : session.agent_kind }}</div>
+          <div class="body">{{ b.text }}</div>
+        </div>
+        <!-- usage / turn_end / unknown: no visual block -->
+      </template>
       <div v-if="blocks.length === 0" style="color: var(--text-dim)">
         No conversation yet.
       </div>

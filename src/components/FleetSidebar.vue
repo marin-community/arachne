@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { ref, computed } from "vue";
 import type { SessionSummary } from "../App.vue";
 
 const props = defineProps<{
@@ -16,16 +16,56 @@ const emit = defineEmits<{
 const task = ref("");
 const repo = ref("marin-community/arachne");
 
-function attention(s: SessionSummary): "ok" | "attention" | "blocked" {
-  const tag = s.branch.tags.find((t) => t.key === "attention");
-  return (tag?.value as any) ?? "ok";
-}
-
 function submit() {
   const t = task.value.trim();
   if (!t) return;
   emit("launch", t, repo.value.trim());
   task.value = "";
+}
+
+// Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
+// (agent self-report) and `triage` (outside assessment) carry values
+// `attention` | `blocked`; absence is the calm/default state. `idle` is a
+// quiet resting mark. Prose status lives on branch.description.
+type Attention = { level: "attention" | "blocked"; source: string } | null;
+
+function loudTag(s: SessionSummary): Attention {
+  for (const key of ["attention", "triage"]) {
+    const tag = s.branch.tags.find((t) => t.key === key);
+    if (tag && (tag.value === "attention" || tag.value === "blocked")) {
+      return { level: tag.value, source: tag.set_by };
+    }
+  }
+  return null;
+}
+
+const sorted = computed(() =>
+  [...props.fleet].sort((a, b) =>
+    a.last_activity_at < b.last_activity_at ? 1 : -1
+  )
+);
+
+function subtitle(s: SessionSummary): string {
+  return s.branch.description || s.branch.title || "—";
+}
+
+function statusClass(s: SessionSummary): string {
+  if (s.status === "orphaned") return "orphaned";
+  if (s.status === "running") {
+    const loud = loudTag(s);
+    if (loud?.level === "blocked") return "error";
+    if (loud?.level === "attention") return "attention";
+    return "running";
+  }
+  return "done";
+}
+
+function statusLabel(s: SessionSummary): string {
+  if (s.status === "orphaned") return "orphan";
+  const loud = loudTag(s);
+  if (loud) return loud.level;
+  if (s.status === "running") return "run";
+  return s.status;
 }
 </script>
 
@@ -42,7 +82,7 @@ function submit() {
     </div>
     <div class="session-list">
       <div
-        v-for="s in fleet"
+        v-for="s in sorted"
         :key="s.id"
         class="session-item"
         :class="{ selected: s.id === selectedId }"
@@ -50,14 +90,10 @@ function submit() {
       >
         <div class="row1">
           <span class="name">{{ s.branch.name || s.id }}</span>
-          <span v-if="s.status === 'running'" class="badge running">run</span>
-          <span v-else-if="s.status === 'done'" class="badge done">done</span>
-          <span v-else-if="s.status === 'error'" class="badge error">error</span>
-          <span v-else-if="s.status === 'orphaned'" class="badge orphaned">orphan</span>
-          <span v-if="attention(s) === 'attention'" class="badge attention">attn</span>
-          <span v-else-if="attention(s) === 'blocked'" class="badge blocked">blocked</span>
+          <span class="badge" :class="statusClass(s)">{{ statusLabel(s) }}</span>
+          <span v-if="s.branch.tags.some((t) => t.key === 'idle')" class="badge idle">idle</span>
         </div>
-        <div class="title">{{ s.branch.title || s.branch.goal || "—" }}</div>
+        <div class="title">{{ subtitle(s) }}</div>
       </div>
       <div v-if="fleet.length === 0" class="session-item" style="color: var(--text-dim)">
         No sessions yet — launch one above.

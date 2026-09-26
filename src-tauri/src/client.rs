@@ -48,8 +48,10 @@ impl LoomClient {
     pub fn new(base_url: &str, token: Option<String>) -> Result<Self, LoomError> {
         let base = reqwest::Url::parse(base_url)
             .map_err(|e| LoomError::Connection(format!("invalid base URL {base_url:?}: {e}")))?;
+        // NOTE: no client-wide timeout. A `timeout()` applies per-request
+        // including streaming bodies, which would kill the SSE connection
+        // every 60s. Per-request timeouts for REST calls are set below.
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
             .build()
             .map_err(|e| LoomError::Connection(format!("building HTTP client: {e}")))?;
         Ok(Self { http, base, token })
@@ -70,6 +72,7 @@ impl LoomClient {
         }
         let resp = req
             .json(body)
+            .timeout(Duration::from_secs(60))
             .send()
             .await
             .map_err(|e| LoomError::Connection(e.to_string()))?;
@@ -107,6 +110,7 @@ impl LoomClient {
             req = req.bearer_auth(token);
         }
         let resp = req
+            .timeout(Duration::from_secs(10))
             .send()
             .await
             .map_err(|e| LoomError::Connection(e.to_string()))?;

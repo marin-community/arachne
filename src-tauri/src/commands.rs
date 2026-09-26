@@ -3,18 +3,32 @@
 //! All state lives in `tauri::State<LoomState>` — the client, the SSE
 //! subscriptions, and the open-session id. The UI drives everything through
 //! these commands plus the `loom://*` emits for pushed frames.
+//!
+//! Subscription lifecycle is the part worth being careful with: each open
+//! session owns a chat forwarder, and a connect owns the fleet poller. Both
+//! run in spawned tasks that watch a cancellation token; `open_session`
+//! cancels the previous forwarder before starting the new one, and
+//! `connect` cancels the old poller. Without that, every session switch or
+//! reconnect leaks another SSE connection (and another duplicate event
+//! stream into the webview) — the browser's connection cap is exactly why
+//! loom multiplexes, and Arachne must not undo it from the other end.
 
 use std::sync::Arc;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
+use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
-use crate::loom::{EventFrame, SessionSummaryView, SessionView};
+use crate::loom::{SessionSummaryView, SessionView};
 
 #[derive(Default)]
 pub struct LoomState {
     pub client: tokio::sync::RwLock<Option<Arc<LoomClient>>>,
+    /// Cancels the current fleet poller so a reconnect can replace it.
+    fleet_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
+    /// Cancels the open session's chat forwarder so a switch can replace it.
+    chat_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -57,15 +71,30 @@ pub async fn connect(
 ) -> Result<(), UiError> {
     let client = Arc::new(LoomClient::new(&base_url, token)?);
     client.health().await?;
-    let poller_client = client.clone();
-    *state.client.write().await = Some(client);
-    spawn_fleet_poller(app.clone(), poller_client);
+
+    // Replace any previous fleet poller (reconnect to a different loom).
+    if let Some(old) = state.fleet_cancel.write().await.take() {
+        old.cancel();
+    }
+    // A reconnect invalidates the open session's chat forwarder too — its
+    // subscriptions belong to the old client.
+    if let Some(old) = state.chat_cancel.write().await.take() {
+        old.cancel();
+    }
+    *state.client.write().await = Some(client.clone());
+
+    let cancel = CancellationToken::new();
+    *state.fleet_cancel.write().await = Some(cancel.clone());
+    spawn_fleet_poller(app, client, cancel);
     Ok(())
 }
 
-fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>) {
+fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: CancellationToken) {
     tauri::async_runtime::spawn(async move {
         loop {
+            if cancel.is_cancelled() {
+                return;
+            }
             match client.list_sessions().await {
                 Ok(sessions) => {
                     let _ = app.emit("loom://fleet", &sessions);
@@ -75,25 +104,42 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>) {
                 }
             }
             // Subscribe to layout SSE; each event means the fleet changed.
-            if let Ok(mut rx) = client.subscribe(&["layout".to_string()]).await {
-                while let Some(_frame) = rx.recv().await {
-                    match client.list_sessions().await {
-                        Ok(sessions) => {
-                            let _ = app.emit("loom://fleet", &sessions);
-                        }
-                        Err(e) => {
-                            let _ = app.emit("loom://error", UiError::from(e));
+            // The subscription's own task ends when cancelled (receiver
+            // dropped) or the stream drops; poller then pauses and retries.
+            let sub_cancel = cancel.clone();
+            let topics = vec!["layout".to_string()];
+            let subscribe = client.subscribe(&topics);
+            match subscribe.await {
+                Ok(mut rx) => loop {
+                    tokio::select! {
+                        _ = sub_cancel.cancelled() => return,
+                        frame = rx.recv() => {
+                            let Some(_frame) = frame else { break };
+                            match client.list_sessions().await {
+                                Ok(sessions) => {
+                                    let _ = app.emit("loom://fleet", &sessions);
+                                }
+                                Err(e) => {
+                                    let _ = app.emit("loom://error", UiError::from(e));
+                                }
+                            }
                         }
                     }
+                },
+                Err(e) => {
+                    let _ = app.emit("loom://error", UiError::from(e));
                 }
             }
-            // Subscription dropped (loom restarted): brief pause, reconnect.
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            // Subscription dropped (loom restarted): pause, retry, unless cancelled.
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
         }
     });
 }
 
-/// Open a session: fetch its view, emit it, and (in the background) start the
+/// Open a session: fetch its view, emit it, and start (replacing any previous)
 /// chat SSE forwarder for this session.
 #[tauri::command]
 pub async fn open_session(
@@ -103,16 +149,46 @@ pub async fn open_session(
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let view = client.get_session(&id).await?;
-    spawn_chat_forwarder(app, client, id);
+
+    // Cancel the previous session's forwarder: its frames would interleave
+    // with the new session's otherwise.
+    if let Some(old) = state.chat_cancel.write().await.take() {
+        old.cancel();
+    }
+    let cancel = CancellationToken::new();
+    *state.chat_cancel.write().await = Some(cancel.clone());
+    spawn_chat_forwarder(app, client, id, cancel);
     Ok(view)
 }
 
-fn spawn_chat_forwarder(app: AppHandle, client: Arc<LoomClient>, id: String) {
+fn spawn_chat_forwarder(
+    app: AppHandle,
+    client: Arc<LoomClient>,
+    id: String,
+    cancel: CancellationToken,
+) {
     tauri::async_runtime::spawn(async move {
         let topics = vec![format!("chat:{id}"), format!("session:{id}")];
-        if let Ok(mut rx) = client.subscribe(&topics).await {
-            while let Some(frame) = rx.recv().await {
-                let _ = app.emit("loom://chat-event", &frame);
+        // Reconnect loop: the stream ends (loom restart) → brief pause →
+        // resubscribe. Cancelled when another session opens.
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            if let Ok(mut rx) = client.subscribe(&topics).await {
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        frame = rx.recv() => {
+                            let Some(frame) = frame else { break };
+                            let _ = app.emit("loom://chat-event", &frame);
+                        }
+                    }
+                }
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
     });
@@ -174,6 +250,21 @@ pub async fn launch_session(
     Ok(view)
 }
 
+/// Archive a session: tear down its terminal + worktree, keep the branch.
+#[tauri::command]
+pub async fn archive_session(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    id: String,
+) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    client.archive(&id).await?;
+    // The fleet poller's layout event will refresh the list; give the UI an
+    // immediate signal that this specific session is gone.
+    let _ = app.emit("loom://archived", &id);
+    Ok(())
+}
+
 /// Open the session's worktree in Zed.
 #[tauri::command]
 pub async fn open_in_zed(work_dir: String) -> Result<(), UiError> {
@@ -200,7 +291,3 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<Vec<SessionSum
     let client = state_client(&state).await?;
     client.list_sessions().await.map_err(Into::into)
 }
-
-// Keep EventFrame referenced so its import is used.
-#[allow(dead_code)]
-fn _anchor(_: Option<EventFrame>) {}

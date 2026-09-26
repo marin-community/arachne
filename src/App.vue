@@ -4,8 +4,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FleetSidebar from "./components/FleetSidebar.vue";
 import ThreadView from "./components/ThreadView.vue";
+import SettingsSheet from "./components/SettingsSheet.vue";
 
-// --- Types mirroring src-tauri/src/loom.rs -------------------------------
+// --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
 interface TagView { key: string; note: string; value: string; set_at: string; set_by: string }
 interface BranchSummary {
@@ -33,16 +34,18 @@ export interface SessionView {
 
 // --- State ----------------------------------------------------------------
 
+const DEFAULT_URL = "http://127.0.0.1:7878";
 const connected = ref(false);
 const connError = ref<string | null>(null);
 const launching = ref(false);
 const fleet = ref<SessionSummary[]>([]);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
+const showSettings = ref(false);
+const loomUrl = ref(localStorage.getItem("loomUrl") ?? DEFAULT_URL);
+const loomToken = ref(localStorage.getItem("loomToken") ?? "");
 
-// --- Boot: connect to the local loom --------------------------------------
-
-const LOOM_URL = "http://127.0.0.1:7878";
+// --- Boot: connect to loom (URL from settings) ------------------------------
 
 onMounted(async () => {
   // Register listeners BEFORE connecting, so the initial fleet snapshot
@@ -55,7 +58,6 @@ onMounted(async () => {
     selectedId.value = view.id;
     selectedView.value = view;
   });
-  // Transient API errors (a session mid-archive, etc.) surface in the header.
   await listen("loom://error", (event) => {
     const err = event.payload as { message: string; unreachable: boolean };
     if (err.unreachable) {
@@ -64,14 +66,28 @@ onMounted(async () => {
     }
   });
 
+  await connect(loomUrl.value, loomToken.value || null);
+});
+
+async function connect(url: string, token: string | null) {
   try {
-    await invoke("connect", { baseUrl: LOOM_URL, token: null });
+    await invoke("connect", { baseUrl: url, token });
     connected.value = true;
     connError.value = null;
   } catch (e: any) {
+    connected.value = false;
     connError.value = e?.message ?? String(e);
   }
-});
+}
+
+function saveSettings(url: string, token: string) {
+  loomUrl.value = url;
+  loomToken.value = token;
+  localStorage.setItem("loomUrl", url);
+  localStorage.setItem("loomToken", token);
+  showSettings.value = false;
+  connect(url, token || null);
+}
 
 // --- Actions ----------------------------------------------------------------
 
@@ -97,6 +113,14 @@ async function launchTask(task: string, repo: string) {
   }
 }
 
+function onArchived(id: string) {
+  if (selectedId.value === id) {
+    selectedId.value = null;
+    selectedView.value = null;
+  }
+  fleet.value = fleet.value.filter((s) => s.id !== id);
+}
+
 const connClass = computed(() =>
   connected.value ? "ok" : connError.value ? "bad" : "warn"
 );
@@ -106,9 +130,9 @@ const connClass = computed(() =>
   <div class="app" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
       <span class="title">🕸 Arachne</span>
-      <span class="conn">
+      <span class="conn" :class="{ clickable: true }" @click="showSettings = true" title="Connection settings">
         <span class="dot" :class="connClass"></span>
-        {{ connected ? (connError ? connError : "loom · 127.0.0.1:7878") : connError ?? "connecting…" }}
+        {{ connected ? (connError ? connError : `loom · ${loomUrl.replace("http://", "")}`) : connError ?? "connecting…" }}
       </span>
     </header>
     <FleetSidebar
@@ -123,6 +147,7 @@ const connClass = computed(() =>
       :key="selectedId"
       :session="selectedView"
       @error="connError = $event"
+      @archive="onArchived"
     />
     <div v-else class="main">
       <div class="empty">
@@ -130,5 +155,13 @@ const connClass = computed(() =>
         <div>Select a session, or launch a new task from the sidebar.</div>
       </div>
     </div>
+    <SettingsSheet
+      v-if="showSettings"
+      :url="loomUrl"
+      :token="loomToken"
+      :connected="connected"
+      @close="showSettings = false"
+      @save="saveSettings"
+    />
   </div>
 </template>
