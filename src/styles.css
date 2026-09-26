@@ -283,6 +283,10 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 }
 .session-item.child .name { font-size: 12px; }
 .session-item.grandchild { margin-left: 26px; }
+.session-item.archived {
+  opacity: 0.55;
+}
+.session-item.archived .badge { color: var(--text-dim); }
 .badge.dim { color: var(--text-dim); background: var(--bg-hover); }
 .new-stream-btn {
   background: none;

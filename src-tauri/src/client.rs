@@ -127,9 +127,17 @@ impl LoomClient {
     }
 
     /// `sessions.summary.list` — the fleet.
+    ///
+    /// `archived: true` so finished children still show (dimmed) under their
+    /// leader — a workstream's history is part of its identity, and the UI
+    /// filters placement rows anyway. Without it, archiving a child erases
+    /// the leader's workstream shape.
     pub async fn list_sessions(&self) -> Result<Vec<crate::loom::SessionSummaryView>, LoomError> {
-        self.op("/api/sessions/summary/list", &serde_json::json!({}))
-            .await
+        self.op(
+            "/api/sessions/summary/list",
+            &serde_json::json!({ "archived": true }),
+        )
+        .await
     }
 
     /// `session_layout.get` — workstream spaces/groups.

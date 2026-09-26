@@ -96,13 +96,38 @@ interface Lane {
 }
 
 function buildLanes(): Lane[] {
+  // Archived children stay in the tree (dimmed) — a workstream's finished
+  // work is part of its shape; only archived ROOTS are dropped from the
+  // lanes. Without this, archiving every child makes a leader look like a
+  // plain chat.
   const live = props.fleet.filter((s) => s.status !== "archived");
-  const byId = new Map(live.map((s) => [s.id, s]));
+  const byId = new Map<string, SessionSummary>();
+  for (const s of props.fleet) {
+    if (s.status !== "archived") byId.set(s.id, s);
+    // An archived child is kept only if its parent is visible.
+  }
+  const childIdsWithVisibleParent = new Set<string>();
+  for (const s of props.fleet) {
+    if (s.status === "archived") {
+      const parent = s.parent_session_id
+        ? byId.get(s.parent_session_id)
+        : s.parent_id
+          ? [...byId.values()].find((c) => c.branch.id === s.parent_id)
+          : undefined;
+      if (parent && parent.id !== s.id) childIdsWithVisibleParent.add(s.id);
+    }
+  }
   const nodes = new Map<string, TreeNode>();
   for (const s of live) nodes.set(s.id, { session: s, children: [] });
+  for (const id of childIdsWithVisibleParent) {
+    const s = props.fleet.find((x) => x.id === id)!;
+    nodes.set(id, { session: s, children: [] });
+  }
 
   const roots: TreeNode[] = [];
+  const seen = new Set<string>();
   for (const s of live) {
+    seen.add(s.id);
     const node = nodes.get(s.id)!;
     const parentKey = s.parent_session_id
       ? byId.get(s.parent_session_id)
@@ -114,6 +139,19 @@ function buildLanes(): Lane[] {
     } else {
       roots.push(node);
     }
+  }
+  for (const id of childIdsWithVisibleParent) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const node = nodes.get(id)!;
+    const s = node.session;
+    const parentKey = s.parent_session_id
+      ? byId.get(s.parent_session_id)
+      : s.parent_id
+        ? [...byId.values()].find((c) => c.branch.id === s.parent_id)
+          : undefined;
+    // parentId was pre-checked when building childIdsWithVisibleParent.
+    if (parentKey) nodes.get(parentKey.id)!.children.push(node);
   }
   const byActivity = (a: TreeNode, b: TreeNode) =>
     a.session.last_activity_at < b.session.last_activity_at
@@ -328,6 +366,7 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
             selected: row.session.id === selectedId,
             workstream: row.depth === 0,
             child: row.depth > 0,
+            archived: row.session.status === 'archived',
             'drop-hint':
               row.depth === 0 && dropTarget === `ws-${row.session.id}`,
           }"
@@ -363,7 +402,7 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
               row.session.branch.name || row.session.id
             }}</span>
             <span class="badge" :class="statusClass(row.session)">{{
-              statusLabel(row.session)
+              row.session.status === "archived" ? "done" : statusLabel(row.session)
             }}</span>
             <span
               v-if="row.childCount > 0"

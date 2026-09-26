@@ -262,7 +262,12 @@ function onArchived(id: string) {
     selectedId.value = null;
     selectedView.value = null;
   }
-  fleet.value = fleet.value.filter((s) => s.id !== id);
+  // Keep the archived row in the fleet: the sidebar shows archived children
+  // dimmed under their leader, so a finished worker stays visible as part of
+  // its workstream's shape. The next fleet snapshot re-syncs status.
+  for (const s of fleet.value) {
+    if (s.id === id) s.status = "archived";
+  }
 }
 
 const connClass = computed(() =>
