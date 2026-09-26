@@ -121,11 +121,6 @@ onMounted(async () => {
     fleet.value = event.payload.sessions;
     layout.value = event.payload.layout;
   });
-  await listen("loom://launched", (event) => {
-    const view = event.payload as SessionView;
-    selectedId.value = view.id;
-    selectedView.value = view;
-  });
   await listen("loom://error", (event) => {
     const err = event.payload as { message: string; unreachable: boolean };
     if (err.unreachable) {
@@ -177,8 +172,10 @@ async function launchTask(task: string, repo: string) {
   launching.value = true;
   try {
     const view = await invoke<SessionView>("launch_session", { repo, task });
-    selectedId.value = view.id;
-    selectedView.value = view;
+    // A new workstream activates immediately: route through selectSession
+    // so open_session runs (chat forwarder + cursor reset + fresh view),
+    // not just the launch stub — otherwise the thread never streams live.
+    await selectSession(view.id);
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   } finally {

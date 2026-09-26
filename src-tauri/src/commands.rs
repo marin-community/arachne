@@ -295,7 +295,6 @@ pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), Ui
 /// and nesting under the parent in the sidebar.
 #[tauri::command]
 pub async fn launch_session(
-    app: AppHandle,
     state: State<'_, LoomState>,
     repo: String,
     task: String,
@@ -310,7 +309,6 @@ pub async fn launch_session(
         }
         _ => None,
     };
-    let is_delegation = parent_branch.is_some();
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
@@ -320,12 +318,10 @@ pub async fn launch_session(
             ..Default::default()
         })
         .await?;
-    // Only dashboard-originated launches yank selection to the new session;
-    // delegations keep the user on the parent thread (the child appears
-    // nested in the sidebar instead).
-    if !is_delegation {
-        let _ = app.emit("loom://launched", &view);
-    }
+    // Selection/activation is the frontend's job: it routes the new
+    // session through open_session (chat forwarder + live streaming) via
+    // the returned view. Delegations stay on the parent thread — the child
+    // just appears nested in the sidebar.
     Ok(view)
 }
 
@@ -333,7 +329,6 @@ pub async fn launch_session(
 /// parent, linked via `parent_branch` so it nests + inherits placement.
 #[tauri::command]
 pub async fn delegate_task(
-    app: AppHandle,
     state: State<'_, LoomState>,
     parent_id: String,
     task: String,
@@ -354,7 +349,7 @@ pub async fn delegate_task(
     } else {
         "marin-community/arachne".to_string()
     };
-    launch_session(app, state, repo, task, Some(parent_id)).await
+    launch_session(state, repo, task, Some(parent_id)).await
 }
 
 /// Archive a session: tear down its terminal + worktree, keep the branch.
