@@ -39,9 +39,16 @@ function loudTag(s: SessionSummary): Attention {
   return null;
 }
 
+// Newest activity first; ties broken by id so the order never flickers
+// between renders (Array.prototype.sort is stable, but identical
+// last_activity_at values otherwise depend on input order).
 const sorted = computed(() =>
   [...props.fleet].sort((a, b) =>
-    a.last_activity_at < b.last_activity_at ? 1 : -1
+    a.last_activity_at === b.last_activity_at
+      ? (a.id < b.id ? 1 : -1)
+      : a.last_activity_at < b.last_activity_at
+        ? 1
+        : -1
   )
 );
 

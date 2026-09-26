@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionView } from "../App.vue";
@@ -123,6 +123,23 @@ onMounted(async () => {
     })
   );
 });
+
+// Defense in depth: the parent keys this component by session id so a
+// different session should always remount, but if the id ever changes under
+// a mounted instance (state desync, future refactor), refetch rather than
+// show the wrong thread.
+watch(
+  () => props.session.id,
+  async (newId, oldId) => {
+    if (newId !== oldId) {
+      collapsed.value = {};
+      hasOlder.value = true;
+      blocks.value = [];
+      await reload();
+      scrollToBottom();
+    }
+  }
+);
 
 onUnmounted(() => {
   unlisteners.forEach((u) => u());

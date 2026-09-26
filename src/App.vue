@@ -93,6 +93,11 @@ function saveSettings(url: string, token: string) {
 
 async function selectSession(id: string) {
   selectedId.value = id;
+  // Drop the stale view immediately: ThreadView is keyed by selectedId and
+  // remounts the moment it changes — if the old view were still here, its
+  // onMounted would fetch the PREVIOUS session's chat, and nothing would
+  // re-run when the fresh view arrives (clicked row N, saw row N±1's thread).
+  selectedView.value = null;
   try {
     selectedView.value = await invoke<SessionView>("open_session", { id });
   } catch (e: any) {
@@ -149,6 +154,9 @@ const connClass = computed(() =>
       @error="connError = $event"
       @archive="onArchived"
     />
+    <div v-else-if="selectedId" class="main">
+      <div class="empty"><div class="big">🕸</div><div>opening session…</div></div>
+    </div>
     <div v-else class="main">
       <div class="empty">
         <div class="big">🕸</div>
