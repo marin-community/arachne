@@ -22,7 +22,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
 use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
-use crate::resources::{ResourceDraft, ResourceKind, ResourceMention, TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME};
+use crate::resources::{
+    ResourceDraft, ResourceKind, ResourceMention, TodoItem, TodoListView, TodoTopicView,
+    TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME, TODOS_NAME,
+};
 
 #[derive(Default)]
 pub struct LoomState {
@@ -110,15 +113,10 @@ impl From<LoomError> for UiError {
 }
 
 async fn state_client(state: &LoomState) -> Result<Arc<LoomClient>, UiError> {
-    state
-        .client
-        .read()
-        .await
-        .clone()
-        .ok_or_else(|| UiError {
-            message: "not connected to loom".into(),
-            unreachable: true,
-        })
+    state.client.read().await.clone().ok_or_else(|| UiError {
+        message: "not connected to loom".into(),
+        unreachable: true,
+    })
 }
 
 /// Persist the loom bearer token to the macOS Keychain. An empty token
@@ -205,13 +203,23 @@ pub async fn handoff_session(
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     client
-        .handoff_session(&id, &profile, agent.as_deref(), model.as_deref(), effort.as_deref())
+        .handoff_session(
+            &id,
+            &profile,
+            agent.as_deref(),
+            model.as_deref(),
+            effort.as_deref(),
+        )
         .await
         .map_err(Into::into)
 }
 
 /// Fetch summaries + layout together and push them as a fleet snapshot.
-async fn emit_fleet(app: &AppHandle, client: &Arc<LoomClient>, mut sessions: Vec<SessionSummaryView>) {
+async fn emit_fleet(
+    app: &AppHandle,
+    client: &Arc<LoomClient>,
+    mut sessions: Vec<SessionSummaryView>,
+) {
     let layout = match client.session_layout().await {
         Ok(l) => l,
         Err(e) => {
@@ -220,10 +228,24 @@ async fn emit_fleet(app: &AppHandle, client: &Arc<LoomClient>, mut sessions: Vec
         }
     };
     sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-    let _ = app.emit(
-        "loom://fleet",
-        &FleetSnapshot { sessions, layout },
-    );
+    let _ = app.emit("loom://fleet", &FleetSnapshot { sessions, layout });
+}
+
+/// `emit_fleet` with a caller-supplied layout (a mutation command already
+/// holds the fresh one) and a best-effort session list fetch. Pushing a
+/// snapshot for the mutation's own effect must never fail the command that
+/// produced it — loom's `layout` event also publishes it.
+async fn emit_fleet_with(
+    app: &AppHandle,
+    client: &Arc<LoomClient>,
+    layout: crate::loom::SessionLayoutView,
+) {
+    let mut sessions = match client.list_sessions().await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+    let _ = app.emit("loom://fleet", &FleetSnapshot { sessions, layout });
 }
 
 fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: CancellationToken) {
@@ -295,7 +317,11 @@ fn fleet_topics(sessions: &[SessionSummaryView]) -> Vec<String> {
         .collect();
     live.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
     let mut topics = vec!["layout".to_owned()];
-    topics.extend(live.into_iter().take(63).map(|session| format!("session:{}", session.id)));
+    topics.extend(
+        live.into_iter()
+            .take(63)
+            .map(|session| format!("session:{}", session.id)),
+    );
     topics
 }
 
@@ -312,10 +338,14 @@ pub async fn open_session(
     let view = match resume_queued_on_open(&client, &id, original.clone()).await {
         Ok(view) => view,
         Err(error) => {
-            let _ = app.emit("loom://error", UiError {
-                message: "Could not resume the queued message. Sending a message will retry.".into(),
-                unreachable: error.is_unreachable(),
-            });
+            let _ = app.emit(
+                "loom://error",
+                UiError {
+                    message: "Could not resume the queued message. Sending a message will retry."
+                        .into(),
+                    unreachable: error.is_unreachable(),
+                },
+            );
             client.get_session(&id).await.unwrap_or(original)
         }
     };
@@ -332,24 +362,38 @@ pub async fn open_session(
     Ok(view)
 }
 
-async fn resume_queued_on_open(client: &LoomClient, id: &str, mut view: SessionView) -> Result<SessionView, LoomError> {
+async fn resume_queued_on_open(
+    client: &LoomClient,
+    id: &str,
+    mut view: SessionView,
+) -> Result<SessionView, LoomError> {
     if view.status != "orphaned" || view.protocol != "acp" {
         return Ok(view);
     }
     let chat = client.session_chat(id, None).await?;
-    if !chat.pending_prompt.as_deref().is_some_and(|prompt| !prompt.trim().is_empty()) {
+    if !chat
+        .pending_prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
         return Ok(view);
     }
     view = client.resume_if_orphaned(id).await?;
     let chat = client.session_chat(id, None).await?;
     if chat.live_turn.is_none()
-        && chat.pending_prompt.as_deref().is_some_and(|prompt| !prompt.trim().is_empty())
+        && chat
+            .pending_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty())
     {
         if let Err(error) = client.send_queued_prompt(id).await {
             // A resumed turn can drain the queue between our read and send.
             let latest = client.session_chat(id, None).await?;
             if latest.live_turn.is_none()
-                && latest.pending_prompt.as_deref().is_some_and(|prompt| !prompt.trim().is_empty())
+                && latest
+                    .pending_prompt
+                    .as_deref()
+                    .is_some_and(|prompt| !prompt.trim().is_empty())
             {
                 return Err(error);
             }
@@ -386,19 +430,29 @@ mod queued_recovery_tests {
                 ("/api/sessions/get", base),
                 ("/api/sessions/adopt", running.clone()),
                 ("/api/sessions/chat", queued),
-                ("/api/sessions/prompt/create", serde_json::json!({"queued":false,"turn":1})),
+                (
+                    "/api/sessions/prompt/create",
+                    serde_json::json!({"queued":false,"turn":1}),
+                ),
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 2048];
                 let count = socket.read(&mut request).await.unwrap();
-                assert!(String::from_utf8_lossy(&request[..count]).starts_with(&format!("POST {path} ")));
+                assert!(String::from_utf8_lossy(&request[..count])
+                    .starts_with(&format!("POST {path} ")));
                 let body = body.to_string();
                 let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
         });
         let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
-        assert_eq!(resume_queued_on_open(&client, "session", view).await.unwrap().status, "running");
+        assert_eq!(
+            resume_queued_on_open(&client, "session", view)
+                .await
+                .unwrap()
+                .status,
+            "running"
+        );
         server.await.unwrap();
     }
 }
@@ -493,8 +547,15 @@ pub async fn send_input(
     let mut prompt = text;
     let ids = resource_ids.unwrap_or_default();
     if !ids.is_empty() {
-        let topic_id = topic_id.ok_or_else(|| resource_error("resource mentions require a topic"))?;
-        let mentions = ids.into_iter().map(|resource_id| ResourceMention { topic_id: topic_id.clone(), resource_id }).collect();
+        let topic_id =
+            topic_id.ok_or_else(|| resource_error("resource mentions require a topic"))?;
+        let mentions = ids
+            .into_iter()
+            .map(|resource_id| ResourceMention {
+                topic_id: topic_id.clone(),
+                resource_id,
+            })
+            .collect();
         prompt.push_str(&resource_context(&client, mentions).await?);
     }
     // An orphan is a recoverable runtime gap, not a different kind of user
@@ -506,7 +567,9 @@ pub async fn send_input(
     }
     if !files.is_empty() {
         prompt.push_str("\n\nAttached files in this session's Scratch directory:\n");
-        for path in &files { prompt.push_str(&format!("- {path}\n")); }
+        for path in &files {
+            prompt.push_str(&format!("- {path}\n"));
+        }
     }
     if view.protocol == "terminal" {
         client.send_text(&id, &prompt, true).await?;
@@ -516,23 +579,45 @@ pub async fn send_input(
     Ok(())
 }
 
-fn decode_attachments(uploads: Vec<crate::loom::ScratchUpload>) -> Result<Vec<(String, Vec<u8>)>, UiError> {
-    if uploads.len() > 20 { return Err(resource_error("attach at most 20 files")); }
+fn decode_attachments(
+    uploads: Vec<crate::loom::ScratchUpload>,
+) -> Result<Vec<(String, Vec<u8>)>, UiError> {
+    if uploads.len() > 20 {
+        return Err(resource_error("attach at most 20 files"));
+    }
     let mut total = 0usize;
     let mut names = std::collections::HashSet::new();
     let mut decoded = Vec::new();
     for upload in uploads {
         let name = &upload.name;
-        if name.is_empty() || name.trim() != name || name == "." || name == ".."
-            || name.len() > 240 || name.contains(['/', '\\']) || name.chars().any(char::is_control)
-            || name.eq_ignore_ascii_case(".gitignore") || !names.insert(name.clone()) {
-            return Err(resource_error(format!("invalid or duplicate attachment name: {name}")));
+        if name.is_empty()
+            || name.trim() != name
+            || name == "."
+            || name == ".."
+            || name.len() > 240
+            || name.contains(['/', '\\'])
+            || name.chars().any(char::is_control)
+            || name.eq_ignore_ascii_case(".gitignore")
+            || !names.insert(name.clone())
+        {
+            return Err(resource_error(format!(
+                "invalid or duplicate attachment name: {name}"
+            )));
         }
-        let bytes = base64::engine::general_purpose::STANDARD.decode(&upload.content_base64)
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&upload.content_base64)
             .map_err(|e| resource_error(format!("decoding attachment {name}: {e}")))?;
-        if bytes.len() > 25 * 1024 * 1024 { return Err(resource_error(format!("{name} exceeds Loom's 25 MiB file limit"))); }
+        if bytes.len() > 25 * 1024 * 1024 {
+            return Err(resource_error(format!(
+                "{name} exceeds Loom's 25 MiB file limit"
+            )));
+        }
         total += bytes.len();
-        if total > 50 * 1024 * 1024 { return Err(resource_error("attachments exceed Loom's 50 MiB total limit")); }
+        if total > 50 * 1024 * 1024 {
+            return Err(resource_error(
+                "attachments exceed Loom's 50 MiB total limit",
+            ));
+        }
         decoded.push((name.clone(), bytes));
     }
     Ok(decoded)
@@ -545,9 +630,18 @@ mod attachment_tests {
 
     #[test]
     fn decodes_binary_and_rejects_unsafe_names_before_upload() {
-        let upload = ScratchUpload { name: "image.png".into(), content_base64: "AAECA/8=".into() };
-        assert_eq!(decode_attachments(vec![upload]).unwrap()[0].1, [0, 1, 2, 3, 255]);
-        let bad = ScratchUpload { name: "../image.png".into(), content_base64: "AA==".into() };
+        let upload = ScratchUpload {
+            name: "image.png".into(),
+            content_base64: "AAECA/8=".into(),
+        };
+        assert_eq!(
+            decode_attachments(vec![upload]).unwrap()[0].1,
+            [0, 1, 2, 3, 255]
+        );
+        let bad = ScratchUpload {
+            name: "../image.png".into(),
+            content_base64: "AA==".into(),
+        };
         assert!(decode_attachments(vec![bad]).is_err());
     }
 }
@@ -643,6 +737,9 @@ pub async fn launch_session(
     agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    // Project the thread was launched preselected to — the layout group
+    // to file the new session into.
+    project: Option<crate::loom::ProjectRef>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent_branch = match parent_id {
@@ -669,9 +766,14 @@ pub async fn launch_session(
     let attachments = attachments.unwrap_or_default();
     // Reject malformed uploads before Loom creates a branch/session. Loom
     // validates the same limits again when it writes Scratch on its host.
-    let launch_bytes: usize = decode_attachments(attachments.clone())?.iter().map(|(_, bytes)| bytes.len()).sum();
+    let launch_bytes: usize = decode_attachments(attachments.clone())?
+        .iter()
+        .map(|(_, bytes)| bytes.len())
+        .sum();
     if launch_bytes > 45 * 1024 * 1024 {
-        return Err(resource_error("launch attachments exceed the 45 MiB JSON request limit"));
+        return Err(resource_error(
+            "launch attachments exceed the 45 MiB JSON request limit",
+        ));
     }
     let mut goal = task;
     if let Some(mentions) = mentions {
@@ -679,7 +781,9 @@ pub async fn launch_session(
     }
     if !attachments.is_empty() {
         goal.push_str("\n\nAttached files in Scratch:\n");
-        for file in &attachments { goal.push_str(&format!("- scratch/{}\n", file.name)); }
+        for file in &attachments {
+            goal.push_str(&format!("- scratch/{}\n", file.name));
+        }
     }
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
@@ -712,6 +816,15 @@ pub async fn launch_session(
     // parameter for callers that explicitly want an unmarked scratch thread.
     if parent_branch.is_none() && !one_off.unwrap_or(false) {
         let _ = client.set_tag(&view.id, "topic", "true").await;
+    }
+    // File the new topic into its project when one was preselected (a
+    // project is a placement group — filing only, never execution state).
+    if let Some(group_id) = project
+        .as_ref()
+        .and_then(|p| p.id.as_deref())
+        .filter(|id| !id.is_empty())
+    {
+        let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
     }
     // Loom does not publish a fleet event for description updates. Publish
     // the final launch state so the new topic card has its body immediately.
@@ -921,6 +1034,33 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
     Ok(FleetSnapshot { sessions, layout })
 }
 
+/// Create a project (a placement group in a space). Projects are filing
+/// only — a group with no execution state (docs/design.md "User model").
+#[tauri::command]
+pub async fn create_group(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    space_id: String,
+    name: String,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(UiError {
+            message: "project name cannot be empty".into(),
+            unreachable: false,
+        });
+    }
+    let client = state_client(&state).await?;
+    let layout = client
+        .create_group(&space_id, &name)
+        .await
+        .map_err(Into::<UiError>::into)?;
+    // The fleet poller's `layout` subscription pushes the snapshot, but the
+    // new group should appear immediately — push it from the fresh layout.
+    emit_fleet_with(&app, &client, layout.clone()).await;
+    Ok(layout)
+}
+
 /// Delete a lane (placement group); its sessions move to the destination
 /// group first. Lanes are just filing — they are not topics.
 #[tauri::command]
@@ -939,13 +1079,18 @@ pub async fn delete_group(
 /// Move sessions into a lane (placement group).
 #[tauri::command]
 pub async fn move_to_group(
+    app: AppHandle,
     state: State<'_, LoomState>,
     session_ids: Vec<String>,
     group_id: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
     let client = state_client(&state).await?;
     let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
-    client.move_sessions(&refs, &group_id).await.map_err(Into::into)
+    let layout = client.move_sessions(&refs, &group_id).await?;
+    // Loom publishes a layout SSE event, but push the fresh snapshot now so
+    // the topic visibly files under its new project heading immediately.
+    emit_fleet_with(&app, &client, layout.clone()).await;
+    Ok(layout)
 }
 
 /// Re-parent a session under another (its topic's top-level chat), or
@@ -1010,7 +1155,9 @@ pub fn resolve_integration_target(
     let mut seen = std::collections::HashSet::new();
     let mut nearest = None;
     for _ in 0..32 {
-        if !seen.insert(cur.id.as_str()) { break; }
+        if !seen.insert(cur.id.as_str()) {
+            break;
+        }
         let parent = cur
             .parent_session_id
             .as_deref()
@@ -1020,15 +1167,23 @@ pub fn resolve_integration_target(
                     .as_deref()
                     .and_then(|bid| by_branch.get(bid).copied())
             });
-        let Some(p) = parent else { break; };
+        let Some(p) = parent else {
+            break;
+        };
         if p.branch.repo_root == *repo && p.status != "archived" && !p.branch.branch.is_empty() {
             let target = IntegrationTarget {
                 coordinator_id: p.id.clone(),
                 target_branch: p.branch.branch.clone(),
                 coordinator_name: p.branch.name.clone(),
             };
-            if nearest.is_none() { nearest = Some(target.clone()); }
-            if p.branch.tags.iter().any(|t| t.key == "topic" && t.value != "false") {
+            if nearest.is_none() {
+                nearest = Some(target.clone());
+            }
+            if p.branch
+                .tags
+                .iter()
+                .any(|t| t.key == "topic" && t.value != "false")
+            {
                 return Some(target);
             }
         }
@@ -1053,14 +1208,16 @@ pub async fn integrate_session(
         unreachable: false,
     })?;
     if strategy == crate::loom::IntegrationStrategy::Push {
-        return Err(UiError { message: "push is a landing strategy".into(), unreachable: false });
+        return Err(UiError {
+            message: "push is a landing strategy".into(),
+            unreachable: false,
+        });
     }
     let fleet = client.list_sessions().await?;
-    let target =
-        resolve_integration_target(&fleet, &session_id).ok_or_else(|| UiError {
-            message: "no coordinator found for this session — it has no topic to integrate into".into(),
-            unreachable: false,
-        })?;
+    let target = resolve_integration_target(&fleet, &session_id).ok_or_else(|| UiError {
+        message: "no coordinator found for this session — it has no topic to integrate into".into(),
+        unreachable: false,
+    })?;
     let view = client.get_session(&session_id).await?;
     let coordinator = client.get_session(&target.coordinator_id).await?;
     if view.branch.repo_root != coordinator.branch.repo_root {
@@ -1070,10 +1227,16 @@ pub async fn integrate_session(
         });
     }
     if view.branch.branch == target.target_branch {
-        return Err(UiError { message: "source and target already use the same branch".into(), unreachable: false });
+        return Err(UiError {
+            message: "source and target already use the same branch".into(),
+            unreachable: false,
+        });
     }
     if coordinator.status == "archived" {
-        return Err(UiError { message: "the coordinator thread is archived; reopen it before integrating".into(), unreachable: false });
+        return Err(UiError {
+            message: "the coordinator thread is archived; reopen it before integrating".into(),
+            unreachable: false,
+        });
     }
     let request = crate::loom::IntegrationRequest {
         action: "integrate",
@@ -1096,9 +1259,7 @@ pub async fn integrate_session(
             .send_text(&target.coordinator_id, &prompt, true)
             .await?;
     } else {
-        client
-            .queue_prompt(&target.coordinator_id, &prompt)
-            .await?;
+        client.queue_prompt(&target.coordinator_id, &prompt).await?;
     }
     // A sent request is not a successful integration. The coordinator's
     // durable conversation records the result after git and validation.
@@ -1185,19 +1346,35 @@ pub async fn land_topic(
         message: format!("unknown landing strategy {strategy:?}"),
         unreachable: false,
     })?;
-    if matches!(strategy, crate::loom::IntegrationStrategy::CherryPick | crate::loom::IntegrationStrategy::Ask) {
-        return Err(UiError { message: "choose a concrete landing strategy".into(), unreachable: false });
+    if matches!(
+        strategy,
+        crate::loom::IntegrationStrategy::CherryPick | crate::loom::IntegrationStrategy::Ask
+    ) {
+        return Err(UiError {
+            message: "choose a concrete landing strategy".into(),
+            unreachable: false,
+        });
     }
     let view = client.get_session(&session_id).await?;
     if view.status == "archived" {
-        return Err(UiError { message: "the topic thread is archived; reopen it before landing".into(), unreachable: false });
+        return Err(UiError {
+            message: "the topic thread is archived; reopen it before landing".into(),
+            unreachable: false,
+        });
     }
     let fleet = client.list_sessions().await?;
-    let summary = fleet.iter().find(|session| session.id == session_id).ok_or_else(|| UiError {
-        message: "topic is no longer in the fleet".into(), unreachable: false,
-    })?;
+    let summary = fleet
+        .iter()
+        .find(|session| session.id == session_id)
+        .ok_or_else(|| UiError {
+            message: "topic is no longer in the fleet".into(),
+            unreachable: false,
+        })?;
     if summary.parent_session_id.is_some() || summary.parent_id.is_some() {
-        return Err(UiError { message: "landing belongs to a topic; integrate this worker first".into(), unreachable: false });
+        return Err(UiError {
+            message: "landing belongs to a topic; integrate this worker first".into(),
+            unreachable: false,
+        });
     }
     // Resolve the landing target. Non-PR strategies land into the primary
     // checkout's currently checked out branch — the checkout a human
@@ -1238,6 +1415,7 @@ pub async fn land_topic(
             ),
         }
     };
+
     let request = crate::loom::LandingRequest {
         action: "land",
         source_branch: view.branch.branch.clone(),
@@ -1270,10 +1448,7 @@ pub struct WorkSummary {
 
 /// Find a branch's recorded base branch from `branches.list` rows.
 /// The DTO carries `base_branch` per branch (BranchView).
-fn branches_list_base(
-    branches: &[serde_json::Value],
-    branch: &str,
-) -> Option<String> {
+fn branches_list_base(branches: &[serde_json::Value], branch: &str) -> Option<String> {
     branches
         .iter()
         .find(|b| b.get("branch").and_then(|v| v.as_str()) == Some(branch))
@@ -1293,7 +1468,8 @@ pub async fn work_summary(
         additions: changes.totals.additions,
         deletions: changes.totals.deletions,
         files: changes.totals.files,
-        has_commits: changes.head_oid.as_deref() != changes.base.get("oid").and_then(|value| value.as_str()),
+        has_commits: changes.head_oid.as_deref()
+            != changes.base.get("oid").and_then(|value| value.as_str()),
     })
 }
 
@@ -1304,27 +1480,47 @@ pub async fn work_changes(
     session_id: String,
 ) -> Result<crate::loom::ChangeSetView, UiError> {
     let client = state_client(&state).await?;
-    client.session_changes(&session_id).await.map_err(Into::into)
+    client
+        .session_changes(&session_id)
+        .await
+        .map_err(Into::into)
 }
 
 fn resource_error(message: impl Into<String>) -> UiError {
-    UiError { message: message.into(), unreachable: false }
+    UiError {
+        message: message.into(),
+        unreachable: false,
+    }
 }
 
-async fn load_topic_resources(client: &LoomClient, branch_id: &str) -> Result<TopicResourcesView, UiError> {
+async fn load_topic_resources(
+    client: &LoomClient,
+    branch_id: &str,
+) -> Result<TopicResourcesView, UiError> {
     let artifact = match client.branch_artifact(branch_id, MANIFEST_NAME).await {
         Ok(value) => value,
         Err(LoomError::Api { status: 404, .. }) => return Ok(TopicResourcesView::default()),
         Err(error) => return Err(error.into()),
     };
-    if artifact.get("meta").and_then(|v| v.get("branch_id")).and_then(|v| v.as_str()) != Some(branch_id) {
-        return Err(resource_error("resource manifest name is occupied by a repository-shared artifact"));
+    if artifact
+        .get("meta")
+        .and_then(|v| v.get("branch_id"))
+        .and_then(|v| v.as_str())
+        != Some(branch_id)
+    {
+        return Err(resource_error(
+            "resource manifest name is occupied by a repository-shared artifact",
+        ));
     }
-    let content = artifact.get("content").and_then(|v| v.as_str())
+    let content = artifact
+        .get("content")
+        .and_then(|v| v.as_str())
         .ok_or_else(|| resource_error("resource manifest has no content"))?;
     let mut manifest: TopicResourcesView = serde_json::from_str(content)
         .map_err(|e| resource_error(format!("invalid resource manifest: {e}")))?;
-    manifest.revision = artifact.get("meta").and_then(|v| v.get("rev"))
+    manifest.revision = artifact
+        .get("meta")
+        .and_then(|v| v.get("rev"))
         .and_then(|v| v.as_i64())
         .ok_or_else(|| resource_error("resource manifest has no revision"))?;
     Ok(manifest)
@@ -1334,39 +1530,75 @@ async fn resource_context(
     client: &LoomClient,
     mentions: Vec<ResourceMention>,
 ) -> Result<String, UiError> {
-    if mentions.len() > 12 { return Err(resource_error("at most 12 resources can be mentioned in one message")); }
+    if mentions.len() > 12 {
+        return Err(resource_error(
+            "at most 12 resources can be mentioned in one message",
+        ));
+    }
     let mut seen = std::collections::HashSet::new();
     let mut resolved = Vec::new();
     for mention in mentions {
-        if !seen.insert((mention.topic_id.clone(), mention.resource_id.clone())) { continue; }
+        if !seen.insert((mention.topic_id.clone(), mention.resource_id.clone())) {
+            continue;
+        }
         let topic = client.get_session(&mention.topic_id).await?;
         let manifest = load_topic_resources(client, &topic.branch.id).await?;
-        let resource = manifest.resources.into_iter().find(|resource| resource.id == mention.resource_id)
-            .ok_or_else(|| resource_error(format!("mentioned resource no longer exists: {}", mention.resource_id)))?;
-        resolved.push(serde_json::json!({ "source_topic": mention.topic_id, "resource": resource }));
+        let resource = manifest
+            .resources
+            .into_iter()
+            .find(|resource| resource.id == mention.resource_id)
+            .ok_or_else(|| {
+                resource_error(format!(
+                    "mentioned resource no longer exists: {}",
+                    mention.resource_id
+                ))
+            })?;
+        resolved
+            .push(serde_json::json!({ "source_topic": mention.topic_id, "resource": resource }));
     }
-    if resolved.is_empty() { return Ok(String::new()); }
+    if resolved.is_empty() {
+        return Ok(String::new());
+    }
     let content = serde_json::to_string_pretty(&resolved)
         .map_err(|e| resource_error(format!("serializing resource mentions: {e}")))?;
     Ok(format!("\n\nReferenced topic resources (current Arachne bindings; use these locators to inspect the resources):\n{content}"))
 }
 
-async fn save_topic_resources(client: &LoomClient, branch_id: &str, manifest: &TopicResourcesView, expected_revision: i64) -> Result<TopicResourcesView, UiError> {
+async fn save_topic_resources(
+    client: &LoomClient,
+    branch_id: &str,
+    manifest: &TopicResourcesView,
+    expected_revision: i64,
+) -> Result<TopicResourcesView, UiError> {
     let content = serde_json::to_string_pretty(&manifest)
         .map_err(|e| resource_error(format!("serializing resources: {e}")))?;
-    let artifact = client.write_branch_artifact(branch_id, MANIFEST_NAME, &content, expected_revision).await?;
-    if artifact.get("meta").and_then(|v| v.get("branch_id")).and_then(|v| v.as_str()) != Some(branch_id) {
-        return Err(resource_error("resource manifest was not saved on the topic branch"));
+    let artifact = client
+        .write_branch_artifact(branch_id, MANIFEST_NAME, &content, expected_revision)
+        .await?;
+    if artifact
+        .get("meta")
+        .and_then(|v| v.get("branch_id"))
+        .and_then(|v| v.as_str())
+        != Some(branch_id)
+    {
+        return Err(resource_error(
+            "resource manifest was not saved on the topic branch",
+        ));
     }
     let mut saved = manifest.clone();
-    saved.revision = artifact.get("meta").and_then(|v| v.get("rev"))
+    saved.revision = artifact
+        .get("meta")
+        .and_then(|v| v.get("rev"))
         .and_then(|v| v.as_i64())
         .ok_or_else(|| resource_error("saved resource manifest has no revision"))?;
     Ok(saved)
 }
 
 #[tauri::command]
-pub async fn topic_resources(state: State<'_, LoomState>, topic_id: String) -> Result<TopicResourcesView, UiError> {
+pub async fn topic_resources(
+    state: State<'_, LoomState>,
+    topic_id: String,
+) -> Result<TopicResourcesView, UiError> {
     let client = state_client(&state).await?;
     let topic = client.get_session(&topic_id).await?;
     load_topic_resources(&client, &topic.branch.id).await
@@ -1374,15 +1606,20 @@ pub async fn topic_resources(state: State<'_, LoomState>, topic_id: String) -> R
 
 #[tauri::command]
 pub async fn attach_topic_resource(
-    state: State<'_, LoomState>, topic_id: String, resource: ResourceDraft,
+    state: State<'_, LoomState>,
+    topic_id: String,
+    resource: ResourceDraft,
     expected_revision: i64,
 ) -> Result<TopicResourcesView, UiError> {
     let client = state_client(&state).await?;
     let topic = client.get_session(&topic_id).await?;
-    let resource = resource.validated(&topic.branch.repo_root, &topic.branch.branch)
+    let resource = resource
+        .validated(&topic.branch.repo_root, &topic.branch.branch)
         .map_err(resource_error)?;
     let mut manifest = load_topic_resources(&client, &topic.branch.id).await?;
-    if manifest.revision != expected_revision { return Err(resource_error("resources changed; reload before editing")); }
+    if manifest.revision != expected_revision {
+        return Err(resource_error("resources changed; reload before editing"));
+    }
     if let Some(existing) = manifest.resources.iter_mut().find(|r| r.id == resource.id) {
         *existing = resource;
     } else {
@@ -1393,47 +1630,81 @@ pub async fn attach_topic_resource(
 
 #[tauri::command]
 pub async fn detach_topic_resource(
-    state: State<'_, LoomState>, topic_id: String, resource_id: String,
+    state: State<'_, LoomState>,
+    topic_id: String,
+    resource_id: String,
     expected_revision: i64,
 ) -> Result<TopicResourcesView, UiError> {
     let client = state_client(&state).await?;
     let topic = client.get_session(&topic_id).await?;
     let mut manifest = load_topic_resources(&client, &topic.branch.id).await?;
-    if manifest.revision != expected_revision { return Err(resource_error("resources changed; reload before editing")); }
+    if manifest.revision != expected_revision {
+        return Err(resource_error("resources changed; reload before editing"));
+    }
     let before = manifest.resources.len();
     manifest.resources.retain(|r| r.id != resource_id);
-    if manifest.resources.len() == before { return Err(resource_error("resource not found")); }
+    if manifest.resources.len() == before {
+        return Err(resource_error("resource not found"));
+    }
     save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await
 }
 
-async fn resolve_topic_resource(client: &LoomClient, topic_id: &str, resource_id: &str) -> Result<(SessionView, TopicResource), UiError> {
+async fn resolve_topic_resource(
+    client: &LoomClient,
+    topic_id: &str,
+    resource_id: &str,
+) -> Result<(SessionView, TopicResource), UiError> {
     let topic = client.get_session(topic_id).await?;
     let manifest = load_topic_resources(client, &topic.branch.id).await?;
-    let resource = manifest.resources.into_iter().find(|r| r.id == resource_id)
+    let resource = manifest
+        .resources
+        .into_iter()
+        .find(|r| r.id == resource_id)
         .ok_or_else(|| resource_error("resource not found"))?;
     Ok((topic, resource))
 }
 
 #[tauri::command]
 pub async fn read_topic_resource(
-    state: State<'_, LoomState>, topic_id: String, resource_id: String,
+    state: State<'_, LoomState>,
+    topic_id: String,
+    resource_id: String,
 ) -> Result<TopicResourceContent, UiError> {
     let client = state_client(&state).await?;
     let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
     let content = match resource.data.kind {
         ResourceKind::File | ResourceKind::DesignDocument => {
-            if topic.status == "archived" { return Err(resource_error("topic checkout is archived; recover it to preview this file")); }
-            if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
-                return Err(resource_error("file reference no longer matches the topic branch"));
+            if topic.status == "archived" {
+                return Err(resource_error(
+                    "topic checkout is archived; recover it to preview this file",
+                ));
             }
-            let path = resource.data.path.as_deref().ok_or_else(|| resource_error("resource has no file path"))?;
+            if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
+                return Err(resource_error(
+                    "file reference no longer matches the topic branch",
+                ));
+            }
+            let path = resource
+                .data
+                .path
+                .as_deref()
+                .ok_or_else(|| resource_error("resource has no file path"))?;
             crate::resources::validate_relative_path(path).map_err(resource_error)?;
             client.worktree_text(&topic_id, path).await?
         }
         ResourceKind::Artifact => {
-            let name = resource.data.path.as_deref().ok_or_else(|| resource_error("resource has no artifact name"))?;
-            client.branch_artifact(&topic.branch.id, name).await?
-                .get("content").and_then(|v| v.as_str()).ok_or_else(|| resource_error("artifact has no content"))?.to_owned()
+            let name = resource
+                .data
+                .path
+                .as_deref()
+                .ok_or_else(|| resource_error("resource has no artifact name"))?;
+            client
+                .branch_artifact(&topic.branch.id, name)
+                .await?
+                .get("content")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| resource_error("artifact has no content"))?
+                .to_owned()
         }
         _ => return Err(resource_error("this resource has no text preview")),
     };
@@ -1442,29 +1713,283 @@ pub async fn read_topic_resource(
 
 #[tauri::command]
 pub async fn open_topic_resource_in_zed(
-    state: State<'_, LoomState>, topic_id: String, resource_id: String,
+    state: State<'_, LoomState>,
+    topic_id: String,
+    resource_id: String,
 ) -> Result<(), UiError> {
     let client = state_client(&state).await?;
     let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
-    if !matches!(resource.data.kind, ResourceKind::File | ResourceKind::DesignDocument) {
+    if !matches!(
+        resource.data.kind,
+        ResourceKind::File | ResourceKind::DesignDocument
+    ) {
         return Err(resource_error("only repository files can open in Zed"));
     }
-    if topic.status == "archived" { return Err(resource_error("topic checkout is archived; recover it before opening a file")); }
-    if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
-        return Err(resource_error("file reference no longer matches the topic branch"));
+    if topic.status == "archived" {
+        return Err(resource_error(
+            "topic checkout is archived; recover it before opening a file",
+        ));
     }
-    let path = resource.data.path.as_deref().ok_or_else(|| resource_error("resource has no file path"))?;
+    if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
+        return Err(resource_error(
+            "file reference no longer matches the topic branch",
+        ));
+    }
+    let path = resource
+        .data
+        .path
+        .as_deref()
+        .ok_or_else(|| resource_error("resource has no file path"))?;
     crate::resources::validate_relative_path(path).map_err(resource_error)?;
-    let host = client.server_host().ok_or_else(|| resource_error("Loom URL has no host"))?;
+    let host = client
+        .server_host()
+        .ok_or_else(|| resource_error("Loom URL has no host"))?;
     let file = std::path::Path::new(&topic.work_dir).join(path);
     let target = zed_target(host, &file.to_string_lossy())?;
     let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
         "/Applications/Zed.app/Contents/MacOS/cli"
-    } else { "zed" };
-    let status = tokio::process::Command::new(cli).arg(&target).status().await
+    } else {
+        "zed"
+    };
+    let status = tokio::process::Command::new(cli)
+        .arg(&target)
+        .status()
+        .await
         .map_err(|e| resource_error(format!("launching zed: {e}")))?;
-    if !status.success() { return Err(resource_error(format!("zed exited with {status}"))); }
+    if !status.success() {
+        return Err(resource_error(format!("zed exited with {status}")));
+    }
     Ok(())
+}
+
+// --- Todos -----------------------------------------------------------------
+//
+// The durable user todo list lives in one cross-topic branch artifact
+// (`arachne-todos`), mirroring the arachne-resources pattern. It is read
+// from (and written to) the TOPIC's branch, so each topic's slice rides
+// its accepted branch — but a single artifact name per branch is what the
+// loom API offers, so the list is stored on the topic branch of whichever
+// topic is being viewed, keyed by `topic_id` for filtering. Mutations are
+// revision-checked exactly like the resource manifest.
+
+async fn load_todo_list(client: &LoomClient, branch_id: &str) -> Result<TodoListView, UiError> {
+    let artifact = match client.branch_artifact(branch_id, TODOS_NAME).await {
+        Ok(value) => value,
+        Err(LoomError::Api { status: 404, .. }) => return Ok(TodoListView::default()),
+        Err(error) => return Err(error.into()),
+    };
+    if artifact
+        .get("meta")
+        .and_then(|v| v.get("branch_id"))
+        .and_then(|v| v.as_str())
+        != Some(branch_id)
+    {
+        return Err(todo_error(
+            "todo list name is occupied by a repository-shared artifact",
+        ));
+    }
+    let content = artifact
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| todo_error("todo list has no content"))?;
+    let mut list: TodoListView =
+        serde_json::from_str(content).map_err(|e| todo_error(format!("invalid todo list: {e}")))?;
+    list.revision = artifact
+        .get("meta")
+        .and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| todo_error("todo list has no revision"))?;
+    Ok(list)
+}
+
+async fn save_todo_list(
+    client: &LoomClient,
+    branch_id: &str,
+    list: &TodoListView,
+    expected_revision: i64,
+) -> Result<TodoListView, UiError> {
+    let content = serde_json::to_string_pretty(&list)
+        .map_err(|e| todo_error(format!("serializing todos: {e}")))?;
+    let artifact = client
+        .write_branch_artifact_titled(
+            branch_id,
+            TODOS_NAME,
+            &content,
+            expected_revision,
+            "Arachne topic todos",
+        )
+        .await?;
+    if artifact
+        .get("meta")
+        .and_then(|v| v.get("branch_id"))
+        .and_then(|v| v.as_str())
+        != Some(branch_id)
+    {
+        return Err(todo_error("todo list was not saved on the topic branch"));
+    }
+    let mut saved = list.clone();
+    saved.revision = artifact
+        .get("meta")
+        .and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| todo_error("saved todo list has no revision"))?;
+    Ok(saved)
+}
+
+fn todo_error(message: impl Into<String>) -> UiError {
+    UiError {
+        message: message.into(),
+        unreachable: false,
+    }
+}
+
+fn todo_text_ok(text: &str) -> Result<(), UiError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return Err(todo_error("todo text must contain 1–512 characters"));
+    }
+    Ok(())
+}
+
+/// A stable identity for a todo: derived from its text and topic so the
+/// same todo re-added is idempotent (mirrors the resource locator idea).
+/// FNV-1a is implemented inline — std's DefaultHasher is not guaranteed
+/// stable across Rust releases, and an id that changes would orphan every
+/// saved todo after an app upgrade.
+fn todo_id(text: &str, topic_id: &str) -> String {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+    let trimmed = text.trim();
+    let mixed = fnv1a(trimmed.as_bytes()) ^ fnv1a(topic_id.as_bytes()).rotate_left(17);
+    format!("todo:{trimmed}:{mixed:016x}")
+}
+
+/// The open topic's todo slice. This is what the inspector's Todos tab
+/// renders — items plus the artifact revision for revision-checked edits.
+#[tauri::command]
+pub async fn topic_todos(
+    state: State<'_, LoomState>,
+    topic_id: String,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    Ok(load_todo_list(&client, &topic.branch.id)
+        .await?
+        .topic_view(&topic_id))
+}
+
+/// Toggle one todo's done state. Because the artifact is one list, the
+/// command toggles by id within the full list (the view is topic-scoped,
+/// but the id is unique across the list, so a topic's toggle cannot
+/// disturb another topic's items).
+#[tauri::command]
+pub async fn toggle_todo(
+    state: State<'_, LoomState>,
+    topic_id: String,
+    todo_id: String,
+    expected_revision: i64,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    let mut list = load_todo_list(&client, &topic.branch.id).await?;
+    if list.revision != expected_revision {
+        return Err(todo_error("todos changed; reload before editing"));
+    }
+    let todo = list
+        .todos
+        .iter_mut()
+        .find(|t| t.id == todo_id)
+        .ok_or_else(|| todo_error("todo not found"))?;
+    todo.done = !todo.done;
+    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+    Ok(saved.topic_view(&topic_id))
+}
+
+/// Add a todo to this topic's slice.
+#[tauri::command]
+pub async fn add_todo(
+    state: State<'_, LoomState>,
+    topic_id: String,
+    text: String,
+    expected_revision: i64,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    todo_text_ok(&text)?;
+    let mut list = load_todo_list(&client, &topic.branch.id).await?;
+    if list.revision != expected_revision {
+        return Err(todo_error("todos changed; reload before editing"));
+    }
+    let id = todo_id(&text, &topic_id);
+    if let Some(existing) = list.todos.iter_mut().find(|t| t.id == id) {
+        existing.text = text.trim().to_owned();
+        existing.topic_id = topic_id.clone();
+    } else {
+        list.todos.push(TodoItem {
+            id,
+            text: text.trim().to_owned(),
+            done: false,
+            topic_id: topic_id.clone(),
+            created_at: chrono_iso_now(),
+        });
+    }
+    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+    Ok(saved.topic_view(&topic_id))
+}
+
+/// Remove a todo from the list.
+#[tauri::command]
+pub async fn remove_todo(
+    state: State<'_, LoomState>,
+    topic_id: String,
+    todo_id: String,
+    expected_revision: i64,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    let mut list = load_todo_list(&client, &topic.branch.id).await?;
+    if list.revision != expected_revision {
+        return Err(todo_error("todos changed; reload before editing"));
+    }
+    let before = list.todos.len();
+    list.todos.retain(|t| t.id != todo_id);
+    if list.todos.len() == before {
+        return Err(todo_error("todo not found"));
+    }
+    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+    Ok(saved.topic_view(&topic_id))
+}
+
+/// RFC3339 without pulling a chrono dependency: loom only needs a
+/// lexicographically comparable timestamp, and the UTC "Z" form matches
+/// the wire format used by `created_at` elsewhere.
+fn chrono_iso_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    // Civil-from-days algorithm (Howard Hinnant) — exact for all dates.
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
 #[cfg(test)]
@@ -1561,6 +2086,7 @@ mod integration_tests {
     }
 
     fn session(id: &str, branch: &str, repo: &str, parent: Option<&str>, topic: bool) -> SessionSummaryView {
+
         serde_json::from_value(serde_json::json!({
             "id": id, "status": "running", "profile": "default", "class": "interactive",
             "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
@@ -1571,7 +2097,8 @@ mod integration_tests {
                     "key":"topic", "value":"true", "note":"", "set_at":"", "set_by":"arachne"
                 }]) } else { serde_json::json!([]) }
             }
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -1594,7 +2121,53 @@ mod integration_tests {
             session("parent", "parent-branch", "/repo", Some("topic"), false),
             session("child", "child-branch", "/repo", Some("parent"), false),
         ];
-        assert_eq!(resolve_integration_target(&fleet, "child").unwrap().target_branch, "parent-branch");
+        assert_eq!(
+            resolve_integration_target(&fleet, "child")
+                .unwrap()
+                .target_branch,
+            "parent-branch"
+        );
         assert!(resolve_integration_target(&fleet, "parent").is_none());
+    }
+}
+
+#[cfg(test)]
+mod todo_command_tests {
+    use super::{chrono_iso_now, todo_id};
+
+    #[test]
+    fn iso_now_is_a_well_formed_utc_stamp() {
+        let stamp = chrono_iso_now();
+        // Shape: 2026-09-27T12:34:56Z — a real UTC civil date.
+        assert_eq!(stamp.len(), 20);
+        let (date, time) = stamp.split_once('T').unwrap();
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        let (y, m, d): (i64, i64, i64) = (
+            parts[0].parse().unwrap(),
+            parts[1].parse().unwrap(),
+            parts[2].parse().unwrap(),
+        );
+        assert!((2020..=2100).contains(&y));
+        assert!((1..=12).contains(&m));
+        assert!((1..=31).contains(&d));
+        let (hms, z) = time.split_at(8);
+        assert_eq!(z, "Z");
+        assert_eq!(hms.matches(':').count(), 2);
+        assert!(hms
+            .split(':')
+            .all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_digit())));
+    }
+
+    #[test]
+    fn todo_identity_is_stable_and_topic_scoped() {
+        assert_eq!(
+            todo_id("Land Arachne topic", "t1"),
+            todo_id(" Land Arachne topic ", "t1")
+        );
+        assert_ne!(
+            todo_id("Land Arachne topic", "t1"),
+            todo_id("Land Arachne topic", "t2")
+        );
     }
 }

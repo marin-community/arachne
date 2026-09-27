@@ -46,6 +46,7 @@ const emit = defineEmits<{
   (e: "handoff", id: string): void;
   (e: "refresh", id: string): void;
   (e: "open-topic", id: string): void;
+  (e: "overview", id: string): void;
   (e: "home"): void;
 }>();
 
@@ -729,6 +730,10 @@ async function onLand(strategy: string) {
         </div>
       </div>
       <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
+      <!-- The scoped dashboard (Needs You / Working / Ready to Integrate) is an
+           explicit detour, not the default Topic view — the main pane stays a
+           conversation whenever a Topic is open. -->
+      <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
