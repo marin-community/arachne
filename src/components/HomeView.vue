@@ -20,6 +20,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
+  (e: "new-thread"): void;
 }>();
 
 function loudValue(s: SessionSummary): "blocked" | "attention" | null {
@@ -131,7 +132,12 @@ function classFor(row: HomeRow): string {
 <template>
   <section class="home">
     <div class="home-scroll">
-      <h1>🕸 Arachne</h1>
+      <div class="home-top">
+        <h1>🕸 Arachne</h1>
+        <button class="primary home-new" @click="emit('new-thread')">
+          + New thread
+        </button>
+      </div>
       <div v-if="needs.length" class="section">
         <div class="section-title">Needs you</div>
         <div
