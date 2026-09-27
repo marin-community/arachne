@@ -59,6 +59,11 @@ interface Placement {
   rank: number | null;
   session_id: string | null;
 }
+export interface AcpUsage {
+  used: number;
+  size: number;
+  cost: { amount: number; currency: string } | null;
+}
 export interface SessionSummary {
   id: string;
   status: string;
@@ -68,6 +73,7 @@ export interface SessionSummary {
   created_by: string | null;
   created_at: string;
   last_activity_at: string;
+  usage?: AcpUsage | null;
   /** When the newest user message was journaled; null on older looms. */
   last_user_message_at?: string | null;
   // The topic's checkout path and whether it still exists on the server.
@@ -91,6 +97,7 @@ export interface SessionView {
   model: string;
   effort: string;
   protocol: string;
+  usage?: AcpUsage | null;
   work_dir: string;
   // The managed `owner/name` slug when launched against a managed repo.
   github_repo: string | null;

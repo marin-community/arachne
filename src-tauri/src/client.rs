@@ -435,6 +435,27 @@ impl LoomClient {
         self.op("/api/sessions/chat", &body).await
     }
 
+    /// Change an agent-owned ACP composer selector. Loom returns its refreshed
+    /// metadata and also broadcasts a `metadata` chat event to other clients.
+    pub async fn set_session_config(
+        &self,
+        id: &str,
+        config_id: &str,
+        value: serde_json::Value,
+    ) -> Result<crate::loom::AcpMetadataView, LoomError> {
+        #[derive(serde::Deserialize)]
+        struct ConfigReply {
+            metadata: crate::loom::AcpMetadataView,
+        }
+        let reply: ConfigReply = self
+            .op(
+                "/api/sessions/config/set",
+                &serde_json::json!({ "session": id, "config_id": config_id, "value": value }),
+            )
+            .await?;
+        Ok(reply.metadata)
+    }
+
     /// `sessions.files` — tracked and unignored files in this session's
     /// server-side worktree, ranked by loom for @-mention completion.
     pub async fn session_files(&self, id: &str, query: &str) -> Result<Vec<String>, LoomError> {

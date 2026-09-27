@@ -64,6 +64,7 @@ pub struct ChatSnapshot {
     pub pending_prompt: Option<String>,
     pub live_started_at: Option<String>,
     pub live_progress_at: Option<String>,
+    pub metadata: crate::loom::AcpMetadataView,
 }
 
 impl ChatSnapshot {
@@ -544,7 +545,24 @@ pub async fn fetch_chat(
         pending_prompt: chat.pending_prompt,
         live_started_at,
         live_progress_at,
+        metadata: chat.metadata,
     })
+}
+
+/// Set one live ACP selector (model, thinking level, mode, etc.). Its IDs and
+/// value shapes come from sessions.chat.metadata.config_options.
+#[tauri::command]
+pub async fn set_session_config(
+    state: State<'_, LoomState>,
+    id: String,
+    config_id: String,
+    value: serde_json::Value,
+) -> Result<crate::loom::AcpMetadataView, UiError> {
+    let client = state_client(&state).await?;
+    client
+        .set_session_config(&id, &config_id, value)
+        .await
+        .map_err(Into::into)
 }
 
 /// Complete file mentions from the session's checkout on the loom host.
