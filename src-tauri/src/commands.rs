@@ -641,8 +641,8 @@ pub async fn launch_session(
         }
         _ => None,
     };
-    // Quick one-offs send only `task` (title falls back to it, like the CLI);
-    // the topic card sends an explicit short title and longer body.
+    // Quick topics send only `task` (title falls back to it, like the CLI);
+    // the expanded topic card sends an explicit short title and longer body.
     let label = title
         .as_deref()
         .map(str::trim)
@@ -696,8 +696,8 @@ pub async fn launch_session(
             })
             .await;
     }
-    // A named topic retains its durable marker even after its children
-    // archive. Quick one-offs stay in the inbox without becoming topics.
+    // New root sessions are topics by default. Keep the legacy one_off
+    // parameter for callers that explicitly want an unmarked scratch thread.
     if parent_branch.is_none() && !one_off.unwrap_or(false) {
         let _ = client.set_tag(&view.id, "topic", "true").await;
     }

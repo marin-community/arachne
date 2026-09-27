@@ -164,6 +164,36 @@ body {
 .topic-card.selected { outline: 1px solid var(--border); background: var(--bg-hover); }
 .topic-card.archived { opacity: 0.55; }
 .topic-head { display: flex; align-items: center; gap: 8px; }
+.topic-chevron {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0;
+  width: 15px;
+  flex: 0 0 15px;
+  cursor: pointer;
+}
+.topic-chevron:hover { color: var(--text); background: transparent; }
+.topic-thread {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 29px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.topic-thread:hover, .topic-thread.selected { background: var(--bg-hover); }
+.topic-thread.archived { opacity: 0.55; }
+.topic-thread-spacer { width: 15px; flex: 0 0 15px; }
+.topic-thread-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .topic-title {
   font-weight: 600;
   flex: 1;

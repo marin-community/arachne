@@ -24,8 +24,9 @@ the intended remote test uses Loom on the DGX over Tailscale.
   sleep, but the topic keeps its branch, documents, and resource bindings.
   Creation offers a short title and a body that becomes the agent goal; either
   can be left blank when the other or an attachment supplies the intent.
-- **Quick one-off:** a single-prompt session in the Inbox. It can stay small
-  without becoming a named topic.
+- **Quick topic:** a single-prompt way to start a topic. Its title can be
+  derived from the prompt; title and body remain optional in the expanded
+  creation form. It can grow delegated threads later without conversion.
 - **Thread/worker:** one Loom session and its conversation. Hierarchy records
   responsibility; it does not determine Git ancestry.
 - **Resource:** a repository, checkout, PR, document, file, or artifact with a
@@ -36,6 +37,12 @@ the intended remote test uses Loom on the DGX over Tailscale.
 The main screen answers “what needs me?” Topic and thread views then show the
 conversation alongside code and resources. Every code reference should lead to
 an editable checkout with one action when that checkout is available.
+
+Every new top-level conversation is a topic, including one started through the
+quick input. The Topics list expands through delegated threads at arbitrary
+depth. Older unmarked top-level conversations remain visible as topics without
+rewriting their Loom history. Delegating from a thread creates a child in the
+conversation tree; its Git base still comes from the topic's accepted branch.
 
 ## Resource slice
 

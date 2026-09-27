@@ -654,12 +654,9 @@ const integrationTarget = computed(() => {
   }
   return nearest;
 });
-const isTopic = computed(() =>
-  !isWorker.value && (
-    props.session.branch.tags.some((tag) => tag.key === "topic" && tag.value !== "false") ||
-    props.fleet.some((s) => s.parent_session_id === props.session.id || s.parent_id === props.session.branch.id)
-  ),
-);
+// Every root conversation is a topic, including older quick launches that
+// predate the durable marker.
+const isTopic = computed(() => !isWorker.value);
 const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
 const allIntegrateOptions = [
   { value: "squash", label: "Squash into topic" },

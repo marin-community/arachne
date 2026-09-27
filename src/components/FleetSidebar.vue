@@ -87,7 +87,7 @@ function submit() {
   const t = task.value.trim();
   if ((!t && !quickAttachments.value.length) || props.launching || quickAttachmentLoading.value) return;
   emit("launch", t || `Review ${quickAttachments.value[0].name}`, repo.value.trim(), {
-    ...launchConfig(), oneOff: true,
+    ...launchConfig(),
     mentions: quickMentions.value.filter((mention) => t.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: quickAttachments.value,
@@ -141,14 +141,6 @@ function badgeLabel(s: SessionSummary): string | null {
 interface TreeNode {
   session: SessionSummary;
   children: TreeNode[];
-}
-
-// The durable marker: a leader chat stamped with the quiet `topic` tag
-// (by arachne, at launch/delegate/reparent). Topic-ness never depended on
-// live children — the tag survives archive and restarts. The childCount
-// fallback keeps pre-marker leaders rendering as topics.
-function isTopic(s: SessionSummary): boolean {
-  return s.branch.tags.some((t) => t.key === "topic");
 }
 
 // The quiet `idle` mark loom stamps when an agent finishes its turn: the
@@ -351,18 +343,14 @@ interface TopicEntry {
   childCount: number;
 }
 
-// Top-level leaders (durable `topic` marker, or delegated children as the
-// pre-marker fallback), newest activity first. Archived leaders stay listed
-// (dimmed) — topic-ness survives archive by design; children file under their
-// leader, so they never appear here.
+// Every top-level thread is a topic, including legacy quick launches that
+// predate the marker. Archived leaders stay listed with their descendants.
 const topics = computed<TopicEntry[]>(() => {
   const byId = new Map(props.fleet.map((s) => [s.id, s]));
+  const byBranch = new Map(props.fleet.map((s) => [s.branch.id, s]));
   const parentOf = (s: SessionSummary) =>
-    s.parent_session_id
-      ? byId.get(s.parent_session_id)
-      : s.parent_id
-        ? props.fleet.find((c) => c.branch.id === s.parent_id)
-        : undefined;
+    (s.parent_session_id ? byId.get(s.parent_session_id) : undefined) ??
+    (s.parent_id ? byBranch.get(s.parent_id) : undefined);
   const childCount = new Map<string, number>();
   for (const s of props.fleet) {
     const p = parentOf(s);
@@ -373,13 +361,54 @@ const topics = computed<TopicEntry[]>(() => {
     .filter((s) => {
       const p = parentOf(s);
       const topLevel = !p || p.id === s.id;
-      return topLevel && (isTopic(s) || (childCount.get(s.id) ?? 0) > 0);
+      return topLevel;
     })
     .map((s) => ({ session: s, childCount: childCount.get(s.id) ?? 0 }))
     .sort((a, b) =>
       a.session.last_activity_at < b.session.last_activity_at ? 1 : -1,
     );
 });
+
+interface TopicThreadRow {
+  session: SessionSummary;
+  depth: number;
+  childCount: number;
+}
+
+const topicChildren = computed(() => {
+  const byId = new Map(props.fleet.map((session) => [session.id, session]));
+  const byBranch = new Map(props.fleet.map((session) => [session.branch.id, session]));
+  const children = new Map<string, SessionSummary[]>();
+  for (const session of props.fleet) {
+    const parent =
+      (session.parent_session_id ? byId.get(session.parent_session_id) : undefined) ??
+      (session.parent_id ? byBranch.get(session.parent_id) : undefined);
+    if (!parent || parent.id === session.id) continue;
+    const siblings = children.get(parent.id) ?? [];
+    siblings.push(session);
+    children.set(parent.id, siblings);
+  }
+  for (const siblings of children.values()) {
+    siblings.sort((a, b) => b.last_activity_at.localeCompare(a.last_activity_at));
+  }
+  return children;
+});
+
+function visibleTopicChildren(rootId: string): TopicThreadRow[] {
+  const rows: TopicThreadRow[] = [];
+  const seen = new Set<string>([rootId]);
+  const walk = (parentId: string, depth: number) => {
+    if (collapsed.value.has(parentId)) return;
+    for (const session of topicChildren.value.get(parentId) ?? []) {
+      if (seen.has(session.id)) continue;
+      seen.add(session.id);
+      rows.push({ session, depth, childCount: topicChildren.value.get(session.id)?.length ?? 0 });
+      walk(session.id, depth + 1);
+    }
+  };
+  walk(rootId, 1);
+  return rows;
+}
 
 // A topic has a short title and a substantive body. The body is both the
 // agent's initial goal and the durable branch description.
@@ -691,14 +720,14 @@ async function archiveRow(id: string) {
       </button>
     </div>
 
-    <!-- Inbox tab: filing lanes, delegation tree, and a fast one-off launch. -->
+    <!-- Inbox tab: filing lanes, delegation tree, and a fast topic launch. -->
     <template v-if="tab === 'inbox'">
       <div class="new-task quick-task-wrap">
         <input
           ref="quickInputEl"
           v-model="task"
-          placeholder="Quick one-off task… Use @ for resources"
-          aria-label="Quick one-off task"
+          placeholder="Quick topic… Use @ for resources"
+          aria-label="Quick topic"
           @input="updateQuickMention"
           @click="updateQuickMention"
           @keydown="onQuickKeydown"
@@ -800,9 +829,7 @@ async function archiveRow(id: string) {
             class="session-item"
             :class="{
               selected: row.session.id === selectedId,
-              topic:
-                row.depth === 0 &&
-                (isTopic(row.session) || row.childCount > 0),
+              topic: row.depth === 0,
               child: row.depth > 0,
               archived: row.session.status === 'archived',
               'drop-hint':
@@ -977,15 +1004,18 @@ async function archiveRow(id: string) {
       </div>
 
       <div class="topic-list">
+        <template v-for="t in topics" :key="t.session.id">
         <div
-          v-for="t in topics"
-          :key="t.session.id"
           class="topic-card"
           :class="{
             selected: t.session.id === selectedId,
             archived: t.session.status === 'archived',
           }"
+          role="button"
+          tabindex="0"
           @click="emit('select', t.session.id)"
+          @keydown.enter.self="emit('select', t.session.id)"
+          @keydown.space.self.prevent="emit('select', t.session.id)"
         >
           <template v-if="editingId === t.session.id">
             <input
@@ -1016,6 +1046,10 @@ async function archiveRow(id: string) {
           </template>
           <template v-else>
             <div class="topic-head">
+              <button v-if="t.childCount" class="topic-chevron" type="button"
+                :aria-label="`${collapsed.has(t.session.id) ? 'Expand' : 'Collapse'} threads in ${t.session.branch.title || t.session.branch.name}`"
+                :aria-expanded="!collapsed.has(t.session.id)"
+                @click.stop="toggle(t.session.id)">{{ collapsed.has(t.session.id) ? '▸' : '▾' }}</button>
               <span class="topic-title">{{
                 t.session.branch.title || t.session.branch.name
               }}</span>
@@ -1065,6 +1099,23 @@ async function archiveRow(id: string) {
             </div>
           </template>
         </div>
+        <div v-for="child in visibleTopicChildren(t.session.id)" :key="child.session.id"
+          class="topic-thread" :class="{ selected: child.session.id === selectedId, archived: child.session.status === 'archived' }"
+          :style="{ marginLeft: `${8 + child.depth * 15}px` }"
+          role="button" tabindex="0"
+          @click="emit('select', child.session.id)"
+          @keydown.enter.self="emit('select', child.session.id)"
+          @keydown.space.self.prevent="emit('select', child.session.id)">
+          <button v-if="child.childCount" class="topic-chevron" type="button"
+            :aria-label="`${collapsed.has(child.session.id) ? 'Expand' : 'Collapse'} subthreads in ${child.session.branch.title || child.session.branch.name}`"
+            :aria-expanded="!collapsed.has(child.session.id)"
+            @click.stop="toggle(child.session.id)">{{ collapsed.has(child.session.id) ? '▸' : '▾' }}</button>
+          <span v-else class="topic-thread-spacer" aria-hidden="true"></span>
+          <span class="topic-thread-title">{{ child.session.branch.title || child.session.branch.name }}</span>
+          <span v-if="child.childCount" class="badge dim">{{ child.childCount }}</span>
+          <span v-else-if="badgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ badgeLabel(child.session) }}</span>
+        </div>
+        </template>
         <div v-if="topics.length === 0" class="topic-empty">
           No topics yet — create one above.
         </div>
