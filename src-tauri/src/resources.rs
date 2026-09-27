@@ -159,7 +159,9 @@ pub fn validate_relative_path(path: &str) -> Result<(), String> {
     if path.is_empty()
         || path.contains('\\')
         || Path::new(path).is_absolute()
-        || path.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
     {
         return Err("path must be relative to the repository without . or ..".into());
     }
@@ -271,7 +273,8 @@ mod tests {
     fn mention_accepts_webview_field_names() {
         let mention: ResourceMention = serde_json::from_value(serde_json::json!({
             "topicId": "topic", "resourceId": "design_document:docs/design.md"
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(mention.topic_id, "topic");
         assert_eq!(mention.resource_id, "design_document:docs/design.md");
     }

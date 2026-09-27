@@ -102,12 +102,10 @@ impl LoomClient {
                 message,
             });
         }
-        resp.json::<T>()
-            .await
-            .map_err(|e| LoomError::Decode {
-                path: path.to_string(),
-                detail: e.to_string(),
-            })
+        resp.json::<T>().await.map_err(|e| LoomError::Decode {
+            path: path.to_string(),
+            detail: e.to_string(),
+        })
     }
 
     /// `GET /api/health` — public, unauthenticated.
@@ -143,9 +141,8 @@ impl LoomClient {
         let profiles = self
             .op("/api/profiles/list", &serde_json::json!({}))
             .await?;
-        let agents: crate::loom::AgentsView = self
-            .op("/api/agents/list", &serde_json::json!({}))
-            .await?;
+        let agents: crate::loom::AgentsView =
+            self.op("/api/agents/list", &serde_json::json!({})).await?;
         Ok(crate::loom::LaunchOptionsView {
             profiles,
             agents: agents.agents,
@@ -170,14 +167,28 @@ impl LoomClient {
         });
         let path = "/api/sessions/handoff/resolve";
         let preview: serde_json::Value = self
-            .op(path, &serde_json::json!({ "session": id, "selection": selection }))
+            .op(
+                path,
+                &serde_json::json!({ "session": id, "selection": selection }),
+            )
             .await?;
         if preview.get("valid").and_then(|v| v.as_bool()) != Some(true) {
-            let errors = preview.get("errors")
+            let errors = preview
+                .get("errors")
                 .and_then(|v| v.as_array())
-                .map(|v| v.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join("; "))
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
                 .unwrap_or_else(|| "selection is invalid".to_string());
-            return Err(LoomError::Api { status: 400, method: "POST", path: path.into(), message: errors });
+            return Err(LoomError::Api {
+                status: 400,
+                method: "POST",
+                path: path.into(),
+                message: errors,
+            });
         }
         self.op(
             "/api/sessions/handoff",
@@ -187,7 +198,8 @@ impl LoomClient {
                 "expected_profile_revision": preview["profile_revision"],
                 "expected_resolver_revision": preview["resolver_revision"],
             }),
-        ).await
+        )
+        .await
     }
 
     /// `sessions.summary.list` — the fleet.
@@ -255,19 +267,13 @@ impl LoomClient {
 
     /// `sessions.get` — one session, including `work_dir` for Open-in-Zed.
     pub async fn get_session(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
-        self.op(
-            "/api/sessions/get",
-            &serde_json::json!({ "session": id }),
-        )
-        .await
+        self.op("/api/sessions/get", &serde_json::json!({ "session": id }))
+            .await
     }
 
     /// `sessions.changes` — committed and uncommitted changes against the
     /// session's recorded base ref. Feeds the Integrate diff summary.
-    pub async fn session_changes(
-        &self,
-        id: &str,
-    ) -> Result<crate::loom::ChangeSetView, LoomError> {
+    pub async fn session_changes(&self, id: &str) -> Result<crate::loom::ChangeSetView, LoomError> {
         self.op(
             "/api/sessions/changes",
             &serde_json::json!({ "session": id }),
@@ -285,7 +291,8 @@ impl LoomClient {
         self.op(
             "/api/artifacts/get",
             &serde_json::json!({ "branch": branch, "name": name, "repo": false }),
-        ).await
+        )
+        .await
     }
 
     pub async fn write_branch_artifact(
@@ -295,8 +302,14 @@ impl LoomClient {
         content: &str,
         base_rev: i64,
     ) -> Result<serde_json::Value, LoomError> {
-        self.write_branch_artifact_titled(branch, name, content, base_rev, "Arachne topic resources")
-            .await
+        self.write_branch_artifact_titled(
+            branch,
+            name,
+            content,
+            base_rev,
+            "Arachne topic resources",
+        )
+        .await
     }
 
     /// `write_branch_artifact` with an explicit display title — the shared
@@ -316,46 +329,63 @@ impl LoomClient {
                 "title": title, "kind": "json",
                 "base_rev": base_rev, "repo": false,
             }),
-        ).await
+        )
+        .await
     }
 
     /// Read text from Loom's server-side worktree. Never interpret the path
     /// as a Mac-local filename, including when Loom runs on this machine.
     pub async fn worktree_text(&self, session: &str, path: &str) -> Result<String, LoomError> {
-        let mut url = self.base.join("/api/sessions/raw")
+        let mut url = self
+            .base
+            .join("/api/sessions/raw")
             .map_err(|e| LoomError::Connection(format!("joining /api/sessions/raw: {e}")))?;
-        url.query_pairs_mut().append_pair("session", session).append_pair("path", path);
+        url.query_pairs_mut()
+            .append_pair("session", session)
+            .append_pair("path", path);
         let mut req = self.http.get(url);
-        if let Some(token) = &self.token { req = req.bearer_auth(token); }
-        let mut resp = req.timeout(Duration::from_secs(30)).send().await
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        let mut resp = req
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
             .map_err(|e| LoomError::Connection(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             return Err(LoomError::Api {
-                status, method: "GET", path: "/api/sessions/raw".into(),
+                status,
+                method: "GET",
+                path: "/api/sessions/raw".into(),
                 message: resp.text().await.unwrap_or_default(),
             });
         }
         const MAX_BYTES: usize = 512 * 1024;
         let mut bytes = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| LoomError::Connection(e.to_string()))? {
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| LoomError::Connection(e.to_string()))?
+        {
             if bytes.len() + chunk.len() > MAX_BYTES {
-                return Err(LoomError::Decode { path: "/api/sessions/raw".into(), detail: "file exceeds 512 KiB preview limit".into() });
+                return Err(LoomError::Decode {
+                    path: "/api/sessions/raw".into(),
+                    detail: "file exceeds 512 KiB preview limit".into(),
+                });
             }
             bytes.extend_from_slice(&chunk);
         }
         String::from_utf8(bytes).map_err(|e| LoomError::Decode {
-            path: "/api/sessions/raw".into(), detail: format!("file is not UTF-8 text: {e}"),
+            path: "/api/sessions/raw".into(),
+            detail: format!("file is not UTF-8 text: {e}"),
         })
     }
 
     /// `branches.list` — every branch loom tracks, including its base ref.
     /// The Land action uses that recorded ref as its default upstream.
-    pub async fn list_branches(
-        &self,
-    ) -> Result<Vec<serde_json::Value>, LoomError> {
-        self.op("/api/branches/list", &serde_json::json!({}))
-            .await
+    pub async fn list_branches(&self) -> Result<Vec<serde_json::Value>, LoomError> {
+        self.op("/api/branches/list", &serde_json::json!({})).await
     }
 
     /// `sessions.chat` — the conversation journal. `before` pages older
@@ -449,7 +479,12 @@ impl LoomClient {
     }
 
     /// `sessions.prompt.create` — send input to an ACP session's agent.
-    pub async fn send_prompt(&self, id: &str, text: &str, files: &[String]) -> Result<(), LoomError> {
+    pub async fn send_prompt(
+        &self,
+        id: &str,
+        text: &str,
+        files: &[String],
+    ) -> Result<(), LoomError> {
         let _: serde_json::Value = self
             .op(
                 "/api/sessions/prompt/create",
@@ -461,25 +496,60 @@ impl LoomClient {
 
     /// Raw Scratch upload keeps file bytes on Loom's host, including when
     /// Arachne is connected over Tailscale to a remote runner.
-    pub async fn upload_scratch(&self, session: &str, name: &str, bytes: Vec<u8>) -> Result<String, LoomError> {
+    pub async fn upload_scratch(
+        &self,
+        session: &str,
+        name: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, LoomError> {
         let path = "/api/sessions/scratch/write";
-        let mut url = self.base.join(path)
+        let mut url = self
+            .base
+            .join(path)
             .map_err(|e| LoomError::Connection(format!("joining {path}: {e}")))?;
-        url.query_pairs_mut().append_pair("session", session).append_pair("name", name);
-        let mut req = self.http.post(url).header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
-        if let Some(token) = &self.token { req = req.bearer_auth(token); }
-        let resp = req.body(bytes).timeout(Duration::from_secs(120)).send().await
+        url.query_pairs_mut()
+            .append_pair("session", session)
+            .append_pair("name", name);
+        let mut req = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream");
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req
+            .body(bytes)
+            .timeout(Duration::from_secs(120))
+            .send()
+            .await
             .map_err(|e| LoomError::Connection(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
-            let message = resp.json::<serde_json::Value>().await.ok()
+            let message = resp
+                .json::<serde_json::Value>()
+                .await
+                .ok()
                 .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
                 .unwrap_or_default();
-            return Err(LoomError::Api { status: status.as_u16(), method: "POST", path: path.into(), message });
+            return Err(LoomError::Api {
+                status: status.as_u16(),
+                method: "POST",
+                path: path.into(),
+                message,
+            });
         }
-        let value: serde_json::Value = resp.json().await.map_err(|e| LoomError::Decode { path: path.into(), detail: e.to_string() })?;
-        value.get("path").and_then(|v| v.as_str()).map(String::from)
-            .ok_or_else(|| LoomError::Decode { path: path.into(), detail: "upload response has no path".into() })
+        let value: serde_json::Value = resp.json().await.map_err(|e| LoomError::Decode {
+            path: path.into(),
+            detail: e.to_string(),
+        })?;
+        value
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .ok_or_else(|| LoomError::Decode {
+                path: path.into(),
+                detail: "upload response has no path".into(),
+            })
     }
 
     /// Queue an ACP request behind the current turn. Integration and landing
@@ -560,7 +630,10 @@ impl LoomClient {
     /// Resume a lost runtime only when an action needs to deliver work to it.
     /// Another client may win the adoption race; in that case its running
     /// session is equally ready to receive the action.
-    pub async fn resume_if_orphaned(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
+    pub async fn resume_if_orphaned(
+        &self,
+        id: &str,
+    ) -> Result<crate::loom::SessionView, LoomError> {
         let view = self.get_session(id).await?;
         if view.status != "orphaned" {
             return Ok(view);
@@ -569,7 +642,11 @@ impl LoomClient {
             Ok(view) => Ok(view),
             Err(error @ LoomError::Api { status: 409, .. }) => {
                 let current = self.get_session(id).await?;
-                if current.status == "running" { Ok(current) } else { Err(error) }
+                if current.status == "running" {
+                    Ok(current)
+                } else {
+                    Err(error)
+                }
             }
             Err(error) => Err(error),
         }
@@ -608,12 +685,7 @@ impl LoomClient {
 
     /// `sessions.tags.set` — stamp a quiet tag on a session. Used to mark a
     /// leader chat as a durable `topic` (survives archive and restarts).
-    pub async fn set_tag(
-        &self,
-        session: &str,
-        key: &str,
-        value: &str,
-    ) -> Result<(), LoomError> {
+    pub async fn set_tag(&self, session: &str, key: &str, value: &str) -> Result<(), LoomError> {
         let _: serde_json::Value = self
             .op(
                 "/api/sessions/tags/set",
@@ -769,8 +841,16 @@ fn encode_base64(bytes: &[u8]) -> String {
             | (chunk.get(2).copied().unwrap_or(0) as u32);
         result.push(CHARS[((n >> 18) & 63) as usize] as char);
         result.push(CHARS[((n >> 12) & 63) as usize] as char);
-        result.push(if chunk.len() > 1 { CHARS[((n >> 6) & 63) as usize] as char } else { '=' });
-        result.push(if chunk.len() > 2 { CHARS[(n & 63) as usize] as char } else { '=' });
+        result.push(if chunk.len() > 1 {
+            CHARS[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        result.push(if chunk.len() > 2 {
+            CHARS[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     result
 }
@@ -782,7 +862,14 @@ mod image_tests {
     #[test]
     fn validates_relative_paths_and_image_signatures() {
         assert!(validate_image_path("images/screenshot.png").is_ok());
-        for path in ["", "/etc/passwd", "../secret.png", "a/./b.png", "a//b.png", "C:\\x.png"] {
+        for path in [
+            "",
+            "/etc/passwd",
+            "../secret.png",
+            "a/./b.png",
+            "a//b.png",
+            "C:\\x.png",
+        ] {
             assert!(validate_image_path(path).is_err(), "{path}");
         }
         assert!(has_image_signature("image/png", b"\x89PNG\r\n\x1a\n"));
@@ -827,7 +914,8 @@ mod resume_tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0u8; 2048];
                 let count = socket.read(&mut request).await.unwrap();
-                assert!(String::from_utf8_lossy(&request[..count]).starts_with(&format!("POST {path} ")));
+                assert!(String::from_utf8_lossy(&request[..count])
+                    .starts_with(&format!("POST {path} ")));
                 let body = body.to_string();
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -837,8 +925,14 @@ mod resume_tests {
             }
         });
         let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
-        assert_eq!(client.resume_if_orphaned("session").await.unwrap().status, "running");
-        assert_eq!(client.resume_if_orphaned("session").await.unwrap().status, "running");
+        assert_eq!(
+            client.resume_if_orphaned("session").await.unwrap().status,
+            "running"
+        );
+        assert_eq!(
+            client.resume_if_orphaned("session").await.unwrap().status,
+            "running"
+        );
         server.await.unwrap();
     }
 }
