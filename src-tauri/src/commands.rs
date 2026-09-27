@@ -299,8 +299,8 @@ fn fleet_topics(sessions: &[SessionSummaryView]) -> Vec<String> {
     topics
 }
 
-/// Open a session: fetch its view, emit it, and start (replacing any previous)
-/// chat SSE forwarder for this session.
+/// Open a session and start its chat forwarder. A queued prompt in a lost ACP
+/// runtime is work the user already requested, so resume it when opened.
 #[tauri::command]
 pub async fn open_session(
     app: AppHandle,
@@ -308,7 +308,17 @@ pub async fn open_session(
     id: String,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
-    let view = client.get_session(&id).await?;
+    let original = client.get_session(&id).await?;
+    let view = match resume_queued_on_open(&client, &id, original.clone()).await {
+        Ok(view) => view,
+        Err(error) => {
+            let _ = app.emit("loom://error", UiError {
+                message: "Could not resume the queued message. Sending a message will retry.".into(),
+                unreachable: error.is_unreachable(),
+            });
+            client.get_session(&id).await.unwrap_or(original)
+        }
+    };
 
     // Cancel the previous session's forwarder: its frames would interleave
     // with the new session's otherwise.
@@ -320,6 +330,77 @@ pub async fn open_session(
     spawn_chat_forwarder(app, client.clone(), id.clone(), cancel);
     state.older_cursor.write().await.take();
     Ok(view)
+}
+
+async fn resume_queued_on_open(client: &LoomClient, id: &str, mut view: SessionView) -> Result<SessionView, LoomError> {
+    if view.status != "orphaned" || view.protocol != "acp" {
+        return Ok(view);
+    }
+    let chat = client.session_chat(id, None).await?;
+    if !chat.pending_prompt.as_deref().is_some_and(|prompt| !prompt.trim().is_empty()) {
+        return Ok(view);
+    }
+    view = client.resume_if_orphaned(id).await?;
+    let chat = client.session_chat(id, None).await?;
+    if chat.live_turn.is_none()
+        && chat.pending_prompt.as_deref().is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        if let Err(error) = client.send_queued_prompt(id).await {
+            // A resumed turn can drain the queue between our read and send.
+            let latest = client.session_chat(id, None).await?;
+            if latest.live_turn.is_none()
+                && latest.pending_prompt.as_deref().is_some_and(|prompt| !prompt.trim().is_empty())
+            {
+                return Err(error);
+            }
+        }
+    }
+    Ok(view)
+}
+
+#[cfg(test)]
+mod queued_recovery_tests {
+    use super::{resume_queued_on_open, SessionView};
+    use crate::client::LoomClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn opening_an_orphan_with_queued_work_resumes_and_dispatches_it() {
+        let base = serde_json::json!({
+            "id":"session", "status":"orphaned", "profile":"default", "class":"interactive",
+            "origin":"user", "agent_kind":"codex", "model":"", "effort":"", "protocol":"acp",
+            "work_dir":"/tmp/work", "term_session":"runtime", "turn_count":0,
+            "created_by":null, "created_at":"now", "last_activity_at":"now",
+            "branch":{"id":"branch", "branch":"topic", "name":"topic", "title":"Topic",
+                      "repo_root":"/tmp", "tags":[]}
+        });
+        let mut running = base.clone();
+        running["status"] = "running".into();
+        let view: SessionView = serde_json::from_value(base.clone()).unwrap();
+        let queued = serde_json::json!({"blocks":[],"live_turn":null,"pending_prompt":"queued work","older_cursor":null});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (path, body) in [
+                ("/api/sessions/chat", queued.clone()),
+                ("/api/sessions/get", base),
+                ("/api/sessions/adopt", running.clone()),
+                ("/api/sessions/chat", queued),
+                ("/api/sessions/prompt/create", serde_json::json!({"queued":false,"turn":1})),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..count]).starts_with(&format!("POST {path} ")));
+                let body = body.to_string();
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
+        assert_eq!(resume_queued_on_open(&client, "session", view).await.unwrap().status, "running");
+        server.await.unwrap();
+    }
 }
 
 fn spawn_chat_forwarder(
@@ -392,7 +473,6 @@ pub async fn send_input(
     state: State<'_, LoomState>,
     id: String,
     text: String,
-    protocol: String,
     topic_id: Option<String>,
     resource_ids: Option<Vec<String>>,
     attachments: Option<Vec<crate::loom::ScratchUpload>>,
@@ -405,6 +485,9 @@ pub async fn send_input(
         let mentions = ids.into_iter().map(|resource_id| ResourceMention { topic_id: topic_id.clone(), resource_id }).collect();
         prompt.push_str(&resource_context(&client, mentions).await?);
     }
+    // An orphan is a recoverable runtime gap, not a different kind of user
+    // conversation. Resume before uploading attachments or sending input.
+    let view = client.resume_if_orphaned(&id).await?;
     let mut files = Vec::new();
     for (name, bytes) in decode_attachments(attachments.unwrap_or_default())? {
         files.push(client.upload_scratch(&id, &name, bytes).await?);
@@ -413,7 +496,7 @@ pub async fn send_input(
         prompt.push_str("\n\nAttached files in this session's Scratch directory:\n");
         for path in &files { prompt.push_str(&format!("- {path}\n")); }
     }
-    if protocol == "terminal" {
+    if view.protocol == "terminal" {
         client.send_text(&id, &prompt, true).await?;
     } else {
         client.send_prompt(&id, &prompt, &files).await?;
@@ -527,13 +610,6 @@ pub async fn send_to_thread(
 pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), UiError> {
     let client = state_client(&state).await?;
     client.interrupt(&id).await.map_err(Into::into)
-}
-
-/// Resume an orphaned session without changing its checkout or queued message.
-#[tauri::command]
-pub async fn adopt_session(state: State<'_, LoomState>, id: String) -> Result<SessionView, UiError> {
-    let client = state_client(&state).await?;
-    client.adopt(&id).await.map_err(Into::into)
 }
 
 /// Launch a session. When `parent_id` is set this is a delegation: the
@@ -1000,6 +1076,7 @@ pub async fn integrate_session(
     };
     let topic_name = coordinator.branch.name.clone();
     let prompt = request.to_prompt(&topic_name);
+    client.resume_if_orphaned(&target.coordinator_id).await?;
     // Queue the structured request behind any active ACP turn. Terminal
     // sessions get the text directly because Loom has no terminal prompt queue.
     if coordinator.protocol == "terminal" {
@@ -1060,6 +1137,7 @@ pub async fn land_topic(
         requested_by: "user",
     };
     let prompt = request.to_prompt(&view.branch.name);
+    client.resume_if_orphaned(&view.id).await?;
     if view.protocol == "terminal" {
         client.send_text(&view.id, &prompt, true).await?;
     } else {

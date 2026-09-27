@@ -8,7 +8,7 @@ import type { SessionSummary } from "../App.vue";
 //   archived            → ok (not listed)
 //   any tag value       → blocked   (needs the user now)
 //     "blocked"
-//   status error/orphan → attention (needs the user soon)
+//   status error        → attention (needs the user soon)
 //   or tag "attention"
 //   anything else       → ok
 // `idle` is a quiet mark (loom never puts it on the loud ladder): an agent
@@ -40,7 +40,7 @@ function level(s: SessionSummary): "blocked" | "attention" | "ok" {
   const loud = loudValue(s);
   if (loud === "blocked") return "blocked";
   if (loud === "attention") return "attention";
-  if (s.status === "error" || s.status === "orphaned") return "attention";
+  if (s.status === "error") return "attention";
   return "ok";
 }
 
@@ -69,7 +69,6 @@ function ago(iso: string): string {
 }
 
 function why(s: SessionSummary): string {
-  if (s.status === "orphaned") return "orphaned — agent process lost";
   if (s.status === "error") return "errored";
   const tag = s.branch.tags.find(
     (t) => t.key === "attention" || t.key === "triage",
@@ -103,7 +102,7 @@ const working = computed<HomeRow[]>(() =>
     .map((s) => ({ s, when: ago(s.last_activity_at), why: subtitle(s) })),
 );
 
-// RESTING: idle marks and finished/error-free sessions that don't need you.
+// RESTING: idle marks and sessions without user-facing attention.
 const resting = computed<HomeRow[]>(() =>
   live.value
     .filter(

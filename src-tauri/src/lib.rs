@@ -32,7 +32,6 @@ pub fn run() {
             commands::send_input,
             commands::send_to_thread,
             commands::interrupt,
-            commands::adopt_session,
             commands::launch_session,
             commands::launch_options,
             commands::handoff_session,

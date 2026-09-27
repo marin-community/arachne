@@ -401,6 +401,17 @@ impl LoomClient {
         Ok(())
     }
 
+    /// Start Loom's durable next-turn queue after a lost runtime is restored.
+    pub async fn send_queued_prompt(&self, id: &str) -> Result<(), LoomError> {
+        let _: serde_json::Value = self
+            .op(
+                "/api/sessions/prompt/create",
+                &serde_json::json!({ "session": id, "text": "", "force_queued": true }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// A durable inbox item on the destination session's channel. Loom
     /// delivers message-kind items to that session and records the author;
     /// the structured payload lets the UI retain source provenance.
@@ -451,6 +462,24 @@ impl LoomClient {
     pub async fn adopt(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
         self.op("/api/sessions/adopt", &serde_json::json!({ "session": id }))
             .await
+    }
+
+    /// Resume a lost runtime only when an action needs to deliver work to it.
+    /// Another client may win the adoption race; in that case its running
+    /// session is equally ready to receive the action.
+    pub async fn resume_if_orphaned(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
+        let view = self.get_session(id).await?;
+        if view.status != "orphaned" {
+            return Ok(view);
+        }
+        match self.adopt(id).await {
+            Ok(view) => Ok(view),
+            Err(error @ LoomError::Api { status: 409, .. }) => {
+                let current = self.get_session(id).await?;
+                if current.status == "running" { Ok(current) } else { Err(error) }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// `sessions.launch` — worktree + terminal + agent, seeded with a task.
@@ -602,5 +631,50 @@ impl LoomClient {
             }
         });
         Ok(rx)
+    }
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::LoomClient;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn session(status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "session", "status": status, "profile": "default", "class": "interactive",
+            "origin": "user", "agent_kind": "codex", "model": "", "effort": "",
+            "protocol": "acp", "work_dir": "/tmp/work", "term_session": "runtime",
+            "turn_count": 0, "created_by": null, "created_at": "now", "last_activity_at": "now",
+            "branch": { "id": "branch", "branch": "topic", "name": "topic", "title": "Topic",
+                "repo_root": "/tmp", "tags": [] }
+        })
+    }
+
+    #[tokio::test]
+    async fn resumes_only_orphaned_sessions() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (path, body) in [
+                ("/api/sessions/get", session("orphaned")),
+                ("/api/sessions/adopt", session("running")),
+                ("/api/sessions/get", session("running")),
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 2048];
+                let count = socket.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..count]).starts_with(&format!("POST {path} ")));
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
+        assert_eq!(client.resume_if_orphaned("session").await.unwrap().status, "running");
+        assert_eq!(client.resume_if_orphaned("session").await.unwrap().status, "running");
+        server.await.unwrap();
     }
 }

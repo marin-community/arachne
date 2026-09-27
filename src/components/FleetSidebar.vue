@@ -119,7 +119,6 @@ function subtitle(s: SessionSummary): string {
 }
 
 function statusClass(s: SessionSummary): string {
-  if (s.status === "orphaned") return "orphaned";
   const loud = loudTag(s);
   if (loud?.level === "blocked") return "error";
   if (loud?.level === "attention") return "attention";
@@ -130,7 +129,7 @@ function statusClass(s: SessionSummary): string {
 // thread spins instead, a resting one (running + idle mark) shows nothing.
 function badgeLabel(s: SessionSummary): string | null {
   if (s.status === "archived") return "done";
-  if (s.status === "orphaned") return "orphan";
+  if (s.status === "orphaned") return null;
   const loud = loudTag(s);
   if (loud) return loud.level;
   if (s.status === "running") return null;

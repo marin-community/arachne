@@ -307,10 +307,10 @@ const handoffAgent = ref(props.session.agent_kind || "");
 const handoffModel = ref(props.session.model || "");
 const handoffEffort = ref(props.session.effort || "");
 const handingOff = ref(false);
-const adopting = ref(false);
 const currentStatus = computed(() =>
   props.fleet.find((s) => s.id === props.session.id)?.status ?? props.session.status,
 );
+const canSend = computed(() => currentStatus.value === "running" || currentStatus.value === "orphaned");
 const canInterrupt = computed(() =>
   currentStatus.value === "running" && (props.session.protocol !== "acp" || turnLive.value),
 );
@@ -527,13 +527,13 @@ async function send() {
     chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
   const text = draft.value.trim();
-  if (currentStatus.value !== "running" || (!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
+  if (!canSend.value || (!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
+  const wasOrphaned = currentStatus.value === "orphaned";
   busy.value = true;
   try {
     await invoke("send_input", {
       id: props.session.id,
       text: text || "Please inspect the attached files.",
-      protocol: props.session.protocol,
       topicId: props.topic?.id ?? null,
       resourceIds: selectedMentions.value.filter((mention) => text.includes(mention.token)).map((mention) => mention.id),
       attachments: attachments.value.map(({ name, contentBase64 }) => ({ name, contentBase64 })),
@@ -543,6 +543,7 @@ async function send() {
     selectedMentions.value = [];
     mentionRange.value = null;
     await reload();
+    if (wasOrphaned) emit("refresh", props.session.id);
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   } finally {
@@ -556,19 +557,6 @@ async function interrupt() {
     await invoke("interrupt", { id: props.session.id });
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
-  }
-}
-
-async function adopt() {
-  if (currentStatus.value !== "orphaned" || adopting.value) return;
-  adopting.value = true;
-  try {
-    await invoke("adopt_session", { id: props.session.id });
-    emit("refresh", props.session.id);
-  } catch (e: any) {
-    emit("error", e?.message ?? String(e));
-  } finally {
-    adopting.value = false;
   }
 }
 
@@ -757,7 +745,6 @@ async function onLand(strategy: string) {
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
       <button :disabled="!canInterrupt" @click="interrupt">Interrupt</button>
-      <button v-if="currentStatus === 'orphaned'" :disabled="adopting" @click="adopt">{{ adopting ? "Adopting…" : "Adopt" }}</button>
       <button class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate = !showDelegate">
         Delegate
@@ -937,16 +924,14 @@ async function onLand(strategy: string) {
         <!-- usage / turn_end / unknown: no visual block -->
       </template>
       <!-- A queued prompt can outlive its agent. Only a live turn spins. -->
-      <div v-if="turnLive || pendingPrompt" class="block working">
+      <div v-if="(turnLive && currentStatus === 'running') || pendingPrompt" class="block working">
         <div class="who">{{ session.agent_kind }}</div>
         <div class="body working-body">
           <span v-if="turnLive && currentStatus === 'running'" class="spinner" aria-hidden="true"></span>
           <span class="working-label">{{
-            currentStatus === 'orphaned'
-              ? (pendingPrompt ? 'Agent stopped — message queued until adopted.' : 'Agent stopped.')
-              : turnLive
-                ? (pendingPrompt ? 'Working — message queued…' : 'Working…')
-                : 'Message queued…'
+            turnLive && currentStatus === 'running'
+              ? (pendingPrompt ? 'Working — message queued…' : 'Working…')
+              : 'Message queued…'
           }}</span>
           <span v-if="turnLive && currentStatus === 'running' && elapsedLabel" class="working-meta">{{
             `${elapsedLabel} elapsed`
@@ -984,16 +969,14 @@ async function onLand(strategy: string) {
       </div>
       <div class="composer">
       <label class="attachment-pick composer-attach" title="Attach files">+
-        <input type="file" multiple :disabled="currentStatus !== 'running' || attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
+        <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
       </label>
       <textarea
         ref="composerEl"
         v-model="draft"
-        :disabled="currentStatus !== 'running'"
+        :disabled="!canSend"
         :placeholder="
-          currentStatus === 'orphaned'
-            ? 'Adopt this thread to resume messages…'
-            : turnLive
+          turnLive
             ? 'Agent is working — your message will queue behind the current turn…'
             : 'Message the agent…'
         "
@@ -1002,7 +985,7 @@ async function onLand(strategy: string) {
         @keydown="onComposerKeydown"
         @paste="onComposerPaste"
       ></textarea>
-      <button class="primary" :disabled="currentStatus !== 'running' || (!draft.trim() && !attachments.length) || busy || attachmentLoading" @click="send">
+      <button class="primary" :disabled="!canSend || (!draft.trim() && !attachments.length) || busy || attachmentLoading" @click="send">
         {{ busy ? "…" : "Send" }}
       </button>
       </div>
