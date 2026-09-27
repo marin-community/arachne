@@ -68,6 +68,10 @@ export interface SessionSummary {
   last_activity_at: string;
   /** When the newest user message was journaled; null on older looms. */
   last_user_message_at?: string | null;
+  // The topic's checkout path and whether it still exists on the server.
+  // Lets the inspector's Resources view offer Open in Zed vs. Recover.
+  work_dir: string;
+  worktree_present: boolean;
   branch: BranchSummary;
   placement: Placement | null;
   github_repo: string | null;

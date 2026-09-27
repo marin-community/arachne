@@ -106,6 +106,13 @@ pub struct SessionSummaryView {
     /// streaming, so topic ordering by it stays still.
     #[serde(default)]
     pub last_user_message_at: Option<String>,
+    /// The session's checkout path and whether it still exists on the server
+    /// (archive removes the worktree). Lets resource surfaces offer
+    /// Open-in-Zed vs. Recover without fetching the full session view.
+    #[serde(default)]
+    pub work_dir: String,
+    #[serde(default)]
+    pub worktree_present: bool,
     pub branch: BranchSummaryView,
     pub placement: Option<SessionPlacementView>,
     pub github_repo: Option<String>,

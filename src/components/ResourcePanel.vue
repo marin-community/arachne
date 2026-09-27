@@ -28,6 +28,58 @@ const props = defineProps<{ topic: SessionSummary; embedded?: boolean }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "error", message: string): void }>();
 const snapshot = ref<TopicResourcesView>({ resources: [], revision: 0 });
 const selectedId = ref<string | null>(null);
+
+// --- Live topic resources --------------------------------------------
+// The spec's resource strip invariant applies to the inspector too: the
+// topic's own repo, PR, and checkout are its most relevant resources, and
+// they should be reachable immediately — not only attached files.
+const repoLabel = computed(() => {
+  if (props.topic.github_repo) return props.topic.github_repo;
+  const root = props.topic.branch.repo_root || "";
+  return root ? root.split("/").filter(Boolean).slice(-2).join("/") : "";
+});
+const repoUrl = computed(() => {
+  const slug = props.topic.github_repo;
+  return slug && /^[\w.-]+\/[\w.-]+$/.test(slug) ? `https://github.com/${slug}` : null;
+});
+const pr = computed(() => props.topic.branch.github ?? null);
+
+async function openExternal(url: string) {
+  try {
+    await open(url);
+  } catch (error: any) {
+    emit("error", error?.message ?? String(error));
+  }
+}
+
+// The topic's own checkout: open in Zed when present, otherwise recover
+// it via repos.worktrees.ensure (never resurrecting the agent) and open.
+const topicWorktree = ref(props.topic.worktree_present ? props.topic.work_dir : "");
+const recoveringWorktree = ref(false);
+
+async function openTopicCheckout() {
+  try {
+    if (topicWorktree.value) {
+      await invoke("open_in_zed", { id: props.topic.id });
+      return;
+    }
+    recoveringWorktree.value = true;
+    const wt = await invoke<{ path: string; created: boolean }>("recover_worktree", {
+      repoRoot: props.topic.branch.repo_root,
+      branch: props.topic.branch.branch,
+    });
+    topicWorktree.value = wt.path;
+    await invoke("open_in_zed", { id: props.topic.id, workDir: wt.path });
+  } catch (error: any) {
+    emit("error", error?.message ?? String(error));
+  } finally {
+    recoveringWorktree.value = false;
+  }
+}
+
+watch(() => props.topic.id, () => {
+  topicWorktree.value = props.topic.worktree_present ? props.topic.work_dir : "";
+});
 const content = ref("");
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: false });
 const renderedContent = computed(() => DOMPurify.sanitize(markdown.render(content.value)));
@@ -190,6 +242,39 @@ async function onPreviewClick(event: MouseEvent) {
       <button v-if="!embedded" title="Close resources" aria-label="Close resources" @click="emit('close')">×</button>
     </header>
     <div class="resource-panel-list">
+      <!-- Live topic resources: the repo, PR, and checkout the topic is
+           happening in — always first, always actionable. -->
+      <section class="resource-panel-live" aria-label="Topic repository and checkout">
+        <button v-if="repoUrl" class="resource-panel-item" title="Open the repository on GitHub" @click="openExternal(repoUrl)">
+          <span class="resource-panel-icon">⌂</span>
+          <span class="resource-panel-item-text">
+            <strong>{{ repoLabel }}</strong>
+            <small>repository</small>
+          </span>
+        </button>
+        <div v-else-if="repoLabel" class="resource-panel-item static">
+          <span class="resource-panel-icon">⌂</span>
+          <span class="resource-panel-item-text">
+            <strong>{{ repoLabel }}</strong>
+            <small>repository</small>
+          </span>
+        </div>
+        <button v-if="pr" class="resource-panel-item" :title="pr.pr_title" @click="openExternal(pr.pr_url)">
+          <span class="resource-panel-icon">⑂</span>
+          <span class="resource-panel-item-text">
+            <strong>PR #{{ pr.pr_number }}</strong>
+            <small>{{ pr.is_draft ? "draft" : pr.pr_state }}<template v-if="pr.review_decision"> · {{ pr.review_decision }}</template><template v-if="pr.checks"> · CI {{ pr.checks }}</template></small>
+          </span>
+        </button>
+        <button class="resource-panel-item" :disabled="recoveringWorktree" :title="topicWorktree || 'The worktree is gone; materialize a checkout for this branch'" @click="openTopicCheckout">
+          <span class="resource-panel-icon">▣</span>
+          <span class="resource-panel-item-text">
+            <strong>{{ recoveringWorktree ? "Recovering…" : topicWorktree ? "Checkout" : "Recover checkout" }}</strong>
+            <small>{{ topicWorktree ? topicWorktree : props.topic.branch.branch }}</small>
+          </span>
+        </button>
+      </section>
+      <div class="resource-panel-subhead">Attached</div>
       <div v-if="loading && !snapshot.resources.length" class="resource-panel-empty">Loading…</div>
       <div v-else-if="!snapshot.resources.length" class="resource-panel-empty">
         No resources attached yet. Attach a design document or file so it stays with this topic.
@@ -242,6 +327,9 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-topic { color: var(--text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .resource-panel-list { overflow-y: auto; max-height: 35%; padding: 7px; }
 .resource-panel.embedded .resource-panel-list { max-height: none; flex: 1; }
+.resource-panel-live { display: flex; flex-direction: column; gap: 2px; }
+.resource-panel-subhead { margin: 6px 2px 4px; font-size: 10px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--text-dim); }
+.resource-panel-item.static { cursor: default; }
 .resource-panel-item { width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; padding: 8px; }
 .resource-panel-item:hover, .resource-panel-item.selected { background: var(--bg-hover); }
 .resource-panel-icon { font-size: 17px; color: var(--accent); }
