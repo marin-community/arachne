@@ -20,15 +20,19 @@ the intended remote test uses Loom on the DGX over Tailscale.
 
 ## User model
 
-- **Topic:** the durable top-level object for intent, context, resources,
+- **Project:** a home for related Topics and a reusable bundle of resource and
+  launch defaults. It has no coordinator, mailbox, agent, or execution state.
+  A Topic has one home Project but may reference resources from elsewhere.
+- **Topic:** the durable unit of intent, context, resources,
   subscriptions, mailbox, coordinator thread, workers, and integration state.
   Its coordinator may sleep. Accepted code state is a ref per attached
   repository, not one branch shared across repositories.
   Creation offers a short title and a body that becomes the agent goal; either
   can be left blank when the other or an attachment supplies the intent.
-- **Quick topic:** a single-prompt way to start a topic. Its title can be
-  derived from the prompt; title and body remain optional in the expanded
-  creation form. It can grow delegated threads later without conversion.
+- **Quick topic:** a single-prompt way to start a topic in the current or
+  default Project. Its title can be derived from the prompt; title and body
+  remain optional in the expanded creation form. It can grow delegated threads
+  later without conversion.
 - **Thread/worker:** one Loom session and its conversation. Hierarchy records
   responsibility; it does not determine Git ancestry.
 - **Resource:** a repository, checkout, PR, document, file, or artifact with a
@@ -42,10 +46,13 @@ The main screen answers “what needs me?” Topic and thread views then show th
 conversation alongside code and resources. Every code reference should lead to
 an editable checkout with one action when that checkout is available.
 
-With no Topic selected, **Topics home** is an aggregate fleet view across all
-Topics. It shows Needs You first and prominently (or “Nothing needs you”),
-then Working, Ready to Integrate, and collapsed Waiting / Resting. Every row
-names its parent Topic and opens its Thread conversation.
+With no Project or Topic selected, **Topics home** is an aggregate fleet view
+across all Projects and Topics. It shows Needs You first and prominently (or
+“Nothing needs you”), then Working, Ready to Integrate, and collapsed Waiting /
+Resting. Every row names its Project and parent Topic and opens its Thread
+conversation. Selecting a Project opens the same status groups filtered to that
+Project's Topics. A
+Project home is an aggregate view, not a Project conversation.
 
 Selecting a Topic opens a **chat**, normally its coordinator Thread. The
 coordinator is the Topic's voice, not one item buried in a dashboard. On a
@@ -53,9 +60,9 @@ first visit, open the coordinator; on later visits, restore the last Thread
 opened within that Topic if it is still available, otherwise return to the
 coordinator. Clicking an already-selected Topic keeps the current Thread.
 The coordinator row in the Threads inspector and a header action provide an
-explicit way back to it. The legible hierarchy is Topics home → Topic →
-Thread, while the main pane remains a conversation and composer whenever a
-Topic is open.
+explicit way back to it. The legible hierarchy is global home → Project →
+Topic → Thread, while the main pane remains a conversation and composer
+whenever a Topic is open.
 
 The right pane is a **Topic inspector** with tabs:
 
@@ -81,10 +88,11 @@ The current bootstrap build opens a scoped dashboard on Topic selection. Keep
 that view as Overview when changing the default route to chat; do not discard
 its aggregate status work.
 
-The sidebar primarily browses Topics. **Topics [+]** opens the optional
-title/body/attachment creation form in a sheet or popover; the form does not
-permanently occupy sidebar space. Inbox may remain a separate tab, but its
-purpose is cross-Topic human attention and reviewable events, rather than an
+The sidebar groups Topics under their home Projects. **Topics [+]** in a
+Project opens the optional title/body/attachment creation form in a sheet or
+popover, preselected to that Project; the form does not permanently occupy
+sidebar space. Inbox may remain a separate tab, but its purpose is
+cross-Topic human attention and reviewable events, rather than an
 unrelated second list. The aggregate Topics home still shows Needs You even
 when Inbox exists. Ready to Integrate requires explicit verified candidate
 state from Loom; a stopped or sleeping worker is not sufficient evidence.
@@ -94,6 +102,30 @@ quick input. The Topics list expands through delegated threads at arbitrary
 depth. Older unmarked top-level conversations remain visible as topics without
 rewriting their Loom history. Delegating from a thread creates a child in the
 conversation tree; its Git base still comes from the topic's accepted branch.
+
+## Project defaults and resource inheritance
+
+A Project can bind multiple repositories, design documents, and other
+Resources. It can also set defaults for runner, agent, inference route, primary
+repository, Topic branch creation policy, and integration policy. A new Topic
+inherits these unless its creation form overrides them. Its Threads inherit
+the effective Topic context and may bind their own worktree, PR, file, or
+artifact. The effective view is **Project resources/defaults → Topic additions
+and overrides → Thread-specific bindings**. Show each binding's origin so the
+user can tell what came from the Project, Topic, or Thread; allow a Topic to
+hide an inherited resource without deleting it from the Project.
+
+Project resource bindings may continue to supply shared references to existing
+Topics; the Topic's own additions, overrides, and hides remain in effect.
+
+Resource identity is shared across these scopes. Inheritance grants context
+and a default binding, not ownership of another Topic's checkout or permission
+to edit it. A Topic can refer to a Resource from another Project explicitly.
+At creation, record the selected runner, agent, inference route, branch policy,
+and canonical refs on the Topic. Updating Project defaults can affect new
+Topics, but must not silently retarget active Topic branches, runners, or
+integration targets. Explicitly applying a changed default to an existing
+Topic is a reviewable operation.
 
 Worktrees are Resources, not Topics. A Topic may retain a checkout for human
 editing, but its canonical accepted state is the repository ref. New coding
