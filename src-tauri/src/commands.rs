@@ -833,10 +833,12 @@ pub async fn launch_session(
             title: Some(label),
             goal: Some(goal),
             parent_branch: parent_branch.clone(),
-            profile,
-            agent,
-            model,
-            effort,
+            // Empty strings mean "inherit the server default" — filter to
+            // None so loom sees omitted-vs-blank as intended.
+            profile: profile.filter(|s| !s.is_empty()),
+            agent: agent.filter(|s| !s.is_empty()),
+            model: model.filter(|s| !s.is_empty()),
+            effort: effort.filter(|s| !s.is_empty()),
             scratch: attachments,
             ..Default::default()
         })
@@ -959,6 +961,9 @@ pub async fn delegate_task(
     state: State<'_, LoomState>,
     parent_id: String,
     task: String,
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent = client.get_session(&parent_id).await?;
@@ -976,6 +981,12 @@ pub async fn delegate_task(
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
             parent_branch: Some(parent.branch.id),
+            // Launch overrides from the picker: empty strings mean "inherit
+            // the server default", so filter them to None (loom's
+            // omitted-vs-blank distinction).
+            agent: agent.filter(|s| !s.is_empty()),
+            model: model.filter(|s| !s.is_empty()),
+            effort: effort.filter(|s| !s.is_empty()),
             ..Default::default()
         })
         .await?;

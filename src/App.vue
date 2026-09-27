@@ -10,6 +10,7 @@ import NewThreadSheet from "./components/NewThreadSheet.vue";
 import NewTopicSheet from "./components/NewTopicSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
+import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
 import { clearDraftOnLaunch } from "./newTopicDraft";
 import {
   readTopicThreadMemory,
@@ -211,6 +212,15 @@ async function connect(url: string, token: string | null) {
     connected.value = true;
     connError.value = null;
     launchOptions.value = await invoke<LaunchOptions>("launch_options").catch(() => null);
+    // The launch-preset store shares this fetch's data (same command):
+    // mirror it into the store so the picker's lists hydrate on connect.
+    if (launchOptions.value) {
+      launchAgents.value = launchOptions.value.agents;
+      launchProfiles.value = launchOptions.value.profiles;
+      launchDefaultAgent.value = launchOptions.value.default_agent;
+    } else {
+      await ensureLaunchConfig().catch(() => {});
+    }
   } catch (e: any) {
     connected.value = false;
     connError.value = e?.message ?? String(e);
@@ -459,8 +469,17 @@ async function updateTopic(
 
 async function delegateFromThread(parentId: string, task: string) {
   launching.value = true;
+  // The launch-preset picker's current selection rides along: the last
+  // chosen harness/model/effort is the default for every delegation.
+  const sel = launchSelection.value;
   try {
-    const view = await invoke<SessionView>("delegate_task", { parentId, task });
+    const view = await invoke<SessionView>("delegate_task", {
+      parentId,
+      task,
+      agent: sel.agent || null,
+      model: sel.model || null,
+      effort: sel.effort || null,
+    });
     // Stay on the parent thread — the child appears nested under it in the
     // sidebar (and inherits the parent's topic) via the layout events.
   } catch (e: any) {

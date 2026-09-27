@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
+import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
@@ -1091,6 +1092,7 @@ async function onLand(strategy: string) {
         @keydown.enter.prevent="submitDelegate"
         @keydown.esc="showDelegate = false"
       />
+      <LaunchPreset />
       <button
         class="primary"
         :disabled="!delegateTask.trim()"
