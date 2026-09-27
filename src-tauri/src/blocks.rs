@@ -252,4 +252,15 @@ mod tests {
         assert_eq!(display["content"], content);
         assert_eq!(display["summary"], "");
     }
+
+    #[test]
+    fn preserves_max_tokens_turn_boundary_for_the_ui() {
+        let display = serde_json::to_value(DisplayBlock::from_view(&block(
+            "turn_end",
+            json!({ "stop_reason": "max_tokens" }),
+        )))
+        .unwrap();
+        assert_eq!(display["kind"], "turn_end");
+        assert_eq!(display["stop_reason"], "max_tokens");
+    }
 }
