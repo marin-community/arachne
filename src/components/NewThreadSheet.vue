@@ -21,14 +21,11 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 // sidebar's single-prompt composer was removed — this sheet is now the
 // only single-prompt launch surface.
 
-// The optional preselected project (Topics [+] on a project heading) is
-// shown as context in the sheet and forwarded on launch.
 const props = defineProps<{
   fleet: SessionSummary[];
   launching?: boolean;
   error?: string | null;
   launchOptions: LaunchOptions | null;
-  project?: { id: string | null; name: string } | null;
 }>();
 
 const emit = defineEmits<{
@@ -37,7 +34,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+    meta?: { base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
   ): void;
 }>();
 
@@ -225,7 +222,6 @@ function submit() {
     mentions: mentions.value.filter((mention) => t.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: attachments.value,
-    project: props.project ?? undefined,
   });
 }
 
@@ -257,7 +253,6 @@ function onGoalKeydown(event: KeyboardEvent) {
     <div class="nts-inner">
       <header class="nts-head">
         <h1>New thread</h1>
-        <span v-if="props.project" class="nts-project" :title="`Files under project ${props.project.name}`">{{ props.project.name }}</span>
         <button
           class="nts-close"
           title="Close (esc)"

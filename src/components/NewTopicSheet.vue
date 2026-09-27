@@ -21,12 +21,18 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 // keeps the drafts: the composer state is snapshotted to localStorage
 // (src/newTopicDraft.ts) and restored when the sheet reopens, so clicking
 // away mid-compose never eats a half-written topic.
+//
+// The optional preselected project (Topics [+] on a project heading) is
+// shown as context in the sheet and forwarded on launch — a topic is the
+// unit a project files, so the + belongs to this sheet, not the plain
+// new-thread one.
 
 const props = defineProps<{
   fleet: SessionSummary[];
   launching?: boolean;
   error?: string | null;
   launchOptions: LaunchOptions | null;
+  project?: { id: string | null; name: string } | null;
 }>();
 
 const emit = defineEmits<{
@@ -35,7 +41,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
   ): void;
 }>();
 
@@ -310,6 +316,7 @@ function submit() {
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: attachments.value,
     ...launchConfig(),
+    project: props.project ?? undefined,
   });
 }
 </script>
@@ -319,6 +326,7 @@ function submit() {
     <div class="nts-inner">
       <header class="nts-head">
         <h1>New topic</h1>
+        <span v-if="props.project" class="nts-project" :title="`Files under project ${props.project.name}`">{{ props.project.name }}</span>
         <button
           class="nts-close"
           title="Close (esc)"
