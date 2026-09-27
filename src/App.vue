@@ -8,7 +8,7 @@ import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import NewThreadSheet from "./components/NewThreadSheet.vue";
 import NewTopicSheet from "./components/NewTopicSheet.vue";
-import ResourcePanel from "./components/ResourcePanel.vue";
+import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
 import {
   readTopicThreadMemory,
@@ -537,7 +537,7 @@ const selectedTopic = computed(() => {
         }}
       </span>
       <button v-if="viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
-        @click="showResources = !showResources">Resources</button>
+        title="Topic inspector" @click="showResources = !showResources">Inspector</button>
     </header>
     <FleetSidebar
       :fleet="fleet"
@@ -605,8 +605,8 @@ const selectedTopic = computed(() => {
       @open-zed="openTopicInZed"
       @home="onHome"
     />
-    <ResourcePanel v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic"
-      @close="showResources = false" @error="connError = $event" />
+    <TopicInspector v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId"
+      @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openNewThread" />
     <SettingsSheet
       v-if="showSettings"
       :url="loomUrl"
