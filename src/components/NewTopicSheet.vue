@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
-import { addAttachments, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 
 // The new-topic sheet: composing a topic takes over the main display panel
 // (grid-area main), exactly like the new-thread sheet — never a floating
@@ -89,9 +89,11 @@ function onFileInput(event: Event) {
   input.value = "";
 }
 function onPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
+  if (!event.clipboardData) return;
+  const files = filesFromClipboard(event.clipboardData);
+  if (!files.length) return;
   event.preventDefault();
-  void addFiles(event.clipboardData.files);
+  void addFiles(files);
 }
 
 // --- @-mentions of existing topic resources -------------------------------------
@@ -307,8 +309,9 @@ function submit() {
         @dragover.prevent
         @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)"
       >
-        <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files to new topic" @change="onFileInput" /></label>
+        <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files or images to new topic" @change="onFileInput" /></label>
         <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
           {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
         </span>
         <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>

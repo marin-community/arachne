@@ -3,7 +3,7 @@ import { ref, computed } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { nextTick } from "vue";
 import type { SessionSummary, SessionLayout, LaunchOptions, ResourceMention } from "../App.vue";
-import { addAttachments, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
@@ -477,8 +477,10 @@ function onQuickFileInput(event: Event) {
   input.value = "";
 }
 function onQuickPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
-  event.preventDefault(); void addQuickFiles(event.clipboardData.files);
+  if (!event.clipboardData) return;
+  const files = filesFromClipboard(event.clipboardData);
+  if (!files.length) return;
+  event.preventDefault(); void addQuickFiles(files);
 }
 interface TopicMentionResource {
   topicId: string;
@@ -781,8 +783,9 @@ async function archiveRow(id: string) {
         </div>
       </div>
       <div class="attachment-row quick-attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addQuickFiles($event.dataTransfer.files)">
-        <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="quickAttachmentLoading" aria-label="Attach files to quick task" @change="onQuickFileInput" /></label>
+        <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="quickAttachmentLoading" aria-label="Attach files or images to quick task" @change="onQuickFileInput" /></label>
         <span v-for="(file, index) in quickAttachments" :key="file.name" class="attachment-chip">
+          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
           {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="quickAttachments.splice(index, 1)">×</button>
         </span>
         <span v-if="quickAttachmentError" class="attachment-error">{{ quickAttachmentError }}</span>
