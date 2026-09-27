@@ -987,6 +987,7 @@ async function archiveRow(id: string) {
           <span class="new-project-hint">A place to file related topics.</span>
           <button type="button" class="primary" :disabled="!newProjectName.trim()" @click="submitNewProject">Create</button>
         </div>
+      </div>
 
       <div class="topic-list">
         <template v-for="section in projectSections" :key="section.id ?? 'ungrouped'">
