@@ -23,11 +23,27 @@ const emit = defineEmits<{
 
 const restingOpen = ref(false);
 const projectIds = computed(() => new Set(layoutProjects(props.layout).map((p) => p.id)));
+const projects = computed(() => layoutProjects(props.layout));
 // A row's project: its root (coordinator) session's placement group when
 // that group is a non-system layout group — the same model the sidebar's
 // Topics tab uses (src/projects.ts).
 const projectIdOf = (s: SessionSummary): string | null =>
   topicProjectId(rootOf(s), projectIds.value);
+// A row's project name: the layout group's name when filed under a
+// project, else the repo slug (github_repo) or the repo_root directory
+// with any .worktrees/<name> suffix peeled, so a session running in a
+// worktree still groups with its parent repo. "—" for unknown.
+const projectNameOf = (s: SessionSummary): string => {
+  const id = projectIdOf(s);
+  const project = projects.value.find((p) => p.id === id);
+  if (project) return project.name;
+  if (s.github_repo) return s.github_repo;
+  const root = s.branch.repo_root;
+  if (!root) return "—";
+  const idx = root.indexOf("/.worktrees/");
+  const base = idx >= 0 ? root.slice(0, idx) : root;
+  return base.split("/").filter(Boolean).pop() ?? root;
+};
 const byId = computed(() => new Map(props.fleet.map((s) => [s.id, s])));
 const byBranch = computed(() => new Map(props.fleet.map((s) => [s.branch.id, s])));
 const parentOf = (s: SessionSummary) =>
@@ -106,6 +122,29 @@ const sections = computed(() => [
   { name: "Working", rows: working.value, kind: "working" },
   { name: "Ready to Integrate", rows: ready.value, kind: "ready" },
 ]);
+
+// Below the attention/priority inbox, Working and Ready rows group by
+// project (the layout group, else the repo). Groups order by their most
+// recent row's activity, so the project with current work rises to the
+// top of its section. When a specific project's home is open, every row
+// shares one project — the grouping only matters on the aggregate home.
+interface ProjectGroup {
+  name: string;
+  rows: SessionSummary[];
+}
+function groupByProject(rows: SessionSummary[]): ProjectGroup[] {
+  const groups = new Map<string, SessionSummary[]>();
+  for (const row of rows) {
+    const key = projectNameOf(row);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key)!.push(row);
+  }
+  return [...groups.entries()]
+    .map(([name, groupRows]) => ({ name, rows: groupRows }))
+    .sort((a, b) => b.rows[0].last_activity_at.localeCompare(a.rows[0].last_activity_at));
+}
+const workingGroups = computed(() => groupByProject(working.value));
+const readyGroups = computed(() => groupByProject(ready.value));
 </script>
 
 <template>
@@ -142,13 +181,29 @@ const sections = computed(() => [
         <div v-if="!section.rows.length" :class="section.kind === 'needs' ? 'all-calm compact-calm' : 'home-section-empty'">
           {{ section.kind === "needs" ? "Nothing needs you." : section.kind === "ready" ? "No candidates reported by Loom yet." : "No threads working." }}
         </div>
-        <div v-for="s in section.rows" :key="s.id" class="home-row" :class="level(s)"
-          role="button" tabindex="0" :aria-label="`Open ${rowTitle(s)}: ${description(s)}`"
-          @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
-          <span class="level-dot" :class="section.kind === 'ready' ? 'ready' : level(s)"></span>
-          <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
-          <span class="row-when">{{ ago(s.last_activity_at) }}</span>
-        </div>
+        <!-- Needs You stays flat: it's the priority inbox, one glance. The
+             calmer Working / Ready sections group their rows by project. -->
+        <template v-if="section.kind === 'needs'">
+          <div v-for="s in section.rows" :key="s.id" class="home-row" :class="level(s)"
+            role="button" tabindex="0" :aria-label="`Open ${rowTitle(s)}: ${description(s)}`"
+            @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
+            <span class="level-dot" :class="level(s)"></span>
+            <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
+            <span class="row-when">{{ ago(s.last_activity_at) }}</span>
+          </div>
+        </template>
+        <template v-else>
+          <template v-for="group in section.kind === 'working' ? workingGroups : readyGroups" :key="group.name">
+            <div class="project-title">{{ group.name }}</div>
+            <div v-for="s in group.rows" :key="s.id" class="home-row" :class="section.kind === 'ready' ? 'ready' : level(s)"
+              role="button" tabindex="0" :aria-label="`Open ${rowTitle(s)}: ${description(s)}`"
+              @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
+              <span class="level-dot" :class="section.kind === 'ready' ? 'ready' : level(s)"></span>
+              <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
+              <span class="row-when">{{ ago(s.last_activity_at) }}</span>
+            </div>
+          </template>
+        </template>
       </div>
 
       <div v-if="resting.length" class="section">
