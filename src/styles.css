@@ -1419,7 +1419,7 @@ button.danger:hover { border-color: var(--blocked); }
 .nts-body-wrap { position: relative; }
 .nts-body-wrap textarea { display: block; width: 100%; }
 .mention-menu.nts-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
-/* Project context chip in the new-thread sheet header. */
+/* Project context chip in the new-topic sheet header. */
 .nts-project {
   font-size: 11px;
   font-weight: 600;

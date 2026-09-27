@@ -35,9 +35,9 @@ const emit = defineEmits<{
   ): void;
   (e: "new-thread"): void;
   (e: "new-topic"): void;
-  // Topics [+] on a project heading: open NewThreadSheet preselected to
+  // Topics [+] on a project heading: open NewTopicSheet preselected to
   // that project (null = the Ungrouped section).
-  (e: "new-thread-in-project", project: ProjectRef | null): void;
+  (e: "new-topic-in-project", project: ProjectRef | null): void;
   (
     e: "reparent",
     sessionId: string,
@@ -821,7 +821,7 @@ async function archiveRow(id: string) {
           @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
         >
           <!-- Project heading: select filters the main-pane home to this
-               project's topics; the + opens NewThreadSheet preselected to
+               project's topics; the + opens NewTopicSheet preselected to
                it; the chevron collapses the section. The whole section
                (this heading, its cards, and its empty space) is the drop
                target for filing, not just the thin header strip. -->
@@ -860,7 +860,7 @@ async function archiveRow(id: string) {
               type="button"
               :title="`New topic in ${section.name}`"
               :aria-label="`New topic in ${section.name}`"
-              @click.stop="emit('new-thread-in-project', { id: section.id, name: section.name })"
+              @click.stop="emit('new-topic-in-project', { id: section.id, name: section.name })"
             >+</button>
           </div>
           <template v-if="!isProjectCollapsed(section.id)">

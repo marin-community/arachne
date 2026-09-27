@@ -328,32 +328,39 @@ async function openTopicInZed(id: string) {
   }
 }
 
+const newTopicProject = ref<{ id: string | null; name: string } | null>(null);
+
 function openNewThread() {
   // A stale connection error from an earlier flow shouldn't read as a
   // launch failure inside the fresh sheet.
   connError.value = null;
   showNewTopic.value = false;
+  newTopicProject.value = null;
   showNewThread.value = true;
 }
 
 function openNewTopic() {
   connError.value = null;
   showNewThread.value = false;
+  newTopicProject.value = null;
   showNewTopic.value = true;
 }
 
 // FleetSidebar's project affordances route through here so App owns the
 // sheet. Navigation itself (the project-filtered home) is a separate
 // minimal handler.
-const newThreadProject = ref<{ id: string | null; name: string } | null>(null);
-function openNewThreadInProject(project: { id: string | null; name: string } | null) {
+function openNewTopicInProject(project: { id: string | null; name: string } | null) {
   connError.value = null;
-  newThreadProject.value = project;
-  showNewThread.value = true;
-}
-function closeNewThread() {
+  newTopicProject.value = project;
   showNewThread.value = false;
-  newThreadProject.value = null;
+  showNewTopic.value = true;
+}
+function closeNewTopic() {
+  showNewTopic.value = false;
+  newTopicProject.value = null;
+}
+function closeNewThreadSheet() {
+  showNewThread.value = false;
 }
 
 // Selecting a project heading filters the main-pane home to that project's
@@ -419,11 +426,11 @@ async function launchTask(
 function launchTopic(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
 ) {
   launchTask(task, repo, meta, (success) => {
     if (success) {
-      showNewTopic.value = false;
+      closeNewTopic();
       // Unmounting the sheet snapshots its draft (onUnmounted runs on
       // this same flush); drop it a microtask later, after that snapshot
       // has landed, so reopening the sheet starts fresh.
@@ -434,14 +441,15 @@ function launchTopic(
 
 // The thread sheet's launch: the sheet's draft carries attachments,
 // resource mentions, and the launch config (the removed sidebar composer's
-// affordances), plus the optional preselected project.
+// affordances). Project preselection lives on the topic sheet — a project
+// files topics, so its + opens that sheet.
 function launchThread(
   task: string,
   repo: string,
-  meta?: { mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+  meta?: { mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launchTask(task, repo, meta, (success) => {
-    if (success) closeNewThread();
+    if (success) closeNewThreadSheet();
   });
 }
 
@@ -609,7 +617,7 @@ const selectedTopic = computed(() => {
       @update-topic="updateTopic"
       @new-thread="openNewThread"
       @new-topic="openNewTopic"
-      @new-thread-in-project="openNewThreadInProject"
+      @new-topic-in-project="openNewTopicInProject"
       @select-project="selectProject"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
@@ -621,7 +629,8 @@ const selectedTopic = computed(() => {
       :launching="launching"
       :error="connError"
       :launch-options="launchOptions"
-      @close="showNewTopic = false"
+      :project="newTopicProject"
+      @close="closeNewTopic"
       @launch="launchTopic"
     />
     <NewThreadSheet
@@ -630,8 +639,7 @@ const selectedTopic = computed(() => {
       :launching="launching"
       :error="connError"
       :launch-options="launchOptions"
-      :project="newThreadProject"
-      @close="closeNewThread"
+      @close="closeNewThreadSheet"
       @launch="launchThread"
     />
     <ThreadView
