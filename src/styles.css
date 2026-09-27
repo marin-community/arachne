@@ -115,22 +115,6 @@ body {
   border-color: var(--accent);
   color: var(--accent);
 }
-.sidebar .new-task {
-  margin: 10px;
-  display: flex;
-  gap: 6px;
-}
-.sidebar .new-task input {
-  flex: 1;
-  min-width: 0;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 6px 8px;
-  font-size: 12px;
-  outline: none;
-}
 .sidebar .new-task input:focus { border-color: var(--accent); }
 .session-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
 
@@ -181,7 +165,7 @@ body {
 }
 .topics-toolbar-actions .toolbar-new-project:hover { color: var(--text); border-color: var(--accent); }
 
-/* New Project inline card (topics tab) — same shape as the quick input. */
+/* New Project inline card (topics tab) — same shape as the sheet inputs. */
 .new-project-card {
   margin: 6px 10px 2px;
   padding: 8px 10px;
@@ -753,8 +737,6 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .mention-menu small, .mention-hint { color: var(--text-dim); font-size: 11px; }
 .mention-hint { padding: 7px 8px; }
 .mention-menu.topic-body-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
-.sidebar .new-task.quick-task-wrap { position: relative; }
-.mention-menu.quick-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
 .attachment-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-height: 26px; }
 .attachment-pick { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px; cursor: pointer; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
 .attachment-pick:hover { border-color: var(--accent); color: var(--text); }
@@ -763,7 +745,6 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .attachment-chip button { border: 0; padding: 0 3px; background: transparent; color: var(--text-dim); }
 .attachment-error { color: var(--blocked); font-size: 11px; }
 .attachment-hint { color: var(--text-dim); font-size: 11px; }
-.quick-attachment-row { margin: -4px 10px 6px; }
 .composer-attachments { padding: 6px 16px 0; }
 .composer-attach { min-width: 28px; font-size: 16px; }
 .composer {

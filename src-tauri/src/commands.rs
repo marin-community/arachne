@@ -730,7 +730,6 @@ pub async fn launch_session(
     parent_id: Option<String>,
     title: Option<String>,
     description: Option<String>,
-    one_off: Option<bool>,
     mentions: Option<Vec<ResourceMention>>,
     attachments: Option<Vec<crate::loom::ScratchUpload>>,
     profile: Option<String>,
@@ -750,8 +749,9 @@ pub async fn launch_session(
         }
         _ => None,
     };
-    // Quick topics send only `task` (title falls back to it, like the CLI);
-    // the expanded topic card sends an explicit short title and longer body.
+    // A bare prompt (the New thread sheet with no explicit title) sends
+    // only `task`, so the title falls back to it like the CLI; the expanded
+    // topic card sends an explicit short title and longer body.
     let label = title
         .as_deref()
         .map(str::trim)
@@ -812,9 +812,9 @@ pub async fn launch_session(
             })
             .await;
     }
-    // New root sessions are topics by default. Keep the legacy one_off
-    // parameter for callers that explicitly want an unmarked scratch thread.
-    if parent_branch.is_none() && !one_off.unwrap_or(false) {
+    // New root sessions are topics by default: stamp the durable marker
+    // so the topic card and inspector recognize them.
+    if parent_branch.is_none() {
         let _ = client.set_tag(&view.id, "topic", "true").await;
     }
     // File the new topic into its project when one was preselected (a
