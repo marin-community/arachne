@@ -585,6 +585,7 @@ Squash into main
 Merge into main
 Rebase / fast-forward into main
 Push topic branch
+Squash into local checkout (land-locally)
 ```
 
 Again, available options depend on repository policy.
@@ -592,6 +593,25 @@ The Topic's coordinator receives the Land request, so asking it to decide is
 not a distinct strategy. If policy does not set a default, the conservative
 primary action is **Open PR**. The coordinator can still escalate a genuine
 decision it encounters while carrying out a chosen strategy.
+
+### Land locally
+
+`land-locally` is the exception to "the coordinator receives the request":
+Arachne itself squash-merges the topic's branch into the primary checkout's
+currently checked out branch — deterministically, with no agent turn. It is
+offered only when the Loom server is loopback (its checkout paths are then
+local paths; a remote server's paths mean nothing on this machine), and it
+lands into the branch the primary checkout has checked out *right now*, not
+a remembered target. The fast path refuses rather than reconciles anything
+that would need judgment: a conflicted merge, a detached primary, a primary
+already on the topic branch, staged changes, or another in-progress
+operation (merge/rebase/cherry-pick/revert/bisect) — in every refusal case
+the checkout is left untouched, and a failed squash is unwound with
+`git reset --merge`, which preserves the user's unrelated unstaged changes
+and untracked files. The outcome is reported synchronously (commit, target
+branch, squashed count) and stamped on the topic's branch as an
+`integration_result` tag, the same durable signal an agent-mediated
+integration writes.
 
 Example:
 

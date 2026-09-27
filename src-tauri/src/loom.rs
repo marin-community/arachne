@@ -344,6 +344,10 @@ pub enum IntegrationStrategy {
     CherryPick,
     OpenPr,
     Push,
+    /// Land deterministically in Arachne itself: squash-merge the topic's
+    /// branch into the primary checkout's current branch, no agent turn
+    /// (spec: docs/integration-and-landing.md, "Land locally").
+    LandLocally,
     Ask,
 }
 
@@ -356,6 +360,7 @@ impl IntegrationStrategy {
             "cherry-pick" => Self::CherryPick,
             "open-pr" => Self::OpenPr,
             "push" => Self::Push,
+            "land-locally" => Self::LandLocally,
             "ask" | "ask-coordinator" => Self::Ask,
             _ => return None,
         })
@@ -369,6 +374,7 @@ impl IntegrationStrategy {
             Self::CherryPick => "cherry-pick",
             Self::OpenPr => "open-pr",
             Self::Push => "push",
+            Self::LandLocally => "land-locally",
             Self::Ask => "ask",
         }
     }
@@ -382,8 +388,15 @@ impl IntegrationStrategy {
             Self::CherryPick => "Cherry-pick commits",
             Self::OpenPr => "Open PR into topic",
             Self::Push => "Push topic branch",
+            Self::LandLocally => "Squash into local checkout",
             Self::Ask => "Ask coordinator to decide",
         }
+    }
+
+    /// True for the strategies carried out deterministically by Arachne
+    /// itself rather than requested from an agent thread.
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::LandLocally)
     }
 }
 
@@ -421,6 +434,9 @@ impl IntegrationRequest {
             IntegrationStrategy::OpenPr => "open-pr".to_string(),
             IntegrationStrategy::Push => "push".to_string(),
             IntegrationStrategy::Ask => "decide".to_string(),
+            // Land-locally never travels as a prompt: `land_topic` executes
+            // it directly. Reached only by misuse — name it, don't panic.
+            IntegrationStrategy::LandLocally => "land-locally".to_string(),
         };
         let request = format!(
             "**Integration request**\n\
@@ -488,6 +504,7 @@ impl LandingRequest {
             IntegrationStrategy::OpenPr => "open-pr",
             IntegrationStrategy::Push => "push",
             IntegrationStrategy::Ask => "decide",
+            IntegrationStrategy::LandLocally => "land-locally",
         };
         // How the target was resolved shapes what the landing agent must
         // re-verify: a `primary-checkout` target can go stale when the user
@@ -599,11 +616,15 @@ mod integration_prompt_tests {
     #[test]
     fn landing_prompt_carries_primary_checkout_policy() {
         let prompt = LandingRequest {
-            action: "land", source_branch: "weaver/topic".into(),
-            target_upstream: "dev".into(), target_origin: "primary-checkout".into(),
+            action: "land",
+            source_branch: "weaver/topic".into(),
+            target_upstream: "dev".into(),
+            target_origin: "primary-checkout".into(),
             repo_root: "/tmp/repo".into(),
-            strategy: IntegrationStrategy::Squash, requested_by: "user",
-        }.to_prompt("Topic");
+            strategy: IntegrationStrategy::Squash,
+            requested_by: "user",
+        }
+        .to_prompt("Topic");
         assert!(prompt.contains("\"target_resource\":\"dev\""));
         assert!(prompt.contains("\"target_origin\":\"primary-checkout\""));
         assert!(prompt.contains("\"repository\":\"/tmp/repo\""));
@@ -615,11 +636,15 @@ mod integration_prompt_tests {
     #[test]
     fn landing_prompt_marks_main_fallback_for_agent_resolution() {
         let prompt = LandingRequest {
-            action: "land", source_branch: "weaver/topic".into(),
-            target_upstream: "main".into(), target_origin: "main-fallback".into(),
+            action: "land",
+            source_branch: "weaver/topic".into(),
+            target_upstream: "main".into(),
+            target_origin: "main-fallback".into(),
             repo_root: "/tmp/repo".into(),
-            strategy: IntegrationStrategy::Merge, requested_by: "user",
-        }.to_prompt("Topic");
+            strategy: IntegrationStrategy::Merge,
+            requested_by: "user",
+        }
+        .to_prompt("Topic");
         assert!(prompt.contains("try resolving it yourself"));
     }
 }

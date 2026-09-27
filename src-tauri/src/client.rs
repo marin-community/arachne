@@ -720,8 +720,16 @@ impl LoomClient {
     }
 
     /// `sessions.tags.set` — stamp a quiet tag on a session. Used to mark a
-    /// leader chat as a durable `topic` (survives archive and restarts).
-    pub async fn set_tag(&self, session: &str, key: &str, value: &str) -> Result<(), LoomError> {
+    /// leader chat as a durable `topic` (survives archive and restarts) and
+    /// to record integration/landing outcomes. `note` is the one-line
+    /// reason shown next to the value in the UI.
+    pub async fn set_tag(
+        &self,
+        session: &str,
+        key: &str,
+        value: &str,
+        note: &str,
+    ) -> Result<(), LoomError> {
         let _: serde_json::Value = self
             .op(
                 "/api/sessions/tags/set",
@@ -729,6 +737,7 @@ impl LoomClient {
                     "session": session,
                     "key": key,
                     "value": value,
+                    "note": note,
                     "by": "arachne",
                 }),
             )

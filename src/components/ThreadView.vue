@@ -43,7 +43,7 @@ interface ChatEventFrame {
   data?: any;
 }
 
-const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null }>();
+const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string }>();
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
@@ -893,17 +893,40 @@ const allIntegrateOptions = [
 const integrateOptions = computed(() => allIntegrateOptions.filter((option) =>
   option.value !== "cherry-pick" || workSummary.value?.has_commits === true,
 ));
-const landOptions = [
+// The deterministic fast path: no agent turn, Arachne squash-merges the
+// topic into the primary checkout's current branch itself. Loom's API has
+// no git writes, so Arachne runs git itself — valid only when the server
+// is loopback, since its checkout paths are then local paths.
+const loomIsLocal = computed(() => {
+  try {
+    const host = new URL(props.loomUrl).hostname;
+    return ["localhost", "127.0.0.1", "::1"].includes(host);
+  } catch {
+    return false;
+  }
+});
+const landOptions = computed(() => [
   { value: "open-pr", label: "Open PR" },
   { value: "squash", label: "Squash into upstream" },
   { value: "merge", label: "Merge into upstream" },
   { value: "rebase", label: "Rebase / fast-forward" },
   { value: "push", label: "Push topic branch" },
-];
+  ...(loomIsLocal.value ? [{ value: "land-locally", label: "Squash into local checkout" }] : []),
+]);
 interface IntegrationTarget {
   coordinator_id: string;
   target_branch: string;
   coordinator_name: string;
+}
+interface LandResult {
+  local: boolean;
+  landing?: {
+    landed: boolean;
+    target_branch: string;
+    commit?: string;
+    commits_squashed: number;
+    primary_checkout: string;
+  };
 }
 const integrating = ref(false);
 const landing = ref(false);
@@ -939,9 +962,16 @@ async function onLand(strategy: string) {
   landing.value = true;
   integrationNote.value = "";
   try {
-    await invoke("land_topic", { sessionId: props.session.id, strategy });
+    const result = await invoke<LandResult>("land_topic", { sessionId: props.session.id, strategy });
     localStorage.setItem(`arachne:strategy:land:${sessionRepo.value}`, strategy);
-    integrationNote.value = "Landing request sent. Follow the result in this thread.";
+    if (result.local && result.landing) {
+      const { landing: done } = result;
+      integrationNote.value = done.landed
+        ? `Landed locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch} · ${done.commit}`
+        : `${done.target_branch} already contained this topic's changes — nothing to do.`;
+    } else {
+      integrationNote.value = "Landing request sent. Follow the result in this thread.";
+    }
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   } finally {
