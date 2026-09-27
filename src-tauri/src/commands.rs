@@ -1108,8 +1108,8 @@ pub async fn land_topic(
         message: format!("unknown landing strategy {strategy:?}"),
         unreachable: false,
     })?;
-    if strategy == crate::loom::IntegrationStrategy::CherryPick {
-        return Err(UiError { message: "cherry-pick is an integration strategy".into(), unreachable: false });
+    if matches!(strategy, crate::loom::IntegrationStrategy::CherryPick | crate::loom::IntegrationStrategy::Ask) {
+        return Err(UiError { message: "choose a concrete landing strategy".into(), unreachable: false });
     }
     let view = client.get_session(&session_id).await?;
     if view.status == "archived" {

@@ -6,7 +6,8 @@
 // dropdown exposes applicable strategies. Strategy memory is per-repo
 // (spec: "Do not use one global integration preference for all
 // repositories") — precedence: last-used for this repo, else the
-// conservative fallback `Ask coordinator to decide`.
+// conservative fallback: `Ask coordinator to decide` for Integrate, or
+// `Open PR` for Land.
 
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 
@@ -39,14 +40,14 @@ const memoryKey = computed(
   () => `arachne:strategy:${props.kind}:${props.repo}`,
 );
 
-const selected = ref("ask");
+const fallback = computed(() => props.kind === "land" ? "open-pr" : "ask");
+const selected = ref("");
 
 function loadMemory() {
-  // Per-repo last-used strategy; fall back to `ask` (conservative:
-  // "Ask coordinator to decide") when nothing is remembered.
+  // Per-repo last-used strategy. An old remembered `ask` for Land is ignored.
   const stored = localStorage.getItem(memoryKey.value);
   selected.value =
-    stored && props.options.some((o) => o.value === stored) ? stored : "ask";
+    stored && props.options.some((o) => o.value === stored) ? stored : fallback.value;
 }
 
 function onDocClick(e: MouseEvent) {
@@ -79,7 +80,7 @@ const selectedLabel = computed(
   () =>
     props.options.find((o) => o.value === selected.value)?.label ??
     props.options[0]?.label ??
-    "Ask coordinator to decide",
+    props.kind === "land" ? "Open PR" : "Ask coordinator to decide",
 );
 </script>
 

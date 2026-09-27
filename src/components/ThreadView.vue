@@ -675,7 +675,6 @@ const landOptions = [
   { value: "merge", label: "Merge into upstream" },
   { value: "rebase", label: "Rebase / fast-forward" },
   { value: "push", label: "Push topic branch" },
-  { value: "ask", label: "Ask coordinator to decide" },
 ];
 interface IntegrationTarget {
   coordinator_id: string;

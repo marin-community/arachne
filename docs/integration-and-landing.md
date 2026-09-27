@@ -578,10 +578,13 @@ Squash into main
 Merge into main
 Rebase / fast-forward into main
 Push topic branch
-Ask coordinator to decide
 ```
 
 Again, available options depend on repository policy.
+The Topic's coordinator receives the Land request, so asking it to decide is
+not a distinct strategy. If policy does not set a default, the conservative
+primary action is **Open PR**. The coordinator can still escalate a genuine
+decision it encounters while carrying out a chosen strategy.
 
 Example:
 
@@ -594,7 +597,8 @@ upstream: main
 [ Land ▼ ]
 ```
 
-Primary click uses the remembered/default landing policy.
+Primary click uses the remembered/default landing policy. A stored strategy
+that is no longer offered falls back to **Open PR**.
 
 ---
 
