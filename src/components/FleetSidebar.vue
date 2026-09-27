@@ -543,7 +543,9 @@ function onDragLeave(key: string) {
 
 // Drop a dragged topic here: moving between project headings (and
 // ungrouped) is filing, so it goes to the layout group rather than
-// reparenting. The ungrouped section files to the user's Inbox group.
+// reparenting. The whole project SECTION is the drop target — cards and
+// empty space under a heading file into that heading's project, not just
+// the thin header strip. The ungrouped section files to the user's Inbox.
 function onDropProject(sectionId: string | null, key: string, e: DragEvent) {
   e.preventDefault();
   dropTarget.value = null;
@@ -558,6 +560,21 @@ function onDropProject(sectionId: string | null, key: string, e: DragEvent) {
   } else {
     dragging.value = null;
   }
+}
+
+// The section wrapper is the drop target, so moving between its header and
+// its cards fires dragleave on the wrapper (dragenter on the child). Only
+// clear the hint when the drag truly leaves the section — otherwise the
+// hint flickers off the moment the pointer crosses into a card.
+function onDragLeaveProject(key: string, e: DragEvent) {
+  const to = e.relatedTarget;
+  if (
+    to instanceof Node &&
+    e.currentTarget instanceof Node &&
+    e.currentTarget.contains(to)
+  )
+    return;
+  if (dropTarget.value === key) dropTarget.value = null;
 }
 
 function onDropLeader(parentId: string, key: string, e: DragEvent) {
@@ -791,16 +808,25 @@ async function archiveRow(id: string) {
       </div>
 
       <div class="topic-list">
-        <template v-for="section in projectSections" :key="section.id ?? 'ungrouped'">
+        <div
+          v-for="section in projectSections"
+          :key="section.id ?? 'ungrouped'"
+          class="project-section"
+          :class="{ 'drop-hint': dropTarget === `project-${section.id ?? 'ungrouped'}` }"
+          @dragover="onDragOver(`project-${section.id ?? 'ungrouped'}`, $event)"
+          @dragleave="onDragLeaveProject(`project-${section.id ?? 'ungrouped'}`, $event)"
+          @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
+        >
           <!-- Project heading: select filters the main-pane home to this
                project's topics; the + opens NewThreadSheet preselected to
-               it; the chevron collapses the section. -->
+               it; the chevron collapses the section. The whole section
+               (this heading, its cards, and its empty space) is the drop
+               target for filing, not just the thin header strip. -->
           <div
             class="project-header"
             :class="{
               selected: selectedProjectId === section.id,
               empty: !section.topics.length,
-              'drop-hint': dropTarget === `project-${section.id ?? 'ungrouped'}`,
             }"
             :title="
               dragging
@@ -813,9 +839,6 @@ async function archiveRow(id: string) {
             tabindex="0"
             :aria-expanded="!isProjectCollapsed(section.id)"
             :aria-label="`Project ${section.name}${section.topics.length ? `, ${section.topics.length} topics` : ', no topics'}`"
-            @dragover="onDragOver(`project-${section.id ?? 'ungrouped'}`, $event)"
-            @dragleave="onDragLeave(`project-${section.id ?? 'ungrouped'}`)"
-            @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
             @click="selectProject({ id: section.id, name: section.name })"
             @keydown.enter.self="selectProject({ id: section.id, name: section.name })"
             @keydown.space.self.prevent="selectProject({ id: section.id, name: section.name })"
@@ -973,7 +996,7 @@ async function archiveRow(id: string) {
         </template>
           <div v-if="!section.topics.length" class="project-empty">No topics in this project yet.</div>
           </template>
-        </template>
+        </div>
         <div v-if="topics.length === 0" class="topic-empty">
           No topics yet — use + to create one.
         </div>
