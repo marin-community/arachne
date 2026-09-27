@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { nextTick } from "vue";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
 

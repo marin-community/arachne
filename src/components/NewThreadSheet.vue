@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
-import { addAttachments, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 
 // The new-thread sheet: composing a thread happens in the main display
 // panel — the thread home — not in a cramped sidebar composer or a
@@ -42,6 +42,34 @@ const emit = defineEmits<{
 const task = ref("");
 const repo = ref("marin-community/arachne");
 const taskEl = ref<HTMLTextAreaElement | null>(null);
+const attachments = ref<FileAttachment[]>([]);
+const attachmentError = ref("");
+const attachmentLoading = ref(false);
+
+async function addFiles(files: FileList | File[]) {
+  if (attachmentLoading.value) return;
+  attachmentLoading.value = true;
+  try {
+    attachments.value = await addAttachments(attachments.value, files, MAX_LAUNCH_TOTAL_BYTES);
+    attachmentError.value = "";
+  } catch (error: any) {
+    attachmentError.value = error?.message ?? String(error);
+  } finally {
+    attachmentLoading.value = false;
+  }
+}
+function onFileInput(event: Event) {
+  const input = event.target as HTMLInputElement;
+  if (input.files) void addFiles(input.files);
+  input.value = "";
+}
+function onPaste(event: ClipboardEvent) {
+  if (!event.clipboardData) return;
+  const files = filesFromClipboard(event.clipboardData);
+  if (!files.length) return;
+  event.preventDefault();
+  void addFiles(files);
+}
 
 // --- Launch config -----------------------------------------------------------
 
@@ -72,32 +100,9 @@ function onAgentChange() {
 
 // --- Attachments ---------------------------------------------------------------
 
-const attachments = ref<FileAttachment[]>([]);
-const attachmentError = ref("");
-const attachmentLoading = ref(false);
-
-async function addFiles(files: FileList | File[]) {
-  if (attachmentLoading.value) return;
-  attachmentLoading.value = true;
-  try {
-    attachments.value = await addAttachments(attachments.value, files, MAX_LAUNCH_TOTAL_BYTES);
-    attachmentError.value = "";
-  } catch (error: any) {
-    attachmentError.value = error?.message ?? String(error);
-  } finally {
-    attachmentLoading.value = false;
-  }
-}
-function onFileInput(event: Event) {
-  const input = event.target as HTMLInputElement;
-  if (input.files) void addFiles(input.files);
-  input.value = "";
-}
-function onPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
-  event.preventDefault();
-  void addFiles(event.clipboardData.files);
-}
+// Declared above alongside the other draft state: `attachments`,
+// `attachmentError`, `attachmentLoading`, `addFiles`, `onFileInput`, and
+// `onPaste` (which also accepts pasted images via filesFromClipboard).
 
 // --- @-mentions of existing topic resources -------------------------------------
 
@@ -282,6 +287,16 @@ function onGoalKeydown(event: KeyboardEvent) {
         </div>
         <span class="nts-hint">⌘/Ctrl+Enter to launch · Enter for a new line</span>
       </label>
+
+      <div class="attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
+        <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files or images to new thread" @change="onFileInput" /></label>
+        <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
+          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
+        </span>
+        <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
+        <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
+      </div>
 
       <label class="nts-field">
         <span class="nts-field-name">Repository</span>

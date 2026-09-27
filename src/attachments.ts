@@ -3,6 +3,8 @@ export interface FileAttachment {
   name: string;
   size: number;
   contentBase64: string;
+  /** Browser-supplied type, used only to identify safe local image previews. */
+  mimeType: string;
 }
 
 const MAX_FILES = 20;
@@ -29,6 +31,35 @@ function readBase64(file: File): Promise<string> {
   });
 }
 
+/**
+ * WebKit sometimes exposes a pasted screenshot only as a ClipboardItem, not
+ * in DataTransfer.files. Normalize both forms so pasting an image behaves the
+ * same as choosing or dropping it.
+ */
+export function filesFromClipboard(data: DataTransfer): File[] {
+  const files = Array.from(data.files);
+  if (files.length) return files;
+  return Array.from(data.items)
+    .filter((item) => item.kind === "file")
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null)
+    .map((file, index) => {
+      if (file.name) return file;
+      const extension = file.type === "image/jpeg" ? "jpg" : file.type.split("/")[1] || "bin";
+      return new File([file], `pasted-image-${index + 1}.${extension}`, { type: file.type });
+    });
+}
+
+const PREVIEW_IMAGE_TYPES = new Set([
+  "image/png", "image/jpeg", "image/gif", "image/webp", "image/avif",
+]);
+
+export function imagePreviewUrl(file: FileAttachment): string | null {
+  return PREVIEW_IMAGE_TYPES.has(file.mimeType.toLowerCase())
+    ? `data:${file.mimeType};base64,${file.contentBase64}`
+    : null;
+}
+
 export async function addAttachments(existing: FileAttachment[], selected: FileList | File[], maxTotalBytes = MAX_TOTAL_BYTES): Promise<FileAttachment[]> {
   const files = Array.from(selected);
   if (existing.length + files.length > MAX_FILES) throw new Error(`Attach at most ${MAX_FILES} files`);
@@ -44,6 +75,7 @@ export async function addAttachments(existing: FileAttachment[], selected: FileL
   }
   const additions = await Promise.all(files.map(async (file) => ({
     name: file.name, size: file.size, contentBase64: await readBase64(file),
+    mimeType: file.type,
   })));
   return [...existing, ...additions];
 }

@@ -154,8 +154,11 @@ bindings of their own.
 File attachments use Loom Scratch. At launch they seed the new session's
 checkout; in an existing ACP thread, Arachne uploads them to that session and
 passes Loom resource links with the prompt. The composer also accepts dropped
-or pasted files. Scratch files are session inputs, while topic resource
-bindings are durable references to repository files and artifacts.
+or pasted files, including screenshots and other raster images; image
+attachments show a local thumbnail before send. Vision-capable agents such as
+Codex can consume those image resources, while other agents retain the same
+file attachment fallback. Scratch files are session inputs, while topic
+resource bindings are durable references to repository files and artifacts.
 
 Later resource types should be added only when a real workflow needs them.
 The next likely additions are a retained integration checkout and a PR that
