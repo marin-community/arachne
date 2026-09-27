@@ -9,7 +9,8 @@ import ChangeReview from "./ChangeReview.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
-import { groupDisplayBlocks, type ChatDisplayBlock } from "../chatRows";
+import CopyButton from "./CopyButton.vue";
+import { groupDisplayBlocks, blockCopyText, toolCallCopyText, type ChatDisplayBlock } from "../chatRows";
 
 interface Cursor {
   turn: number;
@@ -617,6 +618,13 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
   };
 }
 
+// The clipboard gets what the bubble shows: the goal plus the collapsed
+// orientation note, not the goal alone.
+function messageCopyText(block: ChatDisplayBlock): string {
+  const { goal, entrance } = splitEntrance(block.text ?? "");
+  return entrance ? `${goal}\n\n${entrance}` : goal;
+}
+
 function messageAuthor(block: ChatDisplayBlock): string {
   if (block.kind !== "user_message") return props.session.agent_kind;
   if (block.by?.startsWith("channel:")) return `via Loom · ${block.by.slice(8)}`;
@@ -862,12 +870,14 @@ async function onLand(strategy: string) {
             }}</span>
             <span class="tool-title">tool calls</span>
             <span class="tool-summary">{{ row.blocks.length }} {{ row.blocks.length === 1 ? 'call' : 'calls' }}</span>
+            <CopyButton class="tool-copy" :text="row.blocks.map(toolCallCopyText).join('\n\n')" :label="`Copy ${row.blocks.length === 1 ? 'tool call' : row.blocks.length + ' tool calls'}`" />
             <span class="chevron">{{ toolsCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
           </div>
           <div v-if="!toolsCollapsed(row.memberKeys)" class="tool-group-detail">
             <div v-for="(call, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail">
               <span class="status" :class="{ running: call.status === 'running' }">{{ call.status }}</span>
               <strong>{{ call.title || call.tool_kind || 'tool' }}</strong>
+              <CopyButton class="tool-copy" :text="toolCallCopyText(call)" :label="`Copy ${call.title || call.tool_kind || 'tool call'}`" />
               <div v-if="call.summary">{{ call.summary }}</div>
               <ChatImages :block="call" :session-id="session.id" />
             </div>
@@ -883,6 +893,7 @@ async function onLand(strategy: string) {
               @keydown.space.prevent="toggle(row.key)">
               <span class="tool-title">thinking</span>
               <span class="tool-summary">{{ row.block.summary || (row.block.text ?? '').slice(0, 160) }}</span>
+              <CopyButton class="tool-copy" :text="blockCopyText(row.block)" label="Copy thinking" />
               <span class="chevron">{{ isCollapsed(row.key) ? "▸" : "▾" }}</span>
             </div>
             <div v-if="!isCollapsed(row.key)" class="body thought-body">
@@ -898,6 +909,7 @@ async function onLand(strategy: string) {
               [{{ entry[1] }}] {{ entry[0] }}
             </div>
           </div>
+          <CopyButton class="block-copy" :text="blockCopyText(row.block)" label="Copy plan" />
         </div>
         <!-- User / agent messages -->
         <div
@@ -910,6 +922,7 @@ async function onLand(strategy: string) {
         >
           <div class="who">
             {{ messageAuthor(row.block) }}
+            <CopyButton class="block-copy" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : 'reply'}`" />
           </div>
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
