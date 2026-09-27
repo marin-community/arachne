@@ -212,6 +212,12 @@ body {
   border: 1px solid transparent;
 }
 .project-header:hover { background: var(--bg-hover); }
+.project-header.drop-hint {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--bg-hover);
+}
+.topic-card.dragging { opacity: 0.55; }
 .project-header.selected {
   background: var(--bg-raised);
   outline: 1px solid var(--border);
