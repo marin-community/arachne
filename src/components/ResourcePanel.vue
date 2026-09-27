@@ -24,7 +24,7 @@ interface TopicResourceContent {
   content: string;
 }
 
-const props = defineProps<{ topic: SessionSummary }>();
+const props = defineProps<{ topic: SessionSummary; embedded?: boolean }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "error", message: string): void }>();
 const snapshot = ref<TopicResourcesView>({ resources: [], revision: 0 });
 const selectedId = ref<string | null>(null);
@@ -180,14 +180,14 @@ async function onPreviewClick(event: MouseEvent) {
 </script>
 
 <template>
-  <aside class="resource-panel" aria-label="Topic resources">
-    <header class="resource-panel-head">
+  <aside class="resource-panel" :class="{ embedded }" :aria-label="embedded ? 'Topic resources tab' : 'Topic resources'">
+    <header v-if="!embedded" class="resource-panel-head">
       <div>
         <strong>Resources</strong>
         <div class="resource-panel-topic">{{ topic.branch.title || topic.branch.name }}</div>
       </div>
-      <button title="Refresh resources" :disabled="loading" @click="refresh">↻</button>
-      <button title="Close resources" aria-label="Close resources" @click="emit('close')">×</button>
+      <button v-if="!embedded" title="Refresh resources" :disabled="loading" @click="refresh">↻</button>
+      <button v-if="!embedded" title="Close resources" aria-label="Close resources" @click="emit('close')">×</button>
     </header>
     <div class="resource-panel-list">
       <div v-if="loading && !snapshot.resources.length" class="resource-panel-empty">Loading…</div>
@@ -233,11 +233,15 @@ async function onPreviewClick(event: MouseEvent) {
 
 <style scoped>
 .resource-panel { grid-area: resources; display: flex; flex-direction: column; min-width: 0; overflow: hidden; border-left: 1px solid var(--border); background: var(--bg-raised); }
+/* Embedded inside the inspector's Resources tab: the inspector owns the
+   column, the header, and the border-left; only the panel body renders. */
+.resource-panel.embedded { grid-area: auto; flex: 1; border-left: 0; }
 .resource-panel-head { display: flex; align-items: center; gap: 6px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
 .resource-panel-head > div { flex: 1; min-width: 0; }
 .resource-panel-head strong { font-size: 13px; }
 .resource-panel-topic { color: var(--text-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .resource-panel-list { overflow-y: auto; max-height: 35%; padding: 7px; }
+.resource-panel.embedded .resource-panel-list { max-height: none; flex: 1; }
 .resource-panel-item { width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; padding: 8px; }
 .resource-panel-item:hover, .resource-panel-item.selected { background: var(--bg-hover); }
 .resource-panel-icon { font-size: 17px; color: var(--accent); }

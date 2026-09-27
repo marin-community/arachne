@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
 use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
-use crate::resources::{ResourceDraft, ResourceKind, ResourceMention, TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME};
+use crate::resources::{ResourceDraft, ResourceKind, ResourceMention, TodoItem, TodoListView, TodoTopicView, TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME, TODOS_NAME};
 
 #[derive(Default)]
 pub struct LoomState {
@@ -218,6 +218,26 @@ async fn emit_fleet(app: &AppHandle, client: &Arc<LoomClient>, mut sessions: Vec
             let _ = app.emit("loom://error", UiError::from(e));
             return;
         }
+    };
+    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+    let _ = app.emit(
+        "loom://fleet",
+        &FleetSnapshot { sessions, layout },
+    );
+}
+
+/// `emit_fleet` with a caller-supplied layout (a mutation command already
+/// holds the fresh one) and a best-effort session list fetch. Pushing a
+/// snapshot for the mutation's own effect must never fail the command that
+/// produced it — loom's `layout` event also publishes it.
+async fn emit_fleet_with(
+    app: &AppHandle,
+    client: &Arc<LoomClient>,
+    layout: crate::loom::SessionLayoutView,
+) {
+    let mut sessions = match client.list_sessions().await {
+        Ok(s) => s,
+        Err(_) => return,
     };
     sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
     let _ = app.emit(
@@ -643,6 +663,9 @@ pub async fn launch_session(
     agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    // Project the thread was launched preselected to — the layout group
+    // to file the new session into.
+    project: Option<crate::loom::ProjectRef>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent_branch = match parent_id {
@@ -712,6 +735,11 @@ pub async fn launch_session(
     // parameter for callers that explicitly want an unmarked scratch thread.
     if parent_branch.is_none() && !one_off.unwrap_or(false) {
         let _ = client.set_tag(&view.id, "topic", "true").await;
+    }
+    // File the new topic into its project when one was preselected (a
+    // project is a placement group — filing only, never execution state).
+    if let Some(group_id) = project.as_ref().and_then(|p| p.id.as_deref()).filter(|id| !id.is_empty()) {
+        let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
     }
     // Loom does not publish a fleet event for description updates. Publish
     // the final launch state so the new topic card has its body immediately.
@@ -921,6 +949,33 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
     Ok(FleetSnapshot { sessions, layout })
 }
 
+/// Create a project (a placement group in a space). Projects are filing
+/// only — a group with no execution state (docs/design.md "User model").
+#[tauri::command]
+pub async fn create_group(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    space_id: String,
+    name: String,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(UiError {
+            message: "project name cannot be empty".into(),
+            unreachable: false,
+        });
+    }
+    let client = state_client(&state).await?;
+    let layout = client
+        .create_group(&space_id, &name)
+        .await
+        .map_err(Into::<UiError>::into)?;
+    // The fleet poller's `layout` subscription pushes the snapshot, but the
+    // new group should appear immediately — push it from the fresh layout.
+    emit_fleet_with(&app, &client, layout.clone()).await;
+    Ok(layout)
+}
+
 /// Delete a lane (placement group); its sessions move to the destination
 /// group first. Lanes are just filing — they are not topics.
 #[tauri::command]
@@ -939,13 +994,18 @@ pub async fn delete_group(
 /// Move sessions into a lane (placement group).
 #[tauri::command]
 pub async fn move_to_group(
+    app: AppHandle,
     state: State<'_, LoomState>,
     session_ids: Vec<String>,
     group_id: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
     let client = state_client(&state).await?;
     let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
-    client.move_sessions(&refs, &group_id).await.map_err(Into::into)
+    let layout = client.move_sessions(&refs, &group_id).await?;
+    // Loom publishes a layout SSE event, but push the fresh snapshot now so
+    // the topic visibly files under its new project heading immediately.
+    emit_fleet_with(&app, &client, layout.clone()).await;
+    Ok(layout)
 }
 
 /// Re-parent a session under another (its topic's top-level chat), or
@@ -1368,6 +1428,177 @@ pub async fn open_topic_resource_in_zed(
     Ok(())
 }
 
+// --- Todos -----------------------------------------------------------------
+//
+// The durable user todo list lives in one cross-topic branch artifact
+// (`arachne-todos`), mirroring the arachne-resources pattern. It is read
+// from (and written to) the TOPIC's branch, so each topic's slice rides
+// its accepted branch — but a single artifact name per branch is what the
+// loom API offers, so the list is stored on the topic branch of whichever
+// topic is being viewed, keyed by `topic_id` for filtering. Mutations are
+// revision-checked exactly like the resource manifest.
+
+async fn load_todo_list(client: &LoomClient, branch_id: &str) -> Result<TodoListView, UiError> {
+    let artifact = match client.branch_artifact(branch_id, TODOS_NAME).await {
+        Ok(value) => value,
+        Err(LoomError::Api { status: 404, .. }) => return Ok(TodoListView::default()),
+        Err(error) => return Err(error.into()),
+    };
+    if artifact.get("meta").and_then(|v| v.get("branch_id")).and_then(|v| v.as_str()) != Some(branch_id) {
+        return Err(todo_error("todo list name is occupied by a repository-shared artifact"));
+    }
+    let content = artifact.get("content").and_then(|v| v.as_str())
+        .ok_or_else(|| todo_error("todo list has no content"))?;
+    let mut list: TodoListView = serde_json::from_str(content)
+        .map_err(|e| todo_error(format!("invalid todo list: {e}")))?;
+    list.revision = artifact.get("meta").and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| todo_error("todo list has no revision"))?;
+    Ok(list)
+}
+
+async fn save_todo_list(client: &LoomClient, branch_id: &str, list: &TodoListView, expected_revision: i64) -> Result<TodoListView, UiError> {
+    let content = serde_json::to_string_pretty(&list)
+        .map_err(|e| todo_error(format!("serializing todos: {e}")))?;
+    let artifact = client.write_branch_artifact_titled(branch_id, TODOS_NAME, &content, expected_revision, "Arachne topic todos").await?;
+    if artifact.get("meta").and_then(|v| v.get("branch_id")).and_then(|v| v.as_str()) != Some(branch_id) {
+        return Err(todo_error("todo list was not saved on the topic branch"));
+    }
+    let mut saved = list.clone();
+    saved.revision = artifact.get("meta").and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| todo_error("saved todo list has no revision"))?;
+    Ok(saved)
+}
+
+fn todo_error(message: impl Into<String>) -> UiError {
+    UiError { message: message.into(), unreachable: false }
+}
+
+fn todo_text_ok(text: &str) -> Result<(), UiError> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.len() > 512 {
+        return Err(todo_error("todo text must contain 1–512 characters"));
+    }
+    Ok(())
+}
+
+/// A stable identity for a todo: derived from its text and topic so the
+/// same todo re-added is idempotent (mirrors the resource locator idea).
+/// FNV-1a is implemented inline — std's DefaultHasher is not guaranteed
+/// stable across Rust releases, and an id that changes would orphan every
+/// saved todo after an app upgrade.
+fn todo_id(text: &str, topic_id: &str) -> String {
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100_0000_01b3);
+        }
+        hash
+    }
+    let trimmed = text.trim();
+    let mixed = fnv1a(trimmed.as_bytes()) ^ fnv1a(topic_id.as_bytes()).rotate_left(17);
+    format!("todo:{trimmed}:{mixed:016x}")
+}
+
+/// The open topic's todo slice. This is what the inspector's Todos tab
+/// renders — items plus the artifact revision for revision-checked edits.
+#[tauri::command]
+pub async fn topic_todos(state: State<'_, LoomState>, topic_id: String) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    Ok(load_todo_list(&client, &topic.branch.id).await?.topic_view(&topic_id))
+}
+
+/// Toggle one todo's done state. Because the artifact is one list, the
+/// command toggles by id within the full list (the view is topic-scoped,
+/// but the id is unique across the list, so a topic's toggle cannot
+/// disturb another topic's items).
+#[tauri::command]
+pub async fn toggle_todo(
+    state: State<'_, LoomState>, topic_id: String, todo_id: String,
+    expected_revision: i64,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    let mut list = load_todo_list(&client, &topic.branch.id).await?;
+    if list.revision != expected_revision { return Err(todo_error("todos changed; reload before editing")); }
+    let todo = list.todos.iter_mut().find(|t| t.id == todo_id)
+        .ok_or_else(|| todo_error("todo not found"))?;
+    todo.done = !todo.done;
+    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+    Ok(saved.topic_view(&topic_id))
+}
+
+/// Add a todo to this topic's slice.
+#[tauri::command]
+pub async fn add_todo(
+    state: State<'_, LoomState>, topic_id: String, text: String,
+    expected_revision: i64,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    todo_text_ok(&text)?;
+    let mut list = load_todo_list(&client, &topic.branch.id).await?;
+    if list.revision != expected_revision { return Err(todo_error("todos changed; reload before editing")); }
+    let id = todo_id(&text, &topic_id);
+    if let Some(existing) = list.todos.iter_mut().find(|t| t.id == id) {
+        existing.text = text.trim().to_owned();
+        existing.topic_id = topic_id.clone();
+    } else {
+        list.todos.push(TodoItem {
+            id,
+            text: text.trim().to_owned(),
+            done: false,
+            topic_id: topic_id.clone(),
+            created_at: chrono_iso_now(),
+        });
+    }
+    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+    Ok(saved.topic_view(&topic_id))
+}
+
+/// Remove a todo from the list.
+#[tauri::command]
+pub async fn remove_todo(
+    state: State<'_, LoomState>, topic_id: String, todo_id: String,
+    expected_revision: i64,
+) -> Result<TodoTopicView, UiError> {
+    let client = state_client(&state).await?;
+    let topic = client.get_session(&topic_id).await?;
+    let mut list = load_todo_list(&client, &topic.branch.id).await?;
+    if list.revision != expected_revision { return Err(todo_error("todos changed; reload before editing")); }
+    let before = list.todos.len();
+    list.todos.retain(|t| t.id != todo_id);
+    if list.todos.len() == before { return Err(todo_error("todo not found")); }
+    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+    Ok(saved.topic_view(&topic_id))
+}
+
+/// RFC3339 without pulling a chrono dependency: loom only needs a
+/// lexicographically comparable timestamp, and the UTC "Z" form matches
+/// the wire format used by `created_at` elsewhere.
+fn chrono_iso_now() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64;
+    // Civil-from-days algorithm (Howard Hinnant) — exact for all dates.
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 #[cfg(test)]
 mod integration_tests {
     use super::resolve_integration_target;
@@ -1409,5 +1640,38 @@ mod integration_tests {
         ];
         assert_eq!(resolve_integration_target(&fleet, "child").unwrap().target_branch, "parent-branch");
         assert!(resolve_integration_target(&fleet, "parent").is_none());
+    }
+}
+
+#[cfg(test)]
+mod todo_command_tests {
+    use super::{chrono_iso_now, todo_id};
+
+    #[test]
+    fn iso_now_is_a_well_formed_utc_stamp() {
+        let stamp = chrono_iso_now();
+        // Shape: 2026-09-27T12:34:56Z — a real UTC civil date.
+        assert_eq!(stamp.len(), 20);
+        let (date, time) = stamp.split_once('T').unwrap();
+        let parts: Vec<&str> = date.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        let (y, m, d): (i64, i64, i64) = (
+            parts[0].parse().unwrap(),
+            parts[1].parse().unwrap(),
+            parts[2].parse().unwrap(),
+        );
+        assert!((2020..=2100).contains(&y));
+        assert!((1..=12).contains(&m));
+        assert!((1..=31).contains(&d));
+        let (hms, z) = time.split_at(8);
+        assert_eq!(z, "Z");
+        assert_eq!(hms.matches(':').count(), 2);
+        assert!(hms.split(':').all(|p| p.len() == 2 && p.chars().all(|c| c.is_ascii_digit())));
+    }
+
+    #[test]
+    fn todo_identity_is_stable_and_topic_scoped() {
+        assert_eq!(todo_id("Land Arachne topic", "t1"), todo_id(" Land Arachne topic ", "t1"));
+        assert_ne!(todo_id("Land Arachne topic", "t1"), todo_id("Land Arachne topic", "t2"));
     }
 }

@@ -295,11 +295,25 @@ impl LoomClient {
         content: &str,
         base_rev: i64,
     ) -> Result<serde_json::Value, LoomError> {
+        self.write_branch_artifact_titled(branch, name, content, base_rev, "Arachne topic resources")
+            .await
+    }
+
+    /// `write_branch_artifact` with an explicit display title — the shared
+    /// write path for Arachne's branch artifacts (resources, todos).
+    pub async fn write_branch_artifact_titled(
+        &self,
+        branch: &str,
+        name: &str,
+        content: &str,
+        base_rev: i64,
+        title: &str,
+    ) -> Result<serde_json::Value, LoomError> {
         self.op(
             "/api/artifacts/write",
             &serde_json::json!({
                 "branch": branch, "name": name, "content": content,
-                "title": "Arachne topic resources", "kind": "json",
+                "title": title, "kind": "json",
                 "base_rev": base_rev, "repo": false,
             }),
         ).await
