@@ -369,7 +369,7 @@ function submit() {
 
 <style scoped>
 /* Launch config row (profile/agent/model/effort) — same look as the
-   sidebar's quick-task controls, scoped here alongside its sibling. */
+   New thread sheet's controls. */
 .launch-controls {
   display: flex;
   flex-wrap: wrap;

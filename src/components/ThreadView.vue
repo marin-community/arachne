@@ -644,8 +644,8 @@ const integrationTarget = computed(() => {
   }
   return nearest;
 });
-// Every root conversation is a topic, including older quick launches that
-// predate the durable marker.
+// Every root conversation is a topic, including older single-prompt launches
+// that predate the durable marker.
 const isTopic = computed(() => !isWorker.value);
 const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
 const allIntegrateOptions = [

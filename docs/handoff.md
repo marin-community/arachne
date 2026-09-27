@@ -218,7 +218,7 @@ A topic is **not a worktree** and is **not necessarily a continuously running mo
 It may span multiple repositories. Each attached repository may have its own
 canonical Topic branch/ref for accepted code state; there is no universal
 Topic branch. A human-facing checkout is optional and reconstructible from its
-ref. Every new top-level conversation, including a quick one-prompt launch, is
+ref. Every new top-level conversation, including a single-prompt launch, is
 a Topic and may acquire workers later.
 
 Long term, think of it as a durable actor with a mailbox that occasionally invokes an LLM.
@@ -540,8 +540,8 @@ resources. It is accessible from the Topic/coordinator header, not the
 default destination. The Ready group contains only verified integration
 candidates; an idle or completed worker is not automatically Ready.
 
-Quick creation starts a Topic in the selected or default Project, even for a
-single prompt. Topic selection still opens its coordinator chat on first
+Single-prompt creation starts a Topic in the selected or default Project via
+the New thread sheet. Topic selection still opens its coordinator chat on first
 visit, then restores the last-opened Thread when available.
 
 Example:

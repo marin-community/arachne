@@ -29,10 +29,6 @@ the intended remote test uses Loom on the DGX over Tailscale.
   repository, not one branch shared across repositories.
   Creation offers a short title and a body that becomes the agent goal; either
   can be left blank when the other or an attachment supplies the intent.
-- **Quick topic:** a single-prompt way to start a topic in the current or
-  default Project. Its title can be derived from the prompt; title and body
-  remain optional in the expanded creation form. It can grow delegated threads
-  later without conversion.
 - **Thread/worker:** one Loom session and its conversation. Hierarchy records
   responsibility; it does not determine Git ancestry.
 - **Resource:** a repository, checkout, PR, document, file, or artifact with a
@@ -97,8 +93,8 @@ unrelated second list. The aggregate Topics home still shows Needs You even
 when Inbox exists. Ready to Integrate requires explicit verified candidate
 state from Loom; a stopped or sleeping worker is not sufficient evidence.
 
-Every new top-level conversation is a topic, including one started through the
-quick input. The Topics list expands through delegated threads at arbitrary
+Every new top-level conversation is a topic, including one started from the
+New thread sheet with a single prompt. The Topics list expands through delegated threads at arbitrary
 depth. Older unmarked top-level conversations remain visible as topics without
 rewriting their Loom history. Delegating from a thread creates a child in the
 conversation tree; its Git base still comes from the topic's accepted branch.
@@ -147,7 +143,7 @@ same file in Zed. The binding survives session archive, although preview and
 editing require an active checkout. Loom artifacts remain appropriate for
 agent-authored reports and standalone versioned documents.
 
-Typing `@` in a thread message, a new topic body, or a quick task offers
+Typing `@` in a thread message, a new thread goal, or a new topic body offers
 attached resources.
 The visible mention is readable, while Arachne resolves its stable ID against
 the current manifest when sending and includes the backing locator in the

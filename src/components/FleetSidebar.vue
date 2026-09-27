@@ -1,9 +1,7 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { nextTick } from "vue";
-import type { SessionSummary, SessionLayout, LaunchOptions, ResourceMention } from "../App.vue";
-import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import type { SessionSummary, SessionLayout } from "../App.vue";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
@@ -17,20 +15,11 @@ const props = defineProps<{
   selectedId: string | null;
   showNewThread?: boolean;
   showNewTopic?: boolean;
-  launching?: boolean;
-  launchOptions: LaunchOptions | null;
 }>();
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "select-topic", id: string): void;
-  (
-    e: "launch",
-    task: string,
-    repo: string,
-    meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
-    completed?: (success: boolean) => void,
-  ): void;
   (
     e: "update-topic",
     id: string,
@@ -55,62 +44,9 @@ const emit = defineEmits<{
   (e: "select-project", project: ProjectRef | null): void;
 }>();
 
-const task = ref("");
-const quickAttachments = ref<FileAttachment[]>([]);
-const quickAttachmentError = ref("");
-const quickAttachmentLoading = ref(false);
-const quickInputEl = ref<HTMLInputElement | null>(null);
-const quickMentionRange = ref<{ start: number; end: number; query: string } | null>(null);
-const quickMentionIndex = ref(0);
-const quickMentions = ref<{ token: string; topicId: string; resourceId: string }[]>([]);
-const repo = ref("marin-community/arachne");
-const profile = ref("default");
-const agent = ref("");
-const model = ref("");
-const effort = ref("");
-const profiles = computed(() => props.launchOptions?.profiles.filter((p) => p.class === "interactive") ?? []);
-const selectedProfile = computed(() => profiles.value.find((p) => p.name === profile.value));
-const selectedAgent = computed(() => props.launchOptions?.agents.find((a) => a.kind === (agent.value || selectedProfile.value?.agent_kind || props.launchOptions?.default_agent)));
-const modelChoices = computed(() => selectedAgent.value?.models ?? []);
-const effortChoices = computed(() => selectedAgent.value?.efforts ?? []);
-const launchConfig = () => ({
-  profile: profile.value === "default" ? undefined : profile.value,
-  agent: agent.value || undefined,
-  model: model.value.trim() || undefined,
-  effort: effort.value || undefined,
-});
-function onProfileChange() {
-  agent.value = "";
-  model.value = "";
-  effort.value = "";
-}
-function onAgentChange() {
-  model.value = "";
-  effort.value = "";
-}
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
-
-function submit() {
-  if (quickMentionRange.value && matchingQuickResources.value.length) {
-    chooseQuickMention(matchingQuickResources.value[quickMentionIndex.value] || matchingQuickResources.value[0]);
-  }
-  const t = task.value.trim();
-  if ((!t && !quickAttachments.value.length) || props.launching || quickAttachmentLoading.value) return;
-  emit("launch", t || `Review ${quickAttachments.value[0].name}`, repo.value.trim(), {
-    ...launchConfig(),
-    mentions: quickMentions.value.filter((mention) => t.includes(mention.token))
-      .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
-    attachments: quickAttachments.value,
-  }, (success) => {
-    if (!success) return;
-    task.value = "";
-    quickAttachments.value = [];
-    quickMentions.value = [];
-    quickMentionRange.value = null;
-  });
-}
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
 // (agent self-report) and `triage` (outside assessment) carry values
@@ -374,8 +310,8 @@ interface TopicEntry {
   childCount: number;
 }
 
-// Every top-level thread is a topic, including legacy quick launches that
-// predate the marker. Archived leaders stay listed with their descendants.
+// Every top-level thread is a topic, including legacy single-prompt launches
+// that predate the marker. Archived leaders stay listed with their descendants.
 const topics = computed<TopicEntry[]>(() => {
   const byId = new Map(props.fleet.map((s) => [s.id, s]));
   const byBranch = new Map(props.fleet.map((s) => [s.branch.id, s]));
@@ -463,102 +399,6 @@ function visibleTopicChildren(rootId: string): TopicThreadRow[] {
 
 // A topic has a short title and a substantive body. The body is both the
 // agent's initial goal and the durable branch description.
-
-async function addQuickFiles(files: FileList | File[]) {
-  if (quickAttachmentLoading.value) return;
-  quickAttachmentLoading.value = true;
-  try { quickAttachments.value = await addAttachments(quickAttachments.value, files, MAX_LAUNCH_TOTAL_BYTES); quickAttachmentError.value = ""; }
-  catch (error: any) { quickAttachmentError.value = error?.message ?? String(error); }
-  finally { quickAttachmentLoading.value = false; }
-}
-function onQuickFileInput(event: Event) {
-  const input = event.target as HTMLInputElement;
-  if (input.files) void addQuickFiles(input.files);
-  input.value = "";
-}
-function onQuickPaste(event: ClipboardEvent) {
-  if (!event.clipboardData) return;
-  const files = filesFromClipboard(event.clipboardData);
-  if (!files.length) return;
-  event.preventDefault(); void addQuickFiles(files);
-}
-interface TopicMentionResource {
-  topicId: string;
-  id: string;
-  title: string;
-  kind: string;
-  path: string | null;
-  url: string | null;
-  repository: string;
-}
-const topicMentionResources = ref<TopicMentionResource[]>([]);
-const topicMentionLoading = ref(false);
-const topicMentionError = ref("");
-const matchingQuickResources = computed(() => {
-  const query = quickMentionRange.value?.query.trim().toLowerCase() ?? "";
-  return topicMentionResources.value.filter((resource) =>
-    !query || [resource.title, resource.kind, resource.path, resource.url, resource.repository]
-      .some((value) => value?.toLowerCase().includes(query)),
-  ).slice(0, 8);
-});
-
-async function loadTopicMentionResources() {
-  topicMentionLoading.value = true;
-  topicMentionError.value = "";
-  try {
-    const views = await Promise.allSettled(topics.value.slice(0, 24).map(async ({ session }) => {
-      const view = await invoke<{ resources: Omit<TopicMentionResource, "topicId">[] }>("topic_resources", { topicId: session.id });
-      return (view.resources ?? []).map((resource) => ({ ...resource, topicId: session.id }));
-    }));
-    topicMentionResources.value = views.flatMap((result) => result.status === "fulfilled" ? result.value : []);
-    if (views.length && views.every((result) => result.status === "rejected")) {
-      topicMentionError.value = "Could not load topic resources";
-    }
-  } finally {
-    topicMentionLoading.value = false;
-  }
-}
-
-function updateQuickMention() {
-  const caret = quickInputEl.value?.selectionStart ?? task.value.length;
-  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(task.value.slice(0, caret));
-  const wasOpen = !!quickMentionRange.value;
-  quickMentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
-  quickMentionIndex.value = 0;
-  if (quickMentionRange.value && !wasOpen) void loadTopicMentionResources();
-}
-
-function chooseQuickMention(resource: TopicMentionResource) {
-  const range = quickMentionRange.value;
-  if (!range) return;
-  const duplicate = topicMentionResources.value.some((other) => other.id !== resource.id && other.title === resource.title);
-  const label = duplicate ? `${resource.title} (${resource.path || resource.url || resource.repository})` : resource.title;
-  const token = `@{${label}}`;
-  task.value = task.value.slice(0, range.start) + token + " " + task.value.slice(range.end);
-  quickMentions.value.push({ token, topicId: resource.topicId, resourceId: resource.id });
-  quickMentionRange.value = null;
-  nextTick(() => {
-    const caret = range.start + token.length + 1;
-    quickInputEl.value?.focus();
-    quickInputEl.value?.setSelectionRange(caret, caret);
-  });
-}
-
-function onQuickKeydown(event: KeyboardEvent) {
-  if (event.key === "Enter") {
-    event.preventDefault();
-    if (quickMentionRange.value && matchingQuickResources.value.length) chooseQuickMention(matchingQuickResources.value[quickMentionIndex.value] || matchingQuickResources.value[0]);
-    else submit();
-    return;
-  }
-  if (!quickMentionRange.value) return;
-  if (event.key === "Escape") { event.preventDefault(); quickMentionRange.value = null; }
-  else if (event.key === "ArrowDown" && matchingQuickResources.value.length) {
-    event.preventDefault(); quickMentionIndex.value = (quickMentionIndex.value + 1) % matchingQuickResources.value.length;
-  } else if (event.key === "ArrowUp" && matchingQuickResources.value.length) {
-    event.preventDefault(); quickMentionIndex.value = (quickMentionIndex.value - 1 + matchingQuickResources.value.length) % matchingQuickResources.value.length;
-  }
-}
 
 // Inline card editing: title edits are compare-and-swap fenced server-side,
 // so the save passes the values the card last rendered as `expected`.
@@ -752,84 +592,6 @@ async function archiveRow(id: string) {
       <button class="new-thread-btn" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">
         + New topic
       </button>
-      <div class="new-task quick-task-wrap">
-        <input
-          ref="quickInputEl"
-          v-model="task"
-          placeholder="Quick topic… Use @ for resources"
-          aria-label="Quick topic"
-          @input="updateQuickMention"
-          @click="updateQuickMention"
-          @keydown="onQuickKeydown"
-          @paste="onQuickPaste"
-        />
-        <button
-          class="primary"
-          :disabled="(!task.trim() && !quickAttachments.length) || props.launching || quickAttachmentLoading"
-          @click="submit"
-        >
-          {{ props.launching ? "…" : "Run" }}
-        </button>
-        <div v-if="quickMentionRange" class="mention-menu quick-mention-menu" role="listbox" aria-label="Existing resources for quick task">
-          <div v-if="topicMentionLoading" class="mention-hint">Loading resources…</div>
-          <div v-else-if="topicMentionError" class="mention-hint">{{ topicMentionError }}</div>
-          <div v-else-if="!matchingQuickResources.length" class="mention-hint">No matching attached resources</div>
-          <button v-for="(resource, index) in matchingQuickResources" :key="`${resource.topicId}:${resource.id}`"
-            role="option" :aria-selected="index === quickMentionIndex" :class="{ selected: index === quickMentionIndex }"
-            @mousedown.prevent="chooseQuickMention(resource)">
-            <strong>{{ resource.title }}</strong>
-            <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
-          </button>
-        </div>
-      </div>
-      <div class="attachment-row quick-attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addQuickFiles($event.dataTransfer.files)">
-        <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="quickAttachmentLoading" aria-label="Attach files or images to quick task" @change="onQuickFileInput" /></label>
-        <span v-for="(file, index) in quickAttachments" :key="file.name" class="attachment-chip">
-          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
-          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="quickAttachments.splice(index, 1)">×</button>
-        </span>
-        <span v-if="quickAttachmentError" class="attachment-error">{{ quickAttachmentError }}</span>
-        <span v-if="quickAttachmentLoading" class="attachment-hint">Reading files…</span>
-      </div>
-      <div class="new-task" style="margin-top: -4px">
-        <input
-          v-model="repo"
-          placeholder="owner/name"
-          spellcheck="false"
-          style="font-family: var(--mono); font-size: 11px"
-        />
-      </div>
-      <div class="new-task launch-controls" style="margin-top: -4px">
-        <select v-model="profile" aria-label="Inference profile" @change="onProfileChange">
-          <option v-if="!profiles.some((p) => p.name === 'default')" value="default">Default route</option>
-          <option v-for="p in profiles" :key="p.name" :value="p.name">
-            {{ p.name }} · {{ p.agent_kind }}
-          </option>
-        </select>
-        <select v-model="agent" aria-label="Agent runtime" @change="onAgentChange">
-          <option value="">{{ selectedProfile?.agent_kind || launchOptions?.default_agent || 'Default agent' }}</option>
-          <option v-for="choice in launchOptions?.agents ?? []" :key="choice.kind" :value="choice.kind">{{ choice.label }}</option>
-        </select>
-        <select v-if="modelChoices.length && !selectedAgent?.accepts_raw_model" v-model="model" aria-label="Model">
-          <option value="">{{ agent ? 'Runtime default model' : (selectedProfile?.model || 'Runtime default model') }}</option>
-          <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-        </select>
-        <input v-else
-          v-model="model"
-          list="launch-models"
-          :placeholder="agent ? 'Model · runtime default' : (selectedProfile?.model || 'Model · runtime default')"
-          aria-label="Model override"
-          spellcheck="false"
-          style="font-family: var(--mono)"
-        />
-        <datalist id="launch-models">
-          <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-        </datalist>
-        <select v-model="effort" aria-label="Reasoning effort">
-          <option value="">{{ agent ? 'Default effort' : (selectedProfile?.effort || 'Default effort') }}</option>
-          <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-        </select>
-      </div>
 
       <div class="session-list">
         <template v-for="{ lane, rows } in laneRows" :key="lane.id">
@@ -1166,28 +928,3 @@ async function archiveRow(id: string) {
     </template>
   </aside>
 </template>
-
-<style scoped>
-.launch-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.launch-controls select,
-.launch-controls input {
-  box-sizing: border-box;
-  flex: 1 1 118px;
-  min-width: 0;
-  max-width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--text);
-  padding: 6px 8px;
-  font: 11px var(--mono);
-}
-.launch-controls select:focus,
-.launch-controls input:focus {
-  outline: 1px solid var(--accent);
-}
-</style>
