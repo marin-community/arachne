@@ -529,6 +529,13 @@ pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), Ui
     client.interrupt(&id).await.map_err(Into::into)
 }
 
+/// Resume an orphaned session without changing its checkout or queued message.
+#[tauri::command]
+pub async fn adopt_session(state: State<'_, LoomState>, id: String) -> Result<SessionView, UiError> {
+    let client = state_client(&state).await?;
+    client.adopt(&id).await.map_err(Into::into)
+}
+
 /// Launch a session. When `parent_id` is set this is a delegation: the
 /// child records the parent's branch as `parent_branch`, getting origin=agent
 /// and nesting under the parent in the sidebar.

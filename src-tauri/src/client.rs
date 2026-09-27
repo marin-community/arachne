@@ -447,6 +447,12 @@ impl LoomClient {
         Ok(())
     }
 
+    /// `sessions.adopt` — resume an orphaned session in its existing checkout.
+    pub async fn adopt(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
+        self.op("/api/sessions/adopt", &serde_json::json!({ "session": id }))
+            .await
+    }
+
     /// `sessions.launch` — worktree + terminal + agent, seeded with a task.
     pub async fn launch(
         &self,

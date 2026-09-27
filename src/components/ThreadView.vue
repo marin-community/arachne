@@ -67,6 +67,7 @@ const emit = defineEmits<{
   (e: "archive", id: string): void;
   (e: "delegate", parentId: string, task: string): void;
   (e: "handoff", id: string): void;
+  (e: "refresh", id: string): void;
 }>();
 
 const blocks = ref<DisplayBlock[]>([]);
@@ -306,6 +307,13 @@ const handoffAgent = ref(props.session.agent_kind || "");
 const handoffModel = ref(props.session.model || "");
 const handoffEffort = ref(props.session.effort || "");
 const handingOff = ref(false);
+const adopting = ref(false);
+const currentStatus = computed(() =>
+  props.fleet.find((s) => s.id === props.session.id)?.status ?? props.session.status,
+);
+const canInterrupt = computed(() =>
+  currentStatus.value === "running" && (props.session.protocol !== "acp" || turnLive.value),
+);
 const profileAgent = computed(() =>
   props.launchOptions?.profiles.find((p) => p.name === handoffProfile.value)?.agent_kind ||
   props.launchOptions?.default_agent || "",
@@ -519,7 +527,7 @@ async function send() {
     chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
   const text = draft.value.trim();
-  if ((!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
+  if (currentStatus.value !== "running" || (!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
   busy.value = true;
   try {
     await invoke("send_input", {
@@ -543,10 +551,24 @@ async function send() {
 }
 
 async function interrupt() {
+  if (!canInterrupt.value) return;
   try {
     await invoke("interrupt", { id: props.session.id });
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
+  }
+}
+
+async function adopt() {
+  if (currentStatus.value !== "orphaned" || adopting.value) return;
+  adopting.value = true;
+  try {
+    await invoke("adopt_session", { id: props.session.id });
+    emit("refresh", props.session.id);
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    adopting.value = false;
   }
 }
 
@@ -733,7 +755,8 @@ async function onLand(strategy: string) {
       <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
-      <button @click="interrupt">Interrupt</button>
+      <button :disabled="!canInterrupt" @click="interrupt">Interrupt</button>
+      <button v-if="currentStatus === 'orphaned'" :disabled="adopting" @click="adopt">{{ adopting ? "Adopting…" : "Adopt" }}</button>
       <button class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate = !showDelegate">
         Delegate
@@ -913,21 +936,23 @@ async function onLand(strategy: string) {
         </div>
         <!-- usage / turn_end / unknown: no visual block -->
       </template>
-      <!-- Working indicator: shown while an ACP turn is live or a prompt is
-           queued behind it. Sits at the tail of the log so it reads as the
-           agent's next message being composed. -->
+      <!-- A queued prompt can outlive its agent. Only a live turn spins. -->
       <div v-if="turnLive || pendingPrompt" class="block working">
         <div class="who">{{ session.agent_kind }}</div>
         <div class="body working-body">
-          <span class="spinner" aria-hidden="true"></span>
+          <span v-if="turnLive && currentStatus === 'running'" class="spinner" aria-hidden="true"></span>
           <span class="working-label">{{
-            pendingPrompt ? "working — message queued…" : "working…"
+            currentStatus === 'orphaned'
+              ? (pendingPrompt ? 'Agent stopped — message queued until adopted.' : 'Agent stopped.')
+              : turnLive
+                ? (pendingPrompt ? 'Working — message queued…' : 'Working…')
+                : 'Message queued…'
           }}</span>
-          <span v-if="turnLive && elapsedLabel" class="working-meta">{{
+          <span v-if="turnLive && currentStatus === 'running' && elapsedLabel" class="working-meta">{{
             `${elapsedLabel} elapsed`
           }}</span>
           <span
-            v-if="turnLive && progressAge >= 15"
+            v-if="turnLive && currentStatus === 'running' && progressAge >= 15"
             class="working-meta quiet"
             title="No visible output for a while — the model may be reasoning without streaming."
             >no updates for {{ progressAge }}s</span
@@ -959,13 +984,16 @@ async function onLand(strategy: string) {
       </div>
       <div class="composer">
       <label class="attachment-pick composer-attach" title="Attach files">+
-        <input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
+        <input type="file" multiple :disabled="currentStatus !== 'running' || attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
       </label>
       <textarea
         ref="composerEl"
         v-model="draft"
+        :disabled="currentStatus !== 'running'"
         :placeholder="
-          turnLive
+          currentStatus === 'orphaned'
+            ? 'Adopt this thread to resume messages…'
+            : turnLive
             ? 'Agent is working — your message will queue behind the current turn…'
             : 'Message the agent…'
         "
@@ -974,7 +1002,7 @@ async function onLand(strategy: string) {
         @keydown="onComposerKeydown"
         @paste="onComposerPaste"
       ></textarea>
-      <button class="primary" :disabled="(!draft.trim() && !attachments.length) || busy || attachmentLoading" @click="send">
+      <button class="primary" :disabled="currentStatus !== 'running' || (!draft.trim() && !attachments.length) || busy || attachmentLoading" @click="send">
         {{ busy ? "…" : "Send" }}
       </button>
       </div>

@@ -421,6 +421,7 @@ const selectedTopic = computed(() => {
       @archive="onArchived"
       @delegate="delegateFromThread"
       @handoff="selectSession"
+      @refresh="selectSession"
     />
     <HomeView
       v-else
