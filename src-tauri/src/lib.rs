@@ -53,6 +53,10 @@ pub fn run() {
             commands::detach_topic_resource,
             commands::read_topic_resource,
             commands::open_topic_resource_in_zed,
+            commands::topic_todos,
+            commands::add_todo,
+            commands::toggle_todo,
+            commands::remove_todo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running arachne");
