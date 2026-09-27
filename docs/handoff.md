@@ -1046,9 +1046,13 @@ There are real cases where Thread A knows something Thread B needs.
 
 Do not build a generalized multi-agent communications platform yet.
 
-Provide a simple primitive:
-
-**Send to thread…**
+Provide one durable delivery primitive through both **Send to Thread…** in
+the UI and an agent-callable Loom tool. Both routes should use the same
+underlying operation and return a delivery receipt. The source identity comes
+from the authenticated human/session, not caller-supplied display text;
+Loom authorizes the destination and records provenance and an idempotency key.
+Agents should be able to discover destinations they may reach. Delivery is an
+Event and may remain queued without an immediate LLM Wake.
 
 Initial forms:
 
@@ -1059,7 +1063,11 @@ Initial forms:
 
 Destination receives a durable inbound item with provenance.
 
-Later this can become an agent-callable tool.
+The existing Arachne UI sends a human note through Loom's channel-message
+operation. Loom's `channel_send` tool already lets an agent send to channels
+within its authorized session tree or subscriptions; a first-class
+cross-thread tool should make destination selection and delivery semantics
+explicit without broadening access silently.
 
 Agents are free to coordinate through other means when available; Arachne does not need to model every emergent communication strategy.
 

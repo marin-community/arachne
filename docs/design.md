@@ -133,9 +133,15 @@ deterministically, or leave them queued until a later wake. This replaces busy
 waiting without making every notification a model turn. Only unresolved human
 decisions become Attention; integration or review decisions can create Todos.
 
-Cross-thread knowledge transfer stays small: **Send to Thread…** can deliver
-a note, selected message, resource or artifact, or generated summary with
-provenance. A general worker-chat protocol is outside the bootstrap scope.
+Cross-thread knowledge transfer stays small: **Send to Thread…** is both a UI
+action and an agent-callable Loom tool backed by the same durable delivery
+operation. Either can deliver a note, selected message, resource or artifact,
+or generated summary. Loom resolves the source from the caller's identity,
+checks the destination's access policy, and records provenance and an
+idempotency key. An agent can discover destinations it may send to; it cannot
+claim to speak for an unrelated Thread. Delivery creates an Event, not an
+automatic LLM Wake. A general worker-chat protocol is outside the bootstrap
+scope.
 
 ## Near-term acceptance
 
