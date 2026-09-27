@@ -136,7 +136,7 @@ function chooseMention(resource: MentionResource) {
 }
 
 function onComposerKeydown(event: KeyboardEvent) {
-  if (event.key === "Enter" && !event.shiftKey && !event.ctrlKey && !event.metaKey && !event.altKey) {
+  if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
     if (mentionRange.value && matchingResources.value.length) chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
     else void send();
@@ -998,6 +998,7 @@ async function onLand(strategy: string) {
         {{ busy ? "…" : "Send" }}
       </button>
       </div>
+      <div class="composer-hint">⌘/Ctrl + Enter to send · Enter for a new line</div>
     </div>
   </section>
 </template>

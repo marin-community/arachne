@@ -635,6 +635,12 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   max-height: 160px;
 }
 .composer textarea:focus { border-color: var(--accent); }
+.composer-hint {
+  padding: 0 16px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-align: right;
+}
 
 .empty {
   flex: 1;
