@@ -11,6 +11,7 @@ const props = defineProps<{
   fleet: SessionSummary[];
   layout: SessionLayout | null;
   selectedId: string | null;
+  showNewThread?: boolean;
   launching?: boolean;
 }>();
 
@@ -28,6 +29,7 @@ const emit = defineEmits<{
     fields: { title?: string; description?: string },
     expected?: { title: string; provenance: string },
   ): void;
+  (e: "new-thread"): void;
   (
     e: "reparent",
     sessionId: string,
@@ -38,18 +40,9 @@ const emit = defineEmits<{
   (e: "archive", id: string): void;
 }>();
 
-const task = ref("");
-const repo = ref("marin-community/arachne");
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
-
-function submit() {
-  const t = task.value.trim();
-  if (!t) return;
-  emit("launch", t, repo.value.trim());
-  task.value = "";
-}
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
 // (agent self-report) and `triage` (outside assessment) carry values
@@ -338,6 +331,7 @@ const topics = computed<TopicEntry[]>(() => {
 // inbox rows); the goal sent to the agent falls back to the title.
 const newTitle = ref("");
 const newDesc = ref("");
+const repo = ref("marin-community/arachne");
 
 function submitTopic() {
   const title = newTitle.value.trim();
@@ -474,31 +468,11 @@ async function archiveRow(id: string) {
         Topics
       </button>
     </div>
-
-    <!-- Inbox tab: the filing lanes + delegation tree (unchanged behavior) -->
+    <!-- Inbox tab: the filing lanes + delegation tree. -->
     <template v-if="tab === 'inbox'">
-      <div class="new-task">
-        <input
-          v-model="task"
-          placeholder="New topic — describe the goal…"
-          @keydown.enter.prevent="submit"
-        />
-        <button
-          class="primary"
-          :disabled="!task.trim() || props.launching"
-          @click="submit"
-        >
-          {{ props.launching ? "…" : "Launch" }}
-        </button>
-      </div>
-      <div class="new-task" style="margin-top: -4px">
-        <input
-          v-model="repo"
-          placeholder="owner/name"
-          spellcheck="false"
-          style="font-family: var(--mono); font-size: 11px"
-        />
-      </div>
+      <button class="new-thread-btn" :class="{ active: props.showNewThread }" @click="emit('new-thread')">
+        + New thread
+      </button>
 
       <div class="session-list">
         <template v-for="{ lane, rows } in laneRows" :key="lane.id">
@@ -617,7 +591,7 @@ async function archiveRow(id: string) {
           class="session-item"
           style="color: var(--text-dim)"
         >
-          No topics yet — launch one above.
+          No topics yet — start one above.
         </div>
       </div>
     </template>

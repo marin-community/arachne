@@ -347,6 +347,18 @@ pub async fn fetch_chat(
     })
 }
 
+/// Return a bounded raster image attached to a session as a data URL. Loom
+/// resolves `name` inside that session's worktree and authorizes the read.
+#[tauri::command]
+pub async fn load_session_image(
+    state: State<'_, LoomState>,
+    id: String,
+    name: String,
+) -> Result<String, UiError> {
+    let client = state_client(&state).await?;
+    client.session_image(&id, &name).await.map_err(Into::into)
+}
+
 /// Send input to a session: ACP prompt (agents) or terminal text (raw).
 #[tauri::command]
 pub async fn send_input(

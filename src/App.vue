@@ -6,6 +6,7 @@ import FleetSidebar from "./components/FleetSidebar.vue";
 import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
+import NewThreadSheet from "./components/NewThreadSheet.vue";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
@@ -110,6 +111,10 @@ const fleet = ref<SessionSummary[]>([]);
 const layout = ref<SessionLayout | null>(null);
 const selectedId = ref<string | null>(null);
 const selectedView = ref<SessionView | null>(null);
+// The new-thread composer: a sheet over the main panel, not a modal and
+// not the sidebar. Takes over while open; a launch closes it and opens
+// the live thread (launchTask → selectSession).
+const showNewThread = ref(false);
 const showSettings = ref(false);
 // URL is not a secret — localStorage is fine. The TOKEN is a credential:
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
@@ -183,6 +188,13 @@ async function selectSession(id: string) {
   }
 }
 
+function openNewThread() {
+  // A stale connection error from an earlier flow shouldn't read as a
+  // launch failure inside the fresh sheet.
+  connError.value = null;
+  showNewThread.value = true;
+}
+
 async function launchTask(
   task: string,
   repo: string,
@@ -199,8 +211,11 @@ async function launchTask(
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.
+    showNewThread.value = false;
     await selectSession(view.id);
   } catch (e: any) {
+    // Keep the sheet open with the draft intact: a failed launch
+    // (bad repo, loom down) is one edit away from a retry, not a blank form.
     connError.value = e?.message ?? String(e);
   } finally {
     launching.value = false;
@@ -339,16 +354,25 @@ const connClass = computed(() =>
       :fleet="fleet"
       :layout="layout"
       :selected-id="selectedId"
+      :show-new-thread="showNewThread"
       :launching="launching"
       @select="selectSession"
       @launch="launchTask"
       @update-topic="updateTopic"
+      @new-thread="openNewThread"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
       @archive="onArchived"
     />
+    <NewThreadSheet
+      v-if="showNewThread"
+      :launching="launching"
+      :error="connError"
+      @close="showNewThread = false"
+      @launch="launchTask"
+    />
     <ThreadView
-      v-if="selectedId && selectedView"
+      v-else-if="selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
       @error="connError = $event"
@@ -360,6 +384,7 @@ const connClass = computed(() =>
       :fleet="fleet"
       :selected-id="selectedId"
       @select="selectSession"
+      @new-thread="openNewThread"
     />
     <SettingsSheet
       v-if="showSettings"

@@ -77,22 +77,17 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-.sidebar .new-task {
+/* The sidebar's one launch affordance: opens the sheet in the main panel. */
+.sidebar .new-thread-btn {
   margin: 10px;
-  display: flex;
-  gap: 6px;
+  padding: 8px 10px;
+  font-weight: 600;
+  text-align: center;
 }
-.sidebar .new-task input {
-  flex: 1;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 6px 8px;
-  font-size: 12px;
-  outline: none;
+.sidebar .new-thread-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
 }
-.sidebar .new-task input:focus { border-color: var(--accent); }
 .session-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
 
 /* --- Sidebar tabs ---------------------------------------------------- */
@@ -362,6 +357,61 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .block.tool .body { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
 .block.tool .status { color: var(--ok); }
 .block.tool .status.running { color: var(--running); }
+
+/* Rendered chat messages: modest Markdown spacing within the existing bubbles. */
+.chat-markdown { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
+.chat-markdown > :first-child { margin-top: 0; }
+.chat-markdown > :last-child { margin-bottom: 0; }
+.chat-markdown p, .chat-markdown ul, .chat-markdown ol,
+.chat-markdown blockquote, .chat-markdown pre, .chat-markdown table {
+  margin: 0 0 10px;
+}
+.chat-markdown h1, .chat-markdown h2, .chat-markdown h3,
+.chat-markdown h4, .chat-markdown h5, .chat-markdown h6 {
+  margin: 14px 0 7px;
+  line-height: 1.3;
+}
+.chat-markdown h1 { font-size: 1.5em; }
+.chat-markdown h2 { font-size: 1.3em; }
+.chat-markdown h3 { font-size: 1.15em; }
+.chat-markdown ul, .chat-markdown ol { padding-left: 22px; }
+.chat-markdown li + li { margin-top: 3px; }
+.chat-markdown li > p { margin-bottom: 4px; }
+.chat-markdown blockquote { padding-left: 12px; border-left: 3px solid var(--border); color: var(--text-dim); }
+.chat-markdown blockquote > :last-child { margin-bottom: 0; }
+.chat-markdown a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.chat-markdown a:hover { color: var(--text); }
+.chat-markdown code, .chat-markdown pre { font-family: var(--mono); }
+.chat-markdown :not(pre) > code {
+  padding: 1px 4px;
+  border-radius: 4px;
+  background: var(--bg-hover);
+  font-size: .92em;
+}
+.chat-markdown pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  white-space: pre;
+}
+.chat-markdown pre code { font-size: 11.5px; }
+.chat-markdown img {
+  display: block;
+  max-width: min(100%, 720px);
+  max-height: 600px;
+  width: auto;
+  height: auto;
+  margin: 8px 0;
+  border-radius: 6px;
+}
+.chat-markdown table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+.chat-markdown th, .chat-markdown td { border: 1px solid var(--border); padding: 5px 8px; }
+.chat-markdown th { background: var(--bg-hover); }
+.chat-markdown hr { border: 0; border-top: 1px solid var(--border); margin: 12px 0; }
+.chat-markdown input[type="checkbox"] { margin-right: 5px; vertical-align: middle; }
 
 .composer {
   display: flex;
@@ -670,6 +720,22 @@ button.accent { border-color: var(--accent); color: var(--accent); }
   border-left: 2px solid var(--border);
   margin: 2px 0 0 8px;
 }
+.tool-group-detail .tool-detail + .tool-detail { margin-top: 5px; }
+.tool-group-detail .tool-detail strong { color: var(--text); font-weight: 600; }
+.tool-group-detail .tool-detail .status { margin-right: 8px; }
+.chat-images { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.chat-images a { display: inline-block; max-width: 100%; }
+.chat-images img {
+  display: block;
+  max-width: min(100%, 480px);
+  max-height: 360px;
+  width: auto;
+  height: auto;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  object-fit: contain;
+}
+.chat-image-unavailable { color: var(--text-dim); font-size: 11px; }
 .thought-body { margin-top: 4px; }
 .load-older { text-align: center; padding: 6px 0; }
 .load-older button {
@@ -685,6 +751,100 @@ button.danger { color: var(--blocked); }
 button.danger:hover { border-color: var(--blocked); }
 .header .conn.clickable { cursor: pointer; }
 .header .conn.clickable:hover { color: var(--text); }
+
+/* --- New-thread sheet ----------------------------------------------- */
+/* Takes over the main display panel (same grid area as the thread home):
+   not a floating modal, a full takeover with room to compose. */
+.new-thread-sheet {
+  grid-area: main;
+  display: flex;
+  overflow-y: auto;
+  background: radial-gradient(
+      ellipse 80% 40% at 50% -10%,
+      rgba(110, 168, 254, 0.05),
+      transparent
+    ),
+    var(--bg);
+}
+.nts-inner {
+  width: min(680px, 100%);
+  margin: 0 auto;
+  padding: 28px 24px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.nts-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.nts-head h1 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.nts-close {
+  padding: 3px 9px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.nts-close:hover { color: var(--text); }
+.nts-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nts-field-name {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.nts-field textarea {
+  resize: vertical;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 10px 12px;
+  font: 13px/1.5 inherit;
+  outline: none;
+  min-height: 120px;
+}
+.nts-field input {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+  font-family: var(--mono);
+}
+.nts-field textarea:focus,
+.nts-field input:focus { border-color: var(--accent); }
+.nts-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.nts-error {
+  color: var(--blocked);
+  font-size: 12.5px;
+  padding: 8px 12px;
+  border: 1px solid var(--blocked);
+  border-radius: 8px;
+  background: rgba(248, 81, 73, 0.06);
+  word-break: break-word;
+}
+.nts-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
 
 /* --- Home (attention-first) ---------------------------------------- */
 
@@ -703,12 +863,13 @@ button.danger:hover { border-color: var(--blocked); }
   margin: 0 auto;
   padding: 28px 24px 48px;
 }
-.home h1 {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-dim);
-  margin: 0 0 4px;
+.home .home-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
+.home .home-top h1 { flex: 1; margin: 0; }
+.home .home-new { padding: 5px 12px; }
 .home .section { margin-top: 26px; }
 .home .section-title {
   font-size: 11px;

@@ -28,6 +28,7 @@ pub fn run() {
             commands::open_session,
             commands::chat_older_cursor,
             commands::fetch_chat,
+            commands::load_session_image,
             commands::send_input,
             commands::interrupt,
             commands::launch_session,
