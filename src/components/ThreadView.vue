@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionView } from "../App.vue";
+import { useFileCompletion } from "../useFileCompletion";
 
 // DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
 // { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
@@ -66,6 +67,7 @@ const emit = defineEmits<{
 
 const blocks = ref<DisplayBlock[]>([]);
 const draft = ref("");
+const completion = useFileCompletion(draft, computed(() => props.session.id));
 const busy = ref(false);
 const loadingOlder = ref(false);
 const hasOlder = ref(true);
@@ -336,6 +338,14 @@ async function send() {
   }
 }
 
+function onComposerKeydown(event: KeyboardEvent) {
+  if (completion.onKeydown(event)) return;
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    send();
+  }
+}
+
 async function interrupt() {
   try {
     await invoke("interrupt", { id: props.session.id });
@@ -517,15 +527,39 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
       </div>
     </div>
     <div class="composer">
-      <textarea
-        v-model="draft"
-        :placeholder="
-          turnLive
-            ? 'Agent is working — your message will queue behind the current turn…'
-            : 'Message the agent…'
-        "
-        @keydown.enter.exact.prevent="send"
-      ></textarea>
+      <div class="file-completion-anchor">
+        <textarea
+          :ref="completion.input"
+          v-model="draft"
+          :placeholder="
+            turnLive
+              ? 'Agent is working — your message will queue behind the current turn…'
+              : 'Message the agent…'
+          "
+          @input="completion.updateCaret"
+          @click="completion.updateCaret"
+          @keyup="completion.updateCaret"
+          @keydown="onComposerKeydown"
+        ></textarea>
+        <ul
+          v-if="completion.visible.value"
+          class="file-completion-menu above"
+          role="listbox"
+          aria-label="Worktree files"
+        >
+          <li v-for="(path, index) in completion.matches.value" :key="path">
+            <button
+              type="button"
+              role="option"
+              :aria-selected="index === completion.selected.value"
+              @mousedown.prevent
+              @click="completion.choose(path)"
+            >
+              @{{ path }}
+            </button>
+          </li>
+        </ul>
+      </div>
       <button class="primary" :disabled="!draft.trim() || busy" @click="send">
         {{ busy ? "…" : "Send" }}
       </button>
