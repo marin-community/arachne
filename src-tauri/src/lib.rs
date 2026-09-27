@@ -14,6 +14,7 @@
 pub mod blocks;
 pub mod client;
 pub mod commands;
+pub mod landing;
 pub mod loom;
 pub mod resources;
 pub mod secret;

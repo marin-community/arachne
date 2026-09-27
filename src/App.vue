@@ -649,6 +649,7 @@ const selectedTopic = computed(() => {
       :topic="selectedTopic"
       :fleet="fleet"
       :launch-options="launchOptions"
+      :loom-url="loomUrl"
       @error="connError = $event"
       @archive="onArchived"
       @delegate="delegateFromThread"

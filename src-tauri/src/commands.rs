@@ -21,6 +21,7 @@ use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
 
 use crate::client::{LoomClient, LoomError};
+use crate::landing::LocalLanding;
 use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
 use crate::resources::{
     ResourceDraft, ResourceKind, ResourceMention, TodoItem, TodoListView, TodoTopicView,
@@ -859,7 +860,9 @@ pub async fn launch_session(
     // New root sessions are topics by default: stamp the durable marker
     // so the topic card and inspector recognize them.
     if parent_branch.is_none() {
-        let _ = client.set_tag(&view.id, "topic", "true").await;
+        let _ = client
+            .set_tag(&view.id, "topic", "true", "session is a topic")
+            .await;
     }
     // File the new topic into its project when one was preselected (a
     // project is a placement group — filing only, never execution state).
@@ -992,7 +995,9 @@ pub async fn delegate_task(
         .await?;
     // Self-heal the parent's topic marker: leaders launched from the CLI (or
     // before this marker existed) should still hold their shape.
-    let _ = client.set_tag(&parent_id, "topic", "true").await;
+    let _ = client
+        .set_tag(&parent_id, "topic", "true", "joined by child session")
+        .await;
     Ok(view)
 }
 
@@ -1269,7 +1274,9 @@ pub async fn reparent_session(
         .await?;
     // Joining a parent makes that parent a topic — stamp the durable marker.
     if let Some(parent) = parent_id.as_deref().filter(|p| !p.is_empty()) {
-        let _ = client.set_tag(parent, "topic", "true").await;
+        let _ = client
+            .set_tag(parent, "topic", "true", "joined by child session")
+            .await;
     }
     Ok(())
 }
@@ -1429,8 +1436,6 @@ pub async fn integrate_session(
     Ok(target)
 }
 
-/// Land a topic: send a landing request to the topic leader (the topic's
-/// coordinator thread), moving accepted state toward the upstream target.
 /// How a landing target was resolved — the provenance the prompt and the
 /// landing agent need to know what to re-verify.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1503,13 +1508,31 @@ fn resolve_landing_target(
     None
 }
 
+/// The result of a Land action. The agent-mediated strategies just send a
+/// request (their outcome is reported in the topic thread); `land-locally`
+/// runs synchronously and returns the completed squash-merge.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LandResult {
+    /// True when this landing happened locally, right now.
+    pub local: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing: Option<LocalLandingView>,
+}
+
+/// Land a topic: move accepted state toward the upstream target. Most
+/// strategies send a structured landing request to the topic leader (its
+/// coordinator thread); `land-locally` is the deterministic exception —
+/// Arachne squash-merges the topic into the primary checkout's current
+/// branch itself, with no agent turn, and reports the result
+/// synchronously.
 #[tauri::command]
 pub async fn land_topic(
     state: State<'_, LoomState>,
     session_id: String,
     strategy: String,
     upstream: Option<String>,
-) -> Result<(), UiError> {
+) -> Result<LandResult, UiError> {
     let client = state_client(&state).await?;
     let strategy = crate::loom::IntegrationStrategy::parse(&strategy).ok_or_else(|| UiError {
         message: format!("unknown landing strategy {strategy:?}"),
@@ -1545,6 +1568,19 @@ pub async fn land_topic(
             unreachable: false,
         });
     }
+    // The deterministic fast path: `land-locally` runs the squash-merge
+    // right here — no agent turn. Loom's API has no git write operations,
+    // so Arachne runs git itself, and only where its paths are meaningful:
+    // a loopback server runs sessions in checkouts on this same machine.
+    // A remote server's `repo_root` is a server-side path, never a local
+    // one — remote landings stay with the agent-mediated strategies.
+    if strategy.is_local() {
+        let landing = land_topic_locally(client, view, summary).await?;
+        return Ok(LandResult {
+            local: true,
+            landing: Some(landing),
+        });
+    }
     // Resolve the landing target. Non-PR strategies land into the primary
     // checkout's currently checked out branch — the checkout a human
     // actually opens — falling back to `main`; `open-pr` targets the
@@ -1552,11 +1588,15 @@ pub async fn land_topic(
     // `upstream` overrides either. A failed primary-checkout lookup is not
     // fatal for open-PR (which never needs it), so the order matters.
     let branches = client.list_branches().await?;
-    let (upstream, target_origin) = if matches!(strategy, crate::loom::IntegrationStrategy::OpenPr) {
+    let (upstream, target_origin) = if matches!(strategy, crate::loom::IntegrationStrategy::OpenPr)
+    {
         let upstream = upstream
             .or_else(|| branches_list_base(&branches, &view.branch.branch))
             .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| UiError { message: "no upstream branch is recorded for this topic".into(), unreachable: false })?;
+            .ok_or_else(|| UiError {
+                message: "no upstream branch is recorded for this topic".into(),
+                unreachable: false,
+            })?;
         (upstream, LandingTargetOrigin::RecordedBase)
     } else {
         // Resolve the primary checkout's current branch via `repos.branches`.
@@ -1580,7 +1620,10 @@ pub async fn land_topic(
             None => (
                 branches_list_base(&branches, &view.branch.branch)
                     .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| UiError { message: "no landing target could be resolved for this topic".into(), unreachable: false })?,
+                    .ok_or_else(|| UiError {
+                        message: "no landing target could be resolved for this topic".into(),
+                        unreachable: false,
+                    })?,
                 LandingTargetOrigin::RecordedBase,
             ),
         }
@@ -1603,7 +1646,126 @@ pub async fn land_topic(
         client.queue_prompt(&view.id, &prompt).await?;
     }
     // Do not mark the topic landed before the coordinator reports success.
-    Ok(())
+    Ok(LandResult {
+        local: false,
+        landing: None,
+    })
+}
+
+/// The outcome of a `land-locally` landing, returned to the UI so it can
+/// confirm synchronously what the agent-mediated strategies can only
+/// promise ("follow the result in this thread").
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LocalLandingView {
+    pub landed: bool,
+    pub target_branch: String,
+    pub commit: Option<String>,
+    pub commits_squashed: u32,
+    /// The primary checkout the squash landed into (absolute path).
+    pub primary_checkout: String,
+}
+
+impl From<LocalLanding> for LocalLandingView {
+    fn from(landing: LocalLanding) -> Self {
+        LocalLandingView {
+            landed: landing.landed,
+            target_branch: landing.target_branch,
+            commit: landing.commit,
+            commits_squashed: landing.commits_squashed,
+            primary_checkout: landing.primary_checkout,
+        }
+    }
+}
+
+/// True when a Loom server host runs sessions on this machine — the
+/// precondition for running git against its checkout paths locally.
+fn host_is_loopback(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
+}
+
+/// The deterministic fast path behind the `land-locally` strategy: squash
+/// the topic's branch into the primary checkout's currently checked out
+/// branch, locally, with no agent turn.
+///
+/// Preconditions beyond `squash_into_primary_checkout`'s own preflight:
+/// the Loom server must be loopback (its `repo_root` paths are local
+/// paths; a remote server would make Arachne run git against a
+/// server-side path that is meaningless here), and the topic must own a
+/// branch — an archived or branchless topic has nothing to land.
+async fn land_topic_locally(
+    client: Arc<LoomClient>,
+    view: SessionView,
+    summary: &SessionSummaryView,
+) -> Result<LocalLandingView, UiError> {
+    let host = client.server_host().unwrap_or("").to_owned();
+    if !host_is_loopback(&host) {
+        return Err(UiError {
+            message: format!(
+                "land-locally needs the Loom server on this machine; {host} runs sessions remotely —\n\nuse one of the agent-mediated strategies instead"
+            ),
+            unreachable: false,
+        });
+    }
+    if view.branch.branch.trim().is_empty() {
+        return Err(UiError {
+            message: "this topic has no branch to land".into(),
+            unreachable: false,
+        });
+    }
+    let result = crate::landing::squash_into_primary_checkout(
+        std::path::Path::new(&view.branch.repo_root),
+        &view.branch.branch,
+        &summary_title(summary, &view),
+    )
+    .await
+    .map_err(|e| UiError {
+        message: e.to_string(),
+        unreachable: false,
+    })?;
+    // Record the outcome on the topic's branch — the same durable signal the
+    // integration skill stamps for a completed integration, so every fleet
+    // surface (dashboards, inspectors) sees the topic as landed without an
+    // agent having to report it. A tag failure never fails the landing: the
+    // git result stands, as with the agent-mediated flow.
+    let note = if result.landed {
+        format!(
+            "land-locally: squash of {} commit{} into {}",
+            result.commits_squashed,
+            if result.commits_squashed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            result.target_branch
+        )
+    } else {
+        format!(
+            "land-locally: {} already contained the topic's changes",
+            result.target_branch
+        )
+    };
+    let _ = client
+        .set_tag(
+            &view.id,
+            "integration_result",
+            result.commit.as_deref().unwrap_or(""),
+            &note,
+        )
+        .await;
+    Ok(LocalLandingView::from(result))
+}
+
+/// A landing title for the squash commit: the topic's name, else the
+/// branch's title, else the branch name.
+fn summary_title(summary: &SessionSummaryView, view: &SessionView) -> String {
+    if !summary.branch.name.trim().is_empty() {
+        return summary.branch.name.clone();
+    }
+    if !view.branch.title.trim().is_empty() {
+        return view.branch.title.clone();
+    }
+    view.branch.name.clone()
 }
 
 /// Diff totals against Loom's recorded base ref for this checkout. The
@@ -2167,7 +2329,45 @@ mod integration_tests {
     use super::{resolve_integration_target, resolve_landing_target};
     use crate::loom::SessionSummaryView;
 
-    fn repo_branch(name: &str, worktree: Option<&str>, current: bool) -> crate::loom::RepoBranchView {
+    #[test]
+    fn loopback_hosts_qualify_for_local_landing() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            assert!(super::host_is_loopback(host), "{host}");
+        }
+        for host in ["dgx.tail1234.ts.net", "loom.example.com", ""] {
+            assert!(!super::host_is_loopback(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn landing_title_prefers_topic_name_then_branch_title() {
+        let summary = serde_json::from_value::<SessionSummaryView>(serde_json::json!({
+            "id": "s", "status": "running", "profile": "default", "class": "interactive",
+            "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
+            "last_activity_at": "2026-01-01T00:00:00Z", "placement": null,
+            "github_repo": null, "parent_id": null, "parent_session_id": null,
+            "branch": { "id": "b", "branch": "weaver/x", "name": "", "title": "Branch title",
+                "repo_root": "/repo", "tags": [] }
+        }))
+        .unwrap();
+        let view = serde_json::from_value::<crate::loom::SessionView>(serde_json::json!({
+            "id": "s", "status": "running", "profile": "default", "class": "interactive",
+            "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
+            "last_activity_at": "2026-01-01T00:00:00Z", "turn_count": 0,
+            "agent_kind": "claude", "model": "", "effort": "", "protocol": "acp",
+            "work_dir": "", "term_session": "", "placement": null,
+            "branch": { "id": "b", "branch": "weaver/x", "name": "branch-name", "title": "Branch title",
+                "repo_root": "/repo", "tags": [] }
+        })).unwrap();
+        // Empty topic name falls to the branch's title.
+        assert_eq!(super::summary_title(&summary, &view), "Branch title");
+    }
+
+    fn repo_branch(
+        name: &str,
+        worktree: Option<&str>,
+        current: bool,
+    ) -> crate::loom::RepoBranchView {
         crate::loom::RepoBranchView {
             name: name.into(),
             worktree: worktree.map(String::from),
@@ -2183,7 +2383,8 @@ mod integration_tests {
             repo_branch("dev", Some("/repo"), true),
             repo_branch("weaver/topic", Some("/repo/.worktrees/topic"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "dev");
         assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
     }
@@ -2198,7 +2399,8 @@ mod integration_tests {
             repo_branch("weaver/other-worker", Some("/repo/.worktrees/other"), true),
             repo_branch("main", Some("/repo"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
@@ -2211,7 +2413,8 @@ mod integration_tests {
             repo_branch("dev", Some("/repo/.worktrees/dev"), false),
             repo_branch("main", Some("/repo"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
@@ -2226,7 +2429,8 @@ mod integration_tests {
     #[test]
     fn landing_primary_checkout_on_main_is_not_a_fallback() {
         let rows = vec![repo_branch("main", Some("/repo"), true)];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
     }
@@ -2234,7 +2438,8 @@ mod integration_tests {
     #[test]
     fn landing_explicit_upstream_wins() {
         let rows = vec![repo_branch("dev", Some("/repo"), true)];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", Some(" release ")).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", Some(" release ")).unwrap();
         assert_eq!(target, "release");
         assert_eq!(origin, super::LandingTargetOrigin::Explicit);
     }
@@ -2242,7 +2447,8 @@ mod integration_tests {
     #[test]
     fn landing_blank_explicit_upstream_falls_through() {
         let rows = vec![repo_branch("dev", Some("/repo"), true)];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", Some("  ")).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", Some("  ")).unwrap();
         assert_eq!(target, "dev");
         assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
     }
@@ -2256,7 +2462,8 @@ mod integration_tests {
             repo_branch("weaver/topic", Some("/repo"), true),
             repo_branch("main", Some("/repo/.worktrees/main"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
+        let (target, origin) =
+            resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
@@ -2266,11 +2473,19 @@ mod integration_tests {
         let rows = vec![repo_branch("dev", Some("/repo"), false)];
         // No current row and no `main`: the caller falls back to the
         // recorded base.
-        assert_eq!(resolve_landing_target(&rows, "/repo", "weaver/topic", None), None);
+        assert_eq!(
+            resolve_landing_target(&rows, "/repo", "weaver/topic", None),
+            None
+        );
     }
 
-    fn session(id: &str, branch: &str, repo: &str, parent: Option<&str>, topic: bool) -> SessionSummaryView {
-
+    fn session(
+        id: &str,
+        branch: &str,
+        repo: &str,
+        parent: Option<&str>,
+        topic: bool,
+    ) -> SessionSummaryView {
         serde_json::from_value(serde_json::json!({
             "id": id, "status": "running", "profile": "default", "class": "interactive",
             "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
