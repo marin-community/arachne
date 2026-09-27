@@ -11,14 +11,18 @@ use keyring::Entry;
 const SERVICE: &str = "com.arachne.app";
 const ACCOUNT: &str = "loom-token";
 
-fn entry() -> keyring::Result<Entry> {
-    Entry::new(SERVICE, ACCOUNT)
+fn entry(account: &str) -> keyring::Result<Entry> {
+    Entry::new(SERVICE, account)
 }
 
 /// Persist the token to the Keychain. An empty string deletes the entry (so
 /// clearing the field in settings actually clears the secret).
 pub fn save(token: &str) -> Result<(), String> {
-    let e = entry().map_err(|e| format!("keychain: {e}"))?;
+    save_for(ACCOUNT, token)
+}
+
+fn save_for(account: &str, token: &str) -> Result<(), String> {
+    let e = entry(account).map_err(|e| format!("keychain: {e}"))?;
     if token.is_empty() {
         // Delete is not an error when absent.
         let _ = e.delete_credential();
@@ -30,7 +34,11 @@ pub fn save(token: &str) -> Result<(), String> {
 
 /// Read the token from the Keychain; `Ok(None)` when none is stored.
 pub fn load() -> Result<Option<String>, String> {
-    let e = entry().map_err(|e| format!("keychain: {e}"))?;
+    load_for(ACCOUNT)
+}
+
+fn load_for(account: &str) -> Result<Option<String>, String> {
+    let e = entry(account).map_err(|e| format!("keychain: {e}"))?;
     match e.get_password() {
         Ok(t) => Ok(Some(t)),
         Err(keyring::Error::NoEntry) => Ok(None),
@@ -47,13 +55,14 @@ mod tests {
         // Round-trips through the real Keychain. This is a macOS dev machine;
         // if the Keychain is unavailable the test is skipped rather than
         // failing the build.
-        if save("test-token-abc").is_err() {
+        let account = format!("loom-token-test-{}", std::process::id());
+        if save_for(&account, "test-token-abc").is_err() {
             eprintln!("keychain unavailable; skipping");
             return;
         }
-        assert_eq!(load().unwrap().as_deref(), Some("test-token-abc"));
+        assert_eq!(load_for(&account).unwrap().as_deref(), Some("test-token-abc"));
         // Empty deletes.
-        save("").unwrap();
-        assert_eq!(load().unwrap(), None);
+        save_for(&account, "").unwrap();
+        assert_eq!(load_for(&account).unwrap(), None);
     }
 }

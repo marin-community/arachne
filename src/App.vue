@@ -7,6 +7,8 @@ import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import NewThreadSheet from "./components/NewThreadSheet.vue";
+import ResourcePanel from "./components/ResourcePanel.vue";
+import type { FileAttachment } from "./attachments";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
@@ -25,6 +27,14 @@ interface BranchSummary {
   description: string;
   goal: string;
   repo_root: string;
+  github?: {
+    pr_number: number;
+    pr_url: string;
+    pr_state: string;
+    checks: string | null;
+    review_decision: string | null;
+  } | null;
+  github_pr?: number | null;
   tags: TagView[];
   title_provenance?: string;
 }
@@ -52,6 +62,7 @@ export interface SessionSummary {
   parent_id: string | null;
   parent_session_id: string | null;
 }
+export interface ResourceMention { topicId: string; resourceId: string }
 export interface SessionView {
   id: string;
   status: string;
@@ -63,6 +74,7 @@ export interface SessionView {
   effort: string;
   protocol: string;
   work_dir: string;
+  github_repo: string | null;
   term_session: string;
   turn_count: number;
   created_by: string | null;
@@ -100,6 +112,17 @@ interface FleetSnapshot {
   sessions: SessionSummary[];
   layout: SessionLayout;
 }
+export interface LaunchOptions {
+  profiles: { name: string; description: string; agent_kind: string; model: string; effort: string; class: string }[];
+  agents: {
+    kind: string;
+    label: string;
+    models: { id: string; label: string }[];
+    efforts: { id: string; label: string }[];
+    accepts_raw_model: boolean;
+  }[];
+  default_agent: string;
+}
 
 // --- State ----------------------------------------------------------------
 
@@ -109,13 +132,18 @@ const connError = ref<string | null>(null);
 const launching = ref(false);
 const fleet = ref<SessionSummary[]>([]);
 const layout = ref<SessionLayout | null>(null);
+const launchOptions = ref<LaunchOptions | null>(null);
 const selectedId = ref<string | null>(null);
+const selectedTopicId = ref<string | null>(null);
+const viewMode = ref<"home" | "topic" | "thread">("home");
 const selectedView = ref<SessionView | null>(null);
 // The new-thread composer: a sheet over the main panel, not a modal and
 // not the sidebar. Takes over while open; a launch closes it and opens
 // the live thread (launchTask → selectSession).
 const showNewThread = ref(false);
 const showSettings = ref(false);
+const showResources = ref(true);
+const settingsError = ref<string | null>(null);
 // URL is not a secret — localStorage is fine. The TOKEN is a credential:
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
 // "do not store sensitive credentials in frontend localStorage"). It's
@@ -138,6 +166,8 @@ onMounted(async () => {
   await listen<FleetSnapshot>("loom://fleet", (event) => {
     fleet.value = event.payload.sessions;
     layout.value = event.payload.layout;
+    connected.value = true;
+    connError.value = null;
   });
   await listen("loom://error", (event) => {
     const err = event.payload as { message: string; unreachable: boolean };
@@ -155,26 +185,34 @@ async function connect(url: string, token: string | null) {
     await invoke("connect", { baseUrl: url, token });
     connected.value = true;
     connError.value = null;
+    launchOptions.value = await invoke<LaunchOptions>("launch_options").catch(() => null);
   } catch (e: any) {
     connected.value = false;
     connError.value = e?.message ?? String(e);
+    launchOptions.value = null;
   }
 }
 
-function saveSettings(url: string, token: string) {
+async function saveSettings(url: string, token: string) {
+  settingsError.value = null;
+  try {
+    await invoke("save_token", { token });
+  } catch (e: any) {
+    settingsError.value = `Could not save the token in Keychain: ${e?.message ?? String(e)}`;
+    return;
+  }
   loomUrl.value = url;
   loomToken.value = token;
   localStorage.setItem("loomUrl", url);
-  // Persist the token to the Keychain (fire-and-forget: connect proceeds
-  // on the in-memory copy; a failed save surfaces on next boot at worst).
-  invoke("save_token", { token }).catch(() => {});
-  showSettings.value = false;
-  connect(url, token || null);
+  await connect(url, token || null);
+  if (connected.value) showSettings.value = false;
+  else settingsError.value = connError.value;
 }
 
 // --- Actions ----------------------------------------------------------------
 
 async function selectSession(id: string) {
+  viewMode.value = "thread";
   selectedId.value = id;
   // Drop the stale view immediately: ThreadView is keyed by selectedId and
   // remounts the moment it changes — if the old view were still here, its
@@ -182,7 +220,31 @@ async function selectSession(id: string) {
   // re-run when the fresh view arrives (clicked row N, saw row N±1's thread).
   selectedView.value = null;
   try {
-    selectedView.value = await invoke<SessionView>("open_session", { id });
+    const view = await invoke<SessionView>("open_session", { id });
+    if (viewMode.value === "thread" && selectedId.value === id) selectedView.value = view;
+  } catch (e: any) {
+    if (viewMode.value === "thread" && selectedId.value === id)
+      connError.value = e?.message ?? String(e);
+  }
+}
+
+function selectTopic(id: string) {
+  selectedTopicId.value = id;
+  selectedId.value = null;
+  selectedView.value = null;
+  viewMode.value = "topic";
+}
+
+function showTopicsHome() {
+  selectedId.value = null;
+  selectedTopicId.value = null;
+  selectedView.value = null;
+  viewMode.value = "home";
+}
+
+async function openTopicInZed(id: string) {
+  try {
+    await invoke("open_in_zed", { id });
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   }
@@ -198,7 +260,8 @@ function openNewThread() {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string },
+  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+  completed?: (success: boolean) => void,
 ) {
   launching.value = true;
   try {
@@ -207,16 +270,25 @@ async function launchTask(
       task,
       title: meta?.title ?? null,
       description: meta?.description ?? null,
+      oneOff: meta?.oneOff ?? false,
+      mentions: meta?.mentions ?? [],
+      attachments: meta?.attachments?.map(({ name, contentBase64 }) => ({ name, contentBase64 })) ?? [],
+      profile: meta?.profile || null,
+      agent: meta?.agent || null,
+      model: meta?.model || null,
+      effort: meta?.effort || null,
     });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.
     showNewThread.value = false;
     await selectSession(view.id);
+    completed?.(true);
   } catch (e: any) {
     // Keep the sheet open with the draft intact: a failed launch
     // (bad repo, loom down) is one edit away from a retry, not a blank form.
     connError.value = e?.message ?? String(e);
+    completed?.(false);
   } finally {
     launching.value = false;
   }
@@ -314,8 +386,7 @@ async function onArchived(id: string) {
     return;
   }
   if (selectedId.value === id) {
-    selectedId.value = null;
-    selectedView.value = null;
+    showTopicsHome();
   }
   // Keep the archived row in the fleet: the sidebar shows archived children
   // dimmed under their leader, so a finished worker stays visible as part of
@@ -328,12 +399,27 @@ async function onArchived(id: string) {
 const connClass = computed(() =>
   connected.value ? "ok" : connError.value ? "bad" : "warn",
 );
+
+const selectedTopic = computed(() => {
+  let node = fleet.value.find((session) => session.id === (selectedId.value ?? selectedTopicId.value));
+  if (!node) return null;
+  const seen = new Set<string>();
+  while (node && !seen.has(node.id)) {
+    seen.add(node.id);
+    const parent: SessionSummary | undefined = fleet.value.find((session) =>
+      session.id === node?.parent_session_id || session.branch.id === node?.parent_id,
+    );
+    if (!parent) break;
+    node = parent;
+  }
+  return node;
+});
 </script>
 
 <template>
-  <div class="app" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': !showNewThread && viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
-      <span class="title">🕸 Arachne</span>
+      <button class="title home-link" title="Show Topics home" @click="showTopicsHome">🕸 Arachne</button>
       <span
         class="conn"
         :class="{ clickable: true }"
@@ -349,14 +435,18 @@ const connClass = computed(() =>
             : (connError ?? "connecting…")
         }}
       </span>
+      <button v-if="viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
+        @click="showResources = !showResources">Resources</button>
     </header>
     <FleetSidebar
       :fleet="fleet"
       :layout="layout"
-      :selected-id="selectedId"
+      :selected-id="selectedId ?? selectedTopicId"
       :show-new-thread="showNewThread"
       :launching="launching"
+      :launch-options="launchOptions"
       @select="selectSession"
+      @select-topic="selectTopic"
       @launch="launchTask"
       @update-topic="updateTopic"
       @new-thread="openNewThread"
@@ -372,25 +462,38 @@ const connClass = computed(() =>
       @launch="launchTask"
     />
     <ThreadView
-      v-else-if="selectedId && selectedView"
+      v-else-if="viewMode === 'thread' && selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
+      :topic="selectedTopic"
+      :fleet="fleet"
+      :launch-options="launchOptions"
       @error="connError = $event"
       @archive="onArchived"
       @delegate="delegateFromThread"
+      @handoff="selectSession"
+      @refresh="selectSession"
+      @open-topic="selectTopic"
+      @home="showTopicsHome"
     />
     <HomeView
       v-else
+      :key="viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'"
       :fleet="fleet"
-      :selected-id="selectedId"
+      :topic="viewMode === 'topic' ? selectedTopic : null"
       @select="selectSession"
       @new-thread="openNewThread"
+      @open-zed="openTopicInZed"
+      @home="showTopicsHome"
     />
+    <ResourcePanel v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic"
+      @close="showResources = false" @error="connError = $event" />
     <SettingsSheet
       v-if="showSettings"
       :url="loomUrl"
       :token="loomToken"
       :connected="connected"
+      :error="settingsError"
       @close="showSettings = false"
       @save="saveSettings"
     />
