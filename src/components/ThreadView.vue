@@ -7,6 +7,7 @@ import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
 import SplitButton from "./SplitButton.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
+import { pasteAsPlainText } from "../composerPaste";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
@@ -74,6 +75,17 @@ function onFileInput(event: Event) {
 }
 function onComposerPaste(event: ClipboardEvent) {
   if (!event.clipboardData) return;
+  // A turn copied from the conversation carries its raw markdown as
+  // text/plain and the rendered markup as text/html; the composer is a
+  // plain-text editor, so take the markdown flavor before WebKit
+  // flattens the HTML one into the draft.
+  if (pasteAsPlainText(event)) {
+    event.preventDefault();
+    const text = event.clipboardData.getData("text/plain");
+    document.execCommand("insertText", false, text);
+    completion.updateCaret();
+    return;
+  }
   const files = filesFromClipboard(event.clipboardData);
   if (!files.length) return;
   event.preventDefault(); void addFiles(files);

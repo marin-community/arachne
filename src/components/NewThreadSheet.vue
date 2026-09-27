@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import { pasteAsPlainText } from "../composerPaste";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-thread sheet: composing a thread happens in the main display
@@ -67,6 +68,15 @@ function onFileInput(event: Event) {
 }
 function onPaste(event: ClipboardEvent) {
   if (!event.clipboardData) return;
+  // The goal body is markdown (a copied turn pastes its source); take the
+  // text/plain flavor before WebKit flattens the HTML one.
+  if (pasteAsPlainText(event)) {
+    event.preventDefault();
+    const text = event.clipboardData.getData("text/plain");
+    document.execCommand("insertText", false, text);
+    updateMention();
+    return;
+  }
   const files = filesFromClipboard(event.clipboardData);
   if (!files.length) return;
   event.preventDefault();
