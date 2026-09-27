@@ -3,6 +3,7 @@ import { ref, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
+import { byTopicRecency, topicRecencyMap } from "../topicOrder";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -173,11 +174,17 @@ function buildLanes(): Lane[] {
           ? 1
           : -1
         : -1;
+  // Roots are topics: order by when a person last steered them, not by
+  // agent busyness (the same rule as the Topics tab, src/topicOrder.ts).
+  // Workers nested under a leader keep the activity sort — sibling order
+  // within a topic is thread-level, and a busy worker bubbling up among
+  // its own siblings is informative, not disruptive.
+  const byTopic = byTopicRecency(topicRecencyMap(props.fleet));
   const sortTree = (n: TreeNode) => {
     n.children.sort(byActivity);
     n.children.forEach(sortTree);
   };
-  roots.sort(byActivity);
+  roots.sort((a, b) => byTopic(a.session, b.session));
   roots.forEach(sortTree);
 
   // Trees file into lanes (placement groups) by their LEADER's placement.
@@ -312,6 +319,11 @@ interface TopicEntry {
 
 // Every top-level thread is a topic, including legacy single-prompt launches
 // that predate the marker. Archived leaders stay listed with their descendants.
+// Order is by when a person last steered the topic — the newest user
+// message anywhere in its subtree — not by agent busyness:
+// `last_activity_at` restamps on every streamed frame, which made the cards
+// jump around while workers ran (src/topicOrder.ts).
+const topicRecency = computed(() => topicRecencyMap(props.fleet));
 const topics = computed<TopicEntry[]>(() => {
   const byId = new Map(props.fleet.map((s) => [s.id, s]));
   const byBranch = new Map(props.fleet.map((s) => [s.branch.id, s]));
@@ -331,9 +343,7 @@ const topics = computed<TopicEntry[]>(() => {
       return topLevel;
     })
     .map((s) => ({ session: s, childCount: childCount.get(s.id) ?? 0 }))
-    .sort((a, b) =>
-      a.session.last_activity_at < b.session.last_activity_at ? 1 : -1,
-    );
+    .sort((a, b) => byTopicRecency(topicRecency.value)(a.session, b.session));
 });
 
 // Topics filed under their project (a non-system layout group, per the

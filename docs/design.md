@@ -99,6 +99,14 @@ depth. Older unmarked top-level conversations remain visible as topics without
 rewriting their Loom history. Delegating from a thread creates a child in the
 conversation tree; its Git base still comes from the topic's accepted branch.
 
+Topics are ordered by **last user message time** — the newest user message
+anywhere in the topic's subtree (coordinator or worker). A busy agent streams
+constantly, and Loom restamps `last_activity_at` on every frame, so activity
+ordering makes topics jump around while you watch; ordering by when a person
+last steered the topic keeps the list still while work runs. Worker triage
+lists (Needs You, Working, the Topic inspector's threads) keep their own
+attention- and activity-based ordering — they are about workers, not topics.
+
 ## Project defaults and resource inheritance
 
 A Project can bind multiple repositories, design documents, and other

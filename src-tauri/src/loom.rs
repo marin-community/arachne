@@ -87,6 +87,14 @@ pub struct SessionSummaryView {
     pub created_by: Option<String>,
     pub created_at: String,
     pub last_activity_at: String,
+    /// When the newest `user_message` block was journaled (the last time a
+    /// person or a delivery on their behalf steered the conversation), or
+    /// `None` when the journal holds no user input — or when an older loom
+    /// predates the field (`#[serde(default)]` there). Unlike
+    /// `last_activity_at`, it does not advance while the agent is merely
+    /// streaming, so topic ordering by it stays still.
+    #[serde(default)]
+    pub last_user_message_at: Option<String>,
     pub branch: BranchSummaryView,
     pub placement: Option<SessionPlacementView>,
     pub github_repo: Option<String>,
