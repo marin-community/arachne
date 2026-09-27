@@ -18,6 +18,7 @@ pub enum ResourceKind {
     Repository,
     Worktree,
     PullRequest,
+    Issue,
     File,
     DesignDocument,
     Artifact,
@@ -29,6 +30,7 @@ impl ResourceKind {
             Self::Repository => "repository",
             Self::Worktree => "worktree",
             Self::PullRequest => "pull_request",
+            Self::Issue => "issue",
             Self::File => "file",
             Self::DesignDocument => "design_document",
             Self::Artifact => "artifact",
@@ -115,12 +117,12 @@ impl ResourceDraft {
                     return Err("file reference must be the topic's current branch".into());
                 }
             }
-            ResourceKind::PullRequest => {
-                let url = self.url.as_deref().ok_or("pull request URL is required")?;
+            ResourceKind::PullRequest | ResourceKind::Issue => {
+                let url = self.url.as_deref().ok_or("a github.com URL is required")?;
                 if !(url.starts_with("https://github.com/")
                     || url.starts_with("https://www.github.com/"))
                 {
-                    return Err("pull request URL must be on github.com".into());
+                    return Err("the URL must be on github.com".into());
                 }
             }
             ResourceKind::Repository => {}
@@ -139,7 +141,9 @@ impl ResourceDraft {
         // mutable display title. This also makes repeated attachment idempotent.
         let locator = match self.kind {
             ResourceKind::Repository => self.repository.clone(),
-            ResourceKind::PullRequest => self.url.clone().unwrap(),
+            // PRs and issues are their GitHub URL — stable identity across
+            // checkouts, sessions, and who attached them.
+            ResourceKind::PullRequest | ResourceKind::Issue => self.url.clone().unwrap(),
             _ => format!(
                 "{}:{}:{}",
                 self.repository,
@@ -254,6 +258,49 @@ mod tests {
         assert!(design("docs/design.md")
             .validated("/repo", "other")
             .is_err());
+    }
+
+    #[test]
+    fn issue_and_pr_identity_is_their_github_url() {
+        let issue = ResourceDraft {
+            kind: ResourceKind::Issue,
+            title: "Panel misses issues".into(),
+            repository: "/repo".into(),
+            reference: None,
+            path: None,
+            url: Some("https://github.com/acme/app/issues/12".into()),
+        }
+        .validated("/repo", "topic")
+        .unwrap();
+        assert_eq!(issue.id, "issue:https://github.com/acme/app/issues/12");
+        let pr = ResourceDraft {
+            kind: ResourceKind::PullRequest,
+            title: "Panel misses issues".into(),
+            repository: "/repo".into(),
+            reference: None,
+            path: None,
+            url: Some("https://github.com/acme/app/pull/13".into()),
+        }
+        .validated("/repo", "topic")
+        .unwrap();
+        assert_eq!(pr.id, "pull_request:https://github.com/acme/app/pull/13");
+        // Same URL, same identity regardless of kind label noise.
+        let mut renamed = issue.data.clone();
+        renamed.title = "Renamed".into();
+        assert_eq!(renamed.validated("/repo", "topic").unwrap().id, issue.id);
+    }
+
+    #[test]
+    fn issue_urls_must_be_github() {
+        let bad = ResourceDraft {
+            kind: ResourceKind::Issue,
+            title: "Offsite".into(),
+            repository: "/repo".into(),
+            reference: None,
+            path: None,
+            url: Some("https://example.com/12".into()),
+        };
+        assert!(bad.validated("/repo", "topic").is_err());
     }
 
     #[test]
