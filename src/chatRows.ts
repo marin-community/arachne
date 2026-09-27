@@ -144,6 +144,16 @@ function liveThoughtIndex(blocks: readonly ChatDisplayBlock[], liveTurn: number 
   return null;
 }
 
+/** Which corner a block's copy icon pins to: "top" while the host's
+ * top edge sits at or below the scroll viewport's top edge (its top-right
+ * corner is on screen), "bottom" once the top has scrolled out of view —
+ * so a block taller than the pane keeps its icon at the trailing edge.
+ * Blocks entirely off screen keep whatever corner follows; only the
+ * visible edge matters. */
+export function copyCornerFor(hostTop: number, viewportTop: number): "top" | "bottom" {
+  return hostTop >= viewportTop ? "top" : "bottom";
+}
+
 /** Group visually adjacent tool calls and finished thoughts (same turn) into
  * one collapsed work row — except the current thinking block while its turn
  * is in flight, which stays its own open row. Invisible usage blocks may

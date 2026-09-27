@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   blockKey,
   blockCopyText,
+  copyCornerFor,
   countThinkingTokens,
   formatPlanEntries,
   formatTokens,
@@ -166,6 +167,17 @@ test("copy text formats tool call content parts and skips images", () => {
 
 test("copy text for thought blocks preserves the raw text untrimmed", () => {
   assert.equal(blockCopyText({ kind: "thought", text: "\n\n**Thinking**\nstep 1" }), "\n\n**Thinking**\nstep 1");
+});
+
+test("copy corner follows the visible edge: top while the host's top is on screen, bottom once scrolled past", () => {
+  // viewport top at 0: a host starting at or below it shows its top corner.
+  assert.equal(copyCornerFor(0, 0), "top");
+  assert.equal(copyCornerFor(50, 0), "top");
+  // a host whose top has scrolled above the viewport pins bottom.
+  assert.equal(copyCornerFor(-400, 0), "bottom");
+  // scrolled viewport: same rule against its own top edge.
+  assert.equal(copyCornerFor(-100, -300), "top");
+  assert.equal(copyCornerFor(-350, -300), "bottom");
 });
 
 test("thinking token totals use usage numbers over the char heuristic", () => {

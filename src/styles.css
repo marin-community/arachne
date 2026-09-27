@@ -1109,14 +1109,18 @@ button.accent { border-color: var(--accent); color: var(--accent); }
   text-overflow: ellipsis;
 }
 .tool-line .chevron { margin-left: auto; color: var(--text-dim); flex-shrink: 0; }
-/* Copy affordance on every chat block. Nearly invisible until hover —
-   like the chevron it sits next to, it should not compete with the text. */
+/* Copy affordance pinned to a chat bubble's corner — top-right while that
+   corner is on screen, bottom-right once the top has scrolled out of view
+   (ThreadView tracks the geometry through data-copy-host). Nearly
+   invisible until hover so it never competes with the text. */
+.block { position: relative; }
 .copy-button {
+  position: absolute;
+  right: 4px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
-  padding: 1px 4px;
+  padding: 2px 3px;
   border: 0;
   border-radius: 4px;
   background: transparent;
@@ -1126,27 +1130,33 @@ button.accent { border-color: var(--accent); color: var(--accent); }
   font-weight: 400;
   text-transform: none;
   letter-spacing: normal;
+  opacity: 0;
+  z-index: 1;
+  transition: opacity .12s;
 }
+.copy-button.corner-top { top: 2px; }
+.copy-button.corner-bottom { bottom: 2px; }
 .copy-button:hover {
   color: var(--text);
-  background: transparent;
+  background: var(--bg-hover);
   border-color: transparent;
 }
 .copy-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
 .copy-button.copied { color: var(--ok); }
-.block .who .copy-button { visibility: hidden; }
-.block:hover .who .copy-button, .block .who .copy-button:focus-visible { visibility: visible; }
-.tool-copy { opacity: 0; }
-.tool-line:hover .tool-copy, .tool-detail:hover .tool-copy, .tool-copy:focus-visible, .copy-button.copied { opacity: 1; }
-.tool-detail .tool-copy { margin-left: auto; }
-.tool-detail { position: relative; }
+.block:hover .copy-button,
+.copy-button:focus-visible,
+.copy-button.copied { opacity: 1; }
+/* Disclosure headers and detail rows reserve the corner so the pinned
+   icon never sits on the chevron or the summary text. */
+.tool-line { padding-right: 30px; }
 .tool-detail {
+  position: relative;
   font-family: var(--mono);
   font-size: 11px;
   color: var(--text-dim);
   white-space: pre-wrap;
   word-break: break-word;
-  padding: 6px 10px;
+  padding: 6px 30px 6px 10px;
   border-left: 2px solid var(--border);
   margin: 2px 0 0 8px;
 }
