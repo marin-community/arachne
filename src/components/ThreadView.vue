@@ -997,7 +997,7 @@ async function onLand(strategy: string) {
             <span class="tool-summary">{{
               [
                 row.calls.length ? `${row.calls.length} ${row.calls.length === 1 ? 'tool call' : 'tool calls'}` : null,
-                row.thinkingTokens ? `${formatTokens(row.thinkingTokens)} thinking tokens` : null,
+                row.thinkingTokens ? `~${formatTokens(row.thinkingTokens)} thinking tokens` : null,
               ].filter(Boolean).join(' · ') || 'done'
             }}</span>
             <span class="chevron">{{ workCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
