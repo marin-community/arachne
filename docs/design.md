@@ -171,7 +171,9 @@ default; other workers get isolated worktrees.
 The Topic owns integration candidates from its workers, with a queue and
 status visible in the inspector's Integrations tab. **Integrate** absorbs a
 candidate into the Topic's accepted ref for the relevant repository. **Land**
-moves that accepted state to an upstream target such as a PR or main. A nested
+moves that accepted state upstream — non-PR strategies target the primary
+local checkout's currently checked out branch (`main` as fallback), while
+`open-pr` targets the remote's default branch. A nested
 worker may integrate through its parent, but worker → Topic is the normal
 visible path.
 

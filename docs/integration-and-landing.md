@@ -609,6 +609,40 @@ that is no longer offered falls back to **Open PR**.
 
 ---
 
+# Landing target
+
+Non-PR strategies (`squash`, `merge`, `rebase`, `push`) do not target
+`origin/main` by default. They land into the **primary local checkout's
+currently checked out branch**, falling back to `main` when it cannot be
+resolved:
+
+1. an explicit target the user chose — use it;
+2. the primary checkout's current branch — the checkout a human actually
+   opens. The primary checkout is the repository's main working tree, not
+   a worker worktree;
+3. `main` — when the checkout is detached, unreadable, or the control plane
+cannot see it. The landing agent should attempt the primary-checkout
+resolution itself before settling for `main`.
+
+`open-pr` keeps the branch's recorded base (the remote's default branch) as
+its target, since a PR's destination is the remote's concern, not the local
+checkout's.
+
+Rationale: landing is the step that hands the work to a human. Writing to
+`origin/main` while the user's own checkout sits on `main` (or on `dev`)
+leaves the two out of sync — the user's checkout is the surface they read,
+so it is the surface landing must update. The request carries the resolved
+target plus its origin (`primary-checkout`, `main-fallback`,
+`recorded-base`, `explicit`) so the landing agent knows what to re-verify:
+a `primary-checkout` target can go stale when the user switches branches,
+and a `main-fallback` target invites the agent to re-resolve.
+
+The primary checkout may hold the user's uncommitted manual edits. Landing
+must reconcile around them (as it would for any dirty target), not destroy
+them.
+
+---
+
 # Example repository policies
 
 ## Arachne repository
@@ -624,7 +658,8 @@ topic branch:
 
 landing:
   default: open PR
-  target: main
+  non-PR target: primary checkout's current branch, else main
+  PR target: main
 
 required validation:
   cargo/test/etc.
@@ -636,8 +671,8 @@ Flow:
 worker branch
    ↓ squash
 arachne-dev
-   ↓ PR
-main
+   ↓ PR (or squash into the primary checkout's current branch)
+main / the checkout's branch
 ```
 
 ## Loom repository
@@ -883,7 +918,9 @@ Required:
    deterministic temporary-worktree path;
 8. integration result appears in Topic queue and Thread history;
 9. target git state updates;
-10. future workers fork from updated Topic state.
+10. future workers fork from updated Topic state;
+11. non-PR landing strategies resolve the primary checkout's current branch
+    (`main` fallback) and carry the target origin in the request.
 
 Nice to have after the manual loop works:
 

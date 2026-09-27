@@ -1192,7 +1192,9 @@ canonical ref for accepted state. Worker results are candidates against that
 ref, and the Topic view should expose their queue and status. The normal flow
 is worker → Topic; nested workers may integrate recursively when useful.
 **Integrate** absorbs work into Topic state. **Land** separately moves accepted
-Topic state to an external target such as a PR or main.
+Topic state upstream — non-PR strategies target the primary local checkout's
+currently checked out branch (`main` as fallback); `open-pr` targets the
+remote's default branch.
 
 Preflight conflict preview (for example, `git merge-tree`) and readiness are
 relative to a target revision. When the Topic ref advances, Loom should

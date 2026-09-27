@@ -1305,10 +1305,13 @@ impl LandingTargetOrigin {
 /// primary checkout's current branch. Only the row that is both `current`
 /// and checked out at `repo_root` (the main working tree) may become the
 /// target — a worker worktree's own branch must never win, even if a future
-/// loom marked every worktree's branch `current`.
+/// loom marked every worktree's branch `current`. The topic's own branch is
+/// skipped when matched: landing into it would be a no-op self-merge, so the
+/// `main` fallback applies instead.
 fn resolve_landing_target(
     repo_branches: &[crate::loom::RepoBranchView],
     repo_root: &str,
+    topic_branch: &str,
     explicit: Option<&str>,
 ) -> Option<(String, LandingTargetOrigin)> {
     if let Some(value) = explicit {
@@ -1321,7 +1324,11 @@ fn resolve_landing_target(
         .iter()
         .find(|b| b.current && b.worktree.as_deref() == Some(repo_root))
     {
-        return Some((branch.name.clone(), LandingTargetOrigin::PrimaryCheckout));
+        if branch.name != topic_branch {
+            return Some((branch.name.clone(), LandingTargetOrigin::PrimaryCheckout));
+        }
+        // The primary checkout holds the topic branch itself: landing there
+        // is a no-op self-merge. Fall through to `main`.
     }
     // No current row at the primary checkout: it is detached or the checkout
     // could not be read. `main` is the fallback the landing agent should try
@@ -1402,6 +1409,7 @@ pub async fn land_topic(
         match resolve_landing_target(
             &repo_branches,
             &view.branch.repo_root,
+            &view.branch.branch,
             upstream.as_deref(),
         ) {
             Some((upstream, origin)) => (upstream, origin),
@@ -2013,7 +2021,7 @@ mod integration_tests {
             repo_branch("dev", Some("/repo"), true),
             repo_branch("weaver/topic", Some("/repo/.worktrees/topic"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "dev");
         assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
     }
@@ -2028,7 +2036,7 @@ mod integration_tests {
             repo_branch("weaver/other-worker", Some("/repo/.worktrees/other"), true),
             repo_branch("main", Some("/repo"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
@@ -2041,14 +2049,14 @@ mod integration_tests {
             repo_branch("dev", Some("/repo/.worktrees/dev"), false),
             repo_branch("main", Some("/repo"), false),
         ];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
 
     #[test]
     fn landing_empty_rows_still_fall_back_to_main() {
-        let (target, origin) = resolve_landing_target(&[], "/repo", None).unwrap();
+        let (target, origin) = resolve_landing_target(&[], "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
@@ -2056,7 +2064,7 @@ mod integration_tests {
     #[test]
     fn landing_primary_checkout_on_main_is_not_a_fallback() {
         let rows = vec![repo_branch("main", Some("/repo"), true)];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
         assert_eq!(target, "main");
         assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
     }
@@ -2064,7 +2072,7 @@ mod integration_tests {
     #[test]
     fn landing_explicit_upstream_wins() {
         let rows = vec![repo_branch("dev", Some("/repo"), true)];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", Some(" release ")).unwrap();
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", Some(" release ")).unwrap();
         assert_eq!(target, "release");
         assert_eq!(origin, super::LandingTargetOrigin::Explicit);
     }
@@ -2072,9 +2080,23 @@ mod integration_tests {
     #[test]
     fn landing_blank_explicit_upstream_falls_through() {
         let rows = vec![repo_branch("dev", Some("/repo"), true)];
-        let (target, origin) = resolve_landing_target(&rows, "/repo", Some("  ")).unwrap();
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", Some("  ")).unwrap();
         assert_eq!(target, "dev");
         assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
+    }
+
+    #[test]
+    fn landing_skips_topic_branch_at_primary_checkout() {
+        // The primary checkout has the topic's own branch checked out:
+        // landing there would be a no-op self-merge, so the `main` fallback
+        // applies instead.
+        let rows = vec![
+            repo_branch("weaver/topic", Some("/repo"), true),
+            repo_branch("main", Some("/repo/.worktrees/main"), false),
+        ];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", "weaver/topic", None).unwrap();
+        assert_eq!(target, "main");
+        assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
     }
 
     #[test]
@@ -2082,7 +2104,7 @@ mod integration_tests {
         let rows = vec![repo_branch("dev", Some("/repo"), false)];
         // No current row and no `main`: the caller falls back to the
         // recorded base.
-        assert_eq!(resolve_landing_target(&rows, "/repo", None), None);
+        assert_eq!(resolve_landing_target(&rows, "/repo", "weaver/topic", None), None);
     }
 
     fn session(id: &str, branch: &str, repo: &str, parent: Option<&str>, topic: bool) -> SessionSummaryView {
