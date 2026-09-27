@@ -180,18 +180,20 @@ test("copy corner follows the visible edge: top while the host's top is on scree
   assert.equal(copyCornerFor(-350, -300), "bottom");
 });
 
-test("thinking token totals use usage numbers over the char heuristic", () => {
+test("thinking token totals count only the group's own thoughts", () => {
+  // A usage block is a cumulative context gauge for the whole trace, so
+  // it must not leak into the group's thinking total.
   const blocks = [
     thought(1, 1, "a".repeat(40)),
-    { kind: "usage", turn: 1, seq: 2, used: 1200 },
+    { kind: "usage", turn: 1, seq: 2, used: 45_000, size: 200_000 },
     thought(1, 3, "b".repeat(400)),
   ];
-  // Usage present: sum of used (context) beats the chars/4 estimate.
-  assert.equal(countThinkingTokens(blocks, 1), 1200);
-  const noUsage = [thought(1, 1, "a".repeat(40)), thought(1, 2, "b".repeat(400))];
-  assert.equal(countThinkingTokens(noUsage, 1), 110);
-  // Other turns don't count.
-  assert.equal(countThinkingTokens([...noUsage, thought(2, 1, "x".repeat(8))], 1), 110);
+  const rows = groupDisplayBlocks(blocks);
+  const group = rows[0];
+  assert.equal(group.kind, "work_group");
+  assert.equal(group.thinkingTokens, 110);
+  // Directly: the estimate is chars/4 over exactly the given thoughts.
+  assert.equal(countThinkingTokens([blocks[0], blocks[2]]), 110);
 });
 
 test("formatTokens renders K and M human-friendly", () => {

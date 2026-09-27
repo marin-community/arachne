@@ -100,22 +100,14 @@ export function toolCallCopyText(call: ChatDisplayBlock): string {
   return parts.join("\n");
 }
 
-/** Token totals for a turn: chars from its finished thoughts, input+output
- * tokens from its usage blocks. Codex journals thinking as context usage, so
- * the usage numbers already cover it — prefer them when present. */
-export function countThinkingTokens(blocks: readonly ChatDisplayBlock[], turn: number | null | undefined): number {
-  let chars = 0;
-  let used = 0;
-  let sawUsage = false;
-  for (const block of blocks) {
-    if (turn != null && block.turn != null && block.turn !== turn) continue;
-    if (block.kind === "thought") chars += (block.text ?? "").length;
-    else if (block.kind === "usage" && block.used != null && block.used > 0) {
-      sawUsage = true;
-      used += block.used;
-    }
-  }
-  return sawUsage ? used : Math.round(chars / 4);
+/** Estimated thinking tokens for the thoughts in one collapsed work
+ * group. The journal's `usage` blocks are a cumulative context-window
+ * gauge (`used/size` for the whole trace), not per-turn thinking, so they
+ * must not be read as a thinking total; estimate from the group's own
+ * thought text instead (~4 chars per token). */
+export function countThinkingTokens(thoughts: readonly { text?: string }[]): number {
+  const chars = thoughts.reduce((sum, thought) => sum + (thought.text ?? "").length, 0);
+  return Math.round(chars / 4);
 }
 
 /** `123`, `12.5K`, `3.2M` — a human-friendly token count. */
@@ -199,6 +191,7 @@ export function groupDisplayBlocks<T extends ChatDisplayBlock>(
     const state = liveTurn != null && members.some((m) => m.turn == null || m.turn === liveTurn)
       ? "thinking"
       : "done";
+    const thoughts = members.filter((m) => m.kind === "thought");
     rows.push({
       kind: "work_group",
       key: `tools:${memberKeys[0]}`,
@@ -207,8 +200,8 @@ export function groupDisplayBlocks<T extends ChatDisplayBlock>(
       memberKeys,
       state,
       calls: members.filter((m) => m.kind === "tool_call"),
-      thoughts: members.filter((m) => m.kind === "thought"),
-      thinkingTokens: countThinkingTokens(blocks, block.turn),
+      thoughts,
+      thinkingTokens: countThinkingTokens(thoughts),
     });
   }
   return rows;
