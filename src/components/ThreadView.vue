@@ -11,6 +11,7 @@ import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import { groupDisplayBlocks, type ChatDisplayBlock } from "../chatRows";
 import { markdownForSelection } from "../markdownCopy";
+import { bodyOffset } from "../selectionOffsets";
 
 interface Cursor {
   turn: number;
@@ -626,25 +627,6 @@ function onConversationCopy(event: ClipboardEvent) {
   event.clipboardData.setData("text/plain", markdown);
   const html = htmlForSelection(selection);
   if (html) event.clipboardData.setData("text/html", html);
-}
-
-// Where the selection's edge falls inside a rendered body, in
-// textContent-relative characters (0 = body start, length = body end).
-function bodyOffset(range: Range, body: HTMLElement, edge: "start" | "end"): number {
-  // A probe range from the body's start to the selection edge measures the
-  // offset in characters of rendered text — the same space the markdown
-  // mapping consumes. Edges outside the body clamp to 0 / full length
-  // (setEnd before the probe's start would collapse it the wrong way).
-  const probe = document.createRange();
-  probe.selectNodeContents(body);
-  if (edge === "start") {
-    if (range.compareBoundaryPoints(Range.START_TO_START, probe) <= 0) return 0;
-    probe.setEnd(range.startContainer, range.startOffset);
-  } else {
-    if (range.compareBoundaryPoints(Range.END_TO_END, probe) >= 0) return (body.textContent ?? "").length;
-    probe.setStart(range.endContainer, range.endOffset);
-  }
-  return probe.toString().length;
 }
 
 // Serialize the selection to HTML, reusing the browser's serialization of
