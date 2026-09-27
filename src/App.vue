@@ -159,6 +159,8 @@ onMounted(async () => {
   await listen<FleetSnapshot>("loom://fleet", (event) => {
     fleet.value = event.payload.sessions;
     layout.value = event.payload.layout;
+    connected.value = true;
+    connError.value = null;
   });
   await listen("loom://error", (event) => {
     const err = event.payload as { message: string; unreachable: boolean };
