@@ -755,6 +755,7 @@ async function onLand(strategy: string) {
       <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
+      <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
       <button :disabled="!canInterrupt" @click="interrupt">Interrupt</button>
       <button v-if="currentStatus === 'orphaned'" :disabled="adopting" @click="adopt">{{ adopting ? "Adopting…" : "Adopt" }}</button>
       <button class="danger" @click="archive">Archive</button>
@@ -763,7 +764,6 @@ async function onLand(strategy: string) {
       </button>
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
       <button v-if="session.protocol === 'acp'" :disabled="!handoffAllowed" title="Switch runtime when the session is idle" @click="showHandoff = !showHandoff">Switch model…</button>
-      <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
     </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
     <div v-if="isWorker && lastIntegration" class="integrate-note" :title="lastIntegration.note">
