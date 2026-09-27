@@ -347,6 +347,17 @@ pub async fn fetch_chat(
     })
 }
 
+/// Complete file mentions from the session's checkout on the loom host.
+#[tauri::command]
+pub async fn complete_files(
+    state: State<'_, LoomState>,
+    id: String,
+    query: String,
+) -> Result<Vec<String>, UiError> {
+    let client = state_client(&state).await?;
+    client.session_files(&id, &query).await.map_err(Into::into)
+}
+
 /// Send input to a session: ACP prompt (agents) or terminal text (raw).
 #[tauri::command]
 pub async fn send_input(

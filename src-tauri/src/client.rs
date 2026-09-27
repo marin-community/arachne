@@ -213,6 +213,22 @@ impl LoomClient {
         self.op("/api/sessions/chat", &body).await
     }
 
+    /// `sessions.files` — tracked and unignored files in this session's
+    /// server-side worktree, ranked by loom for @-mention completion.
+    pub async fn session_files(&self, id: &str, query: &str) -> Result<Vec<String>, LoomError> {
+        #[derive(serde::Deserialize)]
+        struct FilesReply {
+            files: Vec<String>,
+        }
+        let reply: FilesReply = self
+            .op(
+                "/api/sessions/files",
+                &serde_json::json!({ "session": id, "q": query }),
+            )
+            .await?;
+        Ok(reply.files)
+    }
+
     /// `sessions.prompt.create` — send input to an ACP session's agent.
     pub async fn send_prompt(&self, id: &str, text: &str) -> Result<(), LoomError> {
         let _: serde_json::Value = self

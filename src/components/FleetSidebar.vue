@@ -2,6 +2,7 @@
 import { ref, computed, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
+import { useFileCompletion } from "../useFileCompletion";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -33,6 +34,7 @@ const repo = ref("marin-community/arachne");
 const attachedFiles = ref<string[]>([]);
 const pickerError = ref("");
 const picking = ref(false);
+const completion = useFileCompletion(task, computed(() => props.selectedId));
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
@@ -65,6 +67,14 @@ async function pickFiles() {
     pickerError.value = e?.message ?? String(e);
   } finally {
     picking.value = false;
+  }
+}
+
+function onTaskKeydown(event: KeyboardEvent) {
+  if (completion.onKeydown(event)) return;
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submit();
   }
 }
 
@@ -368,11 +378,35 @@ async function archiveRow(id: string) {
 <template>
   <aside class="sidebar">
     <div class="new-task">
-      <input
-        v-model="task"
-        placeholder="New topic — describe the goal…"
-        @keydown.enter.prevent="submit"
-      />
+      <div class="file-completion-anchor">
+        <input
+          :ref="completion.input"
+          v-model="task"
+          placeholder="New topic — describe the goal…"
+          @input="completion.updateCaret"
+          @click="completion.updateCaret"
+          @keyup="completion.updateCaret"
+          @keydown="onTaskKeydown"
+        />
+        <ul
+          v-if="completion.visible.value"
+          class="file-completion-menu below"
+          role="listbox"
+          aria-label="Checked-out files"
+        >
+          <li v-for="(path, index) in completion.matches.value" :key="path">
+            <button
+              type="button"
+              role="option"
+              :aria-selected="index === completion.selected.value"
+              @mousedown.prevent
+              @click="completion.choose(path)"
+            >
+              @{{ path }}
+            </button>
+          </li>
+        </ul>
+      </div>
       <button
         class="primary"
         :disabled="!task.trim() || props.launching"
