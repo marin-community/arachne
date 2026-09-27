@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use serde::de::DeserializeOwned;
 use tokio::sync::mpsc;
 
@@ -28,6 +29,8 @@ pub enum LoomError {
     },
     #[error("malformed response from {path}")]
     Decode { path: String, detail: String },
+    #[error("invalid image attachment: {0}")]
+    InvalidImage(String),
 }
 
 impl LoomError {
@@ -52,6 +55,7 @@ impl LoomClient {
         // including streaming bodies, which would kill the SSE connection
         // every 60s. Per-request timeouts for REST calls are set below.
         let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| LoomError::Connection(format!("building HTTP client: {e}")))?;
         Ok(Self { http, base, token })
@@ -211,6 +215,81 @@ impl LoomClient {
             body["before_seq"] = serde_json::json!(c.seq);
         }
         self.op("/api/sessions/chat", &body).await
+    }
+
+    /// Fetch a worktree image through Loom's authenticated `sessions.raw`
+    /// download route. The webview only receives a bounded raster data URL;
+    /// it never sees the bearer token or an arbitrary local file path.
+    pub async fn session_image(&self, id: &str, path: &str) -> Result<String, LoomError> {
+        validate_image_path(path)?;
+        const ROUTE: &str = "/api/sessions/raw";
+        const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+        let mut url = self
+            .base
+            .join(ROUTE)
+            .map_err(|e| LoomError::Connection(e.to_string()))?;
+        url.query_pairs_mut()
+            .append_pair("session", id)
+            .append_pair("path", path);
+        let mut request = self.http.get(url).timeout(Duration::from_secs(30));
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|e| LoomError::Connection(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(LoomError::Api {
+                status: response.status().as_u16(),
+                method: "GET",
+                path: ROUTE.into(),
+                message: String::new(),
+            });
+        }
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(str::trim)
+            .map(str::to_owned)
+            .ok_or_else(|| LoomError::InvalidImage("missing image content type".into()))?;
+        if !matches!(
+            mime.as_str(),
+            "image/png"
+                | "image/jpeg"
+                | "image/gif"
+                | "image/webp"
+                | "image/avif"
+                | "image/bmp"
+                | "image/x-icon"
+        ) {
+            return Err(LoomError::InvalidImage(
+                "unsupported image content type".into(),
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > MAX_IMAGE_BYTES as u64)
+        {
+            return Err(LoomError::InvalidImage("image exceeds 10 MiB".into()));
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| LoomError::Connection(e.to_string()))?;
+            if chunk.len() > MAX_IMAGE_BYTES - bytes.len() {
+                return Err(LoomError::InvalidImage("image exceeds 10 MiB".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if !has_image_signature(&mime, &bytes) {
+            return Err(LoomError::InvalidImage(
+                "image bytes do not match content type".into(),
+            ));
+        }
+        Ok(format!("data:{mime};base64,{}", encode_base64(&bytes)))
     }
 
     /// `sessions.prompt.create` — send input to an ACP session's agent.
@@ -386,5 +465,76 @@ impl LoomClient {
             }
         });
         Ok(rx)
+    }
+}
+
+fn validate_image_path(path: &str) -> Result<(), LoomError> {
+    if path.is_empty()
+        || path.len() > 1024
+        || path.starts_with('/')
+        || path.bytes().any(|b| b == b'\\' || b == b'\0' || b == b':')
+        || path
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return Err(LoomError::InvalidImage(
+            "expected a worktree-relative path".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn has_image_signature(mime: &str, bytes: &[u8]) -> bool {
+    match mime {
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg" => bytes.starts_with(b"\xff\xd8\xff"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(&b"WEBP"[..]),
+        "image/avif" => {
+            bytes.get(4..8) == Some(&b"ftyp"[..])
+                && (bytes.get(8..12) == Some(&b"avif"[..])
+                    || bytes.get(8..12) == Some(&b"avis"[..]))
+        }
+        "image/bmp" => bytes.starts_with(b"BM"),
+        "image/x-icon" => bytes.starts_with(b"\0\0\x01\0"),
+        _ => false,
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = ((chunk[0] as u32) << 16)
+            | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
+            | (chunk.get(2).copied().unwrap_or(0) as u32);
+        result.push(CHARS[((n >> 18) & 63) as usize] as char);
+        result.push(CHARS[((n >> 12) & 63) as usize] as char);
+        result.push(if chunk.len() > 1 { CHARS[((n >> 6) & 63) as usize] as char } else { '=' });
+        result.push(if chunk.len() > 2 { CHARS[(n & 63) as usize] as char } else { '=' });
+    }
+    result
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn validates_relative_paths_and_image_signatures() {
+        assert!(validate_image_path("images/screenshot.png").is_ok());
+        for path in ["", "/etc/passwd", "../secret.png", "a/./b.png", "a//b.png", "C:\\x.png"] {
+            assert!(validate_image_path(path).is_err(), "{path}");
+        }
+        assert!(has_image_signature("image/png", b"\x89PNG\r\n\x1a\n"));
+        assert!(!has_image_signature("image/png", b"<script>"));
+    }
+
+    #[test]
+    fn base64_encodes_without_a_new_dependency() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
     }
 }

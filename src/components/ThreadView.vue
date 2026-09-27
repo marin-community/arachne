@@ -3,32 +3,9 @@ import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionView } from "../App.vue";
-
-// DisplayBlock from src-tauri/src/blocks.rs, serialized internally-tagged:
-// { kind: "user_message", text: "…", by: … } — flat fields keyed by `kind`.
-interface DisplayBlock {
-  kind:
-    | "user_message"
-    | "agent_message"
-    | "thought"
-    | "tool_call"
-    | "plan"
-    | "usage"
-    | "turn_end"
-    | "other";
-  text?: string;
-  by?: string | null;
-  tool_kind?: string;
-  title?: string;
-  status?: string;
-  summary?: string;
-  entries?: [string, string][];
-  used?: number | null;
-  size?: number | null;
-  stop_reason?: string;
-  unknown_kind?: string;
-  payload?: string;
-}
+import ChatMarkdown from "./ChatMarkdown.vue";
+import ChatImages from "./ChatImages.vue";
+import { groupDisplayBlocks, type ChatDisplayBlock } from "../chatRows";
 
 interface Cursor {
   turn: number;
@@ -41,7 +18,7 @@ interface Cursor {
 // its own turn; the two timestamps restore the elapsed clock after a
 // reload (the turn's opening message = start, newest block = progress).
 interface ChatSnapshot {
-  blocks: DisplayBlock[];
+  blocks: ChatDisplayBlock[];
   live_turn: number | null;
   pending_prompt: string | null;
   live_started_at: string | null;
@@ -64,7 +41,8 @@ const emit = defineEmits<{
   (e: "delegate", parentId: string, task: string): void;
 }>();
 
-const blocks = ref<DisplayBlock[]>([]);
+const blocks = ref<ChatDisplayBlock[]>([]);
+const rows = computed(() => groupDisplayBlocks(blocks.value));
 const draft = ref("");
 const busy = ref(false);
 const loadingOlder = ref(false);
@@ -269,8 +247,8 @@ async function loadOlder() {
   }
 }
 
-// Collapsible sections (thoughts, tool runs): expanded state per block index.
-const collapsed = ref<Record<number, boolean>>({});
+// Journal coordinates keep disclosure state stable when older pages prepend.
+const collapsed = ref<Record<string, boolean>>({});
 
 onMounted(async () => {
   ticker = setInterval(() => (clock.value = Date.now()), 1000);
@@ -360,11 +338,18 @@ async function archive() {
 
 // Thoughts and tool calls start collapsed; the header always shows the
 // one-line summary so nothing is hidden.
-function isCollapsed(i: number): boolean {
-  return collapsed.value[i] ?? true;
+function isCollapsed(key: string): boolean {
+  return collapsed.value[key] ?? true;
 }
-function toggle(i: number) {
-  collapsed.value[i] = !isCollapsed(i);
+function toggle(key: string) {
+  collapsed.value[key] = !isCollapsed(key);
+}
+function toolsCollapsed(memberKeys: string[]): boolean {
+  return !memberKeys.some((key) => collapsed.value[`tools:${key}`] === false);
+}
+function toggleTools(memberKeys: string[]) {
+  const next = !toolsCollapsed(memberKeys);
+  for (const key of memberKeys) collapsed.value[`tools:${key}`] = next;
 }
 
 // Loom appends an orientation note to the launch goal
@@ -422,74 +407,95 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
           {{ loadingOlder ? "loading…" : "load older" }}
         </button>
       </div>
-      <template v-for="(b, i) in blocks" :key="i">
-        <!-- Tool calls: collapsed one-liner by default, expandable -->
-        <div v-if="b.kind === 'tool_call'" class="block tool">
-          <div class="tool-line" @click="toggle(i)">
-            <span class="status" :class="{ running: b.status === 'running' }">{{
-              b.status
+      <template v-for="row in rows" :key="row.key">
+        <!-- Consecutive calls in one turn share one disclosure. -->
+        <div v-if="row.kind === 'tool_call_group'" class="block tool">
+          <div class="tool-line" role="button" tabindex="0"
+            :aria-expanded="!toolsCollapsed(row.memberKeys)"
+            @click="toggleTools(row.memberKeys)"
+            @keydown.enter.prevent="toggleTools(row.memberKeys)"
+            @keydown.space.prevent="toggleTools(row.memberKeys)">
+            <span class="status" :class="{ running: row.blocks.some((call) => call.status === 'running') }">{{
+              row.blocks.some((call) => call.status === 'running') ? 'running' : 'done'
             }}</span>
-            <span class="tool-title">{{ b.title }}</span>
-            <span v-if="b.summary" class="tool-summary">{{
-              b.summary.slice(0, 200)
-            }}</span>
-            <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
+            <span class="tool-title">tool calls</span>
+            <span class="tool-summary">{{ row.blocks.length }} {{ row.blocks.length === 1 ? 'call' : 'calls' }}</span>
+            <span class="chevron">{{ toolsCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
           </div>
-          <div v-if="!isCollapsed(i)" class="tool-detail">{{ b.summary }}</div>
-        </div>
-        <!-- Thoughts: collapsed italic one-liner, expandable -->
-        <div v-else-if="b.kind === 'thought'" class="block thought">
-          <div class="tool-line" @click="toggle(i)">
-            <span class="tool-title">thinking</span>
-            <span class="tool-summary">{{ (b.text ?? "").slice(0, 160) }}</span>
-            <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
-          </div>
-          <div v-if="!isCollapsed(i)" class="body thought-body">
-            {{ b.text }}
+          <div v-if="!toolsCollapsed(row.memberKeys)" class="tool-group-detail">
+            <div v-for="(call, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail">
+              <span class="status" :class="{ running: call.status === 'running' }">{{ call.status }}</span>
+              <strong>{{ call.title || call.tool_kind || 'tool' }}</strong>
+              <div v-if="call.summary">{{ call.summary }}</div>
+              <ChatImages :block="call" :session-id="session.id" />
+            </div>
           </div>
         </div>
+        <template v-else>
+        <template v-if="row.block.kind === 'thought'">
+          <div class="block thought">
+            <div class="tool-line" role="button" tabindex="0"
+              :aria-expanded="!isCollapsed(row.key)"
+              @click="toggle(row.key)"
+              @keydown.enter.prevent="toggle(row.key)"
+              @keydown.space.prevent="toggle(row.key)">
+              <span class="tool-title">thinking</span>
+              <span class="tool-summary">{{ row.block.summary || (row.block.text ?? '').slice(0, 160) }}</span>
+              <span class="chevron">{{ isCollapsed(row.key) ? "▸" : "▾" }}</span>
+            </div>
+            <div v-if="!isCollapsed(row.key)" class="body thought-body">
+              <ChatMarkdown :text="row.block.text ?? ''" />
+            </div>
+          </div>
+        </template>
         <!-- Plans -->
-        <div v-else-if="b.kind === 'plan'" class="block">
+        <div v-else-if="row.block.kind === 'plan'" class="block">
           <div class="who">plan</div>
           <div class="body">
-            <div v-for="(entry, j) in b.entries" :key="j">
+            <div v-for="(entry, j) in row.block.entries" :key="j">
               [{{ entry[1] }}] {{ entry[0] }}
             </div>
           </div>
         </div>
         <!-- User / agent messages -->
         <div
-          v-else-if="b.kind === 'user_message' || b.kind === 'agent_message'"
+          v-else-if="row.block.kind === 'user_message' || row.block.kind === 'agent_message'"
           class="block"
           :class="{
-            user: b.kind === 'user_message',
-            agent: b.kind === 'agent_message',
+            user: row.block.kind === 'user_message',
+            agent: row.block.kind === 'agent_message',
           }"
         >
           <div class="who">
-            {{ b.kind === "user_message" ? "you" : session.agent_kind }}
+            {{ row.block.kind === "user_message" ? "you" : session.agent_kind }}
           </div>
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
                transcript, but collapse the boilerplate behind a disclosure
                so the goal leads. -->
-          <template v-if="b.kind === 'user_message' && splitEntrance(b.text ?? '').entrance">
-            <div v-if="splitEntrance(b.text ?? '').goal" class="body">
-              {{ splitEntrance(b.text ?? "").goal }}
+          <template v-if="row.block.kind === 'user_message' && splitEntrance(row.block.text ?? '').entrance">
+            <div v-if="splitEntrance(row.block.text ?? '').goal" class="body">
+              <ChatMarkdown :text="splitEntrance(row.block.text ?? '').goal" />
             </div>
             <div class="entrance">
-              <div class="entrance-line" @click="toggle(i)">
+              <div class="entrance-line" role="button" tabindex="0"
+                :aria-expanded="!isCollapsed(row.key)"
+                @click="toggle(row.key)"
+                @keydown.enter.prevent="toggle(row.key)"
+                @keydown.space.prevent="toggle(row.key)">
                 <span class="tool-summary">loom orientation</span>
-                <span class="chevron">{{ isCollapsed(i) ? "▸" : "▾" }}</span>
+                <span class="chevron">{{ isCollapsed(row.key) ? "▸" : "▾" }}</span>
               </div>
-              <div v-if="!isCollapsed(i)" class="body entrance-body">
-                {{ splitEntrance(b.text ?? "").entrance }}
+              <div v-if="!isCollapsed(row.key)" class="body entrance-body">
+                <ChatMarkdown :text="splitEntrance(row.block.text ?? '').entrance ?? ''" />
               </div>
             </div>
           </template>
-          <div v-else class="body">{{ b.text }}</div>
+          <div v-else class="body"><ChatMarkdown :text="row.block.text ?? ''" /></div>
+          <ChatImages :block="row.block" :session-id="session.id" />
         </div>
         <!-- usage / turn_end / unknown: no visual block -->
+        </template>
       </template>
       <!-- Working indicator: shown while an ACP turn is live or a prompt is
            queued behind it. Sits at the tail of the log so it reads as the
