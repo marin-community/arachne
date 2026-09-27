@@ -216,6 +216,18 @@ impl LoomClient {
         .await
     }
 
+    /// `issues.board` — every work item across every repo. `all` includes
+    /// closed items and `automation` items claimed by automation-class
+    /// sessions (mirroring loom SPA's board fetch); the panel filters to the
+    /// topic's slice client-side.
+    pub async fn list_issues(&self) -> Result<Vec<crate::loom::IssueView>, LoomError> {
+        self.op(
+            "/api/issues/board",
+            &serde_json::json!({ "all": true, "automation": true }),
+        )
+        .await
+    }
+
     /// `session_layout.get` — lane spaces/groups.
     pub async fn session_layout(&self) -> Result<crate::loom::SessionLayoutView, LoomError> {
         self.op("/api/session_layout/get", &serde_json::json!({}))

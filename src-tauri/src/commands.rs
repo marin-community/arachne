@@ -1926,14 +1926,172 @@ async fn save_topic_resources(
     Ok(saved)
 }
 
+/// The Resources panel's full view: the durable manifest plus the topic's
+/// live slice — GitHub issues its subtree works, and the PRs of every session
+/// in the subtree. Loom has no topic↔issue link, so the issues are scoped
+/// here: an issue belongs to the topic when its repo matches and a branch of
+/// the topic's subtree claims (or sourced) it. PRs ride the fleet snapshot
+/// (`BranchSummaryView.github`, loom's poll loop), so they are always live.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicResourcesPanel {
+    #[serde(flatten)]
+    pub manifest: TopicResourcesView,
+    /// Issues the topic's subtree works, from `issues.board`.
+    pub issues: Vec<crate::loom::IssueView>,
+    /// Every session in the topic's subtree with a PR, coordinator first.
+    /// `session_id`/`session_name` label the row; `github` is the snapshot.
+    pub prs: Vec<TopicPrRow>,
+}
+
+/// One PR row: which thread's PR this is. The coordinator's PR sorts first
+/// and keeps no name qualifier; workers are labeled with their thread.
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicPrRow {
+    pub session_id: String,
+    pub session_name: String,
+    #[serde(flatten)]
+    pub github: crate::loom::GithubStatusView,
+}
+
+/// The sessions of `topic_id`'s delegation subtree (coordinator first),
+/// walking parent_session_id and parent_id links like topicRootOf does.
+fn topic_subtree<'a>(
+    fleet: &'a [SessionSummaryView],
+    topic_id: &str,
+) -> Vec<&'a SessionSummaryView> {
+    let by_id: std::collections::HashMap<&str, &SessionSummaryView> = fleet
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect();
+    let Some(root) = by_id.get(topic_id) else {
+        return Vec::new();
+    };
+    // parent lookup: parent_session_id by session id, else parent_id (branch
+    // id) — the same two links topicRootOf walks in the UI.
+    let by_branch: std::collections::HashMap<&str, &'a SessionSummaryView> = fleet
+        .iter()
+        .map(|session| (session.branch.id.as_str(), session))
+        .collect();
+    let parent_of = |session: &SessionSummaryView| -> Option<&'a SessionSummaryView> {
+        session
+            .parent_session_id
+            .as_deref()
+            .and_then(|id| by_id.get(id).copied())
+            .or_else(|| {
+                session
+                    .parent_id
+                    .as_deref()
+                    .and_then(|pid| by_branch.get(pid).copied())
+            })
+    };
+    let mut children: std::collections::HashMap<&str, Vec<&'a SessionSummaryView>> =
+        std::collections::HashMap::new();
+    for session in fleet {
+        if let Some(parent) = parent_of(session) {
+            if parent.id != session.id {
+                children
+                    .entry(parent.id.as_str())
+                    .or_default()
+                    .push(session);
+            }
+        }
+    }
+    // BFS from the coordinator, most-recent children first (the fleet list
+    // arrives sorted newest-activity-first, so the iteration order keeps
+    // the topic's freshest workers nearest the top).
+    let mut rows: Vec<&'a SessionSummaryView> = Vec::new();
+    let mut queue: std::collections::VecDeque<&'a SessionSummaryView> =
+        std::collections::VecDeque::new();
+    queue.push_back(root);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(session) = queue.pop_front() {
+        if !seen.insert(session.id.as_str()) {
+            continue;
+        }
+        if let Some(kids) = children.get(session.id.as_str()) {
+            for kid in kids {
+                if !seen.contains(kid.id.as_str()) {
+                    queue.push_back(kid);
+                }
+            }
+        }
+        rows.push(session);
+    }
+    rows
+}
+
+/// Scope loom's issue board to one topic: same repo root, and claimed or
+/// sourced by a branch name that appears in the topic's subtree. Unclaimed
+/// backlog never appears (it belongs to the repo, not this topic).
+fn topic_issues(
+    board: Vec<crate::loom::IssueView>,
+    topic: &SessionView,
+    subtree: &[&SessionSummaryView],
+) -> Vec<crate::loom::IssueView> {
+    let branch_names: std::collections::HashSet<&str> = subtree
+        .iter()
+        .map(|session| session.branch.branch.as_str())
+        .collect();
+    board
+        .into_iter()
+        .filter(|issue| issue.repo_root == topic.branch.repo_root)
+        .filter(|issue| {
+            [issue.claimed_branch.as_deref(), issue.source_branch.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|branch| branch_names.contains(branch))
+        })
+        .collect()
+}
+
+/// The PR rows for a topic subtree: every session with a GitHub PR snapshot,
+/// coordinator first then most recent. The coordinator's row is the topic's
+/// own PR; workers' rows are labeled with their thread.
+fn topic_prs(subtree: &[&SessionSummaryView]) -> Vec<TopicPrRow> {
+    subtree
+        .iter()
+        .filter_map(|session| {
+            session.branch.github.as_ref().map(|github| TopicPrRow {
+                session_id: session.id.clone(),
+                session_name: session.branch.name.clone(),
+                github: github.clone(),
+            })
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub async fn topic_resources(
     state: State<'_, LoomState>,
     topic_id: String,
-) -> Result<TopicResourcesView, UiError> {
+) -> Result<TopicResourcesPanel, UiError> {
     let client = state_client(&state).await?;
     let topic = client.get_session(&topic_id).await?;
-    load_topic_resources(&client, &topic.branch.id).await
+    let manifest = load_topic_resources(&client, &topic.branch.id).await?;
+    // The live slice rides the same fetch: the fleet snapshot for the
+    // subtree's PRs and branches, plus the issue board. A failed board fetch
+    // must not take the manifest down with it — the panel degrades to the
+    // durable bindings only.
+    let fleet = client.list_sessions().await.map(|mut fleet| {
+        fleet.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+        fleet
+    });
+    let (issues, prs) = match fleet {
+        Ok(fleet) => {
+            let subtree = topic_subtree(&fleet, &topic_id);
+            let issues = match client.list_issues().await {
+                Ok(board) => topic_issues(board, &topic, &subtree),
+                Err(_) => Vec::new(),
+            };
+            (issues, topic_prs(&subtree))
+        }
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+    Ok(TopicResourcesPanel {
+        manifest,
+        issues,
+        prs,
+    })
 }
 
 #[tauri::command]
@@ -2527,6 +2685,111 @@ mod integration_tests {
             "parent-branch"
         );
         assert!(resolve_integration_target(&fleet, "parent").is_none());
+    }
+}
+
+#[cfg(test)]
+mod resource_panel_tests {
+    use super::{topic_issues, topic_prs, topic_subtree};
+    use crate::loom::{GithubStatusView, IssueView, SessionSummaryView};
+
+    fn session(id: &str, parent: Option<&str>, branch: &str, pr: Option<i64>) -> SessionSummaryView {
+        let github = pr.map(|n| GithubStatusView {
+            pr_number: n,
+            pr_url: format!("https://github.com/acme/app/pull/{n}"),
+            pr_state: "OPEN".into(),
+            pr_title: format!("PR {n}"),
+            is_draft: false,
+            review_decision: None,
+            checks: None,
+        });
+        serde_json::from_value(serde_json::json!({
+            "id": id, "status": "running", "profile": "default", "class": "interactive",
+            "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
+            "last_activity_at": "2026-01-01T00:00:00Z", "placement": null,
+            "github_repo": null, "parent_session_id": parent, "parent_id": null,
+            "branch": { "id": format!("branch-{id}"), "branch": branch, "name": id,
+                "title": id, "repo_root": "/repo", "tags": [], "github": github }
+        }))
+        .unwrap()
+    }
+
+    fn issue(id: i64, repo: &str, claimed: Option<&str>, sourced: Option<&str>) -> IssueView {
+        IssueView {
+            id,
+            repo_root: repo.into(),
+            github_repo: Some("acme/app".into()),
+            source_branch: sourced.map(String::from),
+            claimed_branch: claimed.map(String::from),
+            title: format!("Issue {id}"),
+            status: "open".into(),
+            github_issue: Some(id),
+            github_state: None,
+        }
+    }
+
+    fn topic_view() -> crate::loom::SessionView {
+        serde_json::from_value(serde_json::json!({
+            "id": "topic", "status": "running", "profile": "default", "class": "interactive",
+            "origin": "user", "created_by": null, "created_at": "2026-01-01T00:00:00Z",
+            "last_activity_at": "2026-01-01T00:00:00Z", "turn_count": 0,
+            "agent_kind": "codex", "model": "", "effort": "", "protocol": "acp",
+            "work_dir": "", "term_session": "", "placement": null,
+            "branch": { "id": "branch-topic", "branch": "weaver/topic", "name": "topic",
+                "title": "Topic", "repo_root": "/repo", "tags": [] }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn subtree_walks_both_parent_links_and_stops_at_strangers() {
+        // topic → worker (by session id) → grandchild (by branch id); an
+        // unrelated session and a cycle never enter the walk.
+        let fleet = vec![
+            session("topic", None, "weaver/topic", None),
+            session("worker", Some("topic"), "weaver/worker", None),
+            session("stranger", Some("nowhere"), "weaver/stranger", None),
+        ];
+        let mut grandchild_value = serde_json::to_value(session("grandchild", None, "weaver/grandchild", None)).unwrap();
+        grandchild_value["parent_id"] = "branch-worker".into();
+        let mut fleet = fleet;
+        fleet.push(serde_json::from_value(grandchild_value).unwrap());
+        let subtree = topic_subtree(&fleet, "topic");
+        let ids: Vec<&str> = subtree.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["topic", "worker", "grandchild"]);
+    }
+
+    #[test]
+    fn issues_scope_by_repo_and_subtree_branch_names() {
+        let fleet = vec![
+            session("topic", None, "weaver/topic", None),
+            session("worker", Some("topic"), "weaver/worker", None),
+        ];
+        let subtree = topic_subtree(&fleet, "topic");
+        let board = vec![
+            issue(1, "/repo", Some("weaver/worker"), None),   // claimed by subtree
+            issue(2, "/repo", None, Some("weaver/topic")),     // sourced by subtree
+            issue(3, "/repo", Some("weaver/other"), None),     // another topic's branch
+            issue(4, "/repo", None, None),                     // unclaimed backlog
+            issue(5, "/other", Some("weaver/topic"), None),    // wrong repo
+        ];
+        let scoped = topic_issues(board, &topic_view(), &subtree);
+        assert_eq!(scoped.iter().map(|i| i.id).collect::<Vec<_>>(), [1, 2]);
+    }
+
+    #[test]
+    fn pr_rows_cover_the_whole_subtree_not_just_the_coordinator() {
+        let fleet = vec![
+            session("topic", None, "weaver/topic", Some(10)),
+            session("worker-a", Some("topic"), "weaver/a", Some(11)),
+            session("worker-b", Some("topic"), "weaver/b", None),
+        ];
+        let subtree = topic_subtree(&fleet, "topic");
+        let prs = topic_prs(&subtree);
+        assert_eq!(prs.iter().map(|p| p.github.pr_number).collect::<Vec<_>>(), [10, 11]);
+        // Each row carries which thread the PR belongs to.
+        assert_eq!(prs[1].session_id, "worker-a");
+        assert_eq!(prs[1].session_name, "worker-a");
     }
 }
 

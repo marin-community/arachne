@@ -195,6 +195,35 @@ pub struct RepoWorktreeView {
 }
 
 // ---------------------------------------------------------------------------
+// Issues (loom work items)
+// ---------------------------------------------------------------------------
+
+/// `issues.board` row — loom's work items, each optionally linked to a GitHub
+/// issue. `claimed_branch`/`source_branch` are branch *names*: issue claims key
+/// by (repo_root, branch name), not branch id. `github_state` is only present
+/// on the single-issue `issues.get` (the board does no GitHub fan-out).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IssueView {
+    pub id: i64,
+    pub repo_root: String,
+    #[serde(default)]
+    pub github_repo: Option<String>,
+    /// Branch the issue was created from (provenance).
+    #[serde(default)]
+    pub source_branch: Option<String>,
+    /// Branch currently working it; `None` is the unclaimed repo backlog.
+    #[serde(default)]
+    pub claimed_branch: Option<String>,
+    pub title: String,
+    pub status: String,
+    #[serde(default)]
+    pub github_issue: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_state: Option<serde_json::Value>,
+}
+
+// ---------------------------------------------------------------------------
 // Session layout (lanes — filing, not topics)
 // ---------------------------------------------------------------------------
 

@@ -143,9 +143,22 @@ conversation hierarchy independent from Git ancestry.
 
 ## Resource slice
 
+The Resources panel's live set is the full spec'd set (User model): the
+topic's **repository**, the **pull requests** of every thread in its subtree
+(a worker's PR is the topic's result too), the **GitHub issues** its subtree
+claims or sourced, and the **checkout**. These rows are derived from Loom's
+own data — the fleet snapshot's per-branch PR status and `issues.board` — so
+they never go stale against the manifest. Loom records `issue_added` and
+`pr.*` events on the working branch, and any frame on a session topic
+re-snapshots the fleet, which refreshes the panel. Recovery is **an action on
+the checkout row**, not a resource: when the worktree is present the row
+opens it in Zed; when archive has removed it, the same row recovers it via
+`repos.worktrees.ensure`.
+
 For bootstrap, attach a small manifest to the coordinator's Loom branch as a
 versioned artifact. Each entry has a kind, title, repository, and backing
-locator: a branch/ref and relative path for a file, or a URL for a PR. The
+locator: a branch/ref and relative path for a file, or a URL for a PR or
+issue. The
 manifest points to existing objects; it does not copy a repository or document
 into Arachne. Revision checks protect concurrent edits.
 
@@ -175,7 +188,9 @@ resource bindings are durable references to repository files and artifacts.
 
 Later resource types should be added only when a real workflow needs them.
 The next likely additions are a retained integration checkout and a PR that
-outlives its checkout. One active writer per mutable checkout remains the
+outlives its checkout — the PR kind already exists in the manifest; agents
+attach the ones the topic should remember durably (skills/resources.md).
+One active writer per mutable checkout remains the
 default; other workers get isolated worktrees.
 
 ## Integration

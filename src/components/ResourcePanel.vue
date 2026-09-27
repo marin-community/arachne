@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import type { SessionSummary } from "../App.vue";
+import { liveRows, type PanelIssue, type PanelPr } from "../resourcePanel";
 
 interface TopicResource {
   id: string;
@@ -19,6 +20,12 @@ interface TopicResourcesView {
   resources: TopicResource[];
   revision: number;
 }
+// `topic_resources` reply: the durable manifest plus the topic's live slice
+// (issues its subtree works, PRs of every thread in the subtree).
+interface TopicResourcesPanel extends TopicResourcesView {
+  issues: PanelIssue[];
+  prs: PanelPr[];
+}
 interface TopicResourceContent {
   resource: TopicResource;
   content: string;
@@ -31,18 +38,15 @@ const selectedId = ref<string | null>(null);
 
 // --- Live topic resources --------------------------------------------
 // The spec's resource strip invariant applies to the inspector too: the
-// topic's own repo, PR, and checkout are its most relevant resources, and
-// they should be reachable immediately — not only attached files.
-const repoLabel = computed(() => {
-  if (props.topic.github_repo) return props.topic.github_repo;
-  const root = props.topic.branch.repo_root || "";
-  return root ? root.split("/").filter(Boolean).slice(-2).join("/") : "";
-});
-const repoUrl = computed(() => {
-  const slug = props.topic.github_repo;
-  return slug && /^[\w.-]+\/[\w.-]+$/.test(slug) ? `https://github.com/${slug}` : null;
-});
-const pr = computed(() => props.topic.branch.github ?? null);
+// topic's repo, PRs, issues, and checkout are its most relevant resources,
+// and they should be reachable immediately — not only attached files. The
+// PRs cover the whole subtree (a worker's PR is the topic's result too);
+// the issues are those the subtree claims or sourced.
+const panelIssues = ref<PanelIssue[]>([]);
+const panelPrs = ref<PanelPr[]>([]);
+const rows = computed(() =>
+  liveRows(props.topic, props.topic.id, panelPrs.value, panelIssues.value),
+);
 
 async function openExternal(url: string) {
   try {
@@ -87,9 +91,10 @@ const loading = ref(false);
 const reading = ref(false);
 const saving = ref(false);
 const showAttach = ref(false);
-const formKind = ref<"design_document" | "file">("design_document");
+const formKind = ref<"design_document" | "file" | "pull_request" | "issue">("design_document");
 const formTitle = ref("Design document");
 const formPath = ref("docs/design.md");
+const formUrl = ref("");
 const message = ref("");
 
 const selected = computed(() => snapshot.value.resources.find((resource) => resource.id === selectedId.value) ?? null);
@@ -102,10 +107,12 @@ async function refresh() {
   loading.value = true;
   message.value = "";
   try {
-    const next = await invoke<TopicResourcesView>("topic_resources", { topicId });
+    const next = await invoke<TopicResourcesPanel>("topic_resources", { topicId });
     if (!next || !Array.isArray(next.resources)) throw new Error("Loom returned an invalid resource list");
     if (topicId !== props.topic.id) return;
     snapshot.value = next;
+    panelIssues.value = next.issues ?? [];
+    panelPrs.value = next.prs ?? [];
     if (!next.resources.some((resource) => resource.id === selectedId.value)) {
       selectedId.value = next.resources.find((resource) => resource.kind === "design_document")?.id
         ?? next.resources[0]?.id ?? null;
@@ -135,6 +142,8 @@ async function selectResource(id: string) {
 
 watch(() => props.topic.id, () => {
   snapshot.value = { resources: [], revision: 0 };
+  panelIssues.value = [];
+  panelPrs.value = [];
   selectedId.value = null;
   content.value = "";
   void refresh();
@@ -148,33 +157,57 @@ function chooseKind() {
   if (formKind.value === "design_document") {
     formTitle.value = "Design document";
     formPath.value = "docs/design.md";
-  } else {
+    formUrl.value = "";
+  } else if (formKind.value === "file") {
     formTitle.value = "";
     formPath.value = "";
+    formUrl.value = "";
+  } else {
+    // PR / issue bindings are URL-backed.
+    formTitle.value = "";
+    formPath.value = "";
+    formUrl.value = "";
   }
 }
 
+const isUrlKind = computed(() => formKind.value === "pull_request" || formKind.value === "issue");
+const attachValid = computed(() =>
+  formTitle.value.trim() && (isUrlKind.value ? formUrl.value.trim() : formPath.value.trim()),
+);
+
 async function attach() {
   const title = formTitle.value.trim();
+  const url = formUrl.value.trim();
   const path = formPath.value.trim();
-  if (!title || !path || saving.value) return;
+  if (!title || saving.value || !attachValid.value) return;
   saving.value = true;
   message.value = "";
   try {
     const next = await invoke<TopicResourcesView>("attach_topic_resource", {
       topicId: props.topic.id,
-      resource: {
-        kind: formKind.value,
-        title,
-        repository: props.topic.branch.repo_root,
-        reference: props.topic.branch.branch,
-        path,
-        url: null,
-      },
+      resource: isUrlKind.value
+        ? {
+            kind: formKind.value,
+            title,
+            repository: props.topic.branch.repo_root,
+            reference: null,
+            path: null,
+            url,
+          }
+        : {
+            kind: formKind.value,
+            title,
+            repository: props.topic.branch.repo_root,
+            reference: props.topic.branch.branch,
+            path,
+            url: null,
+          },
       expectedRevision: snapshot.value.revision,
     });
     snapshot.value = next;
-    const attached = next.resources.find((resource) => resource.kind === formKind.value && resource.path === path);
+    const attached = next.resources.find(
+      (resource) => resource.kind === formKind.value && (isUrlKind.value ? resource.url === url : resource.path === path),
+    );
     selectedId.value = attached?.id ?? selectedId.value;
     showAttach.value = false;
     message.value = "Resource attached to this topic.";
@@ -242,35 +275,52 @@ async function onPreviewClick(event: MouseEvent) {
       <button v-if="!embedded" title="Close resources" aria-label="Close resources" @click="emit('close')">×</button>
     </header>
     <div class="resource-panel-list">
-      <!-- Live topic resources: the repo, PR, and checkout the topic is
-           happening in — always first, always actionable. -->
-      <section class="resource-panel-live" aria-label="Topic repository and checkout">
-        <button v-if="repoUrl" class="resource-panel-item" title="Open the repository on GitHub" @click="openExternal(repoUrl)">
-          <span class="resource-panel-icon">⌂</span>
-          <span class="resource-panel-item-text">
-            <strong>{{ repoLabel }}</strong>
-            <small>repository</small>
-          </span>
-        </button>
-        <div v-else-if="repoLabel" class="resource-panel-item static">
-          <span class="resource-panel-icon">⌂</span>
-          <span class="resource-panel-item-text">
-            <strong>{{ repoLabel }}</strong>
-            <small>repository</small>
-          </span>
-        </div>
-        <button v-if="pr" class="resource-panel-item" :title="pr.pr_title" @click="openExternal(pr.pr_url)">
-          <span class="resource-panel-icon">⑂</span>
-          <span class="resource-panel-item-text">
-            <strong>PR #{{ pr.pr_number }}</strong>
-            <small>{{ pr.is_draft ? "draft" : pr.pr_state }}<template v-if="pr.review_decision"> · {{ pr.review_decision }}</template><template v-if="pr.checks"> · CI {{ pr.checks }}</template></small>
-          </span>
-        </button>
+      <!-- Live topic resources (design.md "Resource slice"): the repo, the
+           PRs of every thread in the topic's subtree, the issues its subtree
+           works, and the checkout — always first, always actionable. -->
+      <section class="resource-panel-live" aria-label="Topic repository, PRs, issues, and checkout">
+        <template v-for="row in rows" :key="row.key">
+          <button v-if="row.kind === 'repository' && row.url" class="resource-panel-item" title="Open the repository on GitHub" @click="openExternal(row.url)">
+            <span class="resource-panel-icon">⌂</span>
+            <span class="resource-panel-item-text">
+              <strong>{{ row.label }}</strong>
+              <small>repository</small>
+            </span>
+          </button>
+          <div v-else-if="row.kind === 'repository'" class="resource-panel-item static">
+            <span class="resource-panel-icon">⌂</span>
+            <span class="resource-panel-item-text">
+              <strong>{{ row.label }}</strong>
+              <small>repository</small>
+            </span>
+          </div>
+          <button v-else-if="row.kind === 'pr'" class="resource-panel-item" :title="row.pr.pr_title" @click="openExternal(row.pr.pr_url)">
+            <span class="resource-panel-icon">⑂</span>
+            <span class="resource-panel-item-text">
+              <strong>PR #{{ row.pr.pr_number }}</strong>
+              <small>
+                <template v-if="!row.ownedByTopic">{{ row.pr.session_name }} · </template>{{ row.pr.is_draft ? "draft" : row.pr.pr_state }}<template v-if="row.pr.review_decision"> · {{ row.pr.review_decision }}</template><template v-if="row.pr.checks"> · CI {{ row.pr.checks }}</template>
+              </small>
+            </span>
+          </button>
+          <button v-else-if="row.kind === 'issue'" class="resource-panel-item" :title="row.issue.title" @click="row.url && openExternal(row.url)">
+            <span class="resource-panel-icon">◉</span>
+            <span class="resource-panel-item-text">
+              <strong>#{{ row.issue.github_issue ?? row.issue.id }} {{ row.issue.title }}</strong>
+              <small>
+                {{ row.open ? "issue" : "closed" }}<template v-if="row.issue.claimed_branch"> · {{ row.issue.claimed_branch }}</template>
+              </small>
+            </span>
+          </button>
+        </template>
+        <!-- The checkout is a resource; recovery is its action. Present →
+             open in Zed. Gone (archive keeps the branch, not the directory)
+             → the same row recovers it via repos.worktrees.ensure. -->
         <button class="resource-panel-item" :disabled="recoveringWorktree" :title="topicWorktree || 'The worktree is gone; materialize a checkout for this branch'" @click="openTopicCheckout">
           <span class="resource-panel-icon">▣</span>
           <span class="resource-panel-item-text">
-            <strong>{{ recoveringWorktree ? "Recovering…" : topicWorktree ? "Checkout" : "Recover checkout" }}</strong>
-            <small>{{ topicWorktree ? topicWorktree : props.topic.branch.branch }}</small>
+            <strong>Checkout</strong>
+            <small>{{ recoveringWorktree ? "recovering…" : topicWorktree || `recover from ${props.topic.branch.branch}` }}</small>
           </span>
         </button>
       </section>
@@ -294,11 +344,14 @@ async function onPreviewClick(event: MouseEvent) {
         <select v-model="formKind" @change="chooseKind">
           <option value="design_document">Design document</option>
           <option value="file">File</option>
+          <option value="pull_request">Pull request</option>
+          <option value="issue">Issue</option>
         </select>
       </label>
       <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
-      <label>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
-      <button class="primary" :disabled="saving || !formTitle.trim() || !formPath.trim()" @click="attach">Attach</button>
+      <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
+      <label v-else>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
+      <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
     </div>
     <div v-if="message" class="resource-panel-message">{{ message }}</div>
     <div v-if="selected" class="resource-panel-preview">
