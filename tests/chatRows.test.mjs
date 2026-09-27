@@ -180,14 +180,13 @@ test("copy corner follows the visible edge: top while the host's top is on scree
   assert.equal(copyCornerFor(-350, -300), "bottom");
 });
 
-test("thinking token totals use usage numbers over the char heuristic", () => {
+test("thinking token estimates use thought text, never context usage", () => {
   const blocks = [
     thought(1, 1, "a".repeat(40)),
     { kind: "usage", turn: 1, seq: 2, used: 1200 },
     thought(1, 3, "b".repeat(400)),
   ];
-  // Usage present: sum of used (context) beats the chars/4 estimate.
-  assert.equal(countThinkingTokens(blocks, 1), 1200);
+  assert.equal(countThinkingTokens(blocks, 1), 110);
   const noUsage = [thought(1, 1, "a".repeat(40)), thought(1, 2, "b".repeat(400))];
   assert.equal(countThinkingTokens(noUsage, 1), 110);
   // Other turns don't count.

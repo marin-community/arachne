@@ -100,22 +100,15 @@ export function toolCallCopyText(call: ChatDisplayBlock): string {
   return parts.join("\n");
 }
 
-/** Token totals for a turn: chars from its finished thoughts, input+output
- * tokens from its usage blocks. Codex journals thinking as context usage, so
- * the usage numbers already cover it — prefer them when present. */
+/** Approximate tokens in the supplied thoughts. ACP `usage.used` is context
+ * occupancy, not reasoning tokens, and must not be repeated on every work row. */
 export function countThinkingTokens(blocks: readonly ChatDisplayBlock[], turn: number | null | undefined): number {
   let chars = 0;
-  let used = 0;
-  let sawUsage = false;
   for (const block of blocks) {
     if (turn != null && block.turn != null && block.turn !== turn) continue;
     if (block.kind === "thought") chars += (block.text ?? "").length;
-    else if (block.kind === "usage" && block.used != null && block.used > 0) {
-      sawUsage = true;
-      used += block.used;
-    }
   }
-  return sawUsage ? used : Math.round(chars / 4);
+  return Math.round(chars / 4);
 }
 
 /** `123`, `12.5K`, `3.2M` — a human-friendly token count. */
@@ -208,7 +201,7 @@ export function groupDisplayBlocks<T extends ChatDisplayBlock>(
       state,
       calls: members.filter((m) => m.kind === "tool_call"),
       thoughts: members.filter((m) => m.kind === "thought"),
-      thinkingTokens: countThinkingTokens(blocks, block.turn),
+      thinkingTokens: countThinkingTokens(members, block.turn),
     });
   }
   return rows;
