@@ -20,6 +20,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
+  (e: "select-topic", id: string): void;
   (
     e: "launch",
     task: string,
@@ -295,6 +296,11 @@ interface Row {
   isCollapsed: boolean;
 }
 
+function selectRow(row: Row) {
+  if (row.depth === 0) emit("select-topic", row.session.id);
+  else emit("select", row.session.id);
+}
+
 const laneRows = computed<{ lane: Lane; rows: Row[] }[]>(() =>
   lanes.value.map((lane) => {
     const out: Row[] = [];
@@ -333,7 +339,13 @@ const userInboxId = computed(() => {
 
 // The sidebar's two surfaces: the Inbox (the filing lanes + delegation tree)
 // and Topics (the per-topic card list with title/description/config).
-const tab = ref<"inbox" | "topics">("inbox");
+const tab = ref<"inbox" | "topics">("topics");
+const showNewTopic = ref(false);
+const newTitleEl = ref<HTMLInputElement | null>(null);
+function openNewTopic() {
+  showNewTopic.value = true;
+  nextTick(() => newTitleEl.value?.focus());
+}
 
 // --- Topics tab --------------------------------------------------------------
 
@@ -593,6 +605,7 @@ function submitTopic() {
     newBody.value = "";
     topicAttachments.value = [];
     topicMentions.value = [];
+    showNewTopic.value = false;
   });
 }
 
@@ -702,21 +715,21 @@ async function archiveRow(id: string) {
     <div class="tab-bar" role="tablist">
       <button
         class="tab"
-        :class="{ active: tab === 'inbox' }"
-        role="tab"
-        :aria-selected="tab === 'inbox'"
-        @click="tab = 'inbox'"
-      >
-        Inbox
-      </button>
-      <button
-        class="tab"
         :class="{ active: tab === 'topics' }"
         role="tab"
         :aria-selected="tab === 'topics'"
         @click="tab = 'topics'"
       >
         Topics
+      </button>
+      <button
+        class="tab"
+        :class="{ active: tab === 'inbox' }"
+        role="tab"
+        :aria-selected="tab === 'inbox'"
+        @click="tab = 'inbox'"
+      >
+        Inbox
       </button>
     </div>
 
@@ -848,7 +861,7 @@ async function archiveRow(id: string) {
               row.depth === 0 &&
               onDropLeader(row.session.id, `ws-${row.session.id}`, $event)
             "
-            @click="emit('select', row.session.id)"
+            @click="selectRow(row)"
             :title="
               row.depth === 0 && dragging
                 ? 'drop here to join this topic'
@@ -923,11 +936,17 @@ async function archiveRow(id: string) {
     <!-- Topics tab: one card per topic (leader chat) with title, description,
          and a config placeholder. -->
     <template v-else>
-      <div class="new-topic-card">
-        <div class="new-topic-heading">New topic</div>
+      <div class="topics-toolbar">
+        <span>Topics</span>
+        <button type="button" aria-label="New topic" title="New topic" @click="openNewTopic">+</button>
+      </div>
+      <div v-if="showNewTopic" class="new-topic-overlay" @click.self="showNewTopic = false" @keydown.esc.stop="showNewTopic = false">
+      <div class="new-topic-card" role="dialog" aria-modal="true" aria-label="New topic">
+        <div class="new-topic-heading">New topic <button type="button" aria-label="Close new topic" @click="showNewTopic = false">×</button></div>
         <label for="new-topic-title">Title <span class="field-optional">optional</span></label>
         <input
           id="new-topic-title"
+          ref="newTitleEl"
           v-model="newTitle"
           placeholder="What is this work about?"
         />
@@ -1002,6 +1021,7 @@ async function archiveRow(id: string) {
           </select>
         </div>
       </div>
+      </div>
 
       <div class="topic-list">
         <template v-for="t in topics" :key="t.session.id">
@@ -1013,9 +1033,9 @@ async function archiveRow(id: string) {
           }"
           role="button"
           tabindex="0"
-          @click="emit('select', t.session.id)"
-          @keydown.enter.self="emit('select', t.session.id)"
-          @keydown.space.self.prevent="emit('select', t.session.id)"
+          @click="emit('select-topic', t.session.id)"
+          @keydown.enter.self="emit('select-topic', t.session.id)"
+          @keydown.space.self.prevent="emit('select-topic', t.session.id)"
         >
           <template v-if="editingId === t.session.id">
             <input
@@ -1117,7 +1137,7 @@ async function archiveRow(id: string) {
         </div>
         </template>
         <div v-if="topics.length === 0" class="topic-empty">
-          No topics yet — create one above.
+          No topics yet — use + to create one.
         </div>
       </div>
     </template>

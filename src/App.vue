@@ -133,6 +133,8 @@ const fleet = ref<SessionSummary[]>([]);
 const layout = ref<SessionLayout | null>(null);
 const launchOptions = ref<LaunchOptions | null>(null);
 const selectedId = ref<string | null>(null);
+const selectedTopicId = ref<string | null>(null);
+const viewMode = ref<"home" | "topic" | "thread">("home");
 const selectedView = ref<SessionView | null>(null);
 const showSettings = ref(false);
 const showResources = ref(true);
@@ -205,6 +207,7 @@ async function saveSettings(url: string, token: string) {
 // --- Actions ----------------------------------------------------------------
 
 async function selectSession(id: string) {
+  viewMode.value = "thread";
   selectedId.value = id;
   // Drop the stale view immediately: ThreadView is keyed by selectedId and
   // remounts the moment it changes — if the old view were still here, its
@@ -212,7 +215,31 @@ async function selectSession(id: string) {
   // re-run when the fresh view arrives (clicked row N, saw row N±1's thread).
   selectedView.value = null;
   try {
-    selectedView.value = await invoke<SessionView>("open_session", { id });
+    const view = await invoke<SessionView>("open_session", { id });
+    if (viewMode.value === "thread" && selectedId.value === id) selectedView.value = view;
+  } catch (e: any) {
+    if (viewMode.value === "thread" && selectedId.value === id)
+      connError.value = e?.message ?? String(e);
+  }
+}
+
+function selectTopic(id: string) {
+  selectedTopicId.value = id;
+  selectedId.value = null;
+  selectedView.value = null;
+  viewMode.value = "topic";
+}
+
+function showTopicsHome() {
+  selectedId.value = null;
+  selectedTopicId.value = null;
+  selectedView.value = null;
+  viewMode.value = "home";
+}
+
+async function openTopicInZed(id: string) {
+  try {
+    await invoke("open_in_zed", { id });
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
   }
@@ -344,8 +371,7 @@ async function onArchived(id: string) {
     return;
   }
   if (selectedId.value === id) {
-    selectedId.value = null;
-    selectedView.value = null;
+    showTopicsHome();
   }
   // Keep the archived row in the fleet: the sidebar shows archived children
   // dimmed under their leader, so a finished worker stays visible as part of
@@ -360,7 +386,7 @@ const connClass = computed(() =>
 );
 
 const selectedTopic = computed(() => {
-  let node = fleet.value.find((session) => session.id === selectedId.value);
+  let node = fleet.value.find((session) => session.id === (selectedId.value ?? selectedTopicId.value));
   if (!node) return null;
   const seen = new Set<string>();
   while (node && !seen.has(node.id)) {
@@ -376,9 +402,9 @@ const selectedTopic = computed(() => {
 </script>
 
 <template>
-  <div class="app" :class="{ 'with-resources': !!selectedView && !!selectedTopic && showResources }" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
-      <button class="title home-link" title="Show attention overview" @click="selectedId = null; selectedView = null">🕸 Arachne</button>
+      <button class="title home-link" title="Show Topics home" @click="showTopicsHome">🕸 Arachne</button>
       <span
         class="conn"
         :class="{ clickable: true }"
@@ -394,16 +420,17 @@ const selectedTopic = computed(() => {
             : (connError ?? "connecting…")
         }}
       </span>
-      <button v-if="selectedView && selectedTopic" class="header-resources" :aria-pressed="showResources"
+      <button v-if="viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
         @click="showResources = !showResources">Resources</button>
     </header>
     <FleetSidebar
       :fleet="fleet"
       :layout="layout"
-      :selected-id="selectedId"
+      :selected-id="selectedId ?? selectedTopicId"
       :launching="launching"
       :launch-options="launchOptions"
       @select="selectSession"
+      @select-topic="selectTopic"
       @launch="launchTask"
       @update-topic="updateTopic"
       @reparent="reparentSession"
@@ -411,7 +438,7 @@ const selectedTopic = computed(() => {
       @archive="onArchived"
     />
     <ThreadView
-      v-if="selectedId && selectedView"
+      v-if="viewMode === 'thread' && selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
       :topic="selectedTopic"
@@ -422,14 +449,19 @@ const selectedTopic = computed(() => {
       @delegate="delegateFromThread"
       @handoff="selectSession"
       @refresh="selectSession"
+      @open-topic="selectTopic"
+      @home="showTopicsHome"
     />
     <HomeView
       v-else
+      :key="viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'"
       :fleet="fleet"
-      :selected-id="selectedId"
+      :topic="viewMode === 'topic' ? selectedTopic : null"
       @select="selectSession"
+      @open-zed="openTopicInZed"
+      @home="showTopicsHome"
     />
-    <ResourcePanel v-if="selectedView && selectedTopic && showResources" :topic="selectedTopic"
+    <ResourcePanel v-if="viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic"
       @close="showResources = false" @error="connError = $event" />
     <SettingsSheet
       v-if="showSettings"

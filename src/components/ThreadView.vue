@@ -68,6 +68,8 @@ const emit = defineEmits<{
   (e: "delegate", parentId: string, task: string): void;
   (e: "handoff", id: string): void;
   (e: "refresh", id: string): void;
+  (e: "open-topic", id: string): void;
+  (e: "home"): void;
 }>();
 
 const blocks = ref<DisplayBlock[]>([]);
@@ -728,6 +730,11 @@ async function onLand(strategy: string) {
 
 <template>
   <section class="main">
+    <div v-if="topic" class="thread-breadcrumb">
+      <button @click="emit('home')">Topics home</button><span> → </span>
+      <button @click="emit('open-topic', topic.id)">{{ topic.branch.title || topic.branch.name }}</button>
+      <span> → {{ session.branch.title || session.branch.name }}</span>
+    </div>
     <div class="thread-header">
       <div class="meta">
         <div class="name">{{ session.branch.name || session.id }}</div>

@@ -42,6 +42,24 @@ The main screen answers “what needs me?” Topic and thread views then show th
 conversation alongside code and resources. Every code reference should lead to
 an editable checkout with one action when that checkout is available.
 
+Navigation is **Topics home → Topic dashboard → Thread detail**. With no Topic
+selected, Topics home is an aggregate fleet view across all Topics. It shows
+Needs You first and prominently (or “Nothing needs you”), then Working, Ready
+to Integrate, and collapsed Waiting / Resting. Every aggregate row names its
+parent Topic. Selecting a Topic in the sidebar scopes those same categories to
+its coordinator and workers, with Topic summary, resources, repository refs,
+Open in Zed, Todos, and New Thread near the header as those capabilities
+become available. Selecting a row opens its individual conversation. Topics
+and Threads are levels of navigation, not peer objects.
+
+The sidebar primarily browses Topics. **Topics [+]** opens the optional
+title/body/attachment creation form in a sheet or popover; the form does not
+permanently occupy sidebar space. Inbox may remain a separate tab, but its
+purpose is cross-Topic human attention and reviewable events, rather than an
+unrelated second list. The aggregate Topics home still shows Needs You even
+when Inbox exists. Ready to Integrate requires explicit verified candidate
+state from Loom; a stopped or sleeping worker is not sufficient evidence.
+
 Every new top-level conversation is a topic, including one started through the
 quick input. The Topics list expands through delegated threads at arbitrary
 depth. Older unmarked top-level conversations remain visible as topics without

@@ -490,9 +490,24 @@ Roughly:
 └─────────────────┴───────────────────────────────┴────────────────────┘
 ```
 
-The default home screen should answer:
+The default **Topics home** screen should answer:
 
-> What needs me?
+> What is happening across everything, and what needs my attention?
+
+Navigation is **Topics home → Topic dashboard → Thread conversation**.
+Topics home aggregates all Topics. The sidebar lists Topics, with **Topics
+[+]** opening the optional creation form in a sheet or popover. Clicking a
+Topic opens its dashboard, not immediately its coordinator conversation;
+clicking a row on either dashboard opens that Thread. Every aggregate row
+names its parent Topic. Inbox may remain a separate attention/review tab, but
+Topics home still includes all cross-Topic Needs You items.
+
+Both aggregate home and Topic detail use the same order: **Needs You** first,
+**Working**, **Ready to Integrate**, then de-emphasized/collapsible **Waiting /
+Resting**. Topic detail scopes those sections to one Topic and adds its
+summary, Resources, refs, Open in Zed, Todos, and New Thread actions. The
+Ready section contains only verified integration candidates; an idle or
+completed worker is not automatically Ready.
 
 Example:
 
@@ -514,7 +529,12 @@ WORKING
   AAII cleanup              GLM · OA Cloud
 
 
-WAITING
+READY TO INTEGRATE
+
+  Arachne · resource strip   clean against Arachne@789abc
+
+
+WAITING / RESTING
 
   PR #1842                  waiting for review
   Hero nightly              waiting for W&B
