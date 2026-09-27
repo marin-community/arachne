@@ -15,6 +15,7 @@ const props = defineProps<{
   layout: SessionLayout | null;
   selectedId: string | null;
   showNewThread?: boolean;
+  showNewTopic?: boolean;
   launching?: boolean;
   launchOptions: LaunchOptions | null;
 }>();
@@ -36,6 +37,7 @@ const emit = defineEmits<{
     expected?: { title: string; provenance: string },
   ): void;
   (e: "new-thread"): void;
+  (e: "new-topic"): void;
   (
     e: "reparent",
     sessionId: string,
@@ -342,12 +344,6 @@ const userInboxId = computed(() => {
 // The sidebar's two surfaces: the Inbox (the filing lanes + delegation tree)
 // and Topics (the per-topic card list with title/description/config).
 const tab = ref<"inbox" | "topics">("topics");
-const showNewTopic = ref(false);
-const newTitleEl = ref<HTMLInputElement | null>(null);
-function openNewTopic() {
-  showNewTopic.value = true;
-  nextTick(() => newTitleEl.value?.focus());
-}
 
 // --- Topics tab --------------------------------------------------------------
 
@@ -426,11 +422,6 @@ function visibleTopicChildren(rootId: string): TopicThreadRow[] {
 
 // A topic has a short title and a substantive body. The body is both the
 // agent's initial goal and the durable branch description.
-const newTitle = ref("");
-const newBody = ref("");
-const topicAttachments = ref<FileAttachment[]>([]);
-const topicAttachmentError = ref("");
-const topicAttachmentLoading = ref(false);
 
 async function addQuickFiles(files: FileList | File[]) {
   if (quickAttachmentLoading.value) return;
@@ -439,30 +430,14 @@ async function addQuickFiles(files: FileList | File[]) {
   catch (error: any) { quickAttachmentError.value = error?.message ?? String(error); }
   finally { quickAttachmentLoading.value = false; }
 }
-async function addTopicFiles(files: FileList | File[]) {
-  if (topicAttachmentLoading.value) return;
-  topicAttachmentLoading.value = true;
-  try { topicAttachments.value = await addAttachments(topicAttachments.value, files, MAX_LAUNCH_TOTAL_BYTES); topicAttachmentError.value = ""; }
-  catch (error: any) { topicAttachmentError.value = error?.message ?? String(error); }
-  finally { topicAttachmentLoading.value = false; }
-}
 function onQuickFileInput(event: Event) {
   const input = event.target as HTMLInputElement;
   if (input.files) void addQuickFiles(input.files);
   input.value = "";
 }
-function onTopicFileInput(event: Event) {
-  const input = event.target as HTMLInputElement;
-  if (input.files) void addTopicFiles(input.files);
-  input.value = "";
-}
 function onQuickPaste(event: ClipboardEvent) {
   if (!event.clipboardData?.files.length) return;
   event.preventDefault(); void addQuickFiles(event.clipboardData.files);
-}
-function onTopicPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
-  event.preventDefault(); void addTopicFiles(event.clipboardData.files);
 }
 interface TopicMentionResource {
   topicId: string;
@@ -473,20 +448,9 @@ interface TopicMentionResource {
   url: string | null;
   repository: string;
 }
-const topicBodyEl = ref<HTMLTextAreaElement | null>(null);
-const topicMentionRange = ref<{ start: number; end: number; query: string } | null>(null);
-const topicMentionIndex = ref(0);
 const topicMentionResources = ref<TopicMentionResource[]>([]);
 const topicMentionLoading = ref(false);
 const topicMentionError = ref("");
-const topicMentions = ref<{ token: string; topicId: string; resourceId: string }[]>([]);
-const matchingTopicResources = computed(() => {
-  const query = topicMentionRange.value?.query.trim().toLowerCase() ?? "";
-  return topicMentionResources.value.filter((resource) =>
-    !query || [resource.title, resource.kind, resource.path, resource.url, resource.repository]
-      .some((value) => value?.toLowerCase().includes(query)),
-  ).slice(0, 8);
-});
 const matchingQuickResources = computed(() => {
   const query = quickMentionRange.value?.query.trim().toLowerCase() ?? "";
   return topicMentionResources.value.filter((resource) =>
@@ -510,15 +474,6 @@ async function loadTopicMentionResources() {
   } finally {
     topicMentionLoading.value = false;
   }
-}
-
-function updateTopicMention() {
-  const caret = topicBodyEl.value?.selectionStart ?? newBody.value.length;
-  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(newBody.value.slice(0, caret));
-  const wasOpen = !!topicMentionRange.value;
-  topicMentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
-  topicMentionIndex.value = 0;
-  if (topicMentionRange.value && !wasOpen) void loadTopicMentionResources();
 }
 
 function updateQuickMention() {
@@ -560,55 +515,6 @@ function onQuickKeydown(event: KeyboardEvent) {
   } else if (event.key === "ArrowUp" && matchingQuickResources.value.length) {
     event.preventDefault(); quickMentionIndex.value = (quickMentionIndex.value - 1 + matchingQuickResources.value.length) % matchingQuickResources.value.length;
   }
-}
-
-function chooseTopicMention(resource: TopicMentionResource) {
-  const range = topicMentionRange.value;
-  if (!range) return;
-  const duplicate = topicMentionResources.value.some((other) => other.id !== resource.id && other.title === resource.title);
-  const label = duplicate ? `${resource.title} (${resource.path || resource.url || resource.repository})` : resource.title;
-  const token = `@{${label}}`;
-  newBody.value = newBody.value.slice(0, range.start) + token + " " + newBody.value.slice(range.end);
-  topicMentions.value.push({ token, topicId: resource.topicId, resourceId: resource.id });
-  topicMentionRange.value = null;
-  nextTick(() => {
-    const caret = range.start + token.length + 1;
-    topicBodyEl.value?.focus();
-    topicBodyEl.value?.setSelectionRange(caret, caret);
-  });
-}
-
-function onTopicBodyKeydown(event: KeyboardEvent) {
-  if (!topicMentionRange.value) return;
-  if (event.key === "Escape") { event.preventDefault(); topicMentionRange.value = null; }
-  else if (event.key === "ArrowDown" && matchingTopicResources.value.length) {
-    event.preventDefault(); topicMentionIndex.value = (topicMentionIndex.value + 1) % matchingTopicResources.value.length;
-  } else if (event.key === "ArrowUp" && matchingTopicResources.value.length) {
-    event.preventDefault(); topicMentionIndex.value = (topicMentionIndex.value - 1 + matchingTopicResources.value.length) % matchingTopicResources.value.length;
-  } else if (event.key === "Enter" && matchingTopicResources.value.length && !event.shiftKey) {
-    event.preventDefault(); chooseTopicMention(matchingTopicResources.value[topicMentionIndex.value] || matchingTopicResources.value[0]);
-  }
-}
-
-function submitTopic() {
-  const title = newTitle.value.trim();
-  const body = newBody.value.trim();
-  if ((!title && !body && !topicAttachments.value.length) || props.launching || topicAttachmentLoading.value) return;
-  emit("launch", body || title || `Review ${topicAttachments.value[0].name}`, repo.value.trim(), {
-    title: title || undefined,
-    description: body || undefined,
-    mentions: topicMentions.value.filter((mention) => body.includes(mention.token))
-      .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
-    attachments: topicAttachments.value,
-    ...launchConfig(),
-  }, (success) => {
-    if (!success) return;
-    newTitle.value = "";
-    newBody.value = "";
-    topicAttachments.value = [];
-    topicMentions.value = [];
-    showNewTopic.value = false;
-  });
 }
 
 // Inline card editing: title edits are compare-and-swap fenced server-side,
@@ -738,6 +644,9 @@ async function archiveRow(id: string) {
     <template v-if="tab === 'inbox'">
       <button class="new-thread-btn" :class="{ active: props.showNewThread }" @click="emit('new-thread')">
         + New thread
+      </button>
+      <button class="new-thread-btn" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">
+        + New topic
       </button>
       <div class="new-task quick-task-wrap">
         <input
@@ -942,89 +851,9 @@ async function archiveRow(id: string) {
     <template v-else>
       <div class="topics-toolbar">
         <span>Topics</span>
-        <button type="button" aria-label="New topic" title="New topic" @click="openNewTopic">+</button>
-      </div>
-      <div v-if="showNewTopic" class="new-topic-overlay" @click.self="showNewTopic = false" @keydown.esc.stop="showNewTopic = false">
-      <div class="new-topic-card" role="dialog" aria-modal="true" aria-label="New topic">
-        <div class="new-topic-heading">New topic <button type="button" aria-label="Close new topic" @click="showNewTopic = false">×</button></div>
-        <label for="new-topic-title">Title <span class="field-optional">optional</span></label>
-        <input
-          id="new-topic-title"
-          ref="newTitleEl"
-          v-model="newTitle"
-          placeholder="What is this work about?"
-        />
-        <label for="new-topic-body">Body <span class="field-optional">optional</span></label>
-        <div class="topic-body-wrap">
-          <textarea
-            id="new-topic-body"
-            ref="topicBodyEl"
-            v-model="newBody"
-            rows="6"
-            placeholder="Describe the goal, context, and what a good result looks like… Use @ to mention an existing resource."
-            @input="updateTopicMention"
-            @click="updateTopicMention"
-            @keydown="onTopicBodyKeydown"
-            @paste="onTopicPaste"
-          ></textarea>
-          <div v-if="topicMentionRange" class="mention-menu topic-body-mention-menu" role="listbox" aria-label="Existing topic resources">
-            <div v-if="topicMentionLoading" class="mention-hint">Loading resources…</div>
-            <div v-else-if="topicMentionError" class="mention-hint">{{ topicMentionError }}</div>
-            <div v-else-if="!matchingTopicResources.length" class="mention-hint">No matching attached resources</div>
-            <button v-for="(resource, index) in matchingTopicResources" :key="`${resource.topicId}:${resource.id}`"
-              role="option" :aria-selected="index === topicMentionIndex" :class="{ selected: index === topicMentionIndex }"
-              @mousedown.prevent="chooseTopicMention(resource)">
-              <strong>{{ resource.title }}</strong>
-              <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
-            </button>
-          </div>
-        </div>
-        <div class="attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addTopicFiles($event.dataTransfer.files)">
-          <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="topicAttachmentLoading" aria-label="Attach files to new topic" @change="onTopicFileInput" /></label>
-          <span v-for="(file, index) in topicAttachments" :key="file.name" class="attachment-chip">
-            {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="topicAttachments.splice(index, 1)">×</button>
-          </span>
-          <span v-if="topicAttachmentError" class="attachment-error">{{ topicAttachmentError }}</span>
-          <span v-if="topicAttachmentLoading" class="attachment-hint">Reading files…</span>
-        </div>
-        <div class="new-topic-foot">
-          <input
-            v-model="repo"
-            placeholder="owner/name"
-            spellcheck="false"
-            style="font-family: var(--mono); font-size: 11px"
-          />
-          <button
-            class="primary"
-            :disabled="(!newTitle.trim() && !newBody.trim() && !topicAttachments.length) || props.launching || topicAttachmentLoading"
-            @click="submitTopic"
-          >
-            {{ props.launching ? "…" : "Create topic" }}
-          </button>
-        </div>
-        <div class="launch-controls" style="margin-top: 8px">
-          <select v-model="profile" aria-label="Inference profile" @change="onProfileChange">
-            <option v-if="!profiles.some((p) => p.name === 'default')" value="default">Default route</option>
-            <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.name }} · {{ p.agent_kind }}</option>
-          </select>
-          <select v-model="agent" aria-label="Agent runtime" @change="onAgentChange">
-            <option value="">{{ selectedProfile?.agent_kind || launchOptions?.default_agent || 'Default agent' }}</option>
-            <option v-for="choice in launchOptions?.agents ?? []" :key="choice.kind" :value="choice.kind">{{ choice.label }}</option>
-          </select>
-          <select v-if="modelChoices.length && !selectedAgent?.accepts_raw_model" v-model="model" aria-label="Model">
-            <option value="">{{ agent ? 'Runtime default model' : (selectedProfile?.model || 'Runtime default model') }}</option>
-            <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-          </select>
-          <input v-else v-model="model" list="launch-models-topic" :placeholder="agent ? 'Model · runtime default' : (selectedProfile?.model || 'Model · runtime default')" aria-label="Model override" spellcheck="false" />
-          <datalist id="launch-models-topic">
-            <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-          </datalist>
-          <select v-model="effort" aria-label="Reasoning effort">
-            <option value="">{{ agent ? 'Default effort' : (selectedProfile?.effort || 'Default effort') }}</option>
-            <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-          </select>
-        </div>
-      </div>
+        <!-- Composing a new topic takes over the main panel (like the
+             new-thread sheet), not a floating overlay here. -->
+        <button type="button" aria-label="New topic" title="New topic" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">+</button>
       </div>
 
       <div class="topic-list">

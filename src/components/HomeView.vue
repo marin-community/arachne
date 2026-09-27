@@ -6,6 +6,7 @@ const props = defineProps<{ fleet: SessionSummary[]; topic?: SessionSummary | nu
 const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "new-thread"): void;
+  (e: "new-topic"): void;
   (e: "open-zed", id: string): void;
   (e: "home"): void;
 }>();
@@ -100,6 +101,9 @@ const sections = computed(() => [
           </template>
           <h1 v-else>Topics home</h1>
         </div>
+        <button class="home-new" title="Start a durable topic — title, description, goal" @click="emit('new-topic')">
+          + New topic
+        </button>
         <button class="primary home-new" @click="emit('new-thread')">+ New thread</button>
       </div>
       <template v-if="topic">

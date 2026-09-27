@@ -7,6 +7,7 @@ import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import NewThreadSheet from "./components/NewThreadSheet.vue";
+import NewTopicSheet from "./components/NewTopicSheet.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import type { FileAttachment } from "./attachments";
 
@@ -141,6 +142,10 @@ const selectedView = ref<SessionView | null>(null);
 // not the sidebar. Takes over while open; a launch closes it and opens
 // the live thread (launchTask → selectSession).
 const showNewThread = ref(false);
+// The topic composer: same main-panel takeover as the thread sheet. A
+// topic is a leader chat with title/description metadata, so its launch
+// path (launchTopic) passes those through to launch_session.
+const showNewTopic = ref(false);
 const showSettings = ref(false);
 const showResources = ref(true);
 const settingsError = ref<string | null>(null);
@@ -254,7 +259,14 @@ function openNewThread() {
   // A stale connection error from an earlier flow shouldn't read as a
   // launch failure inside the fresh sheet.
   connError.value = null;
+  showNewTopic.value = false;
   showNewThread.value = true;
+}
+
+function openNewTopic() {
+  connError.value = null;
+  showNewThread.value = false;
+  showNewTopic.value = true;
 }
 
 async function launchTask(
@@ -292,6 +304,21 @@ async function launchTask(
   } finally {
     launching.value = false;
   }
+}
+
+// The topic sheet's launch: same signature as a thread launch — the sheet
+// owns richer card metadata (title/description) plus attachments and
+// resource mentions, all routed through launchTask so the wiring stays in
+// one place. Success closes the sheet and opens the live thread; failure
+// keeps the drafts for a retry.
+function launchTopic(
+  task: string,
+  repo: string,
+  meta?: { title?: string; description?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+) {
+  launchTask(task, repo, meta, (success) => {
+    if (success) showNewTopic.value = false;
+  });
 }
 
 // Edit a topic's card: title (CAS-fenced against the value the card last
@@ -443,6 +470,7 @@ const selectedTopic = computed(() => {
       :layout="layout"
       :selected-id="selectedId ?? selectedTopicId"
       :show-new-thread="showNewThread"
+      :show-new-topic="showNewTopic"
       :launching="launching"
       :launch-options="launchOptions"
       @select="selectSession"
@@ -450,12 +478,22 @@ const selectedTopic = computed(() => {
       @launch="launchTask"
       @update-topic="updateTopic"
       @new-thread="openNewThread"
+      @new-topic="openNewTopic"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
       @archive="onArchived"
     />
+    <NewTopicSheet
+      v-if="showNewTopic"
+      :fleet="fleet"
+      :launching="launching"
+      :error="connError"
+      :launch-options="launchOptions"
+      @close="showNewTopic = false"
+      @launch="launchTopic"
+    />
     <NewThreadSheet
-      v-if="showNewThread"
+      v-else-if="showNewThread"
       :launching="launching"
       :error="connError"
       @close="showNewThread = false"
@@ -483,6 +521,7 @@ const selectedTopic = computed(() => {
       :topic="viewMode === 'topic' ? selectedTopic : null"
       @select="selectSession"
       @new-thread="openNewThread"
+      @new-topic="openNewTopic"
       @open-zed="openTopicInZed"
       @home="showTopicsHome"
     />
