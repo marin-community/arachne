@@ -128,6 +128,17 @@ It is MIT licensed.
 
 Be willing to inspect and reuse code or concepts from other OSS agent managers, terminal tools, worktree managers, remote-development tools, etc.
 
+Specific design references to investigate:
+
+- Gas Town's integration candidates, Refinery, and merge-queue direction;
+- Stoneforge's disposable integration worktree and mechanical merge/test path;
+- `wta`'s preflight conflict preview;
+- Claude Code and OpenCode, alongside Codex, for the vanilla harness layer:
+  thread/session operations, worktrees, resumability, and permissions.
+
+These are inspirations, not dependencies or evidence that their internals fit
+Loom unchanged.
+
 Rule:
 
 > Search before building, but vendor/reuse only when doing so is actually simpler or better.
@@ -168,7 +179,8 @@ Loom runs sessions, manages worktrees/runtimes, stores durable state, receives e
 
 ## Topic
 
-A durable unit of intent.
+A durable top-level unit of intent, context, resources, Todos, subscriptions,
+mailbox, coordinator Thread, workers, and integration state.
 
 Examples:
 
@@ -193,6 +205,11 @@ It can:
 - escalate something to human attention.
 
 A topic is **not a worktree** and is **not necessarily a continuously running model process**.
+It may span multiple repositories. Each attached repository may have its own
+canonical Topic branch/ref for accepted code state; there is no universal
+Topic branch. A human-facing checkout is optional and reconstructible from its
+ref. Every new top-level conversation, including a quick one-prompt launch, is
+a Topic and may acquire workers later.
 
 Long term, think of it as a durable actor with a mailbox that occasionally invokes an LLM.
 
@@ -235,22 +252,36 @@ Resources include:
 
 Resources should have identity independent of the session that happened to create them.
 
+## Todo
+
+A durable, cross-topic action for the person. The user Todo list is separate
+from a Topic's plan/backlog and from worker-internal checklists. Integration
+and review decisions may create user Todos.
+
 ## Event
 
-Something delivered into a topic/thread mailbox.
+An immutable fact that something happened. Its Source is the emitter; a
+Subscription selects which Events a Topic or Thread cares about; its Mailbox
+holds pending Events/messages durably; a Wake is the decision to invoke an
+agent because of queued Events. Delivery alone does not imply a Wake.
 
 Examples:
 
 - human message;
+- another Thread's note or selected result;
 - worker completion;
 - worker escalation;
 - GitHub review;
 - CI state change;
 - W&B alert;
-- timer;
+- heartbeat, timer, or cron;
 - webhook;
-- another thread sending knowledge;
+- integration conflict after Topic state advances;
 - a runner becoming available.
+
+Events can be coalesced, handled deterministically, or held until a later
+Wake. This is the common mechanism behind watches, scheduled automations,
+cross-thread delivery, and manual messages, without agent busy waiting.
 
 ## Attention
 
@@ -729,6 +760,11 @@ The terminal Agent Deck's Conductor is a useful reference for this shape.
 # Worker results
 
 A child finishing should not require its parent to reread the full child transcript.
+Finishing is not the same as being ready to integrate. A coding worker should
+normally stabilize/commit its result, run required validation, summarize it,
+and preflight mergeability against a specific Topic ref before becoming Ready.
+Readiness records the target revision. The worker may sleep while its separate
+integration state remains Ready, stale, conflicting, or integrated.
 
 Eventually produce a structured handoff:
 
@@ -766,13 +802,28 @@ When an event matters:
 
 ```text
 event
-→ wake coordinator
+→ subscription / durable mailbox
+→ coalesce or handle mechanically, if possible
+→ wake coordinator only when reasoning is needed
 → reason / act / delegate
 → update state
 → sleep
 ```
 
 This is preferable to continuously consuming a session or having agents poll.
+
+---
+
+# Events
+
+The control plane records an immutable **Event** from a **Source**, routes it
+through a **Subscription** to a Topic or Thread's durable **Mailbox**, and
+makes a separate **Wake** decision. Sources include manual messages, other
+Threads, worker completion, integration conflict, GitHub/CI/PR review, W&B,
+heartbeats/timers/cron, and runner availability. A delivery can update state,
+coalesce with related Events, or remain pending without invoking an LLM.
+Repeated delivery must be idempotent. This vocabulary should unify the
+existing watches and automations rather than creating a second scheduler.
 
 ---
 
@@ -794,7 +845,8 @@ Instead:
 GitHub event
 → Loom
 → relevant mailbox
-→ wake relevant thread/topic
+→ coalesce or update state
+→ wake relevant thread/topic when needed
 ```
 
 Likewise:
@@ -1052,11 +1104,28 @@ Limits may exist per:
 
 ## Integration
 
-Combining worker outputs is itself work.
+Integration belongs to the Topic. Each repository attached to it may have a
+canonical ref for accepted state. Worker results are candidates against that
+ref, and the Topic view should expose their queue and status. The normal flow
+is worker → Topic; nested workers may integrate recursively when useful.
+**Integrate** absorbs work into Topic state. **Land** separately moves accepted
+Topic state to an external target such as a PR or main.
 
-It is valid to spawn an integration worker to reconcile multiple branches/results.
+Preflight conflict preview (for example, `git merge-tree`) and readiness are
+relative to a target revision. When the Topic ref advances, Loom should
+deterministically recheck sleeping Ready candidates. Clean ones get a refreshed
+readiness revision and stay asleep;
+new conflicts emit Events and preferentially wake their original workers to
+reconcile. Worker lifecycle and integration state remain independent.
 
-Do not force the coordinator to absorb all implementation details.
+The operation carries source, target, strategy, revision, and validation
+policy. Strategies include squash, merge, rebase, cherry-pick, PR, and ask
+coordinator. A clean, unambiguous integration should use a disposable worktree:
+prepare, apply, validate, atomically advance the Topic ref, then clean up.
+Failure must not disturb the canonical checkout/ref. Conflicts, failing tests,
+ambiguity, or product judgment can wake the original worker, coordinator, or
+an integration worker. Do not force an LLM turn for a clean mechanical merge,
+or force the coordinator to absorb every difficult one.
 
 ---
 

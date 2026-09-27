@@ -2,15 +2,23 @@
 
 ## Purpose
 
-Arachne should make it easy to take work produced by one Thread/worker and incorporate it upward into its parent Topic or parent Thread without requiring the user to manually manage branches, worktrees, cherry-picks, merges, or PR creation.
+Arachne should make it easy to take work produced by one Thread/worker and
+incorporate it into its Topic's accepted state without requiring the user to
+manually manage branches, worktrees, cherry-picks, merges, or PR creation.
+Recursive integration through a parent Thread remains possible, but the normal
+user-facing flow is worker → Topic.
 
 The central idea is:
 
-> **Integration is an agent action with an explicit strategy, not a hard-coded git operation.**
+> **Integration is a structured operation with an explicit strategy and a
+> deterministic fast path for clean mechanical work.**
 
-The UI provides high-confidence shortcuts such as **Integrate** and **Land**, but those actions wake the appropriate coordinating Thread and invoke an integration skill with structured intent.
+The UI provides **Integrate** and **Land**. Loom may complete a clean,
+unambiguous integration without an agent turn; it wakes the appropriate worker
+or coordinator when the operation needs repair or judgment.
 
-The LLM remains responsible for inspecting the actual repository state, handling conflicts, running validation, and reporting the result.
+Validation and the resulting commit/PR are verified by the control plane.
+Agents handle conflicts, failed validation, ambiguity, and product decisions.
 
 ---
 
@@ -28,8 +36,10 @@ A Topic may contain:
 - Todos;
 - subscriptions/events;
 - one or more repositories.
+- integration candidates, queue, and outcomes.
 
-For code repositories, a Topic may define a **topic branch** representing the accepted/integrated state of work within that Topic.
+For each code repository, a Topic may define a **topic branch/ref** representing
+accepted/integrated state. It has no single universal branch across repos.
 
 Example:
 
@@ -57,10 +67,10 @@ worker branch
     ↓
 Integrate
     ↓
-parent/topic branch
+topic branch (or explicit parent scope)
 ```
 
-Integration is recursive.
+Integration may be recursive, but worker → Topic is the default visible path.
 
 A child worker may integrate into its parent worker, which may later integrate into the Topic.
 
@@ -102,6 +112,10 @@ tests passing
 The user may inspect the result or immediately integrate it.
 
 The coordinator may also choose to integrate workers autonomously when policy allows.
+
+The Topic view should show its integration queue: each candidate's source,
+target repo/ref, readiness and conflict status, validation, and outcome. The
+worker card can expose the same candidate without owning the queue.
 
 ---
 
@@ -235,9 +249,11 @@ This should be the safe fallback when policy is unclear.
 
 ---
 
-# Integration is an LLM/skill operation
+# Integration is a structured operation
 
-The UI button should invoke the same underlying operation that could be requested conversationally.
+The UI button and a conversational request should resolve to the same
+structured operation. Neither route requires an LLM turn for a clean,
+mechanical integration.
 
 These should be equivalent:
 
@@ -262,18 +278,57 @@ Example conceptual payload:
   "source_resource": "worktree-zed",
   "target_scope": "topic-arachne",
   "target_resource": "repo-arachne-topic-branch",
+  "target_revision": "789abc",
   "strategy": "squash",
+  "validation_policy": "topic-required-checks",
   "requested_by": "user"
 }
 ```
 
 Exact API/schema is implementation-defined.
 
+## Candidate readiness and preflight
+
+A worker stopping is not enough to make its result Ready. A coding worker
+should normally stabilize/commit changes, run required validation, summarize
+the result, and preflight mergeability against the current Topic ref. The UI
+can then show `Ready · clean against Arachne@789abc`. Readiness records the
+target revision and validation evidence; it is not a timeless property of the
+worker branch. The worker can sleep while the candidate remains Ready.
+
+Loom should deterministically re-run conflict preflight for sleeping Ready
+candidates when Topic state advances. A clean candidate records the new target
+revision and stays asleep. A new
+conflict becomes an Event, with the original worker preferred for reconciliation
+against the updated ref. Worker lifecycle and integration lifecycle are
+separate: sleeping, running, and archived are not synonyms for ready, stale,
+conflicting, integrated, or failed. A `git merge-tree` preview or equivalent
+can surface likely conflicts before the user chooses Integrate; applying the
+strategy in the disposable worktree and validating it remain authoritative.
+
+## Deterministic fast path
+
+For a clean candidate with a configured strategy and validation policy:
+
+1. Create a disposable integration worktree at the expected Topic revision.
+2. Apply the selected strategy there.
+3. Run required validation and record evidence.
+4. Advance the Topic ref only if its expected revision still matches.
+5. Record the resulting commit/PR and clean up the temporary checkout.
+
+An unsuccessful attempt leaves the canonical checkout and ref intact. If the
+ref moved, refresh preflight and retry within policy or mark the candidate
+stale. Conflicts, failing tests, ambiguity, or product judgment route to the
+original worker, coordinator, or an integration worker. Failed temporary
+checkouts may be retained briefly for diagnosis under a bounded cleanup
+policy, but are not the human-facing Topic checkout.
+
 ---
 
-# Integration skill
+# Integration skill for nontrivial cases
 
-Provide a dedicated integration skill/instruction set for the coordinator.
+Provide a dedicated integration skill/instruction set for an agent when the
+deterministic path cannot finish or policy asks for review.
 
 The skill should tell the agent to:
 
@@ -381,11 +436,12 @@ Do not assume Thread ancestry equals git ancestry.
 
 Default behavior:
 
-> Integrate into the nearest ancestor scope that has a writable canonical Resource for the relevant repository.
+> Integrate into the Topic's canonical ref for the relevant repository.
 
-If none exists:
-
-> Integrate into the Topic's canonical Resource for that repository.
+Recursive worker → parent worker integration is an explicit path when the
+parent owns an intermediate accepted ref; it does not change the normal
+Topic-level queue. If the Topic has no canonical ref for that repository,
+Arachne must establish or select a target before claiming readiness.
 
 The target should always be inspectable/overrideable.
 
@@ -493,9 +549,12 @@ The worker/thread should notice or at least accurately report the changed git st
 
 ## Editing integration worktree
 
-Manual changes immediately alter Topic canonical state.
-
-Before integrating another worker, Arachne/Loom should refresh/reconcile target branch state rather than assuming the integration worktree is unchanged.
+Uncommitted manual changes are pending checkout state, not accepted Topic ref
+state. Committing and advancing the ref changes canonical state. Before
+integrating another worker, Arachne/Loom must detect checkout dirtiness and
+refresh/reconcile the target ref rather than assuming the integration worktree
+is unchanged. A temporary integration checkout prevents an attempted merge
+from disturbing human edits.
 
 ---
 
@@ -633,9 +692,12 @@ The button should no longer imply outstanding work.
 
 ---
 
-# Parent coordinator UX
+# Topic integration queue and coordinator UX
 
-The top-level Topic Thread should receive integration events in its timeline.
+The Topic view should show queued candidates and outcomes across its workers,
+including target revision, preflight status, and validation. The top-level
+coordinator Thread also receives integration Events in its timeline. An Event
+can update the queue without immediately waking the coordinator.
 
 Example:
 
@@ -761,7 +823,8 @@ Archival/cleanup is a separate lifecycle concern.
 
 # Todo integration
 
-Arachne should eventually maintain a durable user-facing Todo list distinct from agent-internal todos.
+Arachne should eventually maintain a durable cross-topic user-facing Todo
+list, separate from each Topic's plan/backlog and from worker-internal todos.
 
 Integration actions may generate/remove user todos.
 
@@ -795,28 +858,31 @@ Required:
 4. support at least:
    - squash;
    - merge;
+   - rebase;
    - cherry-pick;
+   - open PR;
    - ask coordinator;
 5. remember last-used strategy per repo;
-6. button sends a structured integration request to coordinator;
-7. coordinator uses an integration skill;
-8. integration result appears in Topic/Thread history;
+6. button sends a structured integration request to Loom;
+7. the coordinator skill handles nontrivial cases while clean cases can use a
+   deterministic temporary-worktree path;
+8. integration result appears in Topic queue and Thread history;
 9. target git state updates;
 10. future workers fork from updated Topic state.
 
-Nice to have:
+Nice to have after the manual loop works:
 
-- PR integration strategy;
 - integration worker delegation;
 - tests displayed inline;
 - conflict escalation UI.
+- target-revision readiness and automatic re-preflight of sleeping candidates.
 
 Defer:
 
 - autonomous integration;
 - complex policy editor;
 - visual git graph;
-- generalized merge queue;
+- broad autonomous merge queue;
 - distributed locking beyond basic Resource lease/reconciliation.
 
 ---
