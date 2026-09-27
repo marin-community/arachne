@@ -400,10 +400,12 @@ decision.\n\
                 "target_resource": self.target_branch,
                 "strategy": strategy,
                 "requested_by": "user",
-            })
-            .to_string(),
+            }),
         );
-        format!("{request}\n\n## Integration procedure\n\n{}", include_str!("../../skills/integration.md"))
+        format!(
+            "{request}\n\n## Integration procedure\n\n{}",
+            include_str!("../../skills/integration.md")
+        )
     }
 }
 
@@ -448,10 +450,12 @@ the outcome. Prefer opening a PR when policy is unclear.\n\
                 "target_resource": self.target_upstream,
                 "strategy": strategy,
                 "requested_by": "user",
-            })
-            .to_string(),
+            }),
         );
-        format!("{request}\n\n## Integration procedure\n\n{}", include_str!("../../skills/integration.md"))
+        format!(
+            "{request}\n\n## Integration procedure\n\n{}",
+            include_str!("../../skills/integration.md")
+        )
     }
 }
 
@@ -471,7 +475,8 @@ mod integration_prompt_tests {
             target_branch: "topic-branch".into(),
             strategy: IntegrationStrategy::Squash,
             requested_by: "user",
-        }.to_prompt("Topic");
+        }
+        .to_prompt("Topic");
         assert!(prompt.contains("\"source_work\":\"/tmp/worker\""));
         assert!(prompt.contains("\"target_resource\":\"topic-branch\""));
         assert!(prompt.contains("One active writer per worktree"));
@@ -479,12 +484,18 @@ mod integration_prompt_tests {
 
     #[test]
     fn landing_push_is_a_supported_strategy() {
-        assert_eq!(IntegrationStrategy::parse("push"), Some(IntegrationStrategy::Push));
+        assert_eq!(
+            IntegrationStrategy::parse("push"),
+            Some(IntegrationStrategy::Push)
+        );
         let prompt = LandingRequest {
-            action: "land", source_branch: "topic-branch".into(),
+            action: "land",
+            source_branch: "topic-branch".into(),
             target_upstream: "origin/main".into(),
-            strategy: IntegrationStrategy::Push, requested_by: "user",
-        }.to_prompt("Topic");
+            strategy: IntegrationStrategy::Push,
+            requested_by: "user",
+        }
+        .to_prompt("Topic");
         assert!(prompt.contains("\"strategy\":\"push\""));
         assert!(prompt.contains("origin/main"));
     }
@@ -559,7 +570,8 @@ mod scratch_upload_tests {
     fn webview_and_loom_use_their_respective_field_names() {
         let upload: ScratchUpload = serde_json::from_value(serde_json::json!({
             "name": "notes.txt", "contentBase64": "aGk="
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(upload.content_base64, "aGk=");
         let value = serde_json::to_value(upload).unwrap();
         assert_eq!(value["content_base64"], "aGk=");
