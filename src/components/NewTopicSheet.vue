@@ -2,7 +2,8 @@
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
-import { addAttachments, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-topic sheet: composing a topic takes over the main display panel
 // (grid-area main), exactly like the new-thread sheet — never a floating
@@ -28,7 +29,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
   ): void;
 }>();
 
@@ -37,6 +38,7 @@ const emit = defineEmits<{
 const title = ref("");
 const body = ref("");
 const repo = ref("marin-community/arachne");
+const base = ref("");
 const titleEl = ref<HTMLInputElement | null>(null);
 const bodyEl = ref<HTMLTextAreaElement | null>(null);
 
@@ -89,9 +91,11 @@ function onFileInput(event: Event) {
   input.value = "";
 }
 function onPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
+  if (!event.clipboardData) return;
+  const files = filesFromClipboard(event.clipboardData);
+  if (!files.length) return;
   event.preventDefault();
-  void addFiles(event.clipboardData.files);
+  void addFiles(files);
 }
 
 // --- @-mentions of existing topic resources -------------------------------------
@@ -221,6 +225,7 @@ function submit() {
   emit("launch", b || t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     title: t || undefined,
     description: b || undefined,
+    base: base.value.trim() || undefined,
     mentions: mentions.value.filter((mention) => b.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: attachments.value,
@@ -289,26 +294,16 @@ function submit() {
         <span class="nts-hint">Enter to launch · Shift+Enter for a new line · the body is the agent's opening message and the durable topic description</span>
       </label>
 
-      <label class="nts-field">
-        <span class="nts-field-name">Repository</span>
-        <input
-          v-model="repo"
-          placeholder="owner/name"
-          spellcheck="false"
-          @keydown.enter.prevent="submit"
-        />
-        <span class="nts-hint">
-          A fresh worktree + branch is created from this repo.
-        </span>
-      </label>
+      <RepoBaseFields v-model:repo="repo" v-model:base="base" @submit="submit" />
 
       <div
         class="attachment-row"
         @dragover.prevent
         @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)"
       >
-        <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files to new topic" @change="onFileInput" /></label>
+        <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files or images to new topic" @change="onFileInput" /></label>
         <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
           {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
         </span>
         <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
@@ -366,7 +361,7 @@ function submit() {
 
 <style scoped>
 /* Launch config row (profile/agent/model/effort) — same look as the
-   sidebar's quick-task controls, scoped here alongside its sibling. */
+   New thread sheet's controls. */
 .launch-controls {
   display: flex;
   flex-wrap: wrap;

@@ -345,7 +345,7 @@ function onHome() {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
   completed?: (success: boolean) => void,
 ) {
   launching.value = true;
@@ -355,7 +355,7 @@ async function launchTask(
       task,
       title: meta?.title ?? null,
       description: meta?.description ?? null,
-      oneOff: meta?.oneOff ?? false,
+      base: meta?.base ?? null,
       mentions: meta?.mentions ?? [],
       attachments: meta?.attachments?.map(({ name, contentBase64 }) => ({ name, contentBase64 })) ?? [],
       profile: meta?.profile || null,
@@ -388,10 +388,23 @@ async function launchTask(
 function launchTopic(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launchTask(task, repo, meta, (success) => {
     if (success) showNewTopic.value = false;
+  });
+}
+
+// The thread sheet's launch: the sheet's draft carries attachments,
+// resource mentions, and the launch config (the removed sidebar composer's
+// affordances), plus the optional preselected project.
+function launchThread(
+  task: string,
+  repo: string,
+  meta?: { mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+) {
+  launchTask(task, repo, meta, (success) => {
+    if (success) closeNewThread();
   });
 }
 
@@ -545,11 +558,8 @@ const selectedTopic = computed(() => {
       :selected-id="selectedId ?? selectedTopicId"
       :show-new-thread="showNewThread"
       :show-new-topic="showNewTopic"
-      :launching="launching"
-      :launch-options="launchOptions"
       @select="selectSession"
       @select-topic="selectTopic"
-      @launch="launchTask"
       @update-topic="updateTopic"
       @new-thread="openNewThread"
       @new-topic="openNewTopic"
@@ -570,11 +580,13 @@ const selectedTopic = computed(() => {
     />
     <NewThreadSheet
       v-else-if="showNewThread"
+      :fleet="fleet"
       :launching="launching"
       :error="connError"
+      :launch-options="launchOptions"
       :project="newThreadProject"
       @close="closeNewThread"
-      @launch="(task, repo, project) => launchTask(task, repo, project ? { project } : undefined)"
+      @launch="launchThread"
     />
     <ThreadView
       v-else-if="viewMode === 'thread' && selectedId && selectedView"

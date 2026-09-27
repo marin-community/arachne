@@ -35,6 +35,7 @@ pub fn run() {
             commands::interrupt,
             commands::launch_session,
             commands::launch_options,
+            commands::repo_branches,
             commands::handoff_session,
             commands::delegate_task,
             commands::archive_session,

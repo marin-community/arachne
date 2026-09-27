@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { blockKey, groupDisplayBlocks } from "../src/chatRows.ts";
+import { blockKey, blockCopyText, formatPlanEntries, groupDisplayBlocks, toolCallCopyText } from "../src/chatRows.ts";
 
 const tool = (turn, seq) => ({
   kind: "tool_call",
@@ -47,4 +47,35 @@ test("member keys identify a group after an older page joins its first call", ()
   assert.equal(extended.kind, "tool_call_group");
   assert.notEqual(original.key, extended.key);
   assert.deepEqual(original.memberKeys, extended.memberKeys.slice(1));
+});
+
+test("copy text returns the message text, trimmed", () => {
+  assert.equal(blockCopyText({ kind: "user_message", text: "  hi there \n" }), "hi there");
+  assert.equal(blockCopyText({ kind: "agent_message", text: "done!" }), "done!");
+  assert.equal(blockCopyText({ kind: "agent_message" }), "");
+});
+
+test("copy text formats plan entries one per line with status prefixes", () => {
+  assert.equal(formatPlanEntries([["Write tests", "pending"], ["Ship", "completed"]]), "[pending] Write tests\n[completed] Ship");
+  const text = blockCopyText({ kind: "plan", entries: [["Step", "in_progress"]] });
+  assert.equal(text, "[in_progress] Step");
+});
+
+test("copy text formats tool call content parts and skips images", () => {
+  const call = {
+    kind: "tool_call",
+    turn: 1,
+    seq: 1,
+    title: "Read files",
+    content: [
+      { type: "text", text: "a.txt" },
+      { type: "image", data: "aGVsbG8=", mime_type: "image/png" },
+      { type: "diff", path: "b.txt" },
+    ],
+  };
+  assert.equal(toolCallCopyText(call), "Read files\na.txt\ndiff b.txt");
+});
+
+test("copy text for thought blocks preserves the raw text untrimmed", () => {
+  assert.equal(blockCopyText({ kind: "thought", text: "\n\n**Thinking**\nstep 1" }), "\n\n**Thinking**\nstep 1");
 });

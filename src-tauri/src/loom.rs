@@ -283,18 +283,6 @@ pub struct ChangeTotalsView {
 // Integration (spec: docs/integration-and-landing.md)
 // ---------------------------------------------------------------------------
 
-/// One local branch of a repository checkout as loom's `repos.branches`
-/// reports it: its worktree, and whether the primary checkout (the main
-/// worktree, the checkout a human actually opens) currently has it checked
-/// out. The landing target for non-PR strategies resolves from these rows.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct RepoBranchView {
-    pub name: String,
-    pub worktree: Option<String>,
-    pub current: bool,
-}
-
 /// The integration strategies the Integrate split button offers. Wire-safe
 /// mirror of the strategies in the spec; the coordinator's skill is the
 /// authority on what each one *means* — these are intent constraints, not
@@ -701,6 +689,33 @@ pub struct LaunchOptionsView {
     pub profiles: Vec<LaunchProfileView>,
     pub agents: Vec<AgentMetadataView>,
     pub default_agent: String,
+}
+
+// ---------------------------------------------------------------------------
+// Managed repositories and their branches
+// ---------------------------------------------------------------------------
+
+/// `repos.list` row — a managed repo in the clone allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoView {
+    /// Canonical GitHub `owner/name`.
+    pub slug: String,
+    /// The clone source URL.
+    pub remote_url: String,
+    /// The managed on-disk checkout path (server-side filesystem path).
+    pub path: String,
+    pub created_at: String,
+}
+
+/// `repos.branches` row — one local git branch of a repo checkout, plus
+/// which has a worktree and whether it is the checkout's current branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoBranchView {
+    pub name: String,
+    pub worktree: Option<String>,
+    pub current: bool,
 }
 
 // ---------------------------------------------------------------------------

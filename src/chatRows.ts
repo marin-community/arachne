@@ -44,6 +44,48 @@ export function blockKey(block: ChatDisplayBlock, index: number): string {
   return `index:${index}`;
 }
 
+/** The raw text a block's copy button puts on the clipboard. */
+export function blockCopyText(block: ChatDisplayBlock): string {
+  switch (block.kind) {
+    case "thought":
+      return block.text ?? "";
+    case "user_message":
+    case "agent_message":
+      return (block.text ?? "").trim();
+    case "plan":
+      return formatPlanEntries(block.entries ?? []);
+    default:
+      return "";
+  }
+}
+
+/** A plan's steps, one per line, status-prefixed like the rendered block. */
+export function formatPlanEntries(entries: [string, string][]): string {
+  return entries.map(([content, status]) => `[${status}] ${content}`).join("\n");
+}
+
+interface ToolCallPart {
+  type?: unknown;
+  text?: unknown;
+  path?: unknown;
+}
+
+/** A single tool call's summary — its text runs, then diff paths. */
+export function toolCallCopyText(call: ChatDisplayBlock): string {
+  const parts: string[] = [];
+  const title = call.title || call.tool_kind;
+  if (title) parts.push(title);
+  for (const part of (call.content ?? []) as ToolCallPart[]) {
+    if (!part || typeof part !== "object") continue;
+    if (part.type === "text" && typeof part.text === "string" && part.text) {
+      parts.push(part.text);
+    } else if (part.type === "diff" && typeof part.path === "string") {
+      parts.push(`diff ${part.path}`);
+    }
+  }
+  return parts.join("\n");
+}
+
 /** Group visually adjacent tool calls in the same turn. Invisible usage
  * blocks may appear between calls; callers can still read them from the
  * original block list when showing token usage. */
