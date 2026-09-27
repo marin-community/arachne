@@ -542,6 +542,15 @@ pub struct ScratchUpload {
     pub content_base64: String,
 }
 
+/// A project reference from the webview: a layout group id (`null` =
+/// ungrouped) plus its display name. Projects are filing only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all(serialize = "snake_case", deserialize = "camelCase"))]
+pub struct ProjectRef {
+    pub id: Option<String>,
+    pub name: String,
+}
+
 #[cfg(test)]
 mod scratch_upload_tests {
     use super::ScratchUpload;

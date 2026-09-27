@@ -42,6 +42,7 @@ pub fn run() {
             commands::open_in_zed,
             commands::refresh_fleet,
             commands::reparent_session,
+            commands::create_group,
             commands::move_to_group,
             commands::delete_group,
             commands::integrate_session,

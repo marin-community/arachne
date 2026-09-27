@@ -226,6 +226,26 @@ async fn emit_fleet(app: &AppHandle, client: &Arc<LoomClient>, mut sessions: Vec
     );
 }
 
+/// `emit_fleet` with a caller-supplied layout (a mutation command already
+/// holds the fresh one) and a best-effort session list fetch. Pushing a
+/// snapshot for the mutation's own effect must never fail the command that
+/// produced it — loom's `layout` event also publishes it.
+async fn emit_fleet_with(
+    app: &AppHandle,
+    client: &Arc<LoomClient>,
+    layout: crate::loom::SessionLayoutView,
+) {
+    let mut sessions = match client.list_sessions().await {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+    let _ = app.emit(
+        "loom://fleet",
+        &FleetSnapshot { sessions, layout },
+    );
+}
+
 fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: CancellationToken) {
     tauri::async_runtime::spawn(async move {
         loop {
@@ -643,6 +663,9 @@ pub async fn launch_session(
     agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    // Project the thread was launched preselected to — the layout group
+    // to file the new session into.
+    project: Option<crate::loom::ProjectRef>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent_branch = match parent_id {
@@ -712,6 +735,11 @@ pub async fn launch_session(
     // parameter for callers that explicitly want an unmarked scratch thread.
     if parent_branch.is_none() && !one_off.unwrap_or(false) {
         let _ = client.set_tag(&view.id, "topic", "true").await;
+    }
+    // File the new topic into its project when one was preselected (a
+    // project is a placement group — filing only, never execution state).
+    if let Some(group_id) = project.as_ref().and_then(|p| p.id.as_deref()).filter(|id| !id.is_empty()) {
+        let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
     }
     // Loom does not publish a fleet event for description updates. Publish
     // the final launch state so the new topic card has its body immediately.
@@ -921,6 +949,33 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
     Ok(FleetSnapshot { sessions, layout })
 }
 
+/// Create a project (a placement group in a space). Projects are filing
+/// only — a group with no execution state (docs/design.md "User model").
+#[tauri::command]
+pub async fn create_group(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    space_id: String,
+    name: String,
+) -> Result<crate::loom::SessionLayoutView, UiError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(UiError {
+            message: "project name cannot be empty".into(),
+            unreachable: false,
+        });
+    }
+    let client = state_client(&state).await?;
+    let layout = client
+        .create_group(&space_id, &name)
+        .await
+        .map_err(Into::<UiError>::into)?;
+    // The fleet poller's `layout` subscription pushes the snapshot, but the
+    // new group should appear immediately — push it from the fresh layout.
+    emit_fleet_with(&app, &client, layout.clone()).await;
+    Ok(layout)
+}
+
 /// Delete a lane (placement group); its sessions move to the destination
 /// group first. Lanes are just filing — they are not topics.
 #[tauri::command]
@@ -939,13 +994,18 @@ pub async fn delete_group(
 /// Move sessions into a lane (placement group).
 #[tauri::command]
 pub async fn move_to_group(
+    app: AppHandle,
     state: State<'_, LoomState>,
     session_ids: Vec<String>,
     group_id: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
     let client = state_client(&state).await?;
     let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
-    client.move_sessions(&refs, &group_id).await.map_err(Into::into)
+    let layout = client.move_sessions(&refs, &group_id).await?;
+    // Loom publishes a layout SSE event, but push the fresh snapshot now so
+    // the topic visibly files under its new project heading immediately.
+    emit_fleet_with(&app, &client, layout.clone()).await;
+    Ok(layout)
 }
 
 /// Re-parent a session under another (its topic's top-level chat), or
