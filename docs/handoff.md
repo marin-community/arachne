@@ -159,7 +159,7 @@ Arachne should not expose Loom's entire control-plane vocabulary directly.
 
 The user-facing model is approximately:
 
-**Topics → Threads/Workers → Resources → Events → Attention**
+**Projects → Topics → Threads/Workers → Resources → Events → Attention**
 
 Loom implements much of the machinery underneath.
 
@@ -177,9 +177,19 @@ The lower-level runtime/control plane.
 
 Loom runs sessions, manages worktrees/runtimes, stores durable state, receives events, tracks GitHub state, etc.
 
+## Project
+
+A lightweight home for related Topics and their shared context. A Project
+bundles default Resources and launch settings: for example, two repositories,
+a design document, a primary repository, a runner, an agent and inference
+route, and a Topic branch policy. It is an organizer and source of defaults,
+not an execution object: it has no coordinator, mailbox, agent, or workers.
+Each Topic has one home Project and may explicitly bind Resources from another
+Project. A Project can span repositories; it is not synonymous with a repo.
+
 ## Topic
 
-A durable top-level unit of intent, context, resources, Todos, subscriptions,
+A durable unit of intent, context, resources, Todos, subscriptions,
 mailbox, coordinator Thread, workers, and integration state.
 
 Examples:
@@ -251,6 +261,8 @@ Resources include:
 - eventually W&B runs/projects, datasets, issues, services, etc.
 
 Resources should have identity independent of the session that happened to create them.
+Bindings to Projects, Topics, and Threads should preserve that identity and
+show where each binding came from.
 
 ## Todo
 
@@ -481,10 +493,12 @@ Roughly:
 
 ```text
 ┌─────────────────┬───────────────────────────────┬────────────────────┐
-│ TOPICS          │ Topic · current Thread        │ Threads            │
-│                 │                               │ Resources          │
-│ Arachne         │      conversation             │ Integrations       │
-│ TaskCompendium  │                               │ Todos              │
+│ PROJECTS/TOPICS │ Topic · current Thread        │ Threads            │
+│ Arachne         │                               │ Resources          │
+│   UI            │      conversation             │ Integrations       │
+│   Integration   │                               │ Todos              │
+│ Marin           │                               │                    │
+│   TaskCompendium│                               │                    │
 │ ...             │ [composer__________________]   │                    │
 └─────────────────┴───────────────────────────────┴────────────────────┘
 ```
@@ -493,11 +507,13 @@ The default **Topics home** screen should answer:
 
 > What is happening across everything, and what needs my attention?
 
-Topics home aggregates all Topics. The sidebar lists Topics, with **Topics
-[+]** opening the optional creation form in a sheet or popover. Every
-aggregate row names its parent Topic and opens that Thread. Inbox may remain
-a separate attention/review tab, but Topics home still includes all
-cross-Topic Needs You items.
+Topics home aggregates all Topics across all Projects. The sidebar groups
+Topics beneath Projects, with **Topics [+]** opening the optional creation
+form in a sheet or popover for the current Project. Every aggregate row names
+its Project and parent Topic and opens that Thread. Clicking a Project shows
+the same status groups filtered to its Topics; it does not open a Project
+chat. Inbox may remain a separate attention/review tab, but Topics home still
+includes all cross-Project Needs You items.
 
 Selecting a Topic normally opens its **coordinator conversation** in the main
 pane, making the coordinator the Topic's voice. First visit opens the
@@ -523,6 +539,10 @@ and de-emphasized/collapsible **Waiting / Resting**. A deliberately opened
 resources. It is accessible from the Topic/coordinator header, not the
 default destination. The Ready group contains only verified integration
 candidates; an idle or completed worker is not automatically Ready.
+
+Quick creation starts a Topic in the selected or default Project, even for a
+single prompt. Topic selection still opens its coordinator chat on first
+visit, then restores the last-opened Thread when available.
 
 Example:
 
@@ -624,6 +644,26 @@ Loom should recreate a checkout from the PR branch/head, register its associatio
 # Resources
 
 The data model should eventually distinguish resources explicitly.
+
+## Binding and defaults
+
+Resources can be bound at three scopes: **Project → Topic → Thread**. A Project
+supplies reusable repository, design document, and other Resource bindings
+plus launch defaults. A Topic inherits those bindings, adds or overrides its
+own, and may hide one for its own context without removing it from the
+Project. A Thread inherits the effective Topic context and adds its own
+worktree, PR, file, or artifact. The UI should show the origin of each binding
+and avoid duplicating the underlying Resource object.
+Project bindings can continue to supply shared references to existing Topics;
+Topic additions, overrides, and hides remain in effect.
+
+New Topics inherit the Project's current runner, agent, inference route,
+primary repo, branch creation policy, and integration policy unless the user
+overrides them. Record the chosen execution settings and canonical refs on
+the Topic. Changing Project defaults must not silently change active Topic
+branches, runners, or integration targets; applying a change to an existing
+Topic is explicit and reviewable. Inheritance of a Resource is context, not
+ownership of a checkout or permission to edit it.
 
 ## Repository
 
@@ -1260,6 +1300,7 @@ Add:
 - PR resources;
 - reliable “open the code” behavior;
 - basic Topics;
+- Project grouping and inherited resource/launch defaults;
 - resource attachment;
 - design-document resources;
 - keep/attach worktree;

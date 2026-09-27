@@ -461,6 +461,11 @@ Advanced users should be able to choose another target if necessary.
 # Topic branches
 
 A Topic may define one canonical branch/reference per repository.
+Its home Project can supply the repository set, branch creation policy, and
+integration defaults when the Topic is created. The selected per-repository
+refs and policies belong to the Topic thereafter. Changing a Project default
+does not silently retarget an active Topic or its pending integration queue;
+applying such a change requires an explicit, reviewable Topic update.
 
 Example:
 
