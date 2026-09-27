@@ -57,5 +57,8 @@ const html = computed(() => {
 </script>
 
 <template>
-  <div class="chat-markdown" v-html="html"></div>
+  <!-- data-markdown keeps the raw source on the rendered node so the
+       conversation's copy handler can rebuild a markdown clipboard flavor
+       (the DOM itself only holds rendered HTML). -->
+  <div class="chat-markdown" :data-markdown="text" v-html="html"></div>
 </template>
