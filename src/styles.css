@@ -1149,7 +1149,7 @@ button.danger:hover { border-color: var(--blocked); }
 }
 /* The topic body's wrap: anchor for the @-mention dropdown. */
 .nts-body-wrap { position: relative; }
-.nts-body-wrap textarea { display: block; }
+.nts-body-wrap textarea { display: block; width: 100%; }
 .mention-menu.nts-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
 /* Project context chip in the new-thread sheet header. */
 .nts-project {
@@ -1502,3 +1502,23 @@ button.danger:hover { border-color: var(--blocked); }
 }
 .todo-remove { flex: none; color: var(--text-dim); }
 .todo-remove:hover { color: var(--blocked); }
+
+/* --- Launch sheet: Repository + Base row ------------------------------ */
+/* Repository and Base split the row in half (with a gutter), matching the
+   sheet's other full-width fields; Base's dropdown anchors below its input
+   via the .nts-base-wrap wrapper (position: relative). */
+.nts-repo-base-row {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.nts-repo-base-row .nts-field { flex: 1 1 0; min-width: 0; }
+.nts-base-wrap { position: relative; }
+.nts-base-wrap input { width: 100%; }
+.nts-base-menu {
+  top: calc(100% + 3px);
+  bottom: auto;
+  left: 0;
+  width: 100%;
+}
+.nts-base-menu button small { color: var(--text-dim); }

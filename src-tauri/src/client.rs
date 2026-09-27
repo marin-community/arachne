@@ -388,6 +388,24 @@ impl LoomClient {
         self.op("/api/branches/list", &serde_json::json!({})).await
     }
 
+    /// `repos.list` — the managed-repo allowlist (slug → checkout path). The
+    /// launch sheet resolves an `owner/name` slug to a checkout for
+    /// `repos.branches`.
+    pub async fn list_repos(&self) -> Result<Vec<crate::loom::RepoView>, LoomError> {
+        self.op("/api/repos/list", &serde_json::json!({})).await
+    }
+
+    /// `repos.branches` — the local git branches of a repo checkout, and
+    /// which has a worktree. `cwd` is a server-side path (the checkout
+    /// itself resolves to its canonical repo root).
+    pub async fn repo_branches(
+        &self,
+        cwd: &str,
+    ) -> Result<Vec<crate::loom::RepoBranchView>, LoomError> {
+        self.op("/api/repos/branches", &serde_json::json!({ "cwd": cwd }))
+            .await
+    }
+
     /// `sessions.chat` — the conversation journal. `before` pages older
     /// turns (from the previous page's `older_cursor`); None = newest tail.
     pub async fn session_chat(

@@ -617,6 +617,33 @@ pub struct LaunchOptionsView {
 }
 
 // ---------------------------------------------------------------------------
+// Managed repositories and their branches
+// ---------------------------------------------------------------------------
+
+/// `repos.list` row — a managed repo in the clone allowlist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoView {
+    /// Canonical GitHub `owner/name`.
+    pub slug: String,
+    /// The clone source URL.
+    pub remote_url: String,
+    /// The managed on-disk checkout path (server-side filesystem path).
+    pub path: String,
+    pub created_at: String,
+}
+
+/// `repos.branches` row — one local git branch of a repo checkout, plus
+/// which has a worktree and whether it is the checkout's current branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoBranchView {
+    pub name: String,
+    pub worktree: Option<String>,
+    pub current: bool,
+}
+
+// ---------------------------------------------------------------------------
 // SSE event stream
 // ---------------------------------------------------------------------------
 

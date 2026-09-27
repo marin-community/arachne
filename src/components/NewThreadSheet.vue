@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-thread sheet: composing a thread happens in the main display
 // panel — the thread home — not in a cramped sidebar composer or a
@@ -35,12 +36,13 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+    meta?: { base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
   ): void;
 }>();
 
 const task = ref("");
 const repo = ref("marin-community/arachne");
+const base = ref("");
 const taskEl = ref<HTMLTextAreaElement | null>(null);
 const attachments = ref<FileAttachment[]>([]);
 const attachmentError = ref("");
@@ -209,6 +211,7 @@ function submit() {
   // (App closes it), while failure keeps the text for a retry.
   emit("launch", t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     ...launchConfig(),
+    base: base.value.trim() || undefined,
     mentions: mentions.value.filter((mention) => t.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: attachments.value,
@@ -298,31 +301,7 @@ function onGoalKeydown(event: KeyboardEvent) {
         <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
       </div>
 
-      <label class="nts-field">
-        <span class="nts-field-name">Repository</span>
-        <input
-          v-model="repo"
-          placeholder="owner/name"
-          spellcheck="false"
-          @keydown.enter.prevent="submit"
-        />
-        <span class="nts-hint">
-          A fresh worktree + branch is created from this repo.
-        </span>
-      </label>
-
-      <div
-        class="attachment-row"
-        @dragover.prevent
-        @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)"
-      >
-        <label class="attachment-pick">+ Attach files<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files to new thread" @change="onFileInput" /></label>
-        <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
-          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
-        </span>
-        <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
-        <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
-      </div>
+      <RepoBaseFields v-model:repo="repo" v-model:base="base" @submit="submit" />
 
       <div class="nts-field">
         <span class="nts-field-name">Launch config <em class="nts-opt">optional</em></span>

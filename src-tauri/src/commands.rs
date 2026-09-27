@@ -190,6 +190,31 @@ pub async fn launch_options(state: State<'_, LoomState>) -> Result<LaunchOptions
     client.launch_options().await.map_err(Into::into)
 }
 
+/// `repos.branches` for the launch sheet's Base picker: the local git
+/// branches of the repo the sheet is launching against. `repo` may be a
+/// managed `owner/name` slug (resolved through `repos.list` to its checkout
+/// path) or a plain server-side path — whatever loom's launch accepts, the
+/// picker accepts too.
+#[tauri::command]
+pub async fn repo_branches(
+    state: State<'_, LoomState>,
+    repo: String,
+) -> Result<Vec<crate::loom::RepoBranchView>, UiError> {
+    let client = state_client(&state).await?;
+    let slug = repo.trim();
+    let cwd = match client.list_repos().await {
+        Ok(repos) => match repos.iter().find(|r| r.slug == slug) {
+            Some(managed) => managed.path.clone(),
+            None => slug.to_string(),
+        },
+        // The allowlist lookup is a convenience, not a gate: a path (or an
+        // unlisted slug) still gets handed to loom, which reports the real
+        // error if nothing resolves.
+        Err(_) => slug.to_string(),
+    };
+    client.repo_branches(&cwd).await.map_err(Into::into)
+}
+
 /// Change the runtime selection of an idle ACP session. The Loom server
 /// rejects active turns; Arachne never interrupts one to force a handoff.
 #[tauri::command]
@@ -730,6 +755,7 @@ pub async fn launch_session(
     parent_id: Option<String>,
     title: Option<String>,
     description: Option<String>,
+    base: Option<String>,
     mentions: Option<Vec<ResourceMention>>,
     attachments: Option<Vec<crate::loom::ScratchUpload>>,
     profile: Option<String>,
@@ -788,6 +814,11 @@ pub async fn launch_session(
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
+            base: base
+                .as_deref()
+                .map(str::trim)
+                .filter(|b| !b.is_empty())
+                .map(String::from),
             title: Some(label),
             goal: Some(goal),
             parent_branch: parent_branch.clone(),

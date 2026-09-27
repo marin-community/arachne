@@ -3,6 +3,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-topic sheet: composing a topic takes over the main display panel
 // (grid-area main), exactly like the new-thread sheet — never a floating
@@ -28,7 +29,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
   ): void;
 }>();
 
@@ -37,6 +38,7 @@ const emit = defineEmits<{
 const title = ref("");
 const body = ref("");
 const repo = ref("marin-community/arachne");
+const base = ref("");
 const titleEl = ref<HTMLInputElement | null>(null);
 const bodyEl = ref<HTMLTextAreaElement | null>(null);
 
@@ -223,6 +225,7 @@ function submit() {
   emit("launch", b || t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     title: t || undefined,
     description: b || undefined,
+    base: base.value.trim() || undefined,
     mentions: mentions.value.filter((mention) => b.includes(mention.token))
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: attachments.value,
@@ -291,18 +294,7 @@ function submit() {
         <span class="nts-hint">Enter to launch · Shift+Enter for a new line · the body is the agent's opening message and the durable topic description</span>
       </label>
 
-      <label class="nts-field">
-        <span class="nts-field-name">Repository</span>
-        <input
-          v-model="repo"
-          placeholder="owner/name"
-          spellcheck="false"
-          @keydown.enter.prevent="submit"
-        />
-        <span class="nts-hint">
-          A fresh worktree + branch is created from this repo.
-        </span>
-      </label>
+      <RepoBaseFields v-model:repo="repo" v-model:base="base" @submit="submit" />
 
       <div
         class="attachment-row"

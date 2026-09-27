@@ -345,7 +345,7 @@ function onHome() {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
   completed?: (success: boolean) => void,
 ) {
   launching.value = true;
@@ -355,6 +355,7 @@ async function launchTask(
       task,
       title: meta?.title ?? null,
       description: meta?.description ?? null,
+      base: meta?.base ?? null,
       mentions: meta?.mentions ?? [],
       attachments: meta?.attachments?.map(({ name, contentBase64 }) => ({ name, contentBase64 })) ?? [],
       profile: meta?.profile || null,
@@ -387,7 +388,7 @@ async function launchTask(
 function launchTopic(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launchTask(task, repo, meta, (success) => {
     if (success) showNewTopic.value = false;
