@@ -153,3 +153,24 @@ impl DisplayBlock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preserves_max_tokens_turn_boundary_for_the_ui() {
+        let block = ChatBlockView {
+            seq: 9,
+            turn: 2,
+            kind: "turn_end".into(),
+            created_at: "2026-09-27T05:11:22Z".into(),
+            payload: serde_json::json!({ "stop_reason": "max_tokens" }),
+        };
+
+        match DisplayBlock::from_view(&block) {
+            DisplayBlock::TurnEnd { stop_reason } => assert_eq!(stop_reason, "max_tokens"),
+            other => panic!("expected turn_end, got {other:?}"),
+        }
+    }
+}

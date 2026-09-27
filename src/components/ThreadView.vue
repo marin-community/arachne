@@ -367,6 +367,24 @@ function toggle(i: number) {
   collapsed.value[i] = !isCollapsed(i);
 }
 
+// Normal/cancelled boundaries are transcript plumbing. Exceptional ACP stop
+// reasons are user-visible outcomes: without this, a max-token turn looks like
+// the agent simply went quiet (especially when its only output was thought).
+function turnEndMessage(reason?: string): string | null {
+  switch (reason) {
+    case "max_tokens":
+      return "The agent hit its response token limit before it could finish. Send a follow-up to continue.";
+    case "max_turn_requests":
+      return "The agent reached its turn-request limit before it could finish.";
+    case "refusal":
+      return "The agent refused this request.";
+    case "error":
+      return "The agent turn failed. Recover the session or send a follow-up to retry.";
+    default:
+      return null;
+  }
+}
+
 // Loom appends an orientation note to the launch goal
 // (loom-launch/provision.rs `entrance_note`, joined by a blank line —
 // build_launch_prompt parts.join("\n\n")). Split the goal from the note so
@@ -489,7 +507,18 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
           </template>
           <div v-else class="body">{{ b.text }}</div>
         </div>
-        <!-- usage / turn_end / unknown: no visual block -->
+        <!-- Exceptional turn boundaries must stay visible. In particular,
+             pi's `length` maps to ACP `max_tokens`: hiding it makes a turn
+             containing only reasoning look like a silent success. -->
+        <div
+          v-else-if="b.kind === 'turn_end' && turnEndMessage(b.stop_reason)"
+          class="block turn-error"
+          role="alert"
+        >
+          <div class="who">turn stopped · {{ b.stop_reason }}</div>
+          <div class="body">{{ turnEndMessage(b.stop_reason) }}</div>
+        </div>
+        <!-- usage / normal turn_end / unknown: no visual block -->
       </template>
       <!-- Working indicator: shown while an ACP turn is live or a prompt is
            queued behind it. Sits at the tail of the log so it reads as the
