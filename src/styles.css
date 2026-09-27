@@ -160,7 +160,151 @@ body {
   padding: 9px 13px 3px;
   font-weight: 650;
 }
-.topics-toolbar button { font-size: 18px; line-height: 1; padding: 2px 8px; }
+.topics-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.topics-toolbar-actions button { font-size: 18px; line-height: 1; padding: 2px 8px; }
+.topics-toolbar-actions .toolbar-new-project {
+  font-size: 11px;
+  padding: 3px 8px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.topics-toolbar-actions .toolbar-new-project:hover { color: var(--text); border-color: var(--accent); }
+
+/* New Project inline card (topics tab) — same shape as the quick input. */
+.new-project-card {
+  margin: 6px 10px 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.new-project-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+.new-project-head button { padding: 0 4px; font-size: 14px; }
+.new-project-card input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  outline: none;
+}
+.new-project-card input:focus { border-color: var(--accent); }
+.new-project-foot { display: flex; align-items: center; gap: 8px; }
+.new-project-hint { flex: 1; font-size: 11px; color: var(--text-dim); }
+.new-project-error { color: var(--blocked); font-size: 11.5px; }
+
+/* Project headings in the Topics tab: select filters the main-pane home. */
+.project-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 12px 2px 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid transparent;
+}
+.project-header:hover { background: var(--bg-hover); }
+.project-header.selected {
+  background: var(--bg-raised);
+  outline: 1px solid var(--border);
+}
+.project-chevron {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0;
+  width: 14px;
+  flex: 0 0 14px;
+  cursor: pointer;
+}
+.project-chevron:hover { color: var(--text); background: transparent; }
+.project-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-header.selected .project-name { color: var(--text); }
+.project-count {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border-radius: 10px;
+  padding: 0 7px;
+}
+.project-new-topic {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.project-new-topic:hover { color: var(--accent); background: transparent; }
+.project-empty {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 2px 10px 6px 34px;
+}
+
+/* Move to Project: a small popover menu on the topic card's foot. */
+.topic-move { position: relative; }
+.topic-move-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-decoration: underline dotted;
+}
+.topic-move-btn:hover { background: none; border: none; color: var(--text); }
+.topic-move-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  z-index: 40;
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .4);
+  overflow: hidden;
+}
+.topic-move-menu button {
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 11.5px;
+}
+.topic-move-menu button:hover { background: var(--bg-hover); }
+.topic-move-menu button.current { color: var(--text-dim); font-weight: 600; }
 .new-topic-overlay {
   position: fixed;
   inset: 28px 0 0;
@@ -1000,6 +1144,19 @@ button.danger:hover { border-color: var(--blocked); }
   color: var(--text-dim);
 }
 .nts-close:hover { color: var(--text); }
+.nts-project {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+}
 .nts-field {
   display: flex;
   flex-direction: column;
@@ -1081,6 +1238,7 @@ button.danger:hover { border-color: var(--blocked); }
 .home .home-heading > h1:not(.topic-dashboard-title) { font-size: 15px; font-weight: 600; color: var(--text-dim); }
 .home .home-new { padding: 5px 12px; }
 .home .topic-dashboard-title { font-size: 22px; color: var(--text); margin: 5px 0 8px; }
+.home .project-dashboard-title { font-size: 22px; color: var(--text); margin: 5px 0 8px; }
 .thread-breadcrumb { padding: 6px 14px 0; color: var(--text-dim); font-size: 11px; }
 .thread-breadcrumb button { color: var(--accent); border: 0; background: none; padding: 0; font-size: inherit; }
 .thread-breadcrumb button:hover { text-decoration: underline; background: none; }

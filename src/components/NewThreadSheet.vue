@@ -8,14 +8,17 @@ import { ref, onMounted, onUnmounted, nextTick } from "vue";
 // swaps the sheet for the live thread. On failure the sheet stays and the
 // draft survives, so a retry is one edit away.
 
+// The optional preselected project (Topics [+] on a project heading) is
+// shown as context in the sheet and forwarded on launch.
 const props = defineProps<{
   launching?: boolean;
   error?: string | null;
+  project?: { id: string | null; name: string } | null;
 }>();
 
 const emit = defineEmits<{
   (e: "close"): void;
-  (e: "launch", task: string, repo: string): void;
+  (e: "launch", task: string, repo: string, project?: { id: string | null; name: string }): void;
 }>();
 
 const task = ref("");
@@ -39,7 +42,7 @@ function submit() {
   if (!t || props.launching) return;
   // The draft is deliberately not cleared: success unmounts the sheet
   // (App closes it), while failure keeps the text for a retry.
-  emit("launch", t, repo.value.trim());
+  emit("launch", t, repo.value.trim(), props.project ?? undefined);
 }
 </script>
 
@@ -48,6 +51,7 @@ function submit() {
     <div class="nts-inner">
       <header class="nts-head">
         <h1>New thread</h1>
+        <span v-if="props.project" class="nts-project" :title="`Files under project ${props.project.name}`">{{ props.project.name }}</span>
         <button
           class="nts-close"
           title="Close (esc)"

@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { nextTick } from "vue";
 import type { SessionSummary, SessionLayout, LaunchOptions, ResourceMention } from "../App.vue";
 import { addAttachments, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
+import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -36,6 +37,9 @@ const emit = defineEmits<{
     expected?: { title: string; provenance: string },
   ): void;
   (e: "new-thread"): void;
+  // Topics [+] on a project heading: open NewThreadSheet preselected to
+  // that project (null = the Ungrouped section).
+  (e: "new-thread-in-project", project: ProjectRef | null): void;
   (
     e: "reparent",
     sessionId: string,
@@ -44,6 +48,9 @@ const emit = defineEmits<{
   ): void;
   (e: "delete-lane", laneId: string): void;
   (e: "archive", id: string): void;
+  // Selecting a project heading filters the main-pane home to that
+  // project's topics (null = the unfiltered Topics home).
+  (e: "select-project", project: ProjectRef | null): void;
 }>();
 
 const task = ref("");
@@ -351,6 +358,20 @@ function openNewTopic() {
 
 // --- Topics tab --------------------------------------------------------------
 
+// The Topics tab groups the same topic cards by Project: a non-system
+// layout group (projects.ts). The project heading carries the Topics [+]
+// affordance; clicking it opens NewThreadSheet preselected to that project.
+
+// Which project's heading is selected (filters the main-pane home). `null`
+// means nothing selected — the aggregate Topics home.
+const selectedProjectId = ref<string | null | undefined>(undefined);
+function selectProject(project: ProjectRef): void {
+  // Clicking an already-selected project clears the filter (a toggle, like
+  // the Topics home link).
+  selectedProjectId.value = selectedProjectId.value === project.id ? undefined : project.id;
+  emit("select-project", selectedProjectId.value === undefined ? null : project);
+}
+
 // A topic card's list entry: the leader session plus its delegated count.
 interface TopicEntry {
   session: SessionSummary;
@@ -382,6 +403,26 @@ const topics = computed<TopicEntry[]>(() => {
       a.session.last_activity_at < b.session.last_activity_at ? 1 : -1,
     );
 });
+
+// Topics filed under their project (a non-system layout group, per the
+// design's Project model). Sections keep layout order and empty projects
+// still render — a project is a place to file, not a topic count.
+// Ungrouped (and any empty section) starts collapsed by default; the user's
+// toggles override that default until the next visit.
+const projectOverrides = ref(new Map<string, boolean>());
+const projectSections = computed(() => buildProjectSections(topics.value, props.layout));
+function isProjectCollapsed(id: string | null): boolean {
+  const key = id ?? "ungrouped";
+  const override = projectOverrides.value.get(key);
+  if (override !== undefined) return override;
+  const section = projectSections.value.find((s) => s.id === id);
+  return !section || section.topics.length === 0;
+}
+function toggleProject(id: string | null) {
+  const key = id ?? "ungrouped";
+  const now = isProjectCollapsed(id);
+  projectOverrides.value.set(key, !now);
+}
 
 interface TopicThreadRow {
   session: SessionSummary;
@@ -647,6 +688,67 @@ function saveEdit(s: SessionSummary) {
     );
   else if (fields.description) emit("update-topic", s.id, fields);
   editingId.value = null;
+}
+
+// --- Projects: create, and move a topic into one --------------------------
+
+// A Project is a loom layout group (filing only — no execution state).
+// The home for creating and filing into groups: the user's own space when
+// it exists (where loom's Inbox lives), else the first space, else the
+// first space at all — mirrors the userInboxId fallback the Inbox tab uses.
+function projectSpaceId(): string | undefined {
+  const spaces = props.layout?.spaces ?? [];
+  const user = spaces.find((s) => s.system_key === "user" || s.name === "User");
+  const home = user ?? spaces.find((s) => s.groups.some((g) => !g.system_key)) ?? spaces[0];
+  return home?.id;
+}
+
+const showNewProject = ref(false);
+const newProjectName = ref("");
+const newProjectError = ref("");
+const newProjectEl = ref<HTMLInputElement | null>(null);
+function openNewProject() {
+  showNewProject.value = true;
+  newProjectError.value = "";
+  nextTick(() => newProjectEl.value?.focus());
+}
+async function submitNewProject() {
+  const name = newProjectName.value.trim();
+  const spaceId = projectSpaceId();
+  if (!name) return;
+  if (!spaceId) {
+    newProjectError.value = "no space available to create the project in";
+    return;
+  }
+  try {
+    await invoke("create_group", { spaceId, name });
+    newProjectName.value = "";
+    showNewProject.value = false;
+  } catch (e: any) {
+    newProjectError.value = e?.message ?? String(e);
+  }
+}
+
+// Move to Project: a small menu of the available projects (plus the user
+// Inbox, which files the topic back to unfiled).
+const moveMenuId = ref<string | null>(null);
+function toggleMoveMenu(id: string) {
+  moveMenuId.value = moveMenuId.value === id ? null : id;
+}
+const moveTargets = computed(() => {
+  const projects = layoutProjects(props.layout).map((p) => ({ id: p.id, name: p.name }));
+  if (userInboxId.value)
+    projects.push({ id: userInboxId.value, name: "Unfiled (Inbox)" });
+  return projects;
+});
+const projectIds = computed(() => new Set(moveTargets.value.map((t) => t.id)));
+async function moveToProject(topicId: string, groupId: string) {
+  moveMenuId.value = null;
+  try {
+    await invoke("move_to_group", { sessionIds: [topicId], groupId });
+  } catch (e: any) {
+    console.error("move_to_group failed", e);
+  }
 }
 
 // --- Drag & drop ------------------------------------------------------------
@@ -942,7 +1044,38 @@ async function archiveRow(id: string) {
     <template v-else>
       <div class="topics-toolbar">
         <span>Topics</span>
-        <button type="button" aria-label="New topic" title="New topic" @click="openNewTopic">+</button>
+        <div class="topics-toolbar-actions">
+          <button
+            type="button"
+            class="toolbar-new-project"
+            :title="'New project (a place to file topics)'"
+            :aria-expanded="showNewProject"
+            aria-controls="new-project-card"
+            @click="showNewProject ? (showNewProject = false) : openNewProject()"
+          >
+            + Project
+          </button>
+          <button type="button" aria-label="New topic" title="New topic" @click="openNewTopic">+</button>
+        </div>
+      </div>
+      <div v-if="showNewProject" class="new-project-card" id="new-project-card" role="dialog" aria-modal="false" aria-label="New project">
+        <div class="new-project-head">
+          <span>New project</span>
+          <button type="button" aria-label="Close new project" @click="showNewProject = false">×</button>
+        </div>
+        <input
+          ref="newProjectEl"
+          v-model="newProjectName"
+          placeholder="Project name"
+          aria-label="Project name"
+          @keydown.enter.prevent="submitNewProject"
+          @keydown.esc.stop="showNewProject = false"
+        />
+        <div v-if="newProjectError" class="new-project-error">{{ newProjectError }}</div>
+        <div class="new-project-foot">
+          <span class="new-project-hint">A place to file related topics.</span>
+          <button type="button" class="primary" :disabled="!newProjectName.trim()" @click="submitNewProject">Create</button>
+        </div>
       </div>
       <div v-if="showNewTopic" class="new-topic-overlay" @click.self="showNewTopic = false" @keydown.esc.stop="showNewTopic = false">
       <div class="new-topic-card" role="dialog" aria-modal="true" aria-label="New topic">
@@ -1028,7 +1161,41 @@ async function archiveRow(id: string) {
       </div>
 
       <div class="topic-list">
-        <template v-for="t in topics" :key="t.session.id">
+        <template v-for="section in projectSections" :key="section.id ?? 'ungrouped'">
+          <!-- Project heading: select filters the main-pane home to this
+               project's topics; the + opens NewThreadSheet preselected to
+               it; the chevron collapses the section. -->
+          <div
+            class="project-header"
+            :class="{ selected: selectedProjectId === section.id, empty: !section.topics.length }"
+            :title="selectedProjectId === section.id ? 'selected — click to clear the project filter' : 'filter home to this project'"
+            role="button"
+            tabindex="0"
+            :aria-expanded="!isProjectCollapsed(section.id)"
+            :aria-label="`Project ${section.name}${section.topics.length ? `, ${section.topics.length} topics` : ', no topics'}`"
+            @click="selectProject({ id: section.id, name: section.name })"
+            @keydown.enter.self="selectProject({ id: section.id, name: section.name })"
+            @keydown.space.self.prevent="selectProject({ id: section.id, name: section.name })"
+          >
+            <button
+              class="project-chevron"
+              type="button"
+              :title="isProjectCollapsed(section.id) ? 'Expand project' : 'Collapse project'"
+              :aria-label="`${isProjectCollapsed(section.id) ? 'Expand' : 'Collapse'} ${section.name}`"
+              @click.stop="toggleProject(section.id)"
+            >{{ isProjectCollapsed(section.id) ? "▸" : "▾" }}</button>
+            <span class="project-name">{{ section.name }}</span>
+            <span class="project-count" :title="`${section.topics.length} topics`">{{ section.topics.length }}</span>
+            <button
+              class="project-new-topic"
+              type="button"
+              :title="`New topic in ${section.name}`"
+              :aria-label="`New topic in ${section.name}`"
+              @click.stop="emit('new-thread-in-project', { id: section.id, name: section.name })"
+            >+</button>
+          </div>
+          <template v-if="!isProjectCollapsed(section.id)">
+        <template v-for="t in section.topics" :key="t.session.id">
         <div
           class="topic-card"
           :class="{
@@ -1120,6 +1287,23 @@ async function archiveRow(id: string) {
               <span class="topic-config-soon" title="topic config — coming soon"
                 >config ⚙</span
               >
+              <div class="topic-move">
+                <button
+                  class="topic-move-btn"
+                  type="button"
+                  title="Move to project"
+                  :aria-label="`Move ${t.session.branch.title || t.session.branch.name} to another project`"
+                  :aria-expanded="moveMenuId === t.session.id"
+                  @click.stop="toggleMoveMenu(t.session.id)"
+                >move</button>
+                <div v-if="moveMenuId === t.session.id" class="topic-move-menu" role="menu" :aria-label="`Move ${t.session.branch.title || t.session.branch.name} to project`">
+                  <button v-for="target in moveTargets" :key="target.id" type="button" role="menuitem"
+                    :class="{ current: topicProjectId(t.session, projectIds) === target.id }"
+                    @click.stop="moveToProject(t.session.id, target.id)">
+                    {{ target.name }}
+                  </button>
+                </div>
+              </div>
             </div>
           </template>
         </div>
@@ -1139,6 +1323,9 @@ async function archiveRow(id: string) {
           <span v-if="child.childCount" class="badge dim">{{ child.childCount }}</span>
           <span v-else-if="badgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ badgeLabel(child.session) }}</span>
         </div>
+        </template>
+          <div v-if="!section.topics.length" class="project-empty">No topics in this project yet.</div>
+          </template>
         </template>
         <div v-if="topics.length === 0" class="topic-empty">
           No topics yet — use + to create one.

@@ -257,10 +257,39 @@ function openNewThread() {
   showNewThread.value = true;
 }
 
+// FleetSidebar's project affordances route through here so App owns the
+// sheet. Navigation itself (the project-filtered home) is a separate
+// minimal handler — W1 owns the navigation refactor.
+const newThreadProject = ref<{ id: string | null; name: string } | null>(null);
+function openNewThreadInProject(project: { id: string | null; name: string } | null) {
+  connError.value = null;
+  newThreadProject.value = project;
+  showNewThread.value = true;
+}
+function closeNewThread() {
+  showNewThread.value = false;
+  newThreadProject.value = null;
+}
+
+// Selecting a project heading filters the main-pane home to that project's
+// topics (null = the aggregate Topics home).
+const selectedProject = ref<{ id: string | null; name: string } | null>(null);
+function selectProject(project: { id: string | null; name: string } | null) {
+  selectedProject.value = project;
+  showTopicsHome();
+}
+
+// Home button and breadcrumb: leaving home clears the project filter too
+// (the aggregate Topics home spans all projects).
+function onHome() {
+  selectedProject.value = null;
+  showTopicsHome();
+}
+
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
+  meta?: { title?: string; description?: string; oneOff?: boolean; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
   completed?: (success: boolean) => void,
 ) {
   launching.value = true;
@@ -277,6 +306,7 @@ async function launchTask(
       agent: meta?.agent || null,
       model: meta?.model || null,
       effort: meta?.effort || null,
+      project: meta?.project ?? null,
     });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
@@ -450,6 +480,8 @@ const selectedTopic = computed(() => {
       @launch="launchTask"
       @update-topic="updateTopic"
       @new-thread="openNewThread"
+      @new-thread-in-project="openNewThreadInProject"
+      @select-project="selectProject"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
       @archive="onArchived"
@@ -458,8 +490,9 @@ const selectedTopic = computed(() => {
       v-if="showNewThread"
       :launching="launching"
       :error="connError"
-      @close="showNewThread = false"
-      @launch="launchTask"
+      :project="newThreadProject"
+      @close="closeNewThread"
+      @launch="(task, repo, project) => launchTask(task, repo, project ? { project } : undefined)"
     />
     <ThreadView
       v-else-if="viewMode === 'thread' && selectedId && selectedView"
@@ -481,10 +514,12 @@ const selectedTopic = computed(() => {
       :key="viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'"
       :fleet="fleet"
       :topic="viewMode === 'topic' ? selectedTopic : null"
+      :project="selectedProject"
+      :layout="layout"
       @select="selectSession"
       @new-thread="openNewThread"
       @open-zed="openTopicInZed"
-      @home="showTopicsHome"
+      @home="onHome"
     />
     <ResourcePanel v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic"
       @close="showResources = false" @error="connError = $event" />

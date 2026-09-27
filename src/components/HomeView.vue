@@ -1,8 +1,18 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import type { SessionSummary } from "../App.vue";
+import type { SessionLayout, SessionSummary } from "../App.vue";
+import { layoutProjects, topicProjectId } from "../projects";
 
-const props = defineProps<{ fleet: SessionSummary[]; topic?: SessionSummary | null }>();
+const props = defineProps<{
+  fleet: SessionSummary[];
+  topic?: SessionSummary | null;
+  /** Selected project (from the sidebar's Topics tab): filters the home to
+   *  that project's topics. `null` = the aggregate Topics home. */
+  project?: { id: string | null; name: string } | null;
+  /** The session layout (from the fleet snapshot) — supplies the project
+   *  group ids. A project is a non-system layout group (src/projects.ts). */
+  layout?: SessionLayout | null;
+}>();
 const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "new-thread"): void;
@@ -11,6 +21,12 @@ const emit = defineEmits<{
 }>();
 
 const restingOpen = ref(false);
+const projectIds = computed(() => new Set(layoutProjects(props.layout).map((p) => p.id)));
+// A row's project: its root (coordinator) session's placement group when
+// that group is a non-system layout group — the same model the sidebar's
+// Topics tab uses (src/projects.ts).
+const projectIdOf = (s: SessionSummary): string | null =>
+  topicProjectId(rootOf(s), projectIds.value);
 const byId = computed(() => new Map(props.fleet.map((s) => [s.id, s])));
 const byBranch = computed(() => new Map(props.fleet.map((s) => [s.branch.id, s])));
 const parentOf = (s: SessionSummary) =>
@@ -70,7 +86,9 @@ function description(s: SessionSummary): string {
 }
 
 const scoped = computed(() => props.fleet.filter((s) =>
-  (s.status !== "archived" || isReady(s)) && (!props.topic || rootOf(s).id === props.topic.id),
+  (s.status !== "archived" || isReady(s)) &&
+  (!props.topic || rootOf(s).id === props.topic.id) &&
+  (props.project?.id == null || projectIdOf(s) === props.project.id),
 ));
 const byRecency = (a: SessionSummary, b: SessionSummary) => b.last_activity_at.localeCompare(a.last_activity_at);
 const needs = computed(() => scoped.value.filter((s) => level(s) !== "ok")
@@ -97,6 +115,10 @@ const sections = computed(() => [
           <template v-if="topic">
             <div class="home-breadcrumb"><button @click="emit('home')">Topics home</button> → {{ title(topic) }}</div>
             <h1 class="topic-dashboard-title">{{ title(topic) }}</h1>
+          </template>
+          <template v-else-if="project">
+            <div class="home-breadcrumb"><button @click="emit('home')">Topics home</button> → {{ project.name }}</div>
+            <h1 class="project-dashboard-title">{{ project.name }}</h1>
           </template>
           <h1 v-else>Topics home</h1>
         </div>
