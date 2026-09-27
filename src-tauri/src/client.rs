@@ -395,9 +395,11 @@ impl LoomClient {
         self.op("/api/repos/list", &serde_json::json!({})).await
     }
 
-    /// `repos.branches` — the local git branches of a repo checkout, and
-    /// which has a worktree. `cwd` is a server-side path (the checkout
-    /// itself resolves to its canonical repo root).
+    /// `repos.branches` — the local branches of a repository checkout and
+    /// which one the primary checkout (the main worktree) currently has
+    /// checked out. `cwd` is a server-side path (the checkout itself resolves
+    /// to its canonical repo root); loopback trust or a user PAT grants it,
+    /// an agent session token does not.
     pub async fn repo_branches(
         &self,
         cwd: &str,
