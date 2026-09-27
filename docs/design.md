@@ -84,7 +84,12 @@ The current bootstrap build opens a scoped dashboard on Topic selection. Keep
 that view as Overview when changing the default route to chat; do not discard
 its aggregate status work.
 
-The sidebar groups Topics under their home Projects. **Topics [+]** in a
+The sidebar groups Topics under their home Projects. Archived Topics
+(archived leaders) disappear from the list by default — archiving in Loom
+tears down the checkout, so a done Topic is history, not fleet — and a
+filter toggle in the toolbar shows them again, dimmed, with their
+descendant threads. Archived child threads keep a live Topic's shape
+(stay counted, dimmed) rather than vanishing. **Topics [+]** in a
 Project opens the optional title/body/attachment creation form in a sheet or
 popover, preselected to that Project; the form does not permanently occupy
 sidebar space. Inbox may remain a separate tab, but its purpose is

@@ -165,6 +165,31 @@ body {
 }
 .topics-toolbar-actions .toolbar-new-project:hover { color: var(--text); border-color: var(--accent); }
 
+/* Archived filter toggle (topics toolbar): an off toggle reads quiet and
+   borderless, like the + Project button; on is accent-tinted. */
+.topics-toolbar-actions .toolbar-filter {
+  font-size: 11px;
+  padding: 3px 8px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.topics-toolbar-actions .toolbar-filter:hover { color: var(--text); border-color: var(--accent); }
+.topics-toolbar-actions .toolbar-filter.on {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* The inline toggle inside the all-archived empty state. */
+.topic-empty-toggle {
+  background: none;
+  border: none;
+  padding: 0 1px;
+  font-size: 12px;
+  color: var(--accent);
+  text-decoration: underline dotted;
+}
+.topic-empty-toggle:hover { background: none; color: var(--text); }
+
 /* New Project inline card (topics tab) — same shape as the sheet inputs. */
 .new-project-card {
   margin: 6px 10px 2px;

@@ -3,6 +3,12 @@ import { ref, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
+import {
+  archivedTopicCount as countArchivedTopics,
+  buildTopicList,
+  childrenMap as buildChildrenMap,
+  visibleTopics,
+} from "../topicList";
 import { byTopicRecency, topicRecencyMap } from "../topicOrder";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
@@ -48,6 +54,11 @@ const emit = defineEmits<{
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
+
+// The Archived filter (topics toolbar): archived leaders disappear from
+// the Topics list by default; this toggle shows them again. See the topic
+// list block below for the model.
+const showArchived = ref(false);
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
 // (agent self-report) and `triage` (outside assessment) carry values
@@ -311,40 +322,24 @@ function selectProject(project: ProjectRef): void {
   emit("select-project", selectedProjectId.value === undefined ? null : project);
 }
 
-// A topic card's list entry: the leader session plus its delegated count.
-interface TopicEntry {
-  session: SessionSummary;
-  childCount: number;
-}
-
 // Every top-level thread is a topic, including legacy single-prompt launches
-// that predate the marker. Archived leaders stay listed with their descendants.
+// that predate the marker. Archived leaders disappear by default (loom's
+// archive tears down the checkout — a done topic is history, not fleet); the
+// toolbar's Archived toggle shows them again, dimmed, with descendants.
 // Order is by when a person last steered the topic — the newest user
-// message anywhere in its subtree — not by agent busyness:
+// message anywhere in its subtree (src/topicOrder.ts) — not agent busyness:
 // `last_activity_at` restamps on every streamed frame, which made the cards
-// jump around while workers ran (src/topicOrder.ts).
+// jump around while workers ran. The list logic lives in src/topicList.ts
+// (tests/topicList.test.mjs).
 const topicRecency = computed(() => topicRecencyMap(props.fleet));
-const topics = computed<TopicEntry[]>(() => {
-  const byId = new Map(props.fleet.map((s) => [s.id, s]));
-  const byBranch = new Map(props.fleet.map((s) => [s.branch.id, s]));
-  const parentOf = (s: SessionSummary) =>
-    (s.parent_session_id ? byId.get(s.parent_session_id) : undefined) ??
-    (s.parent_id ? byBranch.get(s.parent_id) : undefined);
-  const childCount = new Map<string, number>();
-  for (const s of props.fleet) {
-    const p = parentOf(s);
-    if (p && p.id !== s.id)
-      childCount.set(p.id, (childCount.get(p.id) ?? 0) + 1);
-  }
-  return props.fleet
-    .filter((s) => {
-      const p = parentOf(s);
-      const topLevel = !p || p.id === s.id;
-      return topLevel;
-    })
-    .map((s) => ({ session: s, childCount: childCount.get(s.id) ?? 0 }))
-    .sort((a, b) => byTopicRecency(topicRecency.value)(a.session, b.session));
-});
+const allTopics = computed(() =>
+  buildTopicList(props.fleet, byTopicRecency(topicRecency.value)),
+);
+// Archived leaders are dropped unless the Archived toggle is on.
+const topics = computed(() => visibleTopics(allTopics.value, showArchived.value));
+// Archived leaders hidden by the default filter — surfaced in the empty
+// state so "everything is archived" never reads as "no topics exist".
+const archivedCount = computed(() => countArchivedTopics(allTopics.value));
 
 // Topics filed under their project (a non-system layout group, per the
 // design's Project model). Sections keep layout order and empty projects
@@ -369,27 +364,19 @@ function toggleProject(id: string | null) {
 interface TopicThreadRow {
   session: SessionSummary;
   depth: number;
-  childCount: number;
 }
 
-const topicChildren = computed(() => {
-  const byId = new Map(props.fleet.map((session) => [session.id, session]));
-  const byBranch = new Map(props.fleet.map((session) => [session.branch.id, session]));
-  const children = new Map<string, SessionSummary[]>();
-  for (const session of props.fleet) {
-    const parent =
-      (session.parent_session_id ? byId.get(session.parent_session_id) : undefined) ??
-      (session.parent_id ? byBranch.get(session.parent_id) : undefined);
-    if (!parent || parent.id === session.id) continue;
-    const siblings = children.get(parent.id) ?? [];
-    siblings.push(session);
-    children.set(parent.id, siblings);
-  }
-  for (const siblings of children.values()) {
-    siblings.sort((a, b) => b.last_activity_at.localeCompare(a.last_activity_at));
-  }
-  return children;
-});
+const topicChildren = computed(() => buildChildrenMap(props.fleet));
+
+// The badge count matches what's visible: archived children are part of a
+// topic's shape but the default filter hides them, so the card's count (and
+// its expander) reflects the live rows unless the Archived toggle is on.
+function filteredChildCount(sessionId: string): number {
+  const kids = topicChildren.value.get(sessionId) ?? [];
+  return showArchived.value
+    ? kids.length
+    : kids.filter((s) => s.status !== "archived").length;
+}
 
 function visibleTopicChildren(rootId: string): TopicThreadRow[] {
   const rows: TopicThreadRow[] = [];
@@ -399,12 +386,17 @@ function visibleTopicChildren(rootId: string): TopicThreadRow[] {
     for (const session of topicChildren.value.get(parentId) ?? []) {
       if (seen.has(session.id)) continue;
       seen.add(session.id);
-      rows.push({ session, depth, childCount: topicChildren.value.get(session.id)?.length ?? 0 });
+      rows.push({ session, depth });
       walk(session.id, depth + 1);
     }
   };
+  // The same Archived filter as the leaders: archived child threads
+  // disappear from the Topics list by default (they return, dimmed, with
+  // the toggle).
   walk(rootId, 1);
-  return rows;
+  return showArchived.value
+    ? rows
+    : rows.filter((r) => r.session.status !== "archived");
 }
 
 // A topic has a short title and a substantive body. The body is both the
@@ -774,6 +766,17 @@ async function archiveRow(id: string) {
         <div class="topics-toolbar-actions">
           <button
             type="button"
+            class="toolbar-filter"
+            :class="{ on: showArchived }"
+            :aria-pressed="showArchived"
+            title="Show archived topics (they stay hidden by default — archiving tears down the checkout)"
+            aria-label="Show archived topics"
+            @click="showArchived = !showArchived"
+          >
+            Archived
+          </button>
+          <button
+            type="button"
             class="toolbar-new-project"
             :title="'New project (a place to file topics)'"
             :aria-expanded="showNewProject"
@@ -907,7 +910,7 @@ async function archiveRow(id: string) {
           </template>
           <template v-else>
             <div class="topic-head">
-              <button v-if="t.childCount" class="topic-chevron" type="button"
+              <button v-if="filteredChildCount(t.session.id)" class="topic-chevron" type="button"
                 :aria-label="`${collapsed.has(t.session.id) ? 'Expand' : 'Collapse'} threads in ${t.session.branch.title || t.session.branch.name}`"
                 :aria-expanded="!collapsed.has(t.session.id)"
                 @click.stop="toggle(t.session.id)">{{ collapsed.has(t.session.id) ? '▸' : '▾' }}</button>
@@ -939,8 +942,8 @@ async function archiveRow(id: string) {
               "no description yet"
             }}</div>
             <div class="topic-foot">
-              <span class="badge dim" v-if="t.childCount > 0" :title="`${t.childCount} delegated children`">{{
-                t.childCount
+              <span class="badge dim" v-if="filteredChildCount(t.session.id) > 0" :title="`${filteredChildCount(t.session.id)} delegated children`">{{
+                filteredChildCount(t.session.id)
               }}</span>
               <span class="topic-branch">{{
                 t.session.branch.name || t.session.branch.branch
@@ -984,13 +987,13 @@ async function archiveRow(id: string) {
           @click="emit('select', child.session.id)"
           @keydown.enter.self="emit('select', child.session.id)"
           @keydown.space.self.prevent="emit('select', child.session.id)">
-          <button v-if="child.childCount" class="topic-chevron" type="button"
+          <button v-if="filteredChildCount(child.session.id)" class="topic-chevron" type="button"
             :aria-label="`${collapsed.has(child.session.id) ? 'Expand' : 'Collapse'} subthreads in ${child.session.branch.title || child.session.branch.name}`"
             :aria-expanded="!collapsed.has(child.session.id)"
             @click.stop="toggle(child.session.id)">{{ collapsed.has(child.session.id) ? '▸' : '▾' }}</button>
           <span v-else class="topic-thread-spacer" aria-hidden="true"></span>
           <span class="topic-thread-title">{{ child.session.branch.title || child.session.branch.name }}</span>
-          <span v-if="child.childCount" class="badge dim">{{ child.childCount }}</span>
+          <span v-if="filteredChildCount(child.session.id)" class="badge dim">{{ filteredChildCount(child.session.id) }}</span>
           <span v-else-if="badgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ badgeLabel(child.session) }}</span>
         </div>
         </template>
@@ -998,7 +1001,12 @@ async function archiveRow(id: string) {
           </template>
         </div>
         <div v-if="topics.length === 0" class="topic-empty">
-          No topics yet — use + to create one.
+          <template v-if="archivedCount > 0">
+            No active topics — {{ archivedCount }} archived. Turn on
+            <button type="button" class="topic-empty-toggle" @click="showArchived = true">Archived</button>
+            to see them.
+          </template>
+          <template v-else>No topics yet — use + to create one.</template>
         </div>
       </div>
     </template>
