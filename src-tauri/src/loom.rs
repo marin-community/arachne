@@ -39,9 +39,29 @@ pub struct BranchSummaryView {
     pub goal: String,
     #[serde(default)]
     pub description: String,
+    /// Title ownership for compare-and-swap renames via `sessions.update`
+    /// (`user`/`agent`/`derived`/…). Always present on loom's wire; the
+    /// default only keeps older payloads decoding.
+    #[serde(default)]
+    pub title_provenance: String,
     pub repo_root: String,
     #[serde(default)]
+    pub github: Option<GithubStatusView>,
+    #[serde(default)]
+    pub github_pr: Option<i64>,
+    #[serde(default)]
     pub tags: Vec<TagView>,
+}
+
+/// The small part of Loom's cached PR snapshot the resource strip needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GithubStatusView {
+    pub pr_number: i64,
+    pub pr_url: String,
+    pub pr_state: String,
+    pub checks: Option<String>,
+    pub review_decision: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +187,16 @@ pub struct SessionGroupView {
     pub session_ids: Vec<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Update (topic metadata: title / goal / description)
+// ---------------------------------------------------------------------------
+
+/// Request for `POST /api/sessions/update`. `title` renames require the
+/// compare-and-swap fence (`expected_title` + `expected_title_provenance`)
+/// observed by the caller, so concurrent edits are rejected rather than
+/// silently overwritten. `description` is the agent's current-state message
+/// shown beside the attention level — for the topic card it's the durable
+/// short description a human writes.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionsUpdateInput {
@@ -216,6 +246,251 @@ pub struct ChatCursorView {
 }
 
 // ---------------------------------------------------------------------------
+// Worktree changes (integration surface)
+// ---------------------------------------------------------------------------
+
+/// `sessions.changes` — committed and uncommitted changes against the
+/// recorded base ref. Only the totals feed the UI's integrate affordance (the
+/// full per-file hunks stay available for a future review pane).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ChangeSetView {
+    pub version: Option<String>,
+    pub base: serde_json::Value,
+    pub head_oid: Option<String>,
+    #[serde(default)]
+    pub totals: ChangeTotalsView,
+    #[serde(default)]
+    pub files: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ChangeTotalsView {
+    #[serde(default)]
+    pub files: u32,
+    #[serde(default)]
+    pub additions: u32,
+    #[serde(default)]
+    pub deletions: u32,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Integration (spec: docs/integration-and-landing.md)
+// ---------------------------------------------------------------------------
+
+/// The integration strategies the Integrate split button offers. Wire-safe
+/// mirror of the strategies in the spec; the coordinator's skill is the
+/// authority on what each one *means* — these are intent constraints, not
+/// raw git commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IntegrationStrategy {
+    Squash,
+    Merge,
+    Rebase,
+    CherryPick,
+    OpenPr,
+    Push,
+    Ask,
+}
+
+impl IntegrationStrategy {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "squash" => Self::Squash,
+            "merge" => Self::Merge,
+            "rebase" => Self::Rebase,
+            "cherry-pick" => Self::CherryPick,
+            "open-pr" => Self::OpenPr,
+            "push" => Self::Push,
+            "ask" | "ask-coordinator" => Self::Ask,
+            _ => return None,
+        })
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+            Self::CherryPick => "cherry-pick",
+            Self::OpenPr => "open-pr",
+            Self::Push => "push",
+            Self::Ask => "ask",
+        }
+    }
+
+    /// The label in the split button's dropdown.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Squash => "Squash into topic",
+            Self::Merge => "Merge into topic",
+            Self::Rebase => "Rebase onto topic",
+            Self::CherryPick => "Cherry-pick commits",
+            Self::OpenPr => "Open PR into topic",
+            Self::Push => "Push topic branch",
+            Self::Ask => "Ask coordinator to decide",
+        }
+    }
+}
+
+/// A structured integration request, as sent to the coordinator thread.
+/// The spec: "Integration is an agent action with an explicit strategy"
+/// — the button and the sentence "Integrate the Zed worker into the
+/// Arachne topic" produce the same payload. The coordinator consumes it
+/// with the integration skill (skills/integration.md shipped in this
+/// repo) and stays responsible for the git operations, validation, and
+/// reporting.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct IntegrationRequest {
+    pub action: &'static str,
+    pub source_session: String,
+    pub source_branch: String,
+    pub source_work_dir: String,
+    pub repo_root: String,
+    pub target_session: String,
+    pub target_branch: String,
+    pub strategy: IntegrationStrategy,
+    pub requested_by: &'static str,
+}
+
+impl IntegrationRequest {
+    /// Render the request as the prompt the coordinator reads. Structured
+    /// payload first (machine-parseable), then a human-readable statement
+    /// — the skill instructs the agent to treat both as the same intent.
+    pub fn to_prompt(&self, topic_name: &str) -> String {
+        let strategy = match self.strategy {
+            IntegrationStrategy::Squash => "squash".to_string(),
+            IntegrationStrategy::Merge => "merge".to_string(),
+            IntegrationStrategy::Rebase => "rebase".to_string(),
+            IntegrationStrategy::CherryPick => "cherry-pick".to_string(),
+            IntegrationStrategy::OpenPr => "open-pr".to_string(),
+            IntegrationStrategy::Push => "push".to_string(),
+            IntegrationStrategy::Ask => "decide".to_string(),
+        };
+        let request = format!(
+            "**Integration request**\n\
+\n\
+Integrate the work from session `{source}` (branch `{source_branch}`, worktree `{source_work}`) \
+into this topic's accepted state for repository `{repo}`, using strategy **{strategy}**. \
+Apply the integration skill: inspect source and target state, verify the result is complete, \
+resolve straightforward conflicts, run validation, update the topic branch, and report the \
+outcome concisely. If the conflict needs product judgment, escalate rather than inventing a \
+decision.\n\
+\n\
+```json\n{json}\n```",
+            source = self.source_session,
+            source_branch = self.source_branch,
+            source_work = self.source_work_dir,
+            repo = self.repo_root,
+            json = serde_json::json!({
+                "action": "integrate",
+                "source_thread": self.source_session,
+                "source_resource": self.source_branch,
+                "source_work": self.source_work_dir,
+                "repository": self.repo_root,
+                "target_thread": self.target_session,
+                "target_scope": topic_name,
+                "target_resource": self.target_branch,
+                "strategy": strategy,
+                "requested_by": "user",
+            })
+            .to_string(),
+        );
+        format!("{request}\n\n## Integration procedure\n\n{}", include_str!("../../skills/integration.md"))
+    }
+}
+
+/// A landing request (Topic → upstream), the sibling of IntegrationRequest.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LandingRequest {
+    pub action: &'static str,
+    pub source_branch: String,
+    pub target_upstream: String,
+    pub strategy: IntegrationStrategy,
+    pub requested_by: &'static str,
+}
+
+impl LandingRequest {
+    pub fn to_prompt(&self, topic_name: &str) -> String {
+        let strategy = match self.strategy {
+            IntegrationStrategy::Squash => "squash".to_string(),
+            IntegrationStrategy::Merge => "merge".to_string(),
+            IntegrationStrategy::Rebase => "rebase".to_string(),
+            IntegrationStrategy::CherryPick => "cherry-pick".to_string(),
+            IntegrationStrategy::OpenPr => "open-pr".to_string(),
+            IntegrationStrategy::Push => "push".to_string(),
+            IntegrationStrategy::Ask => "decide".to_string(),
+        };
+        let request = format!(
+            "**Landing request**\n\
+\n\
+Land this topic's accepted state: branch `{branch}` → `{upstream}` for topic **{topic}**, \
+using strategy **{strategy}**. Apply the integration skill's landing rules: inspect the \
+topic branch state, run required validation, create the PR or update the target, and report \
+the outcome. Prefer opening a PR when policy is unclear.\n\
+\n\
+```json\n{json}\n```",
+            branch = self.source_branch,
+            upstream = self.target_upstream,
+            topic = topic_name,
+            json = serde_json::json!({
+                "action": "land",
+                "source_thread": topic_name,
+                "source_resource": self.source_branch,
+                "target_resource": self.target_upstream,
+                "strategy": strategy,
+                "requested_by": "user",
+            })
+            .to_string(),
+        );
+        format!("{request}\n\n## Integration procedure\n\n{}", include_str!("../../skills/integration.md"))
+    }
+}
+
+#[cfg(test)]
+mod integration_prompt_tests {
+    use super::{IntegrationRequest, IntegrationStrategy, LandingRequest};
+
+    #[test]
+    fn integration_request_carries_source_target_and_procedure() {
+        let prompt = IntegrationRequest {
+            action: "integrate",
+            source_session: "worker-1".into(),
+            source_branch: "worker-branch".into(),
+            source_work_dir: "/tmp/worker".into(),
+            repo_root: "/tmp/repo".into(),
+            target_session: "topic-1".into(),
+            target_branch: "topic-branch".into(),
+            strategy: IntegrationStrategy::Squash,
+            requested_by: "user",
+        }.to_prompt("Topic");
+        assert!(prompt.contains("\"source_work\":\"/tmp/worker\""));
+        assert!(prompt.contains("\"target_resource\":\"topic-branch\""));
+        assert!(prompt.contains("One active writer per worktree"));
+    }
+
+    #[test]
+    fn landing_push_is_a_supported_strategy() {
+        assert_eq!(IntegrationStrategy::parse("push"), Some(IntegrationStrategy::Push));
+        let prompt = LandingRequest {
+            action: "land", source_branch: "topic-branch".into(),
+            target_upstream: "origin/main".into(),
+            strategy: IntegrationStrategy::Push, requested_by: "user",
+        }.to_prompt("Topic");
+        assert!(prompt.contains("\"strategy\":\"push\""));
+        assert!(prompt.contains("origin/main"));
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Launch
 // ---------------------------------------------------------------------------
 
@@ -251,9 +526,73 @@ pub struct SessionsLaunchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub scratch: Vec<ScratchUpload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all(serialize = "snake_case", deserialize = "camelCase"))]
+pub struct ScratchUpload {
+    pub name: String,
+    pub content_base64: String,
+}
+
+#[cfg(test)]
+mod scratch_upload_tests {
+    use super::ScratchUpload;
+
+    #[test]
+    fn webview_and_loom_use_their_respective_field_names() {
+        let upload: ScratchUpload = serde_json::from_value(serde_json::json!({
+            "name": "notes.txt", "contentBase64": "aGk="
+        })).unwrap();
+        assert_eq!(upload.content_base64, "aGk=");
+        let value = serde_json::to_value(upload).unwrap();
+        assert_eq!(value["content_base64"], "aGk=");
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchProfileView {
+    pub name: String,
+    pub description: String,
+    pub agent_kind: String,
+    pub model: String,
+    pub effort: String,
+    pub class: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentChoiceView {
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMetadataView {
+    pub kind: String,
+    pub label: String,
+    pub models: Vec<AgentChoiceView>,
+    pub efforts: Vec<AgentChoiceView>,
+    pub accepts_raw_model: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentsView {
+    pub agents: Vec<AgentMetadataView>,
+    pub default_agent: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchOptionsView {
+    pub profiles: Vec<LaunchProfileView>,
+    pub agents: Vec<AgentMetadataView>,
+    pub default_agent: String,
 }
 
 // ---------------------------------------------------------------------------

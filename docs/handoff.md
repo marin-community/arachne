@@ -128,6 +128,17 @@ It is MIT licensed.
 
 Be willing to inspect and reuse code or concepts from other OSS agent managers, terminal tools, worktree managers, remote-development tools, etc.
 
+Specific design references to investigate:
+
+- Gas Town's integration candidates, Refinery, and merge-queue direction;
+- Stoneforge's disposable integration worktree and mechanical merge/test path;
+- `wta`'s preflight conflict preview;
+- Claude Code and OpenCode, alongside Codex, for the vanilla harness layer:
+  thread/session operations, worktrees, resumability, and permissions.
+
+These are inspirations, not dependencies or evidence that their internals fit
+Loom unchanged.
+
 Rule:
 
 > Search before building, but vendor/reuse only when doing so is actually simpler or better.
@@ -148,7 +159,7 @@ Arachne should not expose Loom's entire control-plane vocabulary directly.
 
 The user-facing model is approximately:
 
-**Topics → Threads/Workers → Resources → Events → Attention**
+**Projects → Topics → Threads/Workers → Resources → Events → Attention**
 
 Loom implements much of the machinery underneath.
 
@@ -166,9 +177,20 @@ The lower-level runtime/control plane.
 
 Loom runs sessions, manages worktrees/runtimes, stores durable state, receives events, tracks GitHub state, etc.
 
+## Project
+
+A lightweight home for related Topics and their shared context. A Project
+bundles default Resources and launch settings: for example, two repositories,
+a design document, a primary repository, a runner, an agent and inference
+route, and a Topic branch policy. It is an organizer and source of defaults,
+not an execution object: it has no coordinator, mailbox, agent, or workers.
+Each Topic has one home Project and may explicitly bind Resources from another
+Project. A Project can span repositories; it is not synonymous with a repo.
+
 ## Topic
 
-A durable unit of intent.
+A durable unit of intent, context, resources, Todos, subscriptions,
+mailbox, coordinator Thread, workers, and integration state.
 
 Examples:
 
@@ -193,6 +215,11 @@ It can:
 - escalate something to human attention.
 
 A topic is **not a worktree** and is **not necessarily a continuously running model process**.
+It may span multiple repositories. Each attached repository may have its own
+canonical Topic branch/ref for accepted code state; there is no universal
+Topic branch. A human-facing checkout is optional and reconstructible from its
+ref. Every new top-level conversation, including a quick one-prompt launch, is
+a Topic and may acquire workers later.
 
 Long term, think of it as a durable actor with a mailbox that occasionally invokes an LLM.
 
@@ -234,23 +261,39 @@ Resources include:
 - eventually W&B runs/projects, datasets, issues, services, etc.
 
 Resources should have identity independent of the session that happened to create them.
+Bindings to Projects, Topics, and Threads should preserve that identity and
+show where each binding came from.
+
+## Todo
+
+A durable, cross-topic action for the person. The user Todo list is separate
+from a Topic's plan/backlog and from worker-internal checklists. Integration
+and review decisions may create user Todos.
 
 ## Event
 
-Something delivered into a topic/thread mailbox.
+An immutable fact that something happened. Its Source is the emitter; a
+Subscription selects which Events a Topic or Thread cares about; its Mailbox
+holds pending Events/messages durably; a Wake is the decision to invoke an
+agent because of queued Events. Delivery alone does not imply a Wake.
 
 Examples:
 
 - human message;
+- another Thread's note or selected result;
 - worker completion;
 - worker escalation;
 - GitHub review;
 - CI state change;
 - W&B alert;
-- timer;
+- heartbeat, timer, or cron;
 - webhook;
-- another thread sending knowledge;
+- integration conflict after Topic state advances;
 - a runner becoming available.
+
+Events can be coalesced, handled deterministically, or held until a later
+Wake. This is the common mechanism behind watches, scheduled automations,
+cross-thread delivery, and manual messages, without agent busy waiting.
 
 ## Attention
 
@@ -450,18 +493,56 @@ Roughly:
 
 ```text
 ┌─────────────────┬───────────────────────────────┬────────────────────┐
-│ ATTENTION       │                               │ RESOURCES / DIFF   │
-│                 │         THREAD                │                    │
-│ TOPICS     │                               │ PR                 │
-│                 │      conversation             │ Worktree           │
-│ QUICK TASKS     │                               │ Files              │
-│                 │                               │                    │
+│ PROJECTS/TOPICS │ Topic · current Thread        │ Threads            │
+│ Arachne         │                               │ Resources          │
+│   UI            │      conversation             │ Integrations       │
+│   Integration   │                               │ Todos              │
+│ Marin           │                               │                    │
+│   TaskCompendium│                               │                    │
+│ ...             │ [composer__________________]   │                    │
 └─────────────────┴───────────────────────────────┴────────────────────┘
 ```
 
-The default home screen should answer:
+The default **Topics home** screen should answer:
 
-> What needs me?
+> What is happening across everything, and what needs my attention?
+
+Topics home aggregates all Topics across all Projects. The sidebar groups
+Topics beneath Projects, with **Topics [+]** opening the optional creation
+form in a sheet or popover for the current Project. Every aggregate row names
+its Project and parent Topic and opens that Thread. Clicking a Project shows
+the same status groups filtered to its Topics; it does not open a Project
+chat. Inbox may remain a separate attention/review tab, but Topics home still
+includes all cross-Project Needs You items.
+
+Selecting a Topic normally opens its **coordinator conversation** in the main
+pane, making the coordinator the Topic's voice. First visit opens the
+coordinator. Subsequent visits restore the last-opened Thread for that Topic
+if available, falling back to the coordinator. Clicking the already-selected
+Topic keeps the current Thread. The Threads tab and chat header provide an
+explicit Coordinator action. The main pane should almost always be a chat;
+Topics and Threads are levels of context, not peer destinations.
+
+The right pane is the Topic inspector: **Threads | Resources | Integrations |
+Todos**. Threads lists the coordinator and workers and switches the main chat;
+New Thread belongs there. Resources includes Topic refs and checkouts plus
+distinguishable Thread resources, with Open in Zed prominent there or in the
+header. Integrations shows the Topic-owned candidate queue, readiness,
+conflicts, review, and Integrate actions. Todos is a Topic-filtered view of
+the durable cross-topic user Todo list, distinct from a Topic plan or worker
+checklist. Events should feed the appropriate tab and Attention, not become a
+top-level tab until a real workflow needs one.
+
+The aggregate home keeps **Needs You**, **Working**, **Ready to Integrate**,
+and de-emphasized/collapsible **Waiting / Resting**. A deliberately opened
+**Topic Overview** scopes those same groups to one Topic and adds summary and
+resources. It is accessible from the Topic/coordinator header, not the
+default destination. The Ready group contains only verified integration
+candidates; an idle or completed worker is not automatically Ready.
+
+Quick creation starts a Topic in the selected or default Project, even for a
+single prompt. Topic selection still opens its coordinator chat on first
+visit, then restores the last-opened Thread when available.
 
 Example:
 
@@ -483,7 +564,12 @@ WORKING
   AAII cleanup              GLM · OA Cloud
 
 
-WAITING
+READY TO INTEGRATE
+
+  Arachne · resource strip   clean against Arachne@789abc
+
+
+WAITING / RESTING
 
   PR #1842                  waiting for review
   Hero nightly              waiting for W&B
@@ -558,6 +644,26 @@ Loom should recreate a checkout from the PR branch/head, register its associatio
 # Resources
 
 The data model should eventually distinguish resources explicitly.
+
+## Binding and defaults
+
+Resources can be bound at three scopes: **Project → Topic → Thread**. A Project
+supplies reusable repository, design document, and other Resource bindings
+plus launch defaults. A Topic inherits those bindings, adds or overrides its
+own, and may hide one for its own context without removing it from the
+Project. A Thread inherits the effective Topic context and adds its own
+worktree, PR, file, or artifact. The UI should show the origin of each binding
+and avoid duplicating the underlying Resource object.
+Project bindings can continue to supply shared references to existing Topics;
+Topic additions, overrides, and hides remain in effect.
+
+New Topics inherit the Project's current runner, agent, inference route,
+primary repo, branch creation policy, and integration policy unless the user
+overrides them. Record the chosen execution settings and canonical refs on
+the Topic. Changing Project defaults must not silently change active Topic
+branches, runners, or integration targets; applying a change to an existing
+Topic is explicit and reviewable. Inheritance of a Resource is context, not
+ownership of a checkout or permission to edit it.
 
 ## Repository
 
@@ -729,6 +835,11 @@ The terminal Agent Deck's Conductor is a useful reference for this shape.
 # Worker results
 
 A child finishing should not require its parent to reread the full child transcript.
+Finishing is not the same as being ready to integrate. A coding worker should
+normally stabilize/commit its result, run required validation, summarize it,
+and preflight mergeability against a specific Topic ref before becoming Ready.
+Readiness records the target revision. The worker may sleep while its separate
+integration state remains Ready, stale, conflicting, or integrated.
 
 Eventually produce a structured handoff:
 
@@ -766,13 +877,28 @@ When an event matters:
 
 ```text
 event
-→ wake coordinator
+→ subscription / durable mailbox
+→ coalesce or handle mechanically, if possible
+→ wake coordinator only when reasoning is needed
 → reason / act / delegate
 → update state
 → sleep
 ```
 
 This is preferable to continuously consuming a session or having agents poll.
+
+---
+
+# Events
+
+The control plane records an immutable **Event** from a **Source**, routes it
+through a **Subscription** to a Topic or Thread's durable **Mailbox**, and
+makes a separate **Wake** decision. Sources include manual messages, other
+Threads, worker completion, integration conflict, GitHub/CI/PR review, W&B,
+heartbeats/timers/cron, and runner availability. A delivery can update state,
+coalesce with related Events, or remain pending without invoking an LLM.
+Repeated delivery must be idempotent. This vocabulary should unify the
+existing watches and automations rather than creating a second scheduler.
 
 ---
 
@@ -794,7 +920,8 @@ Instead:
 GitHub event
 → Loom
 → relevant mailbox
-→ wake relevant thread/topic
+→ coalesce or update state
+→ wake relevant thread/topic when needed
 ```
 
 Likewise:
@@ -994,9 +1121,13 @@ There are real cases where Thread A knows something Thread B needs.
 
 Do not build a generalized multi-agent communications platform yet.
 
-Provide a simple primitive:
-
-**Send to thread…**
+Provide one durable delivery primitive through both **Send to Thread…** in
+the UI and an agent-callable Loom tool. Both routes should use the same
+underlying operation and return a delivery receipt. The source identity comes
+from the authenticated human/session, not caller-supplied display text;
+Loom authorizes the destination and records provenance and an idempotency key.
+Agents should be able to discover destinations they may reach. Delivery is an
+Event and may remain queued without an immediate LLM Wake.
 
 Initial forms:
 
@@ -1007,7 +1138,11 @@ Initial forms:
 
 Destination receives a durable inbound item with provenance.
 
-Later this can become an agent-callable tool.
+The existing Arachne UI sends a human note through Loom's channel-message
+operation. Loom's `channel_send` tool already lets an agent send to channels
+within its authorized session tree or subscriptions; a first-class
+cross-thread tool should make destination selection and delivery semantics
+explicit without broadening access silently.
 
 Agents are free to coordinate through other means when available; Arachne does not need to model every emergent communication strategy.
 
@@ -1052,11 +1187,28 @@ Limits may exist per:
 
 ## Integration
 
-Combining worker outputs is itself work.
+Integration belongs to the Topic. Each repository attached to it may have a
+canonical ref for accepted state. Worker results are candidates against that
+ref, and the Topic view should expose their queue and status. The normal flow
+is worker → Topic; nested workers may integrate recursively when useful.
+**Integrate** absorbs work into Topic state. **Land** separately moves accepted
+Topic state to an external target such as a PR or main.
 
-It is valid to spawn an integration worker to reconcile multiple branches/results.
+Preflight conflict preview (for example, `git merge-tree`) and readiness are
+relative to a target revision. When the Topic ref advances, Loom should
+deterministically recheck sleeping Ready candidates. Clean ones get a refreshed
+readiness revision and stay asleep;
+new conflicts emit Events and preferentially wake their original workers to
+reconcile. Worker lifecycle and integration state remain independent.
 
-Do not force the coordinator to absorb all implementation details.
+The operation carries source, target, strategy, revision, and validation
+policy. Strategies include squash, merge, rebase, cherry-pick, PR, and ask
+coordinator. A clean, unambiguous integration should use a disposable worktree:
+prepare, apply, validate, atomically advance the Topic ref, then clean up.
+Failure must not disturb the canonical checkout/ref. Conflicts, failing tests,
+ambiguity, or product judgment can wake the original worker, coordinator, or
+an integration worker. Do not force an LLM turn for a clean mechanical merge,
+or force the coordinator to absorb every difficult one.
 
 ---
 
@@ -1148,6 +1300,7 @@ Add:
 - PR resources;
 - reliable “open the code” behavior;
 - basic Topics;
+- Project grouping and inherited resource/launch defaults;
 - resource attachment;
 - design-document resources;
 - keep/attach worktree;
