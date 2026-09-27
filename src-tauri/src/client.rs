@@ -347,6 +347,15 @@ impl LoomClient {
         .await
     }
 
+    /// `sessions.update` — edit a session's branch-level fields: title
+    /// (compare-and-swap fenced), goal, description. Returns the fresh view.
+    pub async fn update_session(
+        &self,
+        input: &crate::loom::SessionsUpdateInput,
+    ) -> Result<crate::loom::SessionView, LoomError> {
+        self.op("/api/sessions/update", input).await
+    }
+
     /// `sessions.tags.set` — stamp a quiet tag on a session. Used to mark a
     /// leader chat as a durable `topic` (survives archive and restarts).
     pub async fn set_tag(

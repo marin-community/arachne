@@ -392,6 +392,8 @@ pub async fn launch_session(
     repo: String,
     task: String,
     parent_id: Option<String>,
+    title: Option<String>,
+    description: Option<String>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent_branch = match parent_id {
@@ -402,15 +404,42 @@ pub async fn launch_session(
         }
         _ => None,
     };
+    // The thread sheet sends only `task` (title falls back to it, like the
+    // CLI); the topic sheet sends an explicit short `title` plus a longer
+    // `description`.
+    let label = title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(String::from)
+        .unwrap_or_else(|| task.chars().take(80).collect());
+    let description = description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(String::from);
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
-            title: Some(task.chars().take(80).collect()),
+            title: Some(label),
             goal: Some(task),
             parent_branch: parent_branch.clone(),
             ..Default::default()
         })
         .await?;
+    // `sessions.launch` has no description field (only GitHub issues seed
+    // one server-side), so the topic sheet's description is stamped right
+    // after launch via `sessions.update`. Best-effort: an empty description
+    // means "none was typed" — nothing to stamp.
+    if let Some(desc) = description {
+        let _ = client
+            .update_session(&crate::loom::SessionsUpdateInput {
+                description: Some(desc),
+                session: Some(view.id.clone()),
+                ..Default::default()
+            })
+            .await;
+    }
     // A top-level launch IS a topic: stamp the durable marker so the sidebar
     // keeps its shape even if every child finishes and archives. (Delegations
     // are stamped by `delegate_task` on the parent, not the child.)

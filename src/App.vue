@@ -7,6 +7,7 @@ import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import NewThreadSheet from "./components/NewThreadSheet.vue";
+import NewTopicSheet from "./components/NewTopicSheet.vue";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
@@ -114,6 +115,10 @@ const selectedView = ref<SessionView | null>(null);
 // not the sidebar. Takes over while open; a launch closes it and opens
 // the live thread (launchTask → selectSession).
 const showNewThread = ref(false);
+// The topic composer: same main-panel takeover as the thread sheet. A
+// topic is a leader chat with title/description metadata, so its launch
+// path (launchTopic) passes those through to launch_session.
+const showNewTopic = ref(false);
 const showSettings = ref(false);
 // URL is not a secret — localStorage is fine. The TOKEN is a credential:
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
@@ -191,7 +196,14 @@ function openNewThread() {
   // A stale connection error from an earlier flow shouldn't read as a
   // launch failure inside the fresh sheet.
   connError.value = null;
+  showNewTopic.value = false;
   showNewThread.value = true;
+}
+
+function openNewTopic() {
+  connError.value = null;
+  showNewThread.value = false;
+  showNewTopic.value = true;
 }
 
 async function launchTask(task: string, repo: string) {
@@ -206,6 +218,32 @@ async function launchTask(task: string, repo: string) {
   } catch (e: any) {
     // Keep the sheet open with the draft intact: a failed launch
     // (bad repo, loom down) is one edit away from a retry, not a blank form.
+    connError.value = e?.message ?? String(e);
+  } finally {
+    launching.value = false;
+  }
+}
+
+// A topic launch carries card metadata (short title, longer description)
+// on top of the thread launch's goal/repo. Same lifecycle: success closes
+// the sheet and opens the live thread; failure keeps the drafts.
+async function launchTopic(meta: {
+  title: string;
+  description: string;
+  goal: string;
+  repo: string;
+}) {
+  launching.value = true;
+  try {
+    const view = await invoke<SessionView>("launch_session", {
+      repo: meta.repo,
+      task: meta.goal,
+      title: meta.title,
+      description: meta.description || null,
+    });
+    showNewTopic.value = false;
+    await selectSession(view.id);
+  } catch (e: any) {
     connError.value = e?.message ?? String(e);
   } finally {
     launching.value = false;
@@ -323,14 +361,23 @@ const connClass = computed(() =>
       :layout="layout"
       :selected-id="selectedId"
       :show-new-thread="showNewThread"
+      :show-new-topic="showNewTopic"
       @select="selectSession"
       @new-thread="openNewThread"
+      @new-topic="openNewTopic"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
       @archive="onArchived"
     />
+    <NewTopicSheet
+      v-if="showNewTopic"
+      :launching="launching"
+      :error="connError"
+      @close="showNewTopic = false"
+      @launch="launchTopic"
+    />
     <NewThreadSheet
-      v-if="showNewThread"
+      v-else-if="showNewThread"
       :launching="launching"
       :error="connError"
       @close="showNewThread = false"
@@ -350,6 +397,7 @@ const connClass = computed(() =>
       :selected-id="selectedId"
       @select="selectSession"
       @new-thread="openNewThread"
+      @new-topic="openNewTopic"
     />
     <SettingsSheet
       v-if="showSettings"

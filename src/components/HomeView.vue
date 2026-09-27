@@ -21,6 +21,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "new-thread"): void;
+  (e: "new-topic"): void;
 }>();
 
 function loudValue(s: SessionSummary): "blocked" | "attention" | null {
@@ -134,7 +135,10 @@ function classFor(row: HomeRow): string {
     <div class="home-scroll">
       <div class="home-top">
         <h1>🕸 Arachne</h1>
-        <button class="primary home-new" @click="emit('new-thread')">
+        <button class="home-new" title="Start a durable topic — title, description, goal" @click="emit('new-topic')">
+          + New topic
+        </button>
+        <button class="primary home-new" title="Start a conversation — goal + repo" @click="emit('new-thread')">
           + New thread
         </button>
       </div>

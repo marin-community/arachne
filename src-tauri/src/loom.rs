@@ -167,6 +167,23 @@ pub struct SessionGroupView {
     pub session_ids: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SessionsUpdateInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_title_provenance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Chat journal
 // ---------------------------------------------------------------------------

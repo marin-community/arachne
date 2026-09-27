@@ -77,12 +77,19 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-/* The sidebar's one launch affordance: opens the sheet in the main panel. */
-.sidebar .new-thread-btn {
+/* The sidebar's launch affordances: each opens its sheet in the main
+   panel. A topic is a leader chat with metadata; a thread is bare. */
+.sidebar .new-launchers {
   margin: 10px;
-  padding: 8px 10px;
+  display: flex;
+  gap: 6px;
+}
+.sidebar .new-thread-btn {
+  flex: 1;
+  padding: 8px 6px;
   font-weight: 600;
   text-align: center;
+  white-space: nowrap;
 }
 .sidebar .new-thread-btn.active {
   border-color: var(--accent);
@@ -628,6 +635,14 @@ button.danger:hover { border-color: var(--blocked); }
   color: var(--text-dim);
 }
 .nts-close:hover { color: var(--text); }
+/* "optional" tag inside a field label (e.g. the topic's description). */
+.nts-opt {
+  font-style: normal;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  opacity: .7;
+}
 .nts-field {
   display: flex;
   flex-direction: column;
@@ -705,7 +720,7 @@ button.danger:hover { border-color: var(--blocked); }
   gap: 12px;
 }
 .home .home-top h1 { flex: 1; margin: 0; }
-.home .home-new { padding: 5px 12px; }
+.home .home-new { padding: 5px 12px; white-space: nowrap; }
 .home .section { margin-top: 26px; }
 .home .section-title {
   font-size: 11px;

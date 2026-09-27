@@ -12,11 +12,13 @@ const props = defineProps<{
   layout: SessionLayout | null;
   selectedId: string | null;
   showNewThread?: boolean;
+  showNewTopic?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "new-thread"): void;
+  (e: "new-topic"): void;
   (
     e: "reparent",
     sessionId: string,
@@ -330,11 +332,26 @@ async function archiveRow(id: string) {
 
 <template>
   <aside class="sidebar">
-    <!-- New threads are composed in the main panel (the thread home),
-         not here: this button opens the sheet. -->
-    <button class="new-thread-btn" :class="{ active: props.showNewThread }" @click="emit('new-thread')">
-      + New thread
-    </button>
+    <!-- New threads and topics are composed in the main panel (the thread
+         home), not here: these buttons open the sheets. -->
+    <div class="new-launchers">
+      <button
+        class="new-thread-btn"
+        :class="{ active: props.showNewThread }"
+        title="Start a conversation — goal + repo"
+        @click="emit('new-thread')"
+      >
+        + New thread
+      </button>
+      <button
+        class="new-thread-btn"
+        :class="{ active: props.showNewTopic }"
+        title="Start a durable topic — title, description, goal, repo"
+        @click="emit('new-topic')"
+      >
+        + New topic
+      </button>
+    </div>
 
     <div class="session-list">
       <template v-for="{ lane, rows } in laneRows" :key="lane.id">
