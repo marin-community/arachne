@@ -63,6 +63,8 @@ export interface SessionSummary {
   created_by: string | null;
   created_at: string;
   last_activity_at: string;
+  /** When the newest user message was journaled; null on older looms. */
+  last_user_message_at?: string | null;
   branch: BranchSummary;
   placement: Placement | null;
   github_repo: string | null;
