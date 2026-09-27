@@ -344,6 +344,18 @@ impl LoomClient {
             .await
     }
 
+    /// `repos.branches` — the local branches of a repository checkout and
+    /// which one the primary checkout (the main worktree) currently has
+    /// checked out. Server-side path; loopback trust or a user PAT grants
+    /// it, an agent session token does not.
+    pub async fn repo_branches(
+        &self,
+        cwd: &str,
+    ) -> Result<Vec<crate::loom::RepoBranchView>, LoomError> {
+        self.op("/api/repos/branches", &serde_json::json!({ "cwd": cwd }))
+            .await
+    }
+
     /// `sessions.chat` — the conversation journal. `before` pages older
     /// turns (from the previous page's `older_cursor`); None = newest tail.
     pub async fn session_chat(

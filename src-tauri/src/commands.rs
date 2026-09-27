@@ -1108,6 +1108,71 @@ pub async fn integrate_session(
 
 /// Land a topic: send a landing request to the topic leader (the topic's
 /// coordinator thread), moving accepted state toward the upstream target.
+/// How a landing target was resolved — the provenance the prompt and the
+/// landing agent need to know what to re-verify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandingTargetOrigin {
+    /// The primary checkout's currently checked out branch.
+    PrimaryCheckout,
+    /// `main` — the checkout's branch could not be read; the landing agent
+    /// should try to resolve the primary checkout itself before settling.
+    MainFallback,
+    /// The branch's recorded base (the remote's default branch) — the
+    /// open-PR strategy's target.
+    RecordedBase,
+    /// An explicit override from the UI.
+    Explicit,
+}
+
+impl LandingTargetOrigin {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::PrimaryCheckout => "primary-checkout",
+            Self::MainFallback => "main-fallback",
+            Self::RecordedBase => "recorded-base",
+            Self::Explicit => "explicit",
+        }
+    }
+}
+
+/// Resolve the landing target for a non-PR strategy: the primary checkout's
+/// currently checked out branch — the checkout a human actually opens —
+/// falling back to `main` when it cannot be resolved (no such branch, no
+/// readable checkout, or the loom server cannot report it).
+///
+/// `repo_branches` mirrors loom's `repos.branches` rows, which mark the
+/// primary checkout's current branch. Only the row that is both `current`
+/// and checked out at `repo_root` (the main working tree) may become the
+/// target — a worker worktree's own branch must never win, even if a future
+/// loom marked every worktree's branch `current`.
+fn resolve_landing_target(
+    repo_branches: &[crate::loom::RepoBranchView],
+    repo_root: &str,
+    explicit: Option<&str>,
+) -> Option<(String, LandingTargetOrigin)> {
+    if let Some(value) = explicit {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some((trimmed.to_string(), LandingTargetOrigin::Explicit));
+        }
+    }
+    if let Some(branch) = repo_branches
+        .iter()
+        .find(|b| b.current && b.worktree.as_deref() == Some(repo_root))
+    {
+        return Some((branch.name.clone(), LandingTargetOrigin::PrimaryCheckout));
+    }
+    // No current row at the primary checkout: it is detached or the checkout
+    // could not be read. `main` is the fallback the landing agent should try
+    // to improve on; when even `main` is absent the caller falls back to the
+    // recorded base.
+    let main_exists = repo_branches.iter().any(|b| b.name == "main");
+    if main_exists || repo_branches.is_empty() {
+        return Some(("main".into(), LandingTargetOrigin::MainFallback));
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn land_topic(
     state: State<'_, LoomState>,
@@ -1134,17 +1199,51 @@ pub async fn land_topic(
     if summary.parent_session_id.is_some() || summary.parent_id.is_some() {
         return Err(UiError { message: "landing belongs to a topic; integrate this worker first".into(), unreachable: false });
     }
+    // Resolve the landing target. Non-PR strategies land into the primary
+    // checkout's currently checked out branch — the checkout a human
+    // actually opens — falling back to `main`; `open-pr` targets the
+    // branch's recorded base, the remote's default branch. An explicit
+    // `upstream` overrides either. A failed primary-checkout lookup is not
+    // fatal for open-PR (which never needs it), so the order matters.
     let branches = client.list_branches().await?;
-    // The upstream target defaults to the branch's recorded base — the
-    // branch loom forked it from, which is the natural upstream.
-    let upstream = upstream
-        .or_else(|| branches_list_base(&branches, &view.branch.branch))
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| UiError { message: "no upstream branch is recorded for this topic".into(), unreachable: false })?;
+    let (upstream, target_origin) = if matches!(strategy, crate::loom::IntegrationStrategy::OpenPr) {
+        let upstream = upstream
+            .or_else(|| branches_list_base(&branches, &view.branch.branch))
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| UiError { message: "no upstream branch is recorded for this topic".into(), unreachable: false })?;
+        (upstream, LandingTargetOrigin::RecordedBase)
+    } else {
+        // Resolve the primary checkout's current branch via `repos.branches`.
+        // A failed lookup (scoped token, unreadable checkout, missing repo) is
+        // not fatal: the goal is "the primary checkout's current branch, or
+        // `main`" — so fall back to `main` with a `main-fallback` origin the
+        // landing agent is told to try improving on.
+        let repo_branches = client
+            .repo_branches(&view.branch.repo_root)
+            .await
+            .unwrap_or_default();
+        match resolve_landing_target(
+            &repo_branches,
+            &view.branch.repo_root,
+            upstream.as_deref(),
+        ) {
+            Some((upstream, origin)) => (upstream, origin),
+            // No primary-checkout resolution and no `main` either: fall back
+            // to the recorded base so landing still has somewhere to go.
+            None => (
+                branches_list_base(&branches, &view.branch.branch)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| UiError { message: "no landing target could be resolved for this topic".into(), unreachable: false })?,
+                LandingTargetOrigin::RecordedBase,
+            ),
+        }
+    };
     let request = crate::loom::LandingRequest {
         action: "land",
         source_branch: view.branch.branch.clone(),
         target_upstream: upstream.clone(),
+        target_origin: target_origin.as_str().to_string(),
+        repo_root: view.branch.repo_root.clone(),
         strategy,
         requested_by: "user",
     };
@@ -1370,8 +1469,96 @@ pub async fn open_topic_resource_in_zed(
 
 #[cfg(test)]
 mod integration_tests {
-    use super::resolve_integration_target;
+    use super::{resolve_integration_target, resolve_landing_target};
     use crate::loom::SessionSummaryView;
+
+    fn repo_branch(name: &str, worktree: Option<&str>, current: bool) -> crate::loom::RepoBranchView {
+        crate::loom::RepoBranchView {
+            name: name.into(),
+            worktree: worktree.map(String::from),
+            current,
+        }
+    }
+
+    #[test]
+    fn landing_prefers_primary_checkout_current_branch() {
+        // The primary checkout is on `dev`; a worker worktree holds the topic
+        // branch. Non-PR landing targets the primary checkout's branch.
+        let rows = vec![
+            repo_branch("dev", Some("/repo"), true),
+            repo_branch("weaver/topic", Some("/repo/.worktrees/topic"), false),
+        ];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        assert_eq!(target, "dev");
+        assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
+    }
+
+    #[test]
+    fn landing_ignores_worker_worktree_branch() {
+        // A worker worktree's branch is never the target, even if it were
+        // somehow marked `current`: only a row checked out at the primary
+        // checkout path wins. Here nothing matches, so `main` (present as a
+        // local branch) is the fallback.
+        let rows = vec![
+            repo_branch("weaver/other-worker", Some("/repo/.worktrees/other"), true),
+            repo_branch("main", Some("/repo"), false),
+        ];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        assert_eq!(target, "main");
+        assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
+    }
+
+    #[test]
+    fn landing_falls_back_to_main_when_primary_checkout_detached() {
+        // A detached primary checkout reports no `current` row; `main`
+        // exists as a local branch and is the fallback the agent may improve on.
+        let rows = vec![
+            repo_branch("dev", Some("/repo/.worktrees/dev"), false),
+            repo_branch("main", Some("/repo"), false),
+        ];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        assert_eq!(target, "main");
+        assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
+    }
+
+    #[test]
+    fn landing_empty_rows_still_fall_back_to_main() {
+        let (target, origin) = resolve_landing_target(&[], "/repo", None).unwrap();
+        assert_eq!(target, "main");
+        assert_eq!(origin, super::LandingTargetOrigin::MainFallback);
+    }
+
+    #[test]
+    fn landing_primary_checkout_on_main_is_not_a_fallback() {
+        let rows = vec![repo_branch("main", Some("/repo"), true)];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", None).unwrap();
+        assert_eq!(target, "main");
+        assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
+    }
+
+    #[test]
+    fn landing_explicit_upstream_wins() {
+        let rows = vec![repo_branch("dev", Some("/repo"), true)];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", Some(" release ")).unwrap();
+        assert_eq!(target, "release");
+        assert_eq!(origin, super::LandingTargetOrigin::Explicit);
+    }
+
+    #[test]
+    fn landing_blank_explicit_upstream_falls_through() {
+        let rows = vec![repo_branch("dev", Some("/repo"), true)];
+        let (target, origin) = resolve_landing_target(&rows, "/repo", Some("  ")).unwrap();
+        assert_eq!(target, "dev");
+        assert_eq!(origin, super::LandingTargetOrigin::PrimaryCheckout);
+    }
+
+    #[test]
+    fn landing_without_main_and_without_current_is_none() {
+        let rows = vec![repo_branch("dev", Some("/repo"), false)];
+        // No current row and no `main`: the caller falls back to the
+        // recorded base.
+        assert_eq!(resolve_landing_target(&rows, "/repo", None), None);
+    }
 
     fn session(id: &str, branch: &str, repo: &str, parent: Option<&str>, topic: bool) -> SessionSummaryView {
         serde_json::from_value(serde_json::json!({

@@ -283,6 +283,18 @@ pub struct ChangeTotalsView {
 // Integration (spec: docs/integration-and-landing.md)
 // ---------------------------------------------------------------------------
 
+/// One local branch of a repository checkout as loom's `repos.branches`
+/// reports it: its worktree, and whether the primary checkout (the main
+/// worktree, the checkout a human actually opens) currently has it checked
+/// out. The landing target for non-PR strategies resolves from these rows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoBranchView {
+    pub name: String,
+    pub worktree: Option<String>,
+    pub current: bool,
+}
+
 /// The integration strategies the Integrate split button offers. Wire-safe
 /// mirror of the strategies in the spec; the coordinator's skill is the
 /// authority on what each one *means* — these are intent constraints, not
@@ -413,7 +425,17 @@ decision.\n\
 pub struct LandingRequest {
     pub action: &'static str,
     pub source_branch: String,
+    /// The resolved landing target. For non-PR strategies this is the
+    /// primary checkout's currently checked out branch (or `main` when that
+    /// could not be resolved); for `open-pr` it is the branch's recorded base.
     pub target_upstream: String,
+    /// How `target_upstream` was resolved — `primary-checkout`,
+    /// `main-fallback`, `recorded-base`, or `explicit` — so the landing
+    /// agent knows what to re-verify before writing.
+    pub target_origin: String,
+    /// The repository the topic branch lives in; the primary checkout for
+    /// landing is resolved from here.
+    pub repo_root: String,
     pub strategy: IntegrationStrategy,
     pub requested_by: &'static str,
 }
@@ -421,31 +443,66 @@ pub struct LandingRequest {
 impl LandingRequest {
     pub fn to_prompt(&self, topic_name: &str) -> String {
         let strategy = match self.strategy {
-            IntegrationStrategy::Squash => "squash".to_string(),
-            IntegrationStrategy::Merge => "merge".to_string(),
-            IntegrationStrategy::Rebase => "rebase".to_string(),
-            IntegrationStrategy::CherryPick => "cherry-pick".to_string(),
-            IntegrationStrategy::OpenPr => "open-pr".to_string(),
-            IntegrationStrategy::Push => "push".to_string(),
-            IntegrationStrategy::Ask => "decide".to_string(),
+            IntegrationStrategy::Squash => "squash",
+            IntegrationStrategy::Merge => "merge",
+            IntegrationStrategy::Rebase => "rebase",
+            IntegrationStrategy::CherryPick => "cherry-pick",
+            IntegrationStrategy::OpenPr => "open-pr",
+            IntegrationStrategy::Push => "push",
+            IntegrationStrategy::Ask => "decide",
+        };
+        // How the target was resolved shapes what the landing agent must
+        // re-verify: a `primary-checkout` target can go stale when the user
+        // switches branches; a `main-fallback` target means the control
+        // plane could not read the checkout, so the agent should try to
+        // resolve the primary checkout itself before settling for `main`.
+        let target = match self.target_origin.as_str() {
+            "primary-checkout" => format!(
+                "`{upstream}`, the primary checkout's currently checked out branch",
+                upstream = self.target_upstream
+            ),
+            "main-fallback" => format!(
+                "`{upstream}` (fallback — the primary checkout's current branch could not be \
+                 resolved from the control plane; try resolving it yourself from the repository \
+                 before settling for `{upstream}`)",
+                upstream = self.target_upstream
+            ),
+            "recorded-base" => format!(
+                "`{upstream}`, the branch's recorded base (the remote's default branch)",
+                upstream = self.target_upstream
+            ),
+            _ => format!(
+                "`{upstream}`, as explicitly requested",
+                upstream = self.target_upstream
+            ),
         };
         let request = format!(
             "**Landing request**\n\
 \n\
-Land this topic's accepted state: branch `{branch}` → `{upstream}` for topic **{topic}**, \
-using strategy **{strategy}**. Apply the integration skill's landing rules: inspect the \
-topic branch state, run required validation, create the PR or update the target, and report \
-the outcome. Prefer opening a PR when policy is unclear.\n\
+Land this topic's accepted state: branch `{branch}` for topic **{topic}** in the repository \
+located at `{repo}`, using strategy **{strategy}**.\n\
+\n\
+Target: {target}.\n\
+\n\
+Apply the integration skill's landing rules: inspect the topic branch state, run required \
+validation, create the PR or update the target branch, and report the outcome. Non-PR \
+strategies land into the primary checkout's currently checked out branch — the checkout a \
+human actually opens — falling back to `main` when it cannot be resolved; re-verify the \
+target against the live checkout before writing. Prefer opening a PR when policy is unclear.\n\
 \n\
 ```json\n{json}\n```",
             branch = self.source_branch,
-            upstream = self.target_upstream,
+            repo = self.repo_root,
             topic = topic_name,
+            strategy = strategy,
+            target = target,
             json = serde_json::json!({
                 "action": "land",
                 "source_thread": topic_name,
                 "source_resource": self.source_branch,
+                "repository": self.repo_root,
                 "target_resource": self.target_upstream,
+                "target_origin": self.target_origin,
                 "strategy": strategy,
                 "requested_by": "user",
             })
@@ -482,11 +539,40 @@ mod integration_prompt_tests {
         assert_eq!(IntegrationStrategy::parse("push"), Some(IntegrationStrategy::Push));
         let prompt = LandingRequest {
             action: "land", source_branch: "topic-branch".into(),
-            target_upstream: "origin/main".into(),
+            target_upstream: "origin/main".into(), target_origin: "recorded-base".into(),
+            repo_root: "/tmp/repo".into(),
             strategy: IntegrationStrategy::Push, requested_by: "user",
         }.to_prompt("Topic");
         assert!(prompt.contains("\"strategy\":\"push\""));
         assert!(prompt.contains("origin/main"));
+        assert!(prompt.contains("\"target_origin\":\"recorded-base\""));
+    }
+
+    #[test]
+    fn landing_prompt_carries_primary_checkout_policy() {
+        let prompt = LandingRequest {
+            action: "land", source_branch: "weaver/topic".into(),
+            target_upstream: "dev".into(), target_origin: "primary-checkout".into(),
+            repo_root: "/tmp/repo".into(),
+            strategy: IntegrationStrategy::Squash, requested_by: "user",
+        }.to_prompt("Topic");
+        assert!(prompt.contains("\"target_resource\":\"dev\""));
+        assert!(prompt.contains("\"target_origin\":\"primary-checkout\""));
+        assert!(prompt.contains("\"repository\":\"/tmp/repo\""));
+        // The prompt states the policy, not just the resolved branch.
+        assert!(prompt.contains("primary checkout's currently checked out branch"));
+        assert!(prompt.contains("falling back to `main`"));
+    }
+
+    #[test]
+    fn landing_prompt_marks_main_fallback_for_agent_resolution() {
+        let prompt = LandingRequest {
+            action: "land", source_branch: "weaver/topic".into(),
+            target_upstream: "main".into(), target_origin: "main-fallback".into(),
+            repo_root: "/tmp/repo".into(),
+            strategy: IntegrationStrategy::Merge, requested_by: "user",
+        }.to_prompt("Topic");
+        assert!(prompt.contains("try resolving it yourself"));
     }
 }
 
