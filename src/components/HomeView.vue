@@ -44,7 +44,7 @@ function level(s: SessionSummary): "blocked" | "attention" | "ok" {
     if (value === "blocked") return "blocked";
     if (value === "attention") attention = true;
   }
-  return attention || s.status === "error" || s.status === "orphaned" ? "attention" : "ok";
+  return attention || s.status === "error" ? "attention" : "ok";
 }
 
 const isIdle = (s: SessionSummary) => s.branch.tags.some((tag) => tag.key === "idle");
@@ -64,7 +64,6 @@ function ago(iso: string): string {
 }
 
 function description(s: SessionSummary): string {
-  if (s.status === "orphaned") return "orphaned — agent process lost";
   if (s.status === "error") return "errored";
   const tag = s.branch.tags.find((t) => t.key === "attention" || t.key === "triage");
   return tag?.note || s.branch.description || s.branch.goal || "—";
