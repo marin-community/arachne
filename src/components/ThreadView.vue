@@ -12,6 +12,7 @@ import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
 import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, type ChatDisplayBlock } from "../chatRows";
 import { useFileCompletion } from "../useFileCompletion";
+import { markdownForSelection } from "../markdownCopy";
 
 interface Cursor {
   turn: number;
@@ -661,6 +662,68 @@ function toggle(key: string) {
 function workCollapsed(memberKeys: string[]): boolean {
   return !memberKeys.some((key) => collapsed.value[`tools:${key}`] === false);
 }
+
+// Markdown-preserving copy. WebKit's default copy from the rendered chat
+// HTML writes text/plain as the selection's textContent — structure lost:
+// bullets become •, backticks vanish, tables flatten. Message bodies keep
+// their raw markdown on the rendered element (data-markdown), so on `copy`
+// we rewrite the flavors: text/plain = the raw markdown of the selected
+// bodies (pasting into GitHub keeps the source), text/html = the rendered
+// sanitized markup (pasting into rich text keeps formatting). Selections
+// spanning several messages join with a blank line; chrome inside the
+// selection is ignored for the markdown flavor.
+function onConversationCopy(event: ClipboardEvent) {
+  const selection = document.getSelection();
+  const container = convEl.value;
+  if (!selection || selection.isCollapsed || !container || !event.clipboardData) return;
+  const range = selection.getRangeAt(0);
+  if (!container.contains(range.commonAncestorContainer)) return;
+  const parts: string[] = [];
+  for (const body of Array.from(container.querySelectorAll<HTMLElement>(".chat-markdown"))) {
+    if (!range.intersectsNode(body)) continue;
+    const md = body.getAttribute("data-markdown");
+    if (md == null || !md.trim()) continue;
+    // Partial selections clip the markdown to what was selected; whole
+    // bodies copy exactly.
+    parts.push(markdownForSelection(md, body, bodyOffset(range, body, "start"), bodyOffset(range, body, "end")));
+  }
+  const markdown = parts.map((part) => part.trim()).filter(Boolean).join("\n\n");
+  if (!markdown) return;
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", markdown);
+  const html = htmlForSelection(selection);
+  if (html) event.clipboardData.setData("text/html", html);
+}
+
+// Where the selection's edge falls inside a rendered body, in
+// textContent-relative characters (0 = body start, length = body end).
+function bodyOffset(range: Range, body: HTMLElement, edge: "start" | "end"): number {
+  // A probe range from the body's start to the selection edge measures the
+  // offset in characters of rendered text — the same space the markdown
+  // mapping consumes. Edges outside the body clamp to 0 / full length
+  // (setEnd before the probe's start would collapse it the wrong way).
+  const probe = document.createRange();
+  probe.selectNodeContents(body);
+  if (edge === "start") {
+    if (range.compareBoundaryPoints(Range.START_TO_START, probe) <= 0) return 0;
+    probe.setEnd(range.startContainer, range.startOffset);
+  } else {
+    if (range.compareBoundaryPoints(Range.END_TO_END, probe) >= 0) return (body.textContent ?? "").length;
+    probe.setStart(range.endContainer, range.endOffset);
+  }
+  return probe.toString().length;
+}
+
+// Serialize the selection to HTML, reusing the browser's serialization of
+// the already-sanitized rendered markup so rich-text paste keeps formatting.
+function htmlForSelection(selection: Selection): string {
+  const div = document.createElement("div");
+  for (let i = 0; i < selection.rangeCount; i++) {
+    div.appendChild(selection.getRangeAt(i).cloneContents());
+  }
+  return div.innerHTML;
+}
+
 function toggleWork(memberKeys: string[]) {
   const next = !workCollapsed(memberKeys);
   for (const key of memberKeys) collapsed.value[`tools:${key}`] = next;
@@ -914,7 +977,7 @@ async function onLand(strategy: string) {
         Spawn child
       </button>
     </div>
-    <div class="conversation" ref="convEl" @scroll="onConversationScroll">
+    <div class="conversation" ref="convEl" @scroll="onConversationScroll" @copy="onConversationCopy">
       <div v-if="hasOlder" class="load-older">
         <button :disabled="loadingOlder" @click="loadOlder">
           {{ loadingOlder ? "loading…" : "load older" }}
