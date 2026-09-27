@@ -48,7 +48,7 @@ body {
 }
 @media (max-width: 1100px) {
   .app.with-resources { grid-template-columns: 300px minmax(0, 1fr); grid-template-areas: "header header" "sidebar main"; }
-  .app.with-resources .resource-panel { position: absolute; z-index: 40; top: 72px; bottom: 0; right: 0; width: min(360px, calc(100vw - 300px)); box-shadow: -12px 0 30px rgba(0,0,0,.35); }
+  .app.with-resources .resource-panel, .app.with-resources .topic-inspector { position: absolute; z-index: 40; top: 72px; bottom: 0; right: 0; width: min(360px, calc(100vw - 300px)); box-shadow: -12px 0 30px rgba(0,0,0,.35); }
 }
 
 /* --- Header -------------------------------------------------------- */
@@ -115,22 +115,6 @@ body {
   border-color: var(--accent);
   color: var(--accent);
 }
-.sidebar .new-task {
-  margin: 10px;
-  display: flex;
-  gap: 6px;
-}
-.sidebar .new-task input {
-  flex: 1;
-  min-width: 0;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 6px 8px;
-  font-size: 12px;
-  outline: none;
-}
 .sidebar .new-task input:focus { border-color: var(--accent); }
 .session-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
 
@@ -167,7 +151,157 @@ body {
   padding: 9px 13px 3px;
   font-weight: 650;
 }
-.topics-toolbar button { font-size: 18px; line-height: 1; padding: 2px 8px; }
+.topics-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.topics-toolbar-actions button { font-size: 18px; line-height: 1; padding: 2px 8px; }
+.topics-toolbar-actions .toolbar-new-project {
+  font-size: 11px;
+  padding: 3px 8px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.topics-toolbar-actions .toolbar-new-project:hover { color: var(--text); border-color: var(--accent); }
+
+/* New Project inline card (topics tab) — same shape as the sheet inputs. */
+.new-project-card {
+  margin: 6px 10px 2px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-raised);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.new-project-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-dim);
+}
+.new-project-head button { padding: 0 4px; font-size: 14px; }
+.new-project-card input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  outline: none;
+}
+.new-project-card input:focus { border-color: var(--accent); }
+.new-project-foot { display: flex; align-items: center; gap: 8px; }
+.new-project-hint { flex: 1; font-size: 11px; color: var(--text-dim); }
+.new-project-error { color: var(--blocked); font-size: 11.5px; }
+
+/* Project headings in the Topics tab: select filters the main-pane home. */
+.project-header {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 12px 2px 4px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+  border: 1px solid transparent;
+}
+.project-header:hover { background: var(--bg-hover); }
+.project-header.drop-hint {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
+  background: var(--bg-hover);
+}
+.topic-card.dragging { opacity: 0.55; }
+.project-header.selected {
+  background: var(--bg-raised);
+  outline: 1px solid var(--border);
+}
+.project-chevron {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0;
+  width: 14px;
+  flex: 0 0 14px;
+  cursor: pointer;
+}
+.project-chevron:hover { color: var(--text); background: transparent; }
+.project-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.project-header.selected .project-name { color: var(--text); }
+.project-count {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  background: var(--bg-hover);
+  border-radius: 10px;
+  padding: 0 7px;
+}
+.project-new-topic {
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  padding: 0 4px;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.project-new-topic:hover { color: var(--accent); background: transparent; }
+.project-empty {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 2px 10px 6px 34px;
+}
+
+/* Move to Project: a small popover menu on the topic card's foot. */
+.topic-move { position: relative; }
+.topic-move-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  text-decoration: underline dotted;
+}
+.topic-move-btn:hover { background: none; border: none; color: var(--text); }
+.topic-move-menu {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 4px);
+  z-index: 40;
+  min-width: 150px;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .4);
+  overflow: hidden;
+}
+.topic-move-menu button {
+  border: 0;
+  background: transparent;
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 11.5px;
+}
+.topic-move-menu button:hover { background: var(--bg-hover); }
+.topic-move-menu button.current { color: var(--text-dim); font-weight: 600; }
 .new-topic-overlay {
   position: fixed;
   inset: 28px 0 0;
@@ -609,17 +743,15 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .mention-menu small, .mention-hint { color: var(--text-dim); font-size: 11px; }
 .mention-hint { padding: 7px 8px; }
 .mention-menu.topic-body-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
-.sidebar .new-task.quick-task-wrap { position: relative; }
-.mention-menu.quick-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
 .attachment-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-height: 26px; }
 .attachment-pick { display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--border); border-radius: 6px; padding: 4px 7px; cursor: pointer; color: var(--text-dim); font-size: 11px; white-space: nowrap; }
 .attachment-pick:hover { border-color: var(--accent); color: var(--text); }
 .attachment-pick input { display: none; }
 .attachment-chip { display: inline-flex; align-items: center; gap: 3px; max-width: 100%; border: 1px solid var(--border); border-radius: 5px; padding: 2px 3px 2px 6px; font-size: 11px; overflow-wrap: anywhere; }
+.attachment-preview { width: 22px; height: 22px; border-radius: 3px; object-fit: cover; background: var(--surface); }
 .attachment-chip button { border: 0; padding: 0 3px; background: transparent; color: var(--text-dim); }
 .attachment-error { color: var(--blocked); font-size: 11px; }
 .attachment-hint { color: var(--text-dim); font-size: 11px; }
-.quick-attachment-row { margin: -4px 10px 6px; }
 .composer-attachments { padding: 6px 16px 0; }
 .composer-attach { min-width: 28px; font-size: 16px; }
 .composer {
@@ -931,6 +1063,37 @@ button.accent { border-color: var(--accent); color: var(--accent); }
   text-overflow: ellipsis;
 }
 .tool-line .chevron { margin-left: auto; color: var(--text-dim); flex-shrink: 0; }
+/* Copy affordance on every chat block. Nearly invisible until hover —
+   like the chevron it sits next to, it should not compete with the text. */
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  padding: 1px 4px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  line-height: 0;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.copy-button:hover {
+  color: var(--text);
+  background: transparent;
+  border-color: transparent;
+}
+.copy-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+.copy-button.copied { color: var(--ok); }
+.block .who .copy-button { visibility: hidden; }
+.block:hover .who .copy-button, .block .who .copy-button:focus-visible { visibility: visible; }
+.tool-copy { opacity: 0; }
+.tool-line:hover .tool-copy, .tool-detail:hover .tool-copy, .tool-copy:focus-visible, .copy-button.copied { opacity: 1; }
+.tool-detail .tool-copy { margin-left: auto; }
+.tool-detail { position: relative; }
 .tool-detail {
   font-family: var(--mono);
   font-size: 11px;
@@ -1023,8 +1186,22 @@ button.danger:hover { border-color: var(--blocked); }
 }
 /* The topic body's wrap: anchor for the @-mention dropdown. */
 .nts-body-wrap { position: relative; }
-.nts-body-wrap textarea { display: block; }
+.nts-body-wrap textarea { display: block; width: 100%; }
 .mention-menu.nts-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
+/* Project context chip in the new-thread sheet header. */
+.nts-project {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 2px 9px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 40%;
+}
 .nts-field {
   display: flex;
   flex-direction: column;
@@ -1105,6 +1282,22 @@ button.danger:hover { border-color: var(--blocked); }
 .home .home-top h1 { margin: 0; }
 .home .home-heading > h1:not(.topic-dashboard-title) { font-size: 15px; font-weight: 600; color: var(--text-dim); }
 .home .home-new { padding: 5px 12px; white-space: nowrap; }
+.home .topic-dashboard-title { font-size: 22px; color: var(--text); margin: 5px 0 8px; }
+.home .project-dashboard-title { font-size: 22px; color: var(--text); margin: 5px 0 8px; }
+.thread-breadcrumb { padding: 6px 14px 0; color: var(--text-dim); font-size: 11px; }
+.thread-breadcrumb button { color: var(--accent); border: 0; background: none; padding: 0; font-size: inherit; }
+.thread-breadcrumb button:hover { text-decoration: underline; background: none; }
+.home-breadcrumb { color: var(--text-dim); font-size: 11px; }
+.home-breadcrumb button { color: var(--accent); border: 0; background: none; padding: 0; font-size: inherit; }
+.home-breadcrumb button:hover { text-decoration: underline; background: none; }
+.topic-dashboard-summary { color: var(--text-dim); margin: 0 0 12px; white-space: pre-wrap; }
+.topic-dashboard-meta { color: var(--text-dim); font: 11px var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.topic-dashboard-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.home-section-empty { color: var(--text-dim); font-size: 12px; padding: 5px 12px; }
+.home .needs-section { border-left: 2px solid var(--attention); padding-left: 12px; margin-left: -14px; }
+.home .all-calm.compact-calm { margin: 6px 0 0; display: block; }
+.resting-toggle { border: 0; background: none; padding: 0; cursor: pointer; }
+.resting-toggle:hover { color: var(--text); background: none; }
 .home .section { margin-top: 26px; }
 .home .section-title {
   font-size: 11px;
@@ -1181,3 +1374,188 @@ button.danger:hover { border-color: var(--blocked); }
 ::-webkit-scrollbar { width: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
+
+/* --- Topic inspector (RHS) ------------------------------------------ */
+
+.topic-inspector {
+  grid-area: resources;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+  border-left: 1px solid var(--border);
+  background: var(--bg-raised);
+}
+.topic-inspector-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 8px 10px 12px;
+}
+.topic-inspector-head .topic-inspector-topic { flex: 1; min-width: 0; }
+.topic-inspector-head strong {
+  font-size: 13px;
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The inspector's tab row: same .tab-bar/.tab chrome as the sidebar, but
+   compact because four tabs share one narrow column. */
+.inspector-tab-bar { flex: none; }
+.inspector-tab-bar .tab { padding: 7px 0 6px; font-size: 11px; }
+.inspector-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+/* The Resources tab embeds ResourcePanel, which owns its own padding. */
+.inspector-body-flush { padding: 0; gap: 0; }
+.inspector-empty {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 10px 4px;
+  line-height: 1.5;
+}
+.inspector-note {
+  color: var(--accent);
+  font-size: 11.5px;
+  padding: 6px 4px;
+  line-height: 1.5;
+}
+.inspector-note-error { color: var(--blocked); }
+
+/* Threads tab */
+.inspector-new-thread {
+  margin: 0 2px 6px;
+  padding: 7px 10px;
+  font-weight: 600;
+  text-align: center;
+}
+.inspector-threads {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.inspector-thread { position: relative; }
+.inspector-thread .chevron {
+  color: var(--text-dim);
+  cursor: pointer;
+  flex: 0 0 14px;
+}
+.inspector-thread .chevron:hover { color: var(--text); }
+.inspector-thread.archived { opacity: 0.55; }
+
+/* Integrations tab */
+.inspector-candidate {
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--ok);
+  border-radius: 8px;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.inspector-candidate-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.inspector-candidate-head .name {
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.inspector-candidate-sub {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-family: var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inspector-candidate-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.inspector-candidate-actions .link { font-size: 12px; }
+
+/* Todos tab */
+.todo-form {
+  display: flex;
+  gap: 6px;
+}
+.todo-form input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  padding: 6px 8px;
+  font-size: 12px;
+  outline: none;
+}
+.todo-form input:focus { border-color: var(--accent); }
+.todo-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.todo-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-radius: 6px;
+  padding: 4px 6px;
+}
+.todo-item:hover { background: var(--bg-hover); }
+.todo-item.done .todo-text {
+  color: var(--text-dim);
+  text-decoration: line-through;
+}
+.todo-check {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  cursor: pointer;
+}
+.todo-check input { margin-top: 2px; accent-color: var(--accent); }
+.todo-text {
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  user-select: text;
+}
+.todo-remove { flex: none; color: var(--text-dim); }
+.todo-remove:hover { color: var(--blocked); }
+
+/* --- Launch sheet: Repository + Base row ------------------------------ */
+/* Repository and Base split the row in half (with a gutter), matching the
+   sheet's other full-width fields; Base's dropdown anchors below its input
+   via the .nts-base-wrap wrapper (position: relative). */
+.nts-repo-base-row {
+  display: flex;
+  gap: 14px;
+  align-items: flex-start;
+}
+.nts-repo-base-row .nts-field { flex: 1 1 0; min-width: 0; }
+.nts-base-wrap { position: relative; }
+.nts-base-wrap input { width: 100%; }
+.nts-base-menu {
+  top: calc(100% + 3px);
+  bottom: auto;
+  left: 0;
+  width: 100%;
+}
+.nts-base-menu button small { color: var(--text-dim); }

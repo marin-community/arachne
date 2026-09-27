@@ -35,6 +35,7 @@ pub fn run() {
             commands::interrupt,
             commands::launch_session,
             commands::launch_options,
+            commands::repo_branches,
             commands::handoff_session,
             commands::delegate_task,
             commands::archive_session,
@@ -42,6 +43,7 @@ pub fn run() {
             commands::open_in_zed,
             commands::refresh_fleet,
             commands::reparent_session,
+            commands::create_group,
             commands::move_to_group,
             commands::delete_group,
             commands::integrate_session,
@@ -53,6 +55,10 @@ pub fn run() {
             commands::detach_topic_resource,
             commands::read_topic_resource,
             commands::open_topic_resource_in_zed,
+            commands::topic_todos,
+            commands::add_todo,
+            commands::toggle_todo,
+            commands::remove_todo,
         ])
         .run(tauri::generate_context!())
         .expect("error while running arachne");

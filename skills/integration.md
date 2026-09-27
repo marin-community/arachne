@@ -39,11 +39,35 @@ state, handling conflicts, running validation, and reporting the result.
 {
   "action": "land",
   "source_resource": "<topic branch>",
-  "target_resource": "<upstream branch, e.g. main>",
+  "repository": "<repo root>",
+  "target_resource": "<upstream branch>",
+  "target_origin": "primary-checkout | main-fallback | recorded-base | explicit",
   "strategy": "open-pr | squash | merge | rebase | push | decide",
   "requested_by": "user"
 }
 ```
+
+**Landing target policy.** For non-PR strategies (`squash`, `merge`,
+`rebase`, `push`), the target is the **primary local checkout's currently
+checked out branch** — the checkout a human actually opens — falling back
+to `main` when it cannot be resolved. The primary checkout is the
+repository's main working tree, not a worker worktree. `target_origin`
+records how the control plane resolved the target:
+
+- `primary-checkout`: resolved from the primary checkout's current branch.
+  Re-verify it against the live checkout before writing — the user may
+  have switched branches since the request was queued.
+- `main-fallback`: the control plane could not read the checkout
+  (detached HEAD, unreadable repo, or a scoped credential). Try resolving
+  the primary checkout's current branch yourself from `repository`
+  before settling for `main`.
+- `recorded-base`: the branch's recorded base (the remote's default
+  branch) — the normal target for `open-pr`.
+- `explicit`: the user chose the target; do not substitute another one
+  without asking.
+
+`open-pr` targets the branch's recorded base. An explicit `upstream`
+override beats all defaults.
 
 ---
 
@@ -70,6 +94,13 @@ state, handling conflicts, running validation, and reporting the result.
    repository's conventions require. If the repo has no obvious convention,
    run what exists.
 8. **Update the target branch.** Push if the repository expects it.
+   For **landing** with a non-PR strategy, the target is the primary local
+   checkout's currently checked out branch (`main` if it cannot be
+   resolved) — resolve the checkout from the request's `repository`,
+   re-verify which branch it has checked out now, and land there. Do not
+   land into a worker worktree. The primary checkout may be dirty with the
+   user's in-progress edits: reconcile (stash, or integrate around them)
+   rather than destroying them.
 9. **Record resulting commits/PRs** in your report; associate the PR if one
    was created. For a completed worker integration, stamp the source session
    with `loom sessions tags set integration_result <commit-or-PR-reference>
@@ -115,7 +146,10 @@ branch into the topic branch. Report the PR number and link.
 
 ### `push` (landing only)
 
-Push the topic branch itself as the landing action.
+Push the topic branch itself as the landing action. Like the other non-PR
+strategies, the effective upstream target is the primary local checkout's
+checked out branch — update that branch (fast-forward it to the topic
+branch, or push the topic branch onto it) rather than assuming `main`.
 
 ### `decide` (Ask coordinator to decide)
 

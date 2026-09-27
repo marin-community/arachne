@@ -6,10 +6,11 @@ import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
 import SplitButton from "./SplitButton.vue";
 import ChangeReview from "./ChangeReview.vue";
-import { addAttachments, type FileAttachment } from "../attachments";
+import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
-import { groupDisplayBlocks, type ChatDisplayBlock } from "../chatRows";
+import CopyButton from "./CopyButton.vue";
+import { groupDisplayBlocks, blockCopyText, toolCallCopyText, type ChatDisplayBlock } from "../chatRows";
 import { markdownForSelection } from "../markdownCopy";
 
 interface Cursor {
@@ -47,6 +48,7 @@ const emit = defineEmits<{
   (e: "handoff", id: string): void;
   (e: "refresh", id: string): void;
   (e: "open-topic", id: string): void;
+  (e: "overview", id: string): void;
   (e: "home"): void;
 }>();
 
@@ -69,8 +71,10 @@ function onFileInput(event: Event) {
   input.value = "";
 }
 function onComposerPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
-  event.preventDefault(); void addFiles(event.clipboardData.files);
+  if (!event.clipboardData) return;
+  const files = filesFromClipboard(event.clipboardData);
+  if (!files.length) return;
+  event.preventDefault(); void addFiles(files);
 }
 interface MentionResource {
   id: string;
@@ -676,6 +680,13 @@ function splitEntrance(text: string): { goal: string; entrance: string | null } 
   };
 }
 
+// The clipboard gets what the bubble shows: the goal plus the collapsed
+// orientation note, not the goal alone.
+function messageCopyText(block: ChatDisplayBlock): string {
+  const { goal, entrance } = splitEntrance(block.text ?? "");
+  return entrance ? `${goal}\n\n${entrance}` : goal;
+}
+
 function messageAuthor(block: ChatDisplayBlock): string {
   if (block.kind !== "user_message") return props.session.agent_kind;
   if (block.by?.startsWith("channel:")) return `via Loom · ${block.by.slice(8)}`;
@@ -703,8 +714,8 @@ const integrationTarget = computed(() => {
   }
   return nearest;
 });
-// Every root conversation is a topic, including older quick launches that
-// predate the durable marker.
+// Every root conversation is a topic, including older single-prompt launches
+// that predate the durable marker.
 const isTopic = computed(() => !isWorker.value);
 const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
 const allIntegrateOptions = [
@@ -791,6 +802,10 @@ async function onLand(strategy: string) {
         </div>
       </div>
       <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
+      <!-- The scoped dashboard (Needs You / Working / Ready to Integrate) is an
+           explicit detour, not the default Topic view — the main pane stays a
+           conversation whenever a Topic is open. -->
+      <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
@@ -917,12 +932,14 @@ async function onLand(strategy: string) {
             }}</span>
             <span class="tool-title">tool calls</span>
             <span class="tool-summary">{{ row.blocks.length }} {{ row.blocks.length === 1 ? 'call' : 'calls' }}</span>
+            <CopyButton class="tool-copy" :text="row.blocks.map(toolCallCopyText).join('\n\n')" :label="`Copy ${row.blocks.length === 1 ? 'tool call' : row.blocks.length + ' tool calls'}`" />
             <span class="chevron">{{ toolsCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
           </div>
           <div v-if="!toolsCollapsed(row.memberKeys)" class="tool-group-detail">
             <div v-for="(call, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail">
               <span class="status" :class="{ running: call.status === 'running' }">{{ call.status }}</span>
               <strong>{{ call.title || call.tool_kind || 'tool' }}</strong>
+              <CopyButton class="tool-copy" :text="toolCallCopyText(call)" :label="`Copy ${call.title || call.tool_kind || 'tool call'}`" />
               <div v-if="call.summary">{{ call.summary }}</div>
               <ChatImages :block="call" :session-id="session.id" />
             </div>
@@ -938,6 +955,7 @@ async function onLand(strategy: string) {
               @keydown.space.prevent="toggle(row.key)">
               <span class="tool-title">thinking</span>
               <span class="tool-summary">{{ row.block.summary || (row.block.text ?? '').slice(0, 160) }}</span>
+              <CopyButton class="tool-copy" :text="blockCopyText(row.block)" label="Copy thinking" />
               <span class="chevron">{{ isCollapsed(row.key) ? "▸" : "▾" }}</span>
             </div>
             <div v-if="!isCollapsed(row.key)" class="body thought-body">
@@ -953,6 +971,7 @@ async function onLand(strategy: string) {
               [{{ entry[1] }}] {{ entry[0] }}
             </div>
           </div>
+          <CopyButton class="block-copy" :text="blockCopyText(row.block)" label="Copy plan" />
         </div>
         <!-- User / agent messages -->
         <div
@@ -965,6 +984,7 @@ async function onLand(strategy: string) {
         >
           <div class="who">
             {{ messageAuthor(row.block) }}
+            <CopyButton class="block-copy" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : 'reply'}`" />
           </div>
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
@@ -1033,14 +1053,15 @@ async function onLand(strategy: string) {
       </div>
       <div v-if="attachments.length || attachmentError || attachmentLoading" class="attachment-row composer-attachments">
         <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
           {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
         </span>
         <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
         <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
       </div>
       <div class="composer">
-      <label class="attachment-pick composer-attach" title="Attach files">+
-        <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
+      <label class="attachment-pick composer-attach" title="Attach files or images">+
+        <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files or images to message" @change="onFileInput" />
       </label>
       <textarea
         ref="composerEl"

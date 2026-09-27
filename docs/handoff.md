@@ -218,7 +218,7 @@ A topic is **not a worktree** and is **not necessarily a continuously running mo
 It may span multiple repositories. Each attached repository may have its own
 canonical Topic branch/ref for accepted code state; there is no universal
 Topic branch. A human-facing checkout is optional and reconstructible from its
-ref. Every new top-level conversation, including a quick one-prompt launch, is
+ref. Every new top-level conversation, including a single-prompt launch, is
 a Topic and may acquire workers later.
 
 Long term, think of it as a durable actor with a mailbox that occasionally invokes an LLM.
@@ -540,8 +540,8 @@ resources. It is accessible from the Topic/coordinator header, not the
 default destination. The Ready group contains only verified integration
 candidates; an idle or completed worker is not automatically Ready.
 
-Quick creation starts a Topic in the selected or default Project, even for a
-single prompt. Topic selection still opens its coordinator chat on first
+Single-prompt creation starts a Topic in the selected or default Project via
+the New thread sheet. Topic selection still opens its coordinator chat on first
 visit, then restores the last-opened Thread when available.
 
 Example:
@@ -1192,7 +1192,9 @@ canonical ref for accepted state. Worker results are candidates against that
 ref, and the Topic view should expose their queue and status. The normal flow
 is worker → Topic; nested workers may integrate recursively when useful.
 **Integrate** absorbs work into Topic state. **Land** separately moves accepted
-Topic state to an external target such as a PR or main.
+Topic state upstream — non-PR strategies target the primary local checkout's
+currently checked out branch (`main` as fallback); `open-pr` targets the
+remote's default branch.
 
 Preflight conflict preview (for example, `git merge-tree`) and readiness are
 relative to a target revision. When the Topic ref advances, Loom should

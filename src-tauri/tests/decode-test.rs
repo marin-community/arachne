@@ -6,7 +6,10 @@ fn decode_launch_response() {
     let data = std::fs::read_to_string("/tmp/launch-resp.json").unwrap();
     let v: SessionView = serde_json::from_str(&data).expect("SessionView decode");
     assert_eq!(v.protocol, "acp");
-    assert_eq!(v.work_dir, "/Users/dlwh/.weaver/repos/marin-community/arachne/.worktrees/decode-probe");
+    assert_eq!(
+        v.work_dir,
+        "/Users/dlwh/.weaver/repos/marin-community/arachne/.worktrees/decode-probe"
+    );
 }
 
 #[test]
@@ -25,7 +28,10 @@ fn decode_summary_list() {
         "usage": {"cost":null,"size":131072,"used":0}
     }]"#;
     let v: Vec<SessionSummaryView> = serde_json::from_str(sample).expect("summary list decode");
-    assert_eq!(v[0].placement.as_ref().unwrap().group_name.as_deref(), Some("Inbox"));
+    assert_eq!(
+        v[0].placement.as_ref().unwrap().group_name.as_deref(),
+        Some("Inbox")
+    );
 }
 
 #[test]

@@ -28,8 +28,7 @@ fn save_for(account: &str, token: &str) -> Result<(), String> {
         let _ = e.delete_credential();
         return Ok(());
     }
-    e.set_password(token)
-        .map_err(|e| format!("keychain: {e}"))
+    e.set_password(token).map_err(|e| format!("keychain: {e}"))
 }
 
 /// Read the token from the Keychain; `Ok(None)` when none is stored.
@@ -60,7 +59,10 @@ mod tests {
             eprintln!("keychain unavailable; skipping");
             return;
         }
-        assert_eq!(load_for(&account).unwrap().as_deref(), Some("test-token-abc"));
+        assert_eq!(
+            load_for(&account).unwrap().as_deref(),
+            Some("test-token-abc")
+        );
         // Empty deletes.
         save_for(&account, "").unwrap();
         assert_eq!(load_for(&account).unwrap(), None);

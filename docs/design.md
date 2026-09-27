@@ -29,10 +29,6 @@ the intended remote test uses Loom on the DGX over Tailscale.
   repository, not one branch shared across repositories.
   Creation offers a short title and a body that becomes the agent goal; either
   can be left blank when the other or an attachment supplies the intent.
-- **Quick topic:** a single-prompt way to start a topic in the current or
-  default Project. Its title can be derived from the prompt; title and body
-  remain optional in the expanded creation form. It can grow delegated threads
-  later without conversion.
 - **Thread/worker:** one Loom session and its conversation. Hierarchy records
   responsibility; it does not determine Git ancestry.
 - **Resource:** a repository, checkout, PR, document, file, or artifact with a
@@ -97,8 +93,8 @@ unrelated second list. The aggregate Topics home still shows Needs You even
 when Inbox exists. Ready to Integrate requires explicit verified candidate
 state from Loom; a stopped or sleeping worker is not sufficient evidence.
 
-Every new top-level conversation is a topic, including one started through the
-quick input. The Topics list expands through delegated threads at arbitrary
+Every new top-level conversation is a topic, including one started from the
+New thread sheet with a single prompt. The Topics list expands through delegated threads at arbitrary
 depth. Older unmarked top-level conversations remain visible as topics without
 rewriting their Loom history. Delegating from a thread creates a child in the
 conversation tree; its Git base still comes from the topic's accepted branch.
@@ -147,7 +143,7 @@ same file in Zed. The binding survives session archive, although preview and
 editing require an active checkout. Loom artifacts remain appropriate for
 agent-authored reports and standalone versioned documents.
 
-Typing `@` in a thread message, a new topic body, or a quick task offers
+Typing `@` in a thread message, a new thread goal, or a new topic body offers
 attached resources.
 The visible mention is readable, while Arachne resolves its stable ID against
 the current manifest when sending and includes the backing locator in the
@@ -158,8 +154,11 @@ bindings of their own.
 File attachments use Loom Scratch. At launch they seed the new session's
 checkout; in an existing ACP thread, Arachne uploads them to that session and
 passes Loom resource links with the prompt. The composer also accepts dropped
-or pasted files. Scratch files are session inputs, while topic resource
-bindings are durable references to repository files and artifacts.
+or pasted files, including screenshots and other raster images; image
+attachments show a local thumbnail before send. Vision-capable agents such as
+Codex can consume those image resources, while other agents retain the same
+file attachment fallback. Scratch files are session inputs, while topic
+resource bindings are durable references to repository files and artifacts.
 
 Later resource types should be added only when a real workflow needs them.
 The next likely additions are a retained integration checkout and a PR that
@@ -171,7 +170,9 @@ default; other workers get isolated worktrees.
 The Topic owns integration candidates from its workers, with a queue and
 status visible in the inspector's Integrations tab. **Integrate** absorbs a
 candidate into the Topic's accepted ref for the relevant repository. **Land**
-moves that accepted state to an upstream target such as a PR or main. A nested
+moves that accepted state upstream — non-PR strategies target the primary
+local checkout's currently checked out branch (`main` as fallback), while
+`open-pr` targets the remote's default branch. A nested
 worker may integrate through its parent, but worker → Topic is the normal
 visible path.
 
