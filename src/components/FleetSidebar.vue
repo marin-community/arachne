@@ -513,6 +513,13 @@ function onDragStart(id: string, e: DragEvent) {
   }
 }
 
+// Fires whether the drop completed or the drag was cancelled, so it's the
+// reliable place to clear both the drag ghost and any lingering drop hint.
+function onDragEnd() {
+  dragging.value = null;
+  dropTarget.value = null;
+}
+
 function onDragOver(key: string, e: DragEvent) {
   if (!dragging.value) return;
   e.preventDefault();
@@ -522,6 +529,25 @@ function onDragOver(key: string, e: DragEvent) {
 
 function onDragLeave(key: string) {
   if (dropTarget.value === key) dropTarget.value = null;
+}
+
+// Drop a dragged topic here: moving between project headings (and
+// ungrouped) is filing, so it goes to the layout group rather than
+// reparenting. The ungrouped section files to the user's Inbox group.
+function onDropProject(sectionId: string | null, key: string, e: DragEvent) {
+  e.preventDefault();
+  dropTarget.value = null;
+  if (!dragging.value) return;
+  const groupId = sectionId ?? userInboxId.value;
+  if (groupId) {
+    const id = dragging.value;
+    dragging.value = null;
+    invoke("move_to_group", { sessionIds: [id], groupId }).catch((err) =>
+      console.error("move_to_group failed", err),
+    );
+  } else {
+    dragging.value = null;
+  }
 }
 
 function onDropLeader(parentId: string, key: string, e: DragEvent) {
@@ -761,12 +787,25 @@ async function archiveRow(id: string) {
                it; the chevron collapses the section. -->
           <div
             class="project-header"
-            :class="{ selected: selectedProjectId === section.id, empty: !section.topics.length }"
-            :title="selectedProjectId === section.id ? 'selected — click to clear the project filter' : 'filter home to this project'"
+            :class="{
+              selected: selectedProjectId === section.id,
+              empty: !section.topics.length,
+              'drop-hint': dropTarget === `project-${section.id ?? 'ungrouped'}`,
+            }"
+            :title="
+              dragging
+                ? `drop here to file under ${section.name}`
+                : selectedProjectId === section.id
+                  ? 'selected — click to clear the project filter'
+                  : 'filter home to this project'
+            "
             role="button"
             tabindex="0"
             :aria-expanded="!isProjectCollapsed(section.id)"
             :aria-label="`Project ${section.name}${section.topics.length ? `, ${section.topics.length} topics` : ', no topics'}`"
+            @dragover="onDragOver(`project-${section.id ?? 'ungrouped'}`, $event)"
+            @dragleave="onDragLeave(`project-${section.id ?? 'ungrouped'}`)"
+            @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
             @click="selectProject({ id: section.id, name: section.name })"
             @keydown.enter.self="selectProject({ id: section.id, name: section.name })"
             @keydown.space.self.prevent="selectProject({ id: section.id, name: section.name })"
@@ -795,9 +834,13 @@ async function archiveRow(id: string) {
           :class="{
             selected: t.session.id === selectedId,
             archived: t.session.status === 'archived',
+            dragging: dragging === t.session.id,
           }"
           role="button"
           tabindex="0"
+          :draggable="editingId !== t.session.id"
+          @dragstart="onDragStart(t.session.id, $event)"
+          @dragend="onDragEnd"
           @click="emit('select-topic', t.session.id)"
           @keydown.enter.self="emit('select-topic', t.session.id)"
           @keydown.space.self.prevent="emit('select-topic', t.session.id)"
