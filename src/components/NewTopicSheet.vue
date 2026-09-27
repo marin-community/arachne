@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick, reactive } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
+import { readDraft, saveDraft, mergeLaunchConfig, type NewTopicDraft } from "../newTopicDraft";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-topic sheet: composing a topic takes over the main display panel
@@ -16,6 +17,10 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 //
 // Launching routes through App's launchTask → selectSession flow, which
 // swaps the sheet for the live thread; on failure the drafts survive.
+// Closing the sheet by other means (selecting a topic, Esc, Cancel) also
+// keeps the drafts: the composer state is snapshotted to localStorage
+// (src/newTopicDraft.ts) and restored when the sheet reopens, so clicking
+// away mid-compose never eats a half-written topic.
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -35,18 +40,66 @@ const emit = defineEmits<{
 }>();
 
 // --- Draft state ---------------------------------------------------------------
+//
+// The draft lives in localStorage (src/newTopicDraft.ts): selecting a topic
+// closes the sheet mid-compose (the main pane is the topic's chat — see
+// App's selectTopic), and closing must not eat a half-written topic. The
+// sheet restores the stored draft on mount — this is a reopen, not a blank
+// form — reconciling the launch config against the runtime's current
+// profiles/agents. A successful launch clears it in App (the topic exists
+// as a real branch now, so the draft has served its purpose).
 
-const title = ref("");
-const body = ref("");
-const repo = ref("marin-community/arachne");
-const base = ref("");
+const draft: NewTopicDraft = reactive(readDraft(localStorage));
+const title = computed({
+  get: () => draft.title,
+  set: (value: string) => { draft.title = value; },
+});
+const body = computed({
+  get: () => draft.body,
+  set: (value: string) => { draft.body = value; },
+});
+const repo = computed({
+  get: () => draft.repo,
+  set: (value: string) => { draft.repo = value; },
+});
+const base = computed({
+  get: () => draft.base,
+  set: (value: string) => { draft.base = value; },
+});
+const attachments = computed({
+  get: () => draft.attachments,
+  set: (value: FileAttachment[]) => { draft.attachments = value; },
+});
+const mentions = computed({
+  get: () => draft.mentions,
+  set: (value: NewTopicDraft["mentions"]) => { draft.mentions = value; },
+});
+
+// Reconcile the launch config against the runtime's current
+// profiles/agents: a stored profile or agent that no longer exists
+// (e.g. the loom config changed while the sheet sat closed) falls back
+// to a valid default instead of silently failing at launch.
+Object.assign(draft, mergeLaunchConfig(draft, props.launchOptions));
+
 const titleEl = ref<HTMLInputElement | null>(null);
 const bodyEl = ref<HTMLTextAreaElement | null>(null);
 
-const profile = ref("default");
-const agent = ref("");
-const model = ref("");
-const effort = ref("");
+const profile = computed({
+  get: () => draft.profile,
+  set: (value: string) => { draft.profile = value; },
+});
+const agent = computed({
+  get: () => draft.agent,
+  set: (value: string) => { draft.agent = value; },
+});
+const model = computed({
+  get: () => draft.model,
+  set: (value: string) => { draft.model = value; },
+});
+const effort = computed({
+  get: () => draft.effort,
+  set: (value: string) => { draft.effort = value; },
+});
 const profiles = computed(() => props.launchOptions?.profiles.filter((p) => p.class === "interactive") ?? []);
 const selectedProfile = computed(() => profiles.value.find((p) => p.name === profile.value));
 const selectedAgent = computed(() => props.launchOptions?.agents.find((a) => a.kind === (agent.value || selectedProfile.value?.agent_kind || props.launchOptions?.default_agent)));
@@ -70,7 +123,9 @@ function onAgentChange() {
 
 // --- Attachments ---------------------------------------------------------------
 
-const attachments = ref<FileAttachment[]>([]);
+// Restored attachments come back as plain FileAttachment snapshots
+// (name/size/payload/mime); re-adding more checks the total budget
+// including them, same as a live session.
 const attachmentError = ref("");
 const attachmentLoading = ref(false);
 
@@ -138,7 +193,6 @@ const mentionIndex = ref(0);
 const mentionResources = ref<TopicMentionResource[]>([]);
 const mentionLoading = ref(false);
 const mentionError = ref("");
-const mentions = ref<{ token: string; topicId: string; resourceId: string }[]>([]);
 const matchingResources = computed(() => {
   const query = mentionRange.value?.query.trim().toLowerCase() ?? "";
   return mentionResources.value.filter((resource) =>
@@ -180,7 +234,7 @@ function chooseMention(resource: TopicMentionResource) {
   const label = duplicate ? `${resource.title} (${resource.path || resource.url || resource.repository})` : resource.title;
   const token = `@{${label}}`;
   body.value = body.value.slice(0, range.start) + token + " " + body.value.slice(range.end);
-  mentions.value.push({ token, topicId: resource.topicId, resourceId: resource.id });
+  mentions.value = [...mentions.value, { token, topicId: resource.topicId, resourceId: resource.id }];
   mentionRange.value = null;
   nextTick(() => {
     const caret = range.start + token.length + 1;
@@ -214,24 +268,40 @@ function onBodyKeydown(event: KeyboardEvent) {
 // --- Sheet lifecycle ---------------------------------------------------------------
 
 // Keyboard-first: focus the title on open, and Esc always closes — unless
-// the mention menu is open (it owns Esc first).
+// the mention menu is open (it owns Esc first). A restored draft opens
+// with focus at the end of the body — the cursor lands where the writing
+// stopped, not back at the title.
 function onKeydown(e: KeyboardEvent) {
   if (e.key === "Escape") emit("close");
 }
 onMounted(async () => {
   document.addEventListener("keydown", onKeydown);
   await nextTick();
-  titleEl.value?.focus();
+  if (!title.value && !body.value) {
+    titleEl.value?.focus();
+    return;
+  }
+  const target = title.value ? bodyEl.value : titleEl.value;
+  target?.focus();
+  if (target === bodyEl.value) target?.setSelectionRange(target.value.length, target.value.length);
 });
-onUnmounted(() => document.removeEventListener("keydown", onKeydown));
+// Snapshot the draft on unmount — the save happens on every close
+// (launch, Cancel, Esc, selecting a topic), so a mid-compose close never
+// loses work. App clears the snapshot after a successful launch, once
+// this hook has flushed.
+onUnmounted(() => {
+  document.removeEventListener("keydown", onKeydown);
+  saveDraft(localStorage, draft);
+});
 
 function submit() {
   const t = title.value.trim();
   const b = body.value.trim();
   if ((!t && !b && !attachments.value.length) || props.launching || attachmentLoading.value) return;
   // The body is both the agent's initial goal and the durable branch
-  // description; either alone can seed a topic. Drafts are deliberately
-  // not cleared here — success unmounts the sheet, failure keeps them.
+  // description; either alone can seed a topic. The draft is not cleared
+  // here: App clears it on successful launch (the sheet unmounts), and
+  // every other exit (failure, Esc, navigation) keeps it for reopening.
   emit("launch", b || t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     title: t || undefined,
     description: b || undefined,
@@ -314,7 +384,7 @@ function submit() {
         <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files or images to new topic" @change="onFileInput" /></label>
         <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
           <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
-          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
+          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments = attachments.filter((_, i) => i !== index)">×</button>
         </span>
         <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
         <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
