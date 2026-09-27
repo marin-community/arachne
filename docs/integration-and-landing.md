@@ -113,9 +113,11 @@ The user may inspect the result or immediately integrate it.
 
 The coordinator may also choose to integrate workers autonomously when policy allows.
 
-The Topic view should show its integration queue: each candidate's source,
-target repo/ref, readiness and conflict status, validation, and outcome. The
-worker card can expose the same candidate without owning the queue.
+The Topic inspector's **Integrations** tab should show its queue: each
+candidate's source, target repo/ref, readiness and conflict status,
+validation, and outcome. The worker Thread can expose a link or action near
+its result without owning the queue. Selecting a Topic opens its coordinator
+chat (or last-opened Thread), not this queue.
 
 ---
 
@@ -663,6 +665,8 @@ Individual changes may later be upstreamed to Loom main intentionally.
 # Thread UI
 
 A completed coding worker should expose integration near the result.
+Its Topic's Integrations tab is the persistent place to inspect all candidates
+and outcomes while the main pane remains this Thread's conversation.
 
 Example:
 
@@ -698,10 +702,12 @@ The button should no longer imply outstanding work.
 
 # Topic integration queue and coordinator UX
 
-The Topic view should show queued candidates and outcomes across its workers,
-including target revision, preflight status, and validation. The top-level
-coordinator Thread also receives integration Events in its timeline. An Event
-can update the queue without immediately waking the coordinator.
+The right-side Integrations tab should show queued candidates and outcomes
+across the Topic's workers, including target revision, preflight status, and
+validation. The top-level coordinator Thread also receives integration Events
+in its timeline. An Event can update the queue without immediately waking
+the coordinator. A deliberate Topic Overview may summarize the same queue;
+it is not the default landing surface when selecting the Topic.
 
 Example:
 

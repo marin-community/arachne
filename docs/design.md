@@ -42,15 +42,44 @@ The main screen answers “what needs me?” Topic and thread views then show th
 conversation alongside code and resources. Every code reference should lead to
 an editable checkout with one action when that checkout is available.
 
-Navigation is **Topics home → Topic dashboard → Thread detail**. With no Topic
-selected, Topics home is an aggregate fleet view across all Topics. It shows
-Needs You first and prominently (or “Nothing needs you”), then Working, Ready
-to Integrate, and collapsed Waiting / Resting. Every aggregate row names its
-parent Topic. Selecting a Topic in the sidebar scopes those same categories to
-its coordinator and workers, with Topic summary, resources, repository refs,
-Open in Zed, Todos, and New Thread near the header as those capabilities
-become available. Selecting a row opens its individual conversation. Topics
-and Threads are levels of navigation, not peer objects.
+With no Topic selected, **Topics home** is an aggregate fleet view across all
+Topics. It shows Needs You first and prominently (or “Nothing needs you”),
+then Working, Ready to Integrate, and collapsed Waiting / Resting. Every row
+names its parent Topic and opens its Thread conversation.
+
+Selecting a Topic opens a **chat**, normally its coordinator Thread. The
+coordinator is the Topic's voice, not one item buried in a dashboard. On a
+first visit, open the coordinator; on later visits, restore the last Thread
+opened within that Topic if it is still available, otherwise return to the
+coordinator. Clicking an already-selected Topic keeps the current Thread.
+The coordinator row in the Threads inspector and a header action provide an
+explicit way back to it. The legible hierarchy is Topics home → Topic →
+Thread, while the main pane remains a conversation and composer whenever a
+Topic is open.
+
+The right pane is a **Topic inspector** with tabs:
+
+- **Threads:** coordinator and worker fleet with their attention, working,
+  readiness, and resting states. Selecting a row switches the main chat.
+  Place New Thread here.
+- **Resources:** Topic resources and refs, with Thread resources distinguished
+  when viewing a worker. Keep Open in Zed prominent here or in the chat header.
+- **Integrations:** the Topic-owned candidate queue, preflight/validation
+  state, review links, and Integrate actions. Land remains a separate Topic
+  action toward upstream.
+- **Todos:** a Topic-filtered view of the durable cross-topic user Todo list.
+  Topic plans and worker-internal checklists remain separate.
+
+An **Overview** action in the Topic or coordinator header opens the scoped
+dashboard deliberately: Needs You, Working, Ready to Integrate, Waiting /
+Resting, summary, and resources. It is not the default Topic destination.
+Events feed these surfaces and Attention; do not add an Events inspector tab
+until a concrete workflow calls for it. The chat header stays compact: Topic,
+current Thread, runtime, and a small set of relevant actions.
+
+The current bootstrap build opens a scoped dashboard on Topic selection. Keep
+that view as Overview when changing the default route to chat; do not discard
+its aggregate status work.
 
 The sidebar primarily browses Topics. **Topics [+]** opens the optional
 title/body/attachment creation form in a sheet or popover; the form does not
@@ -108,10 +137,11 @@ default; other workers get isolated worktrees.
 ## Integration
 
 The Topic owns integration candidates from its workers, with a queue and
-status visible in the Topic view. **Integrate** absorbs a candidate into the
-Topic's accepted ref for the relevant repository. **Land** moves that accepted
-state to an upstream target such as a PR or main. A nested worker may integrate
-through its parent, but worker → Topic is the normal visible path.
+status visible in the inspector's Integrations tab. **Integrate** absorbs a
+candidate into the Topic's accepted ref for the relevant repository. **Land**
+moves that accepted state to an upstream target such as a PR or main. A nested
+worker may integrate through its parent, but worker → Topic is the normal
+visible path.
 
 Worker lifecycle and integration lifecycle are separate. Stopping does not
 make a coding result Ready. The worker normally commits or stabilizes its

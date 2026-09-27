@@ -481,12 +481,11 @@ Roughly:
 
 ```text
 ┌─────────────────┬───────────────────────────────┬────────────────────┐
-│ ATTENTION       │                               │ RESOURCES / DIFF   │
-│                 │         THREAD                │                    │
-│ TOPICS     │                               │ PR                 │
-│                 │      conversation             │ Worktree           │
-│ QUICK TASKS     │                               │ Files              │
-│                 │                               │                    │
+│ TOPICS          │ Topic · current Thread        │ Threads            │
+│                 │                               │ Resources          │
+│ Arachne         │      conversation             │ Integrations       │
+│ TaskCompendium  │                               │ Todos              │
+│ ...             │ [composer__________________]   │                    │
 └─────────────────┴───────────────────────────────┴────────────────────┘
 ```
 
@@ -494,20 +493,36 @@ The default **Topics home** screen should answer:
 
 > What is happening across everything, and what needs my attention?
 
-Navigation is **Topics home → Topic dashboard → Thread conversation**.
 Topics home aggregates all Topics. The sidebar lists Topics, with **Topics
-[+]** opening the optional creation form in a sheet or popover. Clicking a
-Topic opens its dashboard, not immediately its coordinator conversation;
-clicking a row on either dashboard opens that Thread. Every aggregate row
-names its parent Topic. Inbox may remain a separate attention/review tab, but
-Topics home still includes all cross-Topic Needs You items.
+[+]** opening the optional creation form in a sheet or popover. Every
+aggregate row names its parent Topic and opens that Thread. Inbox may remain
+a separate attention/review tab, but Topics home still includes all
+cross-Topic Needs You items.
 
-Both aggregate home and Topic detail use the same order: **Needs You** first,
-**Working**, **Ready to Integrate**, then de-emphasized/collapsible **Waiting /
-Resting**. Topic detail scopes those sections to one Topic and adds its
-summary, Resources, refs, Open in Zed, Todos, and New Thread actions. The
-Ready section contains only verified integration candidates; an idle or
-completed worker is not automatically Ready.
+Selecting a Topic normally opens its **coordinator conversation** in the main
+pane, making the coordinator the Topic's voice. First visit opens the
+coordinator. Subsequent visits restore the last-opened Thread for that Topic
+if available, falling back to the coordinator. Clicking the already-selected
+Topic keeps the current Thread. The Threads tab and chat header provide an
+explicit Coordinator action. The main pane should almost always be a chat;
+Topics and Threads are levels of context, not peer destinations.
+
+The right pane is the Topic inspector: **Threads | Resources | Integrations |
+Todos**. Threads lists the coordinator and workers and switches the main chat;
+New Thread belongs there. Resources includes Topic refs and checkouts plus
+distinguishable Thread resources, with Open in Zed prominent there or in the
+header. Integrations shows the Topic-owned candidate queue, readiness,
+conflicts, review, and Integrate actions. Todos is a Topic-filtered view of
+the durable cross-topic user Todo list, distinct from a Topic plan or worker
+checklist. Events should feed the appropriate tab and Attention, not become a
+top-level tab until a real workflow needs one.
+
+The aggregate home keeps **Needs You**, **Working**, **Ready to Integrate**,
+and de-emphasized/collapsible **Waiting / Resting**. A deliberately opened
+**Topic Overview** scopes those same groups to one Topic and adds summary and
+resources. It is accessible from the Topic/coordinator header, not the
+default destination. The Ready group contains only verified integration
+candidates; an idle or completed worker is not automatically Ready.
 
 Example:
 
