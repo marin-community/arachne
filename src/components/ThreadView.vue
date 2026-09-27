@@ -10,7 +10,7 @@ import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachmen
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
-import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, type ChatDisplayBlock } from "../chatRows";
+import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, type ChatDisplayBlock } from "../chatRows";
 
 interface Cursor {
   turn: number;
@@ -472,10 +472,56 @@ async function loadOlder() {
 // Journal coordinates keep disclosure state stable when older pages prepend.
 const collapsed = ref<Record<string, boolean>>({});
 
+// --- Copy-icon corner following -------------------------------------------
+//
+// A block's copy icon pins to the top-right corner of its bubble while
+// that corner is on screen, and flips to the bottom-right once the top
+// has scrolled out of view. The corner depends on pure geometry (block
+// top vs scroll container top), recomputed on scroll (rAF-coalesced) and
+// whenever rows repaint. Host elements carry the row key on
+// data-copy-host so the handler can walk the rendered rows.
+const copyCorners = ref<Record<string, "top" | "bottom">>({});
+let cornerRaf: number | null = null;
+
+function recomputeCorners() {
+  const scroller = convEl.value;
+  if (!scroller) return;
+  const viewportTop = scroller.getBoundingClientRect().top;
+  const next: Record<string, "top" | "bottom"> = {};
+  for (const el of Array.from(scroller.querySelectorAll<HTMLElement>("[data-copy-host]"))) {
+    next[el.dataset.copyHost!] = copyCornerFor(el.getBoundingClientRect().top, viewportTop);
+  }
+  copyCorners.value = next;
+}
+
+function onConversationScroll() {
+  if (cornerRaf != null) return;
+  cornerRaf = requestAnimationFrame(() => {
+    cornerRaf = null;
+    recomputeCorners();
+  });
+}
+
+function cornerOf(key: string): "top" | "bottom" {
+  return copyCorners.value[key] ?? "top";
+}
+
+// Rows repaint after every fetch or page load; disclosure toggles mutate
+// `collapsed` in place and change every host's height. Both recomputations
+// wait a tick for the DOM to settle. (Deep watch on `collapsed` only:
+// deep-watching `rows` would traverse every block payload each reload.)
+watch(rows, () => {
+  nextTick(recomputeCorners);
+});
+watch(collapsed, () => {
+  nextTick(recomputeCorners);
+}, { deep: true });
+
 onMounted(async () => {
   ticker = setInterval(() => (clock.value = Date.now()), 1000);
   await reload();
   scrollToBottom();
+  recomputeCorners();
   unlisteners.push(
     await listen("loom://chat-event", (event) => {
       const frame = event.payload as ChatEventFrame;
@@ -516,6 +562,7 @@ onUnmounted(() => {
   unlisteners.forEach((u) => u());
   if (reloadTimer) clearTimeout(reloadTimer);
   if (ticker) clearInterval(ticker);
+  if (cornerRaf != null) cancelAnimationFrame(cornerRaf);
 });
 
 async function send() {
@@ -863,7 +910,7 @@ async function onLand(strategy: string) {
         Spawn child
       </button>
     </div>
-    <div class="conversation" ref="convEl">
+    <div class="conversation" ref="convEl" @scroll="onConversationScroll">
       <div v-if="hasOlder" class="load-older">
         <button :disabled="loadingOlder" @click="loadOlder">
           {{ loadingOlder ? "loading…" : "load older" }}
@@ -872,7 +919,7 @@ async function onLand(strategy: string) {
       <template v-for="row in rows" :key="row.key">
         <!-- Consecutive tool calls and finished thinking in one turn share one
              disclosure. -->
-        <div v-if="row.kind === 'work_group'" class="block tool">
+        <div v-if="row.kind === 'work_group'" class="block tool" :data-copy-host="row.key">
           <div class="tool-line" role="button" tabindex="0"
             :aria-expanded="!workCollapsed(row.memberKeys)"
             @click="toggleWork(row.memberKeys)"
@@ -886,15 +933,15 @@ async function onLand(strategy: string) {
                 row.thinkingTokens ? `${formatTokens(row.thinkingTokens)} thinking tokens` : null,
               ].filter(Boolean).join(' · ') || 'done'
             }}</span>
-            <CopyButton class="tool-copy" :text="row.blocks.map((member) => member.kind === 'tool_call' ? toolCallCopyText(member) : (member.text ?? '')).join('\n\n')" :label="`Copy ${row.blocks.length === 1 ? 'block' : row.blocks.length + ' blocks'}`" />
             <span class="chevron">{{ workCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
           </div>
+          <CopyButton :corner="cornerOf(row.key)" :text="row.blocks.map((member) => member.kind === 'tool_call' ? toolCallCopyText(member) : (member.text ?? '')).join('\n\n')" :label="`Copy ${row.blocks.length === 1 ? 'block' : row.blocks.length + ' blocks'}`" />
           <div v-if="!workCollapsed(row.memberKeys)" class="tool-group-detail">
-            <div v-for="(member, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail">
+            <div v-for="(member, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail" :data-copy-host="`detail:${row.memberKeys[j]}`">
               <template v-if="member.kind === 'tool_call'">
                 <span class="status" :class="{ running: member.status === 'running' }">{{ member.status }}</span>
                 <strong>{{ member.title || member.tool_kind || 'tool' }}</strong>
-                <CopyButton class="tool-copy" :text="toolCallCopyText(member)" :label="`Copy ${member.title || member.tool_kind || 'tool call'}`" />
+                <CopyButton :corner="cornerOf(`detail:${row.memberKeys[j]}`)" :text="toolCallCopyText(member)" :label="`Copy ${member.title || member.tool_kind || 'tool call'}`" />
                 <div v-if="member.summary">{{ member.summary }}</div>
               </template>
               <template v-else>
@@ -924,7 +971,7 @@ async function onLand(strategy: string) {
           </div>
         </template>
         <template v-else-if="row.block.kind === 'thought'">
-          <div class="block thought">
+          <div class="block thought" :data-copy-host="row.key">
             <div class="tool-line" role="button" tabindex="0"
               :aria-expanded="!isCollapsed(row.key)"
               @click="toggle(row.key)"
@@ -932,23 +979,23 @@ async function onLand(strategy: string) {
               @keydown.space.prevent="toggle(row.key)">
               <span class="tool-title">thinking</span>
               <span class="tool-summary">{{ row.block.summary || (row.block.text ?? '').slice(0, 160) }}</span>
-              <CopyButton class="tool-copy" :text="blockCopyText(row.block)" label="Copy thinking" />
               <span class="chevron">{{ isCollapsed(row.key) ? "▸" : "▾" }}</span>
             </div>
+            <CopyButton :corner="cornerOf(row.key)" :text="blockCopyText(row.block)" label="Copy thinking" />
             <div v-if="!isCollapsed(row.key)" class="body thought-body">
               <ChatMarkdown :text="row.block.text ?? ''" />
             </div>
           </div>
         </template>
         <!-- Plans -->
-        <div v-else-if="row.block.kind === 'plan'" class="block">
+        <div v-else-if="row.block.kind === 'plan'" class="block" :data-copy-host="row.key">
           <div class="who">plan</div>
           <div class="body">
             <div v-for="(entry, j) in row.block.entries" :key="j">
               [{{ entry[1] }}] {{ entry[0] }}
             </div>
           </div>
-          <CopyButton class="block-copy" :text="blockCopyText(row.block)" label="Copy plan" />
+          <CopyButton :corner="cornerOf(row.key)" :text="blockCopyText(row.block)" label="Copy plan" />
         </div>
         <!-- User / agent messages -->
         <div
@@ -958,11 +1005,12 @@ async function onLand(strategy: string) {
             user: row.block.kind === 'user_message',
             agent: row.block.kind === 'agent_message',
           }"
+          :data-copy-host="row.key"
         >
           <div class="who">
             {{ messageAuthor(row.block) }}
-            <CopyButton class="block-copy" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : 'reply'}`" />
           </div>
+          <CopyButton :corner="cornerOf(row.key)" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : 'reply'}`" />
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
                transcript, but collapse the boilerplate behind a disclosure

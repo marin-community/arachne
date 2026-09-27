@@ -5,7 +5,13 @@ import { copyText } from "../clipboard";
 // The two-squares glyph on every chat bubble, tool call and thinking
 // block. Copies the block's raw text, then flips to a checkmark for a
 // moment — the clipboard itself gives no feedback that a click landed.
-const props = defineProps<{ text: string; label?: string }>();
+//
+// The button pins to a corner of its host block (`corner` prop):
+// "top" keeps it inside the visible frame; "bottom" lets it follow the
+// tail of a block whose top has scrolled out of view. The host block
+// owns the positioning (position: relative + this button position:
+// absolute) — see .copy-button in styles.css.
+const props = defineProps<{ text: string; label?: string; corner?: "top" | "bottom" }>();
 const copied = ref(false);
 let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -27,7 +33,7 @@ onUnmounted(() => {
        thought or tool-call header sits inside. -->
   <button
     class="copy-button"
-    :class="{ copied }"
+    :class="[`corner-${corner ?? 'top'}`, { copied }]"
     type="button"
     :title="label ?? 'Copy'"
     :aria-label="label ?? 'Copy'"
