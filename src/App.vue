@@ -26,6 +26,15 @@ interface TagView {
   set_at: string;
   set_by: string;
 }
+interface GithubStatus {
+  pr_number: number;
+  pr_url: string;
+  pr_state: string;
+  pr_title: string;
+  is_draft: boolean;
+  review_decision: string | null;
+  checks: string | null;
+}
 interface BranchSummary {
   id: string;
   branch: string;
@@ -44,6 +53,7 @@ interface BranchSummary {
   github_pr?: number | null;
   tags: TagView[];
   title_provenance?: string;
+  github: GithubStatus | null;
 }
 interface Placement {
   space_id: string | null;
@@ -85,6 +95,11 @@ export interface SessionView {
   work_dir: string;
   github_repo: string | null;
   term_session: string;
+  // True when the session's checkout still exists on the server — archive
+  // removes worktrees, so a false value gates Open-in-Zed behind recovery.
+  worktree_present: boolean;
+  // The managed `owner/name` slug when launched against a managed repo.
+  github_repo: string | null;
   turn_count: number;
   created_by: string | null;
   created_at: string;

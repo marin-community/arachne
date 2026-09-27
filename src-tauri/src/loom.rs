@@ -28,6 +28,24 @@ pub struct TagView {
     pub set_by: String,
 }
 
+/// The branch's GitHub PR snapshot, maintained by loom's poll loop. Only
+/// the fields the resource strip renders.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct GithubStatusView {
+    pub pr_number: i64,
+    pub pr_url: String,
+    pub pr_state: String,
+    pub pr_title: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub review_decision: Option<String>,
+    /// One-word CI rollup (e.g. `success`), when known.
+    #[serde(default)]
+    pub checks: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct BranchSummaryView {
@@ -51,6 +69,12 @@ pub struct BranchSummaryView {
     pub github_pr: Option<i64>,
     #[serde(default)]
     pub tags: Vec<TagView>,
+    /// The branch's latest GitHub pull-request snapshot (link, review
+    /// decision, check rollup), or `null` when GitHub polling is off, the
+    /// repo has no remote PR, or `gh` is unavailable. Maintained by the
+    /// loom poll loop.
+    #[serde(default)]
+    pub github: Option<GithubStatusView>,
 }
 
 /// The small part of Loom's cached PR snapshot the resource strip needs.
@@ -140,6 +164,12 @@ pub struct SessionView {
     pub protocol: String,
     pub work_dir: String,
     pub term_session: String,
+    /// True when the session's `work_dir` still exists on the server.
+    /// Archive removes the worktree while keeping the branch, so this
+    /// decides whether "Open in Zed" is live or needs recovery through
+    /// `repos.worktrees.ensure` first.
+    #[serde(default)]
+    pub worktree_present: bool,
     /// The managed `owner/name` slug when the session launched against a
     /// managed repo (delegation's source of truth). `null` for cwd-forked
     /// sessions — delegation then forks from the parent's checkout.
@@ -152,6 +182,22 @@ pub struct SessionView {
     pub branch: BranchSummaryView,
     #[serde(default)]
     pub placement: Option<SessionPlacementView>,
+}
+
+// ---------------------------------------------------------------------------
+// Repos / worktrees
+// ---------------------------------------------------------------------------
+
+/// `repos.worktrees.ensure` — a branch's (possibly just-recovered)
+/// checkout. Idempotent: `created` distinguishes a materialized worktree
+/// from one already on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct RepoWorktreeView {
+    pub repo_root: String,
+    pub branch: String,
+    pub path: String,
+    pub created: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -43,6 +43,8 @@ pub fn run() {
             commands::archive_session,
             commands::update_session,
             commands::open_in_zed,
+            commands::open_in_terminal,
+            commands::recover_worktree,
             commands::refresh_fleet,
             commands::reparent_session,
             commands::create_group,
