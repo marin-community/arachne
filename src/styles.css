@@ -231,6 +231,7 @@ body {
 .project-section {
   display: flex;
   flex-direction: column;
+  flex-shrink: 0;
   gap: 8px;
   border-radius: 8px;
   min-height: 44px;
