@@ -837,6 +837,7 @@ pub async fn launch_session(
             // Empty strings mean "inherit the server default" — filter to
             // None so loom sees omitted-vs-blank as intended.
             profile: profile.filter(|s| !s.is_empty()),
+            launch_guidance: Some(crate::loom::topic_launch_guidance()),
             agent: agent.filter(|s| !s.is_empty()),
             model: model.filter(|s| !s.is_empty()),
             effort: effort.filter(|s| !s.is_empty()),
@@ -984,6 +985,7 @@ pub async fn delegate_task(
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
             parent_branch: Some(parent.branch.id),
+            launch_guidance: Some(crate::loom::topic_launch_guidance()),
             // Launch overrides from the picker: empty strings mean "inherit
             // the server default", so filter them to None (loom's
             // omitted-vs-blank distinction).
