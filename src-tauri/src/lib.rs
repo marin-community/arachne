@@ -31,6 +31,7 @@ pub fn run() {
             commands::send_input,
             commands::interrupt,
             commands::launch_session,
+            commands::pick_topic_files,
             commands::delegate_task,
             commands::archive_session,
             commands::open_in_zed,

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
@@ -16,7 +17,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
-  (e: "launch", task: string, repo: string): void;
+  (e: "launch", task: string, repo: string, files: string[]): void;
   (
     e: "reparent",
     sessionId: string,
@@ -29,6 +30,9 @@ const emit = defineEmits<{
 
 const task = ref("");
 const repo = ref("marin-community/arachne");
+const attachedFiles = ref<string[]>([]);
+const pickerError = ref("");
+const picking = ref(false);
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
@@ -36,8 +40,32 @@ const dropTarget = ref<string | null>(null);
 function submit() {
   const t = task.value.trim();
   if (!t) return;
-  emit("launch", t, repo.value.trim());
+  emit("launch", t, repo.value.trim(), attachedFiles.value);
   task.value = "";
+  attachedFiles.value = [];
+}
+
+watch(repo, () => {
+  attachedFiles.value = [];
+  pickerError.value = "";
+});
+
+async function pickFiles() {
+  pickerError.value = "";
+  picking.value = true;
+  const selectedRepo = repo.value.trim();
+  try {
+    const paths = await invoke<string[]>("pick_topic_files", {
+      repo: selectedRepo,
+    });
+    if (repo.value.trim() === selectedRepo) {
+      attachedFiles.value = [...new Set([...attachedFiles.value, ...paths])];
+    }
+  } catch (e: any) {
+    pickerError.value = e?.message ?? String(e);
+  } finally {
+    picking.value = false;
+  }
 }
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
@@ -360,6 +388,21 @@ async function archiveRow(id: string) {
         spellcheck="false"
         style="font-family: var(--mono); font-size: 11px"
       />
+    </div>
+    <div class="topic-attachments">
+      <button
+        class="link"
+        type="button"
+        :disabled="picking || props.launching || !repo.trim()"
+        @click="pickFiles"
+      >
+        {{ picking ? "Opening…" : "Attach files" }}
+      </button>
+      <div v-if="pickerError" class="attachment-error">{{ pickerError }}</div>
+      <div v-for="path in attachedFiles" :key="path" class="attached-file" :title="path">
+        <span>{{ path.split("/").pop() }}</span>
+        <button type="button" class="link" :aria-label="`Remove ${path}`" @click="attachedFiles = attachedFiles.filter((p) => p !== path)">×</button>
+      </div>
     </div>
 
     <div class="session-list">

@@ -182,10 +182,10 @@ async function selectSession(id: string) {
   }
 }
 
-async function launchTask(task: string, repo: string) {
+async function launchTask(task: string, repo: string, files: string[]) {
   launching.value = true;
   try {
-    const view = await invoke<SessionView>("launch_session", { repo, task });
+    const view = await invoke<SessionView>("launch_session", { repo, task, files });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.

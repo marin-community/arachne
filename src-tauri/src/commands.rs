@@ -379,6 +379,7 @@ pub async fn launch_session(
     state: State<'_, LoomState>,
     repo: String,
     task: String,
+    files: Vec<String>,
     parent_id: Option<String>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
@@ -390,11 +391,23 @@ pub async fn launch_session(
         }
         _ => None,
     };
+    let goal = if files.is_empty() {
+        task.clone()
+    } else {
+        format!(
+            "{task}\n\nAttached files:\n{}",
+            files
+                .iter()
+                .map(|path| format!("- {path}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: Some(repo),
             title: Some(task.chars().take(80).collect()),
-            goal: Some(task),
+            goal: Some(goal),
             parent_branch: parent_branch.clone(),
             ..Default::default()
         })
@@ -410,6 +423,69 @@ pub async fn launch_session(
     // the returned view. Delegations stay on the parent thread — the child
     // just appears nested in the sidebar.
     Ok(view)
+}
+
+/// Open the macOS file picker at the local checkout of the selected repo.
+/// The checkout path comes from Loom's session summaries, rather than from a
+/// guessed location on the client machine.
+#[tauri::command]
+pub async fn pick_topic_files(
+    state: State<'_, LoomState>,
+    repo: String,
+) -> Result<Vec<String>, UiError> {
+    let client = state_client(&state).await?;
+    let sessions = client.list_sessions().await?;
+    let checkout = sessions
+        .iter()
+        .filter(|s| s.github_repo.as_deref() == Some(repo.as_str()))
+        .map(|s| s.branch.repo_root.as_str())
+        .find(|path| std::path::Path::new(path).is_dir())
+        .or_else(|| std::path::Path::new(&repo).is_dir().then_some(repo.as_str()))
+        .ok_or_else(|| UiError {
+            message: format!("no local checkout found for {repo}"),
+            unreachable: false,
+        })?;
+
+    // Pass the path as an argv item so names containing quotes or other
+    // AppleScript syntax cannot change the script. A cancelled picker returns
+    // -128, which is an ordinary empty selection.
+    let script = r#"
+on run argv
+    set checkout to POSIX file (item 1 of argv) as alias
+    set picked to choose file with prompt "Attach files to new topic" default location checkout with multiple selections allowed
+    set paths to {}
+    repeat with fileItem in picked
+        set end of paths to POSIX path of fileItem
+    end repeat
+    set AppleScript's text item delimiters to (character id 30)
+    return paths as text
+end run
+"#;
+    let output = tokio::process::Command::new("osascript")
+        .args(["-e", script, "--", checkout])
+        .output()
+        .await
+        .map_err(|e| UiError {
+            message: format!("opening file picker: {e}"),
+            unreachable: false,
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("(-128)") {
+            return Ok(vec![]);
+        }
+        return Err(UiError {
+            message: format!("file picker failed: {}", stderr.trim()),
+            unreachable: false,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .trim_end_matches('\n')
+        .split('\u{1e}')
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 /// Create a child session delegated to the given parent.
