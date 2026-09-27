@@ -610,7 +610,14 @@ async function interrupt() {
 
 async function openInZed() {
   try {
-    await invoke("open_in_zed", { id: props.session.id });
+    // Post-recovery, the fresh checkout path wins over the stale session view
+    // (`recover_worktree` returned a path the server just materialized).
+    await invoke("open_in_zed", {
+      id: props.session.id,
+      ...(zedTarget.value && !props.session.worktree_present
+        ? { workDir: zedTarget.value }
+        : {}),
+    });
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   }
@@ -643,6 +650,68 @@ async function openResource(url: string) {
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   }
+}
+
+// --- Resource strip ---------------------------------------------------------
+//
+// The spec's invariant: "If Arachne shows something referring to code, it
+// should be possible to reach an editable checkout of that code in one
+// action." The strip exposes the thread's repo, its PR, and a live path to
+// the checkout. When the worktree is gone (archive keeps the branch, not
+// the directory), Open-in-Zed becomes Recover: `repos.worktrees.ensure`
+// materializes a fresh checkout server-side, and the path updates to it.
+
+const pr = computed(() => props.session.branch.github ?? null);
+
+// The repo label: the managed slug when launched against one, else the
+// basename of the checkout's repo root.
+const repoLabel = computed(() => {
+  if (props.session.github_repo) return props.session.github_repo;
+  const root = props.session.branch.repo_root || "";
+  return root ? root.split("/").filter(Boolean).slice(-2).join("/") : "";
+});
+
+// What Open-in-Zed opens: the live work_dir, or nothing when the checkout
+// is gone (recovery replaces it).
+const zedPath = computed(() =>
+  props.session.worktree_present ? props.session.work_dir : "",
+);
+
+const recovering = ref(false);
+const recoveredPath = ref<string | null>(null);
+
+async function recover() {
+  if (recovering.value) return;
+  recovering.value = true;
+  try {
+    const wt = await invoke<{ path: string; created: boolean }>(
+      "recover_worktree",
+      {
+        repoRoot: props.session.branch.repo_root,
+        branch: props.session.branch.branch,
+      },
+    );
+    recoveredPath.value = wt.path;
+    await invoke("open_in_zed", { workDir: wt.path });
+  } catch (e: any) {
+    emit("error", e?.message ?? String(e));
+  } finally {
+    recovering.value = false;
+  }
+}
+
+// The effective path Open-in-Zed acts on: recovered overrides the stale
+// session view (the view is not refetched mid-session; the recovery result
+// is fresher).
+const zedTarget = computed(() => recoveredPath.value ?? zedPath.value);
+
+function openTerminal() {
+  // The terminal action: shell out to macOS Terminal on the same checkout.
+  // A no-op when the checkout is gone — recover first.
+  if (!zedTarget.value) return;
+  invoke("open_in_terminal", { path: zedTarget.value }).catch((e: any) =>
+    emit("error", e?.message ?? String(e)),
+  );
 }
 
 // Archive lives in App.vue (single shared path with the sidebar row
@@ -883,7 +952,6 @@ async function onLand(strategy: string) {
           {{ session.turn_count }}
         </div>
       </div>
-      <button :disabled="session.status === 'archived' || !session.work_dir" @click="openInZed">Open in Zed</button>
       <!-- The scoped dashboard (Needs You / Working / Ready to Integrate) is an
            explicit detour, not the default Topic view — the main pane stays a
            conversation whenever a Topic is open. -->
@@ -891,7 +959,7 @@ async function onLand(strategy: string) {
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
-      <button :disabled="!canInterrupt" @click="interrupt">Interrupt</button>
+      <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate = !showDelegate">
         Delegate
@@ -963,13 +1031,37 @@ async function onLand(strategy: string) {
       <span class="resource-separator">·</span>
       <button v-if="prUrl" class="resource-link" @click="openResource(prUrl)">
         PR #{{ session.branch.github?.pr_number || session.branch.github_pr }}
-        <span v-if="session.branch.github?.checks">{{ session.branch.github.checks }}</span>
+        <span v-if="pr && pr.is_draft" class="pr-badge pr-draft">draft</span>
+        <span v-if="pr && pr.pr_state" class="pr-badge" :data-state="pr.pr_state">{{ pr.pr_state }}</span>
+        <span v-if="pr && pr.review_decision" class="pr-badge pr-review" :data-decision="pr.review_decision">{{ pr.review_decision }}</span>
+        <span v-if="pr && pr.checks" class="pr-badge pr-checks" :data-state="pr.checks">CI {{ pr.checks }}</span>
       </button>
       <span v-else class="resource-item">No PR linked</span>
       <span class="resource-separator">·</span>
       <span class="resource-item" :title="session.work_dir">{{ session.branch.branch || "No branch" }}</span>
       <span class="resource-separator">·</span>
-      <span class="resource-item path" :title="session.work_dir">{{ session.work_dir || "No active checkout" }}</span>
+      <span class="resource-item path" :title="zedTarget || session.work_dir">{{ zedTarget || "No active checkout" }}</span>
+      <span class="resource-separator">·</span>
+      <button
+        v-if="zedTarget"
+        class="resource-link"
+        title="Open the checkout in Zed"
+        @click="openInZed"
+      >Open in Zed</button>
+      <button
+        v-else
+        class="resource-link recover"
+        :disabled="recovering"
+        title="The worktree is gone; materialize a checkout for this branch"
+        @click="recover"
+      >{{ recovering ? "Recovering…" : "Recover checkout" }}</button>
+      <span v-if="zedTarget" class="resource-separator">·</span>
+      <button
+        v-if="zedTarget"
+        class="resource-link"
+        title="Open a terminal at the checkout"
+        @click="openTerminal"
+      >Terminal</button>
       <template v-if="isWorker && integrationTarget">
         <span class="resource-separator">·</span>
         <span class="resource-item" :title="`Integration target: ${integrationTarget.branch.repo_root} / ${integrationTarget.branch.branch}`">→ {{ integrationTarget.branch.branch }}</span>

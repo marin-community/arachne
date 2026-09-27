@@ -749,6 +749,22 @@ impl LoomClient {
         Ok(())
     }
 
+    /// `repos.worktrees.ensure` — materialize a branch's worktree when it is
+    /// gone (archive removes it, branch survives), idempotently. The
+    /// checkout-recovery half of “open this code”: server-side, no agent,
+    /// no session resurrection.
+    pub async fn ensure_worktree(
+        &self,
+        cwd: &str,
+        branch: &str,
+    ) -> Result<crate::loom::RepoWorktreeView, LoomError> {
+        self.op(
+            "/api/repos/worktrees/ensure",
+            &serde_json::json!({ "cwd": cwd, "branch": branch }),
+        )
+        .await
+    }
+
     // -- SSE ----------------------------------------------------------------
 
     /// Subscribe to the multiplexed event stream for `topics`.

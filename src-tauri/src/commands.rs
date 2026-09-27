@@ -1060,7 +1060,11 @@ fn zed_target(host: &str, work_dir: &str) -> Result<String, UiError> {
 
 /// Open the exact session checkout in Zed, using SSH for remote Loom.
 #[tauri::command]
-pub async fn open_in_zed(state: State<'_, LoomState>, id: String) -> Result<(), UiError> {
+pub async fn open_in_zed(
+    state: State<'_, LoomState>,
+    id: String,
+    work_dir: Option<String>,
+) -> Result<(), UiError> {
     let client = state_client(&state).await?;
     let view = client.get_session(&id).await?;
     if view.status == "archived" {
@@ -1073,7 +1077,12 @@ pub async fn open_in_zed(state: State<'_, LoomState>, id: String) -> Result<(), 
         message: "Loom URL has no host".into(),
         unreachable: false,
     })?;
-    let target = zed_target(host, &view.work_dir)?;
+    // A caller-supplied path (post `recover_worktree`) wins over the stale
+    // session view: the recovery just materialized this checkout server-side.
+    let target = zed_target(
+        host,
+        work_dir.as_deref().unwrap_or(&view.work_dir),
+    )?;
     // GUI apps often inherit a minimal PATH without /usr/local/bin, where
     // Zed installs its CLI symlink. Prefer the app-bundled CLI on macOS.
     let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
@@ -1096,6 +1105,43 @@ pub async fn open_in_zed(state: State<'_, LoomState>, id: String) -> Result<(), 
         });
     }
     Ok(())
+}
+
+/// Open a macOS Terminal window at the checkout path.
+#[tauri::command]
+pub async fn open_in_terminal(path: String) -> Result<(), UiError> {
+    // `open -a Terminal <dir>` opens a window at the directory on macOS;
+    // -a stays silent when Terminal is missing (unlikely on this target).
+    let status = tokio::process::Command::new("open")
+        .args(["-a", "Terminal", &path])
+        .status()
+        .await
+        .map_err(|e| UiError {
+            message: format!("launching Terminal: {e}"),
+            unreachable: false,
+        })?;
+    if !status.success() {
+        return Err(UiError {
+            message: format!("open exited with {status}"),
+            unreachable: false,
+        });
+    }
+    Ok(())
+}
+
+/// Recover a session's checkout after it was archived (or its worktree
+/// vanished): `repos.worktrees.ensure` materializes the branch under
+/// `.worktrees/<slug>` on the loom server, idempotently. Returns the fresh
+/// path so the caller can open it in Zed right away. Recovery never
+/// resurrects the session's agent — it just gives the human a checkout.
+#[tauri::command]
+pub async fn recover_worktree(
+    state: State<'_, LoomState>,
+    repo_root: String,
+    branch: String,
+) -> Result<crate::loom::RepoWorktreeView, UiError> {
+    let client = state_client(&state).await?;
+    client.ensure_worktree(&repo_root, &branch).await.map_err(Into::into)
 }
 
 #[cfg(test)]
