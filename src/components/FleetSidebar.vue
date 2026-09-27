@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, computed, watch } from "vue";
+import { ref, computed, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
-import { useFileCompletion } from "../useFileCompletion";
+import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
+import { byTopicRecency, topicRecencyMap } from "../topicOrder";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -13,12 +14,24 @@ const props = defineProps<{
   fleet: SessionSummary[];
   layout: SessionLayout | null;
   selectedId: string | null;
-  launching?: boolean;
+  showNewThread?: boolean;
+  showNewTopic?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
-  (e: "launch", task: string, repo: string, files: string[]): void;
+  (e: "select-topic", id: string): void;
+  (
+    e: "update-topic",
+    id: string,
+    fields: { title?: string; description?: string },
+    expected?: { title: string; provenance: string },
+  ): void;
+  (e: "new-thread"): void;
+  (e: "new-topic"): void;
+  // Topics [+] on a project heading: open NewThreadSheet preselected to
+  // that project (null = the Ungrouped section).
+  (e: "new-thread-in-project", project: ProjectRef | null): void;
   (
     e: "reparent",
     sessionId: string,
@@ -27,56 +40,14 @@ const emit = defineEmits<{
   ): void;
   (e: "delete-lane", laneId: string): void;
   (e: "archive", id: string): void;
+  // Selecting a project heading filters the main-pane home to that
+  // project's topics (null = the unfiltered Topics home).
+  (e: "select-project", project: ProjectRef | null): void;
 }>();
 
-const task = ref("");
-const repo = ref("marin-community/arachne");
-const attachedFiles = ref<string[]>([]);
-const pickerError = ref("");
-const picking = ref(false);
-const completion = useFileCompletion(task, computed(() => props.selectedId));
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
-
-function submit() {
-  const t = task.value.trim();
-  if (!t) return;
-  emit("launch", t, repo.value.trim(), attachedFiles.value);
-  task.value = "";
-  attachedFiles.value = [];
-}
-
-watch(repo, () => {
-  attachedFiles.value = [];
-  pickerError.value = "";
-});
-
-async function pickFiles() {
-  pickerError.value = "";
-  picking.value = true;
-  const selectedRepo = repo.value.trim();
-  try {
-    const paths = await invoke<string[]>("pick_topic_files", {
-      repo: selectedRepo,
-    });
-    if (repo.value.trim() === selectedRepo) {
-      attachedFiles.value = [...new Set([...attachedFiles.value, ...paths])];
-    }
-  } catch (e: any) {
-    pickerError.value = e?.message ?? String(e);
-  } finally {
-    picking.value = false;
-  }
-}
-
-function onTaskKeydown(event: KeyboardEvent) {
-  if (completion.onKeydown(event)) return;
-  if (event.key === "Enter") {
-    event.preventDefault();
-    submit();
-  }
-}
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
 // (agent self-report) and `triage` (outside assessment) carry values
@@ -97,26 +68,21 @@ function subtitle(s: SessionSummary): string {
 }
 
 function statusClass(s: SessionSummary): string {
-  if (s.status === "orphaned") return "orphaned";
-  if (s.status === "running") {
-    const loud = loudTag(s);
-    if (loud?.level === "blocked") return "error";
-    if (loud?.level === "attention") return "attention";
-    return "running";
-  }
+  const loud = loudTag(s);
+  if (loud?.level === "blocked") return "error";
+  if (loud?.level === "attention") return "attention";
   return "done";
 }
 
-function statusLabel(s: SessionSummary): string {
-  if (s.status === "orphaned") return "orphan";
+// The text badge for a row, or null when it should stay quiet: a working
+// thread spins instead, a resting one (running + idle mark) shows nothing.
+function badgeLabel(s: SessionSummary): string | null {
+  if (s.status === "archived") return "done";
+  if (s.status === "orphaned") return null;
   const loud = loudTag(s);
   if (loud) return loud.level;
-  if (s.status === "running") return "run";
+  if (s.status === "running") return null;
   return s.status;
-}
-
-function isIdle(s: SessionSummary): boolean {
-  return s.branch.tags.some((t) => t.key === "idle");
 }
 
 // --- Topic tree --------------------------------------------------------------
@@ -126,12 +92,12 @@ interface TreeNode {
   children: TreeNode[];
 }
 
-// The durable marker: a leader chat stamped with the quiet `topic` tag
-// (by arachne, at launch/delegate/reparent). Topic-ness never depended on
-// live children — the tag survives archive and restarts. The childCount
-// fallback keeps pre-marker leaders rendering as topics.
-function isTopic(s: SessionSummary): boolean {
-  return s.branch.tags.some((t) => t.key === "topic");
+// The quiet `idle` mark loom stamps when an agent finishes its turn: the
+// process stays `running` between turns, so "running" alone means "alive",
+// not "working". (Mirrors loom's own idleTag: a resting agent is idle, a
+// working one has no idle mark.)
+function isIdle(s: SessionSummary): boolean {
+  return s.branch.tags.some((t) => t.key === "idle");
 }
 
 interface Lane {
@@ -208,11 +174,17 @@ function buildLanes(): Lane[] {
           ? 1
           : -1
         : -1;
+  // Roots are topics: order by when a person last steered them, not by
+  // agent busyness (the same rule as the Topics tab, src/topicOrder.ts).
+  // Workers nested under a leader keep the activity sort — sibling order
+  // within a topic is thread-level, and a busy worker bubbling up among
+  // its own siblings is informative, not disruptive.
+  const byTopic = byTopicRecency(topicRecencyMap(props.fleet));
   const sortTree = (n: TreeNode) => {
     n.children.sort(byActivity);
     n.children.forEach(sortTree);
   };
-  roots.sort(byActivity);
+  roots.sort((a, b) => byTopic(a.session, b.session));
   roots.forEach(sortTree);
 
   // Trees file into lanes (placement groups) by their LEADER's placement.
@@ -278,6 +250,11 @@ interface Row {
   isCollapsed: boolean;
 }
 
+function selectRow(row: Row) {
+  if (row.depth === 0) emit("select-topic", row.session.id);
+  else emit("select", row.session.id);
+}
+
 const laneRows = computed<{ lane: Lane; rows: Row[] }[]>(() =>
   lanes.value.map((lane) => {
     const out: Row[] = [];
@@ -312,6 +289,226 @@ const userInboxId = computed(() => {
   return undefined;
 });
 
+// --- Tabs --------------------------------------------------------------------
+
+// The sidebar's two surfaces: the Inbox (the filing lanes + delegation tree)
+// and Topics (the per-topic card list with title/description/config).
+const tab = ref<"inbox" | "topics">("topics");
+
+// --- Topics tab --------------------------------------------------------------
+
+// The Topics tab groups the same topic cards by Project: a non-system
+// layout group (projects.ts). The project heading carries the Topics [+]
+// affordance; clicking it opens NewThreadSheet preselected to that project.
+
+// Which project's heading is selected (filters the main-pane home). `null`
+// means nothing selected — the aggregate Topics home.
+const selectedProjectId = ref<string | null | undefined>(undefined);
+function selectProject(project: ProjectRef): void {
+  // Clicking an already-selected project clears the filter (a toggle, like
+  // the Topics home link).
+  selectedProjectId.value = selectedProjectId.value === project.id ? undefined : project.id;
+  emit("select-project", selectedProjectId.value === undefined ? null : project);
+}
+
+// A topic card's list entry: the leader session plus its delegated count.
+interface TopicEntry {
+  session: SessionSummary;
+  childCount: number;
+}
+
+// Every top-level thread is a topic, including legacy single-prompt launches
+// that predate the marker. Archived leaders stay listed with their descendants.
+// Order is by when a person last steered the topic — the newest user
+// message anywhere in its subtree — not by agent busyness:
+// `last_activity_at` restamps on every streamed frame, which made the cards
+// jump around while workers ran (src/topicOrder.ts).
+const topicRecency = computed(() => topicRecencyMap(props.fleet));
+const topics = computed<TopicEntry[]>(() => {
+  const byId = new Map(props.fleet.map((s) => [s.id, s]));
+  const byBranch = new Map(props.fleet.map((s) => [s.branch.id, s]));
+  const parentOf = (s: SessionSummary) =>
+    (s.parent_session_id ? byId.get(s.parent_session_id) : undefined) ??
+    (s.parent_id ? byBranch.get(s.parent_id) : undefined);
+  const childCount = new Map<string, number>();
+  for (const s of props.fleet) {
+    const p = parentOf(s);
+    if (p && p.id !== s.id)
+      childCount.set(p.id, (childCount.get(p.id) ?? 0) + 1);
+  }
+  return props.fleet
+    .filter((s) => {
+      const p = parentOf(s);
+      const topLevel = !p || p.id === s.id;
+      return topLevel;
+    })
+    .map((s) => ({ session: s, childCount: childCount.get(s.id) ?? 0 }))
+    .sort((a, b) => byTopicRecency(topicRecency.value)(a.session, b.session));
+});
+
+// Topics filed under their project (a non-system layout group, per the
+// design's Project model). Sections keep layout order and empty projects
+// still render — a project is a place to file, not a topic count.
+// Ungrouped (and any empty section) starts collapsed by default; the user's
+// toggles override that default until the next visit.
+const projectOverrides = ref(new Map<string, boolean>());
+const projectSections = computed(() => buildProjectSections(topics.value, props.layout));
+function isProjectCollapsed(id: string | null): boolean {
+  const key = id ?? "ungrouped";
+  const override = projectOverrides.value.get(key);
+  if (override !== undefined) return override;
+  const section = projectSections.value.find((s) => s.id === id);
+  return !section || section.topics.length === 0;
+}
+function toggleProject(id: string | null) {
+  const key = id ?? "ungrouped";
+  const now = isProjectCollapsed(id);
+  projectOverrides.value.set(key, !now);
+}
+
+interface TopicThreadRow {
+  session: SessionSummary;
+  depth: number;
+  childCount: number;
+}
+
+const topicChildren = computed(() => {
+  const byId = new Map(props.fleet.map((session) => [session.id, session]));
+  const byBranch = new Map(props.fleet.map((session) => [session.branch.id, session]));
+  const children = new Map<string, SessionSummary[]>();
+  for (const session of props.fleet) {
+    const parent =
+      (session.parent_session_id ? byId.get(session.parent_session_id) : undefined) ??
+      (session.parent_id ? byBranch.get(session.parent_id) : undefined);
+    if (!parent || parent.id === session.id) continue;
+    const siblings = children.get(parent.id) ?? [];
+    siblings.push(session);
+    children.set(parent.id, siblings);
+  }
+  for (const siblings of children.values()) {
+    siblings.sort((a, b) => b.last_activity_at.localeCompare(a.last_activity_at));
+  }
+  return children;
+});
+
+function visibleTopicChildren(rootId: string): TopicThreadRow[] {
+  const rows: TopicThreadRow[] = [];
+  const seen = new Set<string>([rootId]);
+  const walk = (parentId: string, depth: number) => {
+    if (collapsed.value.has(parentId)) return;
+    for (const session of topicChildren.value.get(parentId) ?? []) {
+      if (seen.has(session.id)) continue;
+      seen.add(session.id);
+      rows.push({ session, depth, childCount: topicChildren.value.get(session.id)?.length ?? 0 });
+      walk(session.id, depth + 1);
+    }
+  };
+  walk(rootId, 1);
+  return rows;
+}
+
+// A topic has a short title and a substantive body. The body is both the
+// agent's initial goal and the durable branch description.
+
+// Inline card editing: title edits are compare-and-swap fenced server-side,
+// so the save passes the values the card last rendered as `expected`.
+const editingId = ref<string | null>(null);
+const editTitle = ref("");
+const editDesc = ref("");
+
+function startEdit(s: SessionSummary) {
+  editingId.value = s.id;
+  editTitle.value = s.branch.title;
+  editDesc.value = s.branch.description;
+}
+
+function cancelEdit() {
+  editingId.value = null;
+}
+
+function saveEdit(s: SessionSummary) {
+  const fields: { title?: string; description?: string } = {};
+  const title = editTitle.value.trim();
+  // An emptied title is ignored (loom rejects empty labels); only changed
+  // fields ride the update so the CAS fence is never tripped needlessly.
+  if (title && title !== s.branch.title) fields.title = title;
+  if (editDesc.value !== s.branch.description)
+    fields.description = editDesc.value;
+  if (fields.title)
+    emit(
+      "update-topic",
+      s.id,
+      fields,
+      {
+        title: s.branch.title,
+        provenance: s.branch.title_provenance || "user",
+      },
+    );
+  else if (fields.description) emit("update-topic", s.id, fields);
+  editingId.value = null;
+}
+
+// --- Projects: create, and move a topic into one --------------------------
+
+// A Project is a loom layout group (filing only — no execution state).
+// The home for creating and filing into groups: the user's own space when
+// it exists (where loom's Inbox lives), else the first space, else the
+// first space at all — mirrors the userInboxId fallback the Inbox tab uses.
+function projectSpaceId(): string | undefined {
+  const spaces = props.layout?.spaces ?? [];
+  const user = spaces.find((s) => s.system_key === "user" || s.name === "User");
+  const home = user ?? spaces.find((s) => s.groups.some((g) => !g.system_key)) ?? spaces[0];
+  return home?.id;
+}
+
+const showNewProject = ref(false);
+const newProjectName = ref("");
+const newProjectError = ref("");
+const newProjectEl = ref<HTMLInputElement | null>(null);
+function openNewProject() {
+  showNewProject.value = true;
+  newProjectError.value = "";
+  nextTick(() => newProjectEl.value?.focus());
+}
+async function submitNewProject() {
+  const name = newProjectName.value.trim();
+  const spaceId = projectSpaceId();
+  if (!name) return;
+  if (!spaceId) {
+    newProjectError.value = "no space available to create the project in";
+    return;
+  }
+  try {
+    await invoke("create_group", { spaceId, name });
+    newProjectName.value = "";
+    showNewProject.value = false;
+  } catch (e: any) {
+    newProjectError.value = e?.message ?? String(e);
+  }
+}
+
+// Move to Project: a small menu of the available projects (plus the user
+// Inbox, which files the topic back to unfiled).
+const moveMenuId = ref<string | null>(null);
+function toggleMoveMenu(id: string) {
+  moveMenuId.value = moveMenuId.value === id ? null : id;
+}
+const moveTargets = computed(() => {
+  const projects = layoutProjects(props.layout).map((p) => ({ id: p.id, name: p.name }));
+  if (userInboxId.value)
+    projects.push({ id: userInboxId.value, name: "Unfiled (Inbox)" });
+  return projects;
+});
+const projectIds = computed(() => new Set(moveTargets.value.map((t) => t.id)));
+async function moveToProject(topicId: string, groupId: string) {
+  moveMenuId.value = null;
+  try {
+    await invoke("move_to_group", { sessionIds: [topicId], groupId });
+  } catch (e: any) {
+    console.error("move_to_group failed", e);
+  }
+}
+
 // --- Drag & drop ------------------------------------------------------------
 //
 // Drag a chat onto a LEADER row → it joins that leader's topic
@@ -326,6 +523,13 @@ function onDragStart(id: string, e: DragEvent) {
   }
 }
 
+// Fires whether the drop completed or the drag was cancelled, so it's the
+// reliable place to clear both the drag ghost and any lingering drop hint.
+function onDragEnd() {
+  dragging.value = null;
+  dropTarget.value = null;
+}
+
 function onDragOver(key: string, e: DragEvent) {
   if (!dragging.value) return;
   e.preventDefault();
@@ -334,6 +538,42 @@ function onDragOver(key: string, e: DragEvent) {
 }
 
 function onDragLeave(key: string) {
+  if (dropTarget.value === key) dropTarget.value = null;
+}
+
+// Drop a dragged topic here: moving between project headings (and
+// ungrouped) is filing, so it goes to the layout group rather than
+// reparenting. The whole project SECTION is the drop target — cards and
+// empty space under a heading file into that heading's project, not just
+// the thin header strip. The ungrouped section files to the user's Inbox.
+function onDropProject(sectionId: string | null, key: string, e: DragEvent) {
+  e.preventDefault();
+  dropTarget.value = null;
+  if (!dragging.value) return;
+  const groupId = sectionId ?? userInboxId.value;
+  if (groupId) {
+    const id = dragging.value;
+    dragging.value = null;
+    invoke("move_to_group", { sessionIds: [id], groupId }).catch((err) =>
+      console.error("move_to_group failed", err),
+    );
+  } else {
+    dragging.value = null;
+  }
+}
+
+// The section wrapper is the drop target, so moving between its header and
+// its cards fires dragleave on the wrapper (dragenter on the child). Only
+// clear the hint when the drag truly leaves the section — otherwise the
+// hint flickers off the moment the pointer crosses into a card.
+function onDragLeaveProject(key: string, e: DragEvent) {
+  const to = e.relatedTarget;
+  if (
+    to instanceof Node &&
+    e.currentTarget instanceof Node &&
+    e.currentTarget.contains(to)
+  )
+    return;
   if (dropTarget.value === key) dropTarget.value = null;
 }
 
@@ -377,169 +617,390 @@ async function archiveRow(id: string) {
 
 <template>
   <aside class="sidebar">
-    <div class="new-task">
-      <div class="file-completion-anchor">
-        <input
-          :ref="completion.input"
-          v-model="task"
-          placeholder="New topic — describe the goal…"
-          @input="completion.updateCaret"
-          @click="completion.updateCaret"
-          @keyup="completion.updateCaret"
-          @keydown="onTaskKeydown"
-        />
-        <ul
-          v-if="completion.visible.value"
-          class="file-completion-menu below"
-          role="listbox"
-          aria-label="Checked-out files"
-        >
-          <li v-for="(path, index) in completion.matches.value" :key="path">
-            <button
-              type="button"
-              role="option"
-              :aria-selected="index === completion.selected.value"
-              @mousedown.prevent
-              @click="completion.choose(path)"
-            >
-              @{{ path }}
-            </button>
-          </li>
-        </ul>
-      </div>
+    <div class="tab-bar" role="tablist">
       <button
-        class="primary"
-        :disabled="!task.trim() || props.launching"
-        @click="submit"
+        class="tab"
+        :class="{ active: tab === 'topics' }"
+        role="tab"
+        :aria-selected="tab === 'topics'"
+        @click="tab = 'topics'"
       >
-        {{ props.launching ? "…" : "Launch" }}
+        Topics
+      </button>
+      <button
+        class="tab"
+        :class="{ active: tab === 'inbox' }"
+        role="tab"
+        :aria-selected="tab === 'inbox'"
+        @click="tab = 'inbox'"
+      >
+        Inbox
       </button>
     </div>
-    <div class="new-task" style="margin-top: -4px">
-      <input
-        v-model="repo"
-        placeholder="owner/name"
-        spellcheck="false"
-        style="font-family: var(--mono); font-size: 11px"
-      />
-    </div>
-    <div class="topic-attachments">
-      <button
-        class="link"
-        type="button"
-        :disabled="picking || props.launching || !repo.trim()"
-        @click="pickFiles"
-      >
-        {{ picking ? "Opening…" : "Attach files" }}
+    <!-- Inbox tab: the filing lanes + delegation tree. -->
+    <template v-if="tab === 'inbox'">
+      <button class="new-thread-btn" :class="{ active: props.showNewThread }" @click="emit('new-thread')">
+        + New thread
       </button>
-      <div v-if="pickerError" class="attachment-error">{{ pickerError }}</div>
-      <div v-for="path in attachedFiles" :key="path" class="attached-file" :title="path">
-        <span>{{ path.split("/").pop() }}</span>
-        <button type="button" class="link" :aria-label="`Remove ${path}`" @click="attachedFiles = attachedFiles.filter((p) => p !== path)">×</button>
-      </div>
-    </div>
+      <button class="new-thread-btn" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">
+        + New topic
+      </button>
 
-    <div class="session-list">
-      <template v-for="{ lane, rows } in laneRows" :key="lane.id">
-        <div
-          class="group-header"
-          :class="{ 'drop-hint': dropTarget === `lane-${lane.id}` }"
-          @dragover="onDragOver(`lane-${lane.id}`, $event)"
-          @dragleave="onDragLeave(`lane-${lane.id}`)"
-          @drop="onDropLane(lane.id, `lane-${lane.id}`, $event)"
-          :title="
-            dragging ? 'drop here to file as a top-level chat' : lane.name
-          "
-        >
-          <span class="group-name">{{ lane.name }}</span>
-          <span class="group-count">{{ lane.count }}</span>
-          <button
-            v-if="!lane.system && lane.id !== 'unfiled'"
-            class="link stream-delete"
-            title="delete lane (chats move to Inbox)"
-            @click.stop="emit('delete-lane', lane.id)"
+      <div class="session-list">
+        <template v-for="{ lane, rows } in laneRows" :key="lane.id">
+          <div
+            class="group-header"
+            :class="{ 'drop-hint': dropTarget === `lane-${lane.id}` }"
+            @dragover="onDragOver(`lane-${lane.id}`, $event)"
+            @dragleave="onDragLeave(`lane-${lane.id}`)"
+            @drop="onDropLane(lane.id, `lane-${lane.id}`, $event)"
+            :title="
+              dragging ? 'drop here to file as a top-level chat' : lane.name
+            "
           >
-            ✕
-          </button>
-        </div>
-        <div
-          v-for="row in rows"
-          :key="row.session.id"
-          class="session-item"
-          :class="{
-            selected: row.session.id === selectedId,
-            topic: row.depth === 0 && (isTopic(row.session) || row.childCount > 0),
-            child: row.depth > 0,
-            archived: row.session.status === 'archived',
-            'drop-hint':
-              row.depth === 0 && dropTarget === `ws-${row.session.id}`,
-          }"
-          :style="
-            row.depth > 0 ? { marginLeft: `${12 + row.depth * 14}px` } : {}
-          "
-          draggable="true"
-          @dragstart="onDragStart(row.session.id, $event)"
-          @dragover="
-            row.depth === 0 && onDragOver(`ws-${row.session.id}`, $event)
-          "
-          @dragleave="onDragLeave(`ws-${row.session.id}`)"
-          @drop.stop="
-            row.depth === 0 &&
-            onDropLeader(row.session.id, `ws-${row.session.id}`, $event)
-          "
-          @click="emit('select', row.session.id)"
-          :title="
-            row.depth === 0 && dragging
-              ? 'drop here to join this topic'
-              : undefined
-          "
-        >
-          <div class="row1">
-            <span
-              v-if="row.childCount > 0"
-              class="chevron"
-              @click.stop="toggle(row.session.id)"
-            >
-              {{ row.isCollapsed ? "▸" : "▾" }}
-            </span>
-            <span class="name">{{
-              row.session.branch.name || row.session.id
-            }}</span>
-            <span class="badge" :class="statusClass(row.session)">{{
-              row.session.status === "archived" ? "done" : statusLabel(row.session)
-            }}</span>
-            <span
-              v-if="row.childCount > 0"
-              class="badge dim"
-              :title="`${row.childCount} delegated children`"
-            >
-              {{ row.childCount }}
-            </span>
-            <span v-if="isIdle(row.session)" class="badge idle">idle</span>
+            <span class="group-name">{{ lane.name }}</span>
+            <span class="group-count">{{ lane.count }}</span>
             <button
-              v-if="row.session.status !== 'archived'"
-              class="row-archive"
-              :class="{ confirm: confirmId === row.session.id }"
-              :title="
-                confirmId === row.session.id
-                  ? 'click again to archive — tears down worktree, keeps branch'
-                  : 'archive this session'
-              "
-              @click.stop="archiveRow(row.session.id)"
+              v-if="!lane.system && lane.id !== 'unfiled'"
+              class="link stream-delete"
+              title="delete lane (chats move to Inbox)"
+              @click.stop="emit('delete-lane', lane.id)"
             >
-              {{ confirmId === row.session.id ? "archive?" : "✕" }}
+              ✕
             </button>
           </div>
-          <div class="title">{{ subtitle(row.session) }}</div>
+          <div
+            v-for="row in rows"
+            :key="row.session.id"
+            class="session-item"
+            :class="{
+              selected: row.session.id === selectedId,
+              topic: row.depth === 0,
+              child: row.depth > 0,
+              archived: row.session.status === 'archived',
+              'drop-hint':
+                row.depth === 0 && dropTarget === `ws-${row.session.id}`,
+            }"
+            :style="
+              row.depth > 0 ? { marginLeft: `${12 + row.depth * 14}px` } : {}
+            "
+            draggable="true"
+            @dragstart="onDragStart(row.session.id, $event)"
+            @dragover="
+              row.depth === 0 && onDragOver(`ws-${row.session.id}`, $event)
+            "
+            @dragleave="onDragLeave(`ws-${row.session.id}`)"
+            @drop.stop="
+              row.depth === 0 &&
+              onDropLeader(row.session.id, `ws-${row.session.id}`, $event)
+            "
+            @click="selectRow(row)"
+            :title="
+              row.depth === 0 && dragging
+                ? 'drop here to join this topic'
+                : undefined
+            "
+          >
+            <div class="row1">
+              <span
+                v-if="row.childCount > 0"
+                class="chevron"
+                @click.stop="toggle(row.session.id)"
+              >
+                {{ row.isCollapsed ? "▸" : "▾" }}
+              </span>
+              <span class="name">{{
+                row.session.branch.name || row.session.id
+              }}</span>
+              <!-- A genuinely-working thread (running, mid-turn) shows a
+                   spinner; a resting one (finished turn → quiet idle mark) and
+                   terminal rows stay quiet. Loud-tag threads keep their text
+                   badge so attention/blocked never reads as ordinary progress. -->
+              <span
+                v-if="
+                  row.session.status === 'running' &&
+                  !isIdle(row.session) &&
+                  !loudTag(row.session)
+                "
+                class="spinner mini"
+                title="working"
+                aria-hidden="true"
+              ></span>
+              <span
+                v-else-if="badgeLabel(row.session)"
+                class="badge"
+                :class="statusClass(row.session)"
+                >{{ badgeLabel(row.session) }}</span
+              >
+              <span
+                v-if="row.childCount > 0"
+                class="badge dim"
+                :title="`${row.childCount} delegated children`"
+              >
+                {{ row.childCount }}
+              </span>
+              <button
+                v-if="row.session.status !== 'archived'"
+                class="row-archive"
+                :class="{ confirm: confirmId === row.session.id }"
+                :title="
+                  confirmId === row.session.id
+                    ? 'click again to archive — tears down worktree, keeps branch'
+                    : 'archive this session'
+                "
+                @click.stop="archiveRow(row.session.id)"
+              >
+                {{ confirmId === row.session.id ? "archive?" : "✕" }}
+              </button>
+            </div>
+            <div class="title">{{ subtitle(row.session) }}</div>
+          </div>
+        </template>
+        <div
+          v-if="lanes.length === 0"
+          class="session-item"
+          style="color: var(--text-dim)"
+        >
+          No topics yet — start one above.
         </div>
-      </template>
-      <div
-        v-if="lanes.length === 0"
-        class="session-item"
-        style="color: var(--text-dim)"
-      >
-        No topics yet — launch one above.
       </div>
-    </div>
+    </template>
+
+    <!-- Topics tab: one card per topic (leader chat) with title, description,
+         and a config placeholder. -->
+    <template v-else>
+      <div class="topics-toolbar">
+        <span>Topics</span>
+        <div class="topics-toolbar-actions">
+          <button
+            type="button"
+            class="toolbar-new-project"
+            :title="'New project (a place to file topics)'"
+            :aria-expanded="showNewProject"
+            aria-controls="new-project-card"
+            @click="showNewProject ? (showNewProject = false) : openNewProject()"
+          >
+            + Project
+          </button>
+          <!-- Composing a new topic takes over the main panel (like the
+               new-thread sheet), not a floating overlay here. -->
+          <button type="button" aria-label="New topic" title="New topic" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">+</button>
+        </div>
+      </div>
+      <div v-if="showNewProject" class="new-project-card" id="new-project-card" role="dialog" aria-modal="false" aria-label="New project">
+        <div class="new-project-head">
+          <span>New project</span>
+          <button type="button" aria-label="Close new project" @click="showNewProject = false">×</button>
+        </div>
+        <input
+          ref="newProjectEl"
+          v-model="newProjectName"
+          placeholder="Project name"
+          aria-label="Project name"
+          @keydown.enter.prevent="submitNewProject"
+          @keydown.esc.stop="showNewProject = false"
+        />
+        <div v-if="newProjectError" class="new-project-error">{{ newProjectError }}</div>
+        <div class="new-project-foot">
+          <span class="new-project-hint">A place to file related topics.</span>
+          <button type="button" class="primary" :disabled="!newProjectName.trim()" @click="submitNewProject">Create</button>
+        </div>
+      </div>
+
+      <div class="topic-list">
+        <div
+          v-for="section in projectSections"
+          :key="section.id ?? 'ungrouped'"
+          class="project-section"
+          :class="{ 'drop-hint': dropTarget === `project-${section.id ?? 'ungrouped'}` }"
+          @dragover="onDragOver(`project-${section.id ?? 'ungrouped'}`, $event)"
+          @dragleave="onDragLeaveProject(`project-${section.id ?? 'ungrouped'}`, $event)"
+          @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
+        >
+          <!-- Project heading: select filters the main-pane home to this
+               project's topics; the + opens NewThreadSheet preselected to
+               it; the chevron collapses the section. The whole section
+               (this heading, its cards, and its empty space) is the drop
+               target for filing, not just the thin header strip. -->
+          <div
+            class="project-header"
+            :class="{
+              selected: selectedProjectId === section.id,
+              empty: !section.topics.length,
+            }"
+            :title="
+              dragging
+                ? `drop here to file under ${section.name}`
+                : selectedProjectId === section.id
+                  ? 'selected — click to clear the project filter'
+                  : 'filter home to this project'
+            "
+            role="button"
+            tabindex="0"
+            :aria-expanded="!isProjectCollapsed(section.id)"
+            :aria-label="`Project ${section.name}${section.topics.length ? `, ${section.topics.length} topics` : ', no topics'}`"
+            @click="selectProject({ id: section.id, name: section.name })"
+            @keydown.enter.self="selectProject({ id: section.id, name: section.name })"
+            @keydown.space.self.prevent="selectProject({ id: section.id, name: section.name })"
+          >
+            <button
+              class="project-chevron"
+              type="button"
+              :title="isProjectCollapsed(section.id) ? 'Expand project' : 'Collapse project'"
+              :aria-label="`${isProjectCollapsed(section.id) ? 'Expand' : 'Collapse'} ${section.name}`"
+              @click.stop="toggleProject(section.id)"
+            >{{ isProjectCollapsed(section.id) ? "▸" : "▾" }}</button>
+            <span class="project-name">{{ section.name }}</span>
+            <span class="project-count" :title="`${section.topics.length} topics`">{{ section.topics.length }}</span>
+            <button
+              class="project-new-topic"
+              type="button"
+              :title="`New topic in ${section.name}`"
+              :aria-label="`New topic in ${section.name}`"
+              @click.stop="emit('new-thread-in-project', { id: section.id, name: section.name })"
+            >+</button>
+          </div>
+          <template v-if="!isProjectCollapsed(section.id)">
+        <template v-for="t in section.topics" :key="t.session.id">
+        <div
+          class="topic-card"
+          :class="{
+            selected: t.session.id === selectedId,
+            archived: t.session.status === 'archived',
+            dragging: dragging === t.session.id,
+          }"
+          role="button"
+          tabindex="0"
+          :draggable="editingId !== t.session.id"
+          @dragstart="onDragStart(t.session.id, $event)"
+          @dragend="onDragEnd"
+          @click="emit('select-topic', t.session.id)"
+          @keydown.enter.self="emit('select-topic', t.session.id)"
+          @keydown.space.self.prevent="emit('select-topic', t.session.id)"
+        >
+          <template v-if="editingId === t.session.id">
+            <input
+              v-model="editTitle"
+              class="topic-edit-title"
+              placeholder="title"
+              @keydown.enter.prevent="saveEdit(t.session)"
+              @keydown.esc.stop="cancelEdit"
+              @click.stop
+            />
+            <textarea
+              v-model="editDesc"
+              class="topic-edit-desc"
+              rows="3"
+              placeholder="description"
+              @keydown.esc.stop="cancelEdit"
+              @click.stop
+            ></textarea>
+            <div class="topic-edit-foot">
+              <button
+                class="primary"
+                @click.stop="saveEdit(t.session)"
+              >
+                Save
+              </button>
+              <button @click.stop="cancelEdit">Cancel</button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="topic-head">
+              <button v-if="t.childCount" class="topic-chevron" type="button"
+                :aria-label="`${collapsed.has(t.session.id) ? 'Expand' : 'Collapse'} threads in ${t.session.branch.title || t.session.branch.name}`"
+                :aria-expanded="!collapsed.has(t.session.id)"
+                @click.stop="toggle(t.session.id)">{{ collapsed.has(t.session.id) ? '▸' : '▾' }}</button>
+              <span class="topic-title">{{
+                t.session.branch.title || t.session.branch.name
+              }}</span>
+              <!-- Same quiet-badge rules as inbox rows: working topic
+                   spins, resting/terminal stay quiet, loud tags stay text. -->
+              <span
+                v-if="
+                  t.session.status === 'running' &&
+                  !isIdle(t.session) &&
+                  !loudTag(t.session)
+                "
+                class="spinner mini"
+                title="working"
+                aria-hidden="true"
+              ></span>
+              <span
+                v-else-if="badgeLabel(t.session)"
+                class="badge"
+                :class="statusClass(t.session)"
+                >{{ badgeLabel(t.session) }}</span
+              >
+            </div>
+            <div class="topic-desc">{{
+              t.session.branch.description ||
+              t.session.branch.goal ||
+              "no description yet"
+            }}</div>
+            <div class="topic-foot">
+              <span class="badge dim" v-if="t.childCount > 0" :title="`${t.childCount} delegated children`">{{
+                t.childCount
+              }}</span>
+              <span class="topic-branch">{{
+                t.session.branch.name || t.session.branch.branch
+              }}</span>
+              <button
+                class="topic-edit-btn"
+                title="edit title and description"
+                @click.stop="startEdit(t.session)"
+              >
+                edit
+              </button>
+              <!-- TODO: topic config (agent, model, repo defaults, automation
+                   triggers) — the settings surface this stub grows into. -->
+              <span class="topic-config-soon" title="topic config — coming soon"
+                >config ⚙</span
+              >
+              <div class="topic-move">
+                <button
+                  class="topic-move-btn"
+                  type="button"
+                  title="Move to project"
+                  :aria-label="`Move ${t.session.branch.title || t.session.branch.name} to another project`"
+                  :aria-expanded="moveMenuId === t.session.id"
+                  @click.stop="toggleMoveMenu(t.session.id)"
+                >move</button>
+                <div v-if="moveMenuId === t.session.id" class="topic-move-menu" role="menu" :aria-label="`Move ${t.session.branch.title || t.session.branch.name} to project`">
+                  <button v-for="target in moveTargets" :key="target.id" type="button" role="menuitem"
+                    :class="{ current: topicProjectId(t.session, projectIds) === target.id }"
+                    @click.stop="moveToProject(t.session.id, target.id)">
+                    {{ target.name }}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div v-for="child in visibleTopicChildren(t.session.id)" :key="child.session.id"
+          class="topic-thread" :class="{ selected: child.session.id === selectedId, archived: child.session.status === 'archived' }"
+          :style="{ marginLeft: `${8 + child.depth * 15}px` }"
+          role="button" tabindex="0"
+          @click="emit('select', child.session.id)"
+          @keydown.enter.self="emit('select', child.session.id)"
+          @keydown.space.self.prevent="emit('select', child.session.id)">
+          <button v-if="child.childCount" class="topic-chevron" type="button"
+            :aria-label="`${collapsed.has(child.session.id) ? 'Expand' : 'Collapse'} subthreads in ${child.session.branch.title || child.session.branch.name}`"
+            :aria-expanded="!collapsed.has(child.session.id)"
+            @click.stop="toggle(child.session.id)">{{ collapsed.has(child.session.id) ? '▸' : '▾' }}</button>
+          <span v-else class="topic-thread-spacer" aria-hidden="true"></span>
+          <span class="topic-thread-title">{{ child.session.branch.title || child.session.branch.name }}</span>
+          <span v-if="child.childCount" class="badge dim">{{ child.childCount }}</span>
+          <span v-else-if="badgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ badgeLabel(child.session) }}</span>
+        </div>
+        </template>
+          <div v-if="!section.topics.length" class="project-empty">No topics in this project yet.</div>
+          </template>
+        </div>
+        <div v-if="topics.length === 0" class="topic-empty">
+          No topics yet — use + to create one.
+        </div>
+      </div>
+    </template>
   </aside>
 </template>

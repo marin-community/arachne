@@ -28,6 +28,9 @@
 #   sudo apt-get install -y git git-lfs gh node npm jq build-essential pkg-config libssl-dev
 #   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 #   (agent: pi-acp — an executable `pi-acp` on PATH; see ~/.pi/agent/)
+#   (Codex subscription: `codex login` as the Loom service user; verify with
+#    `codex login status`. Loom can start codex-acp via npx if its binary is
+#    absent, so the first Codex ACP launch also needs npm registry access.)
 #
 # Usage:
 #   ./deploy-loom-dgx.sh                  # full build + install + configure
@@ -192,14 +195,14 @@ UNIT
 # ---------------------------------------------------------------------------
 # 6. Start and wait for health
 #
-# The health probe is public (no auth). We probe over loopback from the box
-# itself.
+# The health probe is public (no auth). The service binds only to the
+# Tailscale address, so probe that address from the box itself.
 # ---------------------------------------------------------------------------
 log "starting ${SERVICE_NAME}"
 ssh "$REMOTE" "set -e
   sudo systemctl restart ${SERVICE_NAME}
   for i in \$(seq 1 60); do
-    if curl -fsS -m 2 http://127.0.0.1:7878/api/health >/dev/null 2>&1; then
+    if curl -fsS -m 2 http://${BIND_ADDR}:7878/api/health >/dev/null 2>&1; then
       echo 'loom is healthy'
       exit 0
     fi
@@ -214,16 +217,17 @@ ssh "$REMOTE" "set -e
 # 7. Post-start configuration (idempotent)
 #
 # The on-box loom CLI authenticates with the machine-local token (auto-minted
-# on first boot, owner = seeded operator). Everything here is loopback.
+# on first boot, owner = seeded operator) against the Tailscale-only bind.
 #   - seed the Account PAT from the box's gh login, if none set;
 #   - register managed repos (clone allowlist; clones happen lazily on first
 #     session launch);
 #   - mint a personal API token for the Mac, kept at ~/.loom-dgx-mac-token
-#     (0600) so re-runs of this script re-print the same token.
+#     (0600) so re-runs of this script reuse it. Never print it in logs.
 # ---------------------------------------------------------------------------
 log "configuring loom on ${REMOTE}"
 ssh "$REMOTE" "set -e
   export PATH=\"${LOOM_ROOT}/current:\$PATH\"
+  export WEAVER_API=http://${BIND_ADDR}:7878
   # Account PAT (used by interactive sessions for git/gh as ${DGX_GITHUB_LOGIN})
   if ! loom auth github-token get | grep -q '\"set\": *true'; then
     gh auth token | loom auth github-token set - || echo 'WARN: could not seed Account PAT (sessions will lack git push until set)'
@@ -243,13 +247,11 @@ ssh "$REMOTE" "set -e
   fi
   echo
   echo '================================================================'
-  echo ' Mac token (also saved on the DGX at ~/.loom-dgx-mac-token):'
-  echo
-  printf '   %s\n' \"\$(cat \"\$TOKEN_FILE\")\"
+  echo ' Mac token saved on the DGX at ~/.loom-dgx-mac-token (0600).'
   echo
   echo ' From the Mac, point Arachne at the DGX (settings sheet in the header):'
   echo '   URL:   http://${DGX}:7878'
-  echo '   Token: the value above'
+  echo '   Token: retrieve privately from ~/.loom-dgx-mac-token'
   echo '================================================================'
 "
 

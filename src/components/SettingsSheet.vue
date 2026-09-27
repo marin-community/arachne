@@ -5,6 +5,7 @@ const props = defineProps<{
   url: string;
   token: string;
   connected: boolean;
+  error?: string | null;
 }>();
 
 const emit = defineEmits<{
@@ -32,6 +33,7 @@ const token = ref(props.token);
         Local dev: <code>http://127.0.0.1:7878</code>, no token. Remote (DGX over
         Tailscale): the server URL plus a token from <code>loom tokens create</code>.
       </div>
+      <div v-if="error" class="hint" role="alert" style="color: var(--danger, #d76969)">{{ error }}</div>
       <div class="modal-actions">
         <button @click="emit('close')">Cancel</button>
         <button
