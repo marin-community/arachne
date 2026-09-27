@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, computed, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FleetSidebar from "./components/FleetSidebar.vue";
@@ -10,6 +10,12 @@ import NewThreadSheet from "./components/NewThreadSheet.vue";
 import NewTopicSheet from "./components/NewTopicSheet.vue";
 import ResourcePanel from "./components/ResourcePanel.vue";
 import type { FileAttachment } from "./attachments";
+import {
+  readTopicThreadMemory,
+  rememberTopicThread,
+  resolveTopicThread,
+  topicRootOf,
+} from "./topic-view";
 
 // --- Types mirroring src-tauri/src/loom.rs (snake_case wire) ---------------
 
@@ -235,10 +241,48 @@ async function selectSession(id: string) {
 
 function selectTopic(id: string) {
   selectedTopicId.value = id;
+  // The chat-first route (docs/design.md "Navigation"): the main pane is a
+  // conversation whenever a Topic is open. The scoped dashboard remains an
+  // explicit Overview detour — showTopicOverview — not the destination.
+  openTopicChat(id);
+}
+
+// Which thread to show when a Topic opens: the current one when it belongs
+// to the Topic (clicking an already-selected Topic keeps the open chat),
+// otherwise the thread last opened within it while it is still available,
+// else the coordinator. Pure decision logic lives in src/topic-view.ts.
+async function openTopicChat(id: string) {
+  const choice = resolveTopicThread({
+    topicId: id,
+    fleet: fleet.value,
+    currentThreadId: viewMode.value === "thread" ? selectedId.value : null,
+    rememberedThreadId: readTopicThreadMemory(localStorage)[id] ?? null,
+  });
+  if (choice.source !== "current") rememberTopicThread(localStorage, id, choice.threadId);
+  await selectSession(choice.threadId);
+}
+
+// The explicit scoped dashboard (HomeView topic mode): Needs You, Working,
+// Ready to Integrate, and the topic summary. Reached deliberately through
+// the Overview action in the Topic/coordinator chat header — the main pane
+// stays a conversation whenever a Topic is open.
+function showTopicOverview(id: string) {
+  selectedTopicId.value = id;
   selectedId.value = null;
   selectedView.value = null;
   viewMode.value = "topic";
 }
+
+// Keep the last-opened-thread memory current while the user moves between
+// threads: entering a thread inside a topic records it for that topic. A
+// stale entry (thread deleted, archived, or reparented) is simply never
+// restored — resolveTopicThread re-validates before using it.
+watch([selectedId, viewMode, fleet], () => {
+  const threadId = viewMode.value === "thread" ? selectedId.value : null;
+  if (!threadId || !fleet.value.length) return;
+  const topic = topicRootOf(fleet.value, threadId);
+  if (topic && topic.id !== threadId) rememberTopicThread(localStorage, topic.id, threadId);
+});
 
 function showTopicsHome() {
   selectedId.value = null;
@@ -512,6 +556,7 @@ const selectedTopic = computed(() => {
       @handoff="selectSession"
       @refresh="selectSession"
       @open-topic="selectTopic"
+      @overview="showTopicOverview"
       @home="showTopicsHome"
     />
     <HomeView
