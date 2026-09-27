@@ -692,7 +692,7 @@ async function recover() {
       },
     );
     recoveredPath.value = wt.path;
-    await invoke("open_in_zed", { workDir: wt.path });
+    await invoke("open_in_zed", { id: props.session.id, workDir: wt.path });
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   } finally {
