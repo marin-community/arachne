@@ -26,12 +26,26 @@ export type ChatRow<T extends ChatDisplayBlock = ChatDisplayBlock> =
       index: number;
     }
   | {
-      kind: "tool_call_group";
+      /** The thought currently being thought: the live turn's trailing
+       * thought, rendered open while the turn runs, folded once it ends. */
+      kind: "live_thought";
+      key: string;
+      block: T;
+      index: number;
+    }
+  | {
+      /** Adjacent tool calls and finished thinking in the same turn. */
+      kind: "work_group";
       key: string;
       blocks: T[];
       firstIndex: number;
       /** Stable identities for retaining disclosure state when a page joins a run. */
       memberKeys: string[];
+      /** `thinking` while the turn is still in flight, else `done`. */
+      state: "thinking" | "done";
+      calls: T[];
+      thoughts: T[];
+      thinkingTokens: number;
     };
 
 /** A journal-position key stays fixed when older blocks are prepended. */
@@ -86,41 +100,105 @@ export function toolCallCopyText(call: ChatDisplayBlock): string {
   return parts.join("\n");
 }
 
-/** Group visually adjacent tool calls in the same turn. Invisible usage
- * blocks may appear between calls; callers can still read them from the
- * original block list when showing token usage. */
-export function groupDisplayBlocks<T extends ChatDisplayBlock>(blocks: readonly T[]): ChatRow<T>[] {
+/** Token totals for a turn: chars from its finished thoughts, input+output
+ * tokens from its usage blocks. Codex journals thinking as context usage, so
+ * the usage numbers already cover it — prefer them when present. */
+export function countThinkingTokens(blocks: readonly ChatDisplayBlock[], turn: number | null | undefined): number {
+  let chars = 0;
+  let used = 0;
+  let sawUsage = false;
+  for (const block of blocks) {
+    if (turn != null && block.turn != null && block.turn !== turn) continue;
+    if (block.kind === "thought") chars += (block.text ?? "").length;
+    else if (block.kind === "usage" && block.used != null && block.used > 0) {
+      sawUsage = true;
+      used += block.used;
+    }
+  }
+  return sawUsage ? used : Math.round(chars / 4);
+}
+
+/** `123`, `12.5K`, `3.2M` — a human-friendly token count. */
+export function formatTokens(tokens: number): string {
+  if (tokens < 1000) return String(tokens);
+  const units: [number, string][] = [[1e6, "M"], [1e3, "K"]];
+  for (const [scale, suffix] of units) {
+    if (tokens >= scale) {
+      const value = tokens / scale;
+      return `${value >= 10 ? Math.round(value) : Math.round(value * 10) / 10}${suffix}`;
+    }
+  }
+  return String(tokens);
+}
+
+/** The thought still being thought, if any: the trailing non-usage block of
+ * the live turn. Once tool calls or messages follow, thinking is over. */
+function liveThoughtIndex(blocks: readonly ChatDisplayBlock[], liveTurn: number | null): number | null {
+  if (liveTurn == null) return null;
+  let last = -1;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i].kind !== "usage") last = i;
+  }
+  const block = blocks[last];
+  if (block?.kind === "thought" && (block.turn == null || block.turn === liveTurn)) return last;
+  return null;
+}
+
+/** Group visually adjacent tool calls and finished thoughts (same turn) into
+ * one collapsed work row — except the current thinking block while its turn
+ * is in flight, which stays its own open row. Invisible usage blocks may
+ * appear between members; callers can still read them from the original
+ * block list when showing token usage. */
+export function groupDisplayBlocks<T extends ChatDisplayBlock>(
+  blocks: readonly T[],
+  liveTurn?: number | null,
+): ChatRow<T>[] {
   const rows: ChatRow<T>[] = [];
+  const liveThought = liveThoughtIndex(blocks, liveTurn ?? null);
   for (let index = 0; index < blocks.length; index++) {
     const block = blocks[index];
     if (block.kind === "usage") continue;
-    if (block.kind !== "tool_call") {
+    if (index === liveThought) {
+      rows.push({ kind: "live_thought", key: `block:${blockKey(block, index)}`, block, index });
+      continue;
+    }
+    if (block.kind !== "tool_call" && block.kind !== "thought") {
       rows.push({ kind: "single", key: `block:${blockKey(block, index)}`, block, index });
       continue;
     }
 
     const firstIndex = index;
-    const calls: T[] = [block];
+    const members: T[] = [block];
     const memberKeys = [blockKey(block, index)];
     while (index + 1 < blocks.length) {
       let nextIndex = index + 1;
-      while (blocks[nextIndex]?.kind === "usage") nextIndex++;
+      while (nextIndex === liveThought || blocks[nextIndex]?.kind === "usage") nextIndex++;
       const next = blocks[nextIndex];
       if (!next) break;
-      if (next.kind !== "tool_call") break;
+      if (next.kind !== "tool_call" && next.kind !== "thought") break;
       // Coordinates from different turns imply a boundary even if a backend
       // omitted the turn_end block. Missing coordinates retain adjacency.
       if (block.turn != null && next.turn != null && block.turn !== next.turn) break;
       index = nextIndex;
-      calls.push(next);
+      members.push(next);
       memberKeys.push(blockKey(next, index));
     }
+
+    // While the turn is in flight the group is still growing behind the
+    // live-thought row; label it so the status pill reads correctly.
+    const state = liveTurn != null && members.some((m) => m.turn == null || m.turn === liveTurn)
+      ? "thinking"
+      : "done";
     rows.push({
-      kind: "tool_call_group",
+      kind: "work_group",
       key: `tools:${memberKeys[0]}`,
-      blocks: calls,
+      blocks: members,
       firstIndex,
       memberKeys,
+      state,
+      calls: members.filter((m) => m.kind === "tool_call"),
+      thoughts: members.filter((m) => m.kind === "thought"),
+      thinkingTokens: countThinkingTokens(blocks, block.turn),
     });
   }
   return rows;

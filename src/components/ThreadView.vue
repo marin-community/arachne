@@ -10,7 +10,7 @@ import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachmen
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
-import { groupDisplayBlocks, blockCopyText, toolCallCopyText, type ChatDisplayBlock } from "../chatRows";
+import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, type ChatDisplayBlock } from "../chatRows";
 import { markdownForSelection } from "../markdownCopy";
 
 interface Cursor {
@@ -53,7 +53,7 @@ const emit = defineEmits<{
 }>();
 
 const blocks = ref<ChatDisplayBlock[]>([]);
-const rows = computed(() => groupDisplayBlocks(blocks.value));
+const rows = computed(() => groupDisplayBlocks(blocks.value, turnLive.value ? snapshotLiveTurn.value : null));
 const draft = ref("");
 const attachments = ref<FileAttachment[]>([]);
 const attachmentError = ref("");
@@ -175,6 +175,10 @@ const unlisteners: UnlistenFn[] = [];
 // label moving; `sseTurnAt` remembers when the last turn event arrived so a
 // reload that raced a turn boundary never clobbers fresher SSE truth.
 const turnLive = ref(false);
+// The live turn's journal coordinate: a work group whose members belong to
+// it keeps rendering its last thought live (streamed thinking shows no
+// journal block until it closes).
+const snapshotLiveTurn = ref<number | null>(null);
 const turnStartedAt = ref<number | null>(null);
 const lastProgressAt = ref<number | null>(null);
 const pendingPrompt = ref<string | null>(null);
@@ -190,6 +194,7 @@ function markProgress(at?: number) {
 
 function turnStarted() {
   turnLive.value = true;
+  snapshotLiveTurn.value = null;
   turnStartedAt.value = Date.now();
   lastProgressAt.value = Date.now();
   pendingPrompt.value = null;
@@ -199,6 +204,7 @@ function turnStarted() {
 
 function turnEnded() {
   turnLive.value = false;
+  snapshotLiveTurn.value = null;
   turnStartedAt.value = null;
   lastProgressAt.value = null;
   sseTurnAt = Date.now();
@@ -213,6 +219,7 @@ function applyLive(snap: ChatSnapshot, fetchedAt: number) {
   const sseIsNewer = sseTurnAt >= fetchedAt;
   if (snap.live_turn != null) {
     turnLive.value = true;
+    snapshotLiveTurn.value = snap.live_turn;
     // Restore the elapsed clock from the journal, never regressing what
     // streaming already observed (mirrors loom SPA's preserve semantics).
     if (snap.live_started_at) {
@@ -229,6 +236,7 @@ function applyLive(snap: ChatSnapshot, fetchedAt: number) {
     }
   } else if (!sseIsNewer) {
     turnLive.value = false;
+    snapshotLiveTurn.value = null;
     turnStartedAt.value = null;
     lastProgressAt.value = null;
   }
@@ -238,6 +246,7 @@ function onChatFrame(frame: ChatEventFrame) {
   const d = frame.data ?? {};
   switch (frame.event) {
     case "turn":
+      if (d.turn != null) snapshotLiveTurn.value = d.turn;
       if (d.state === "started") turnStarted();
       else turnEnded();
       break;
@@ -412,6 +421,8 @@ async function reload() {
       id: props.session.id,
     });
     blocks.value = snap.blocks;
+    if (snap.live_turn != null) snapshotLiveTurn.value = snap.live_turn;
+    else if (!turnLive.value) snapshotLiveTurn.value = null;
     applyLive(snap, fetchedAt);
     const cursor = await invoke<Cursor | null>("chat_older_cursor");
     hasOlder.value = cursor !== null;
@@ -494,6 +505,7 @@ watch(
       turnStartedAt.value = null;
       lastProgressAt.value = null;
       pendingPrompt.value = null;
+      snapshotLiveTurn.value = null;
       sseTurnAt = 0;
       await reload();
       scrollToBottom();
@@ -596,7 +608,7 @@ function isCollapsed(key: string): boolean {
 function toggle(key: string) {
   collapsed.value[key] = !isCollapsed(key);
 }
-function toolsCollapsed(memberKeys: string[]): boolean {
+function workCollapsed(memberKeys: string[]): boolean {
   return !memberKeys.some((key) => collapsed.value[`tools:${key}`] === false);
 }
 
@@ -660,8 +672,9 @@ function htmlForSelection(selection: Selection): string {
   }
   return div.innerHTML;
 }
-function toggleTools(memberKeys: string[]) {
-  const next = !toolsCollapsed(memberKeys);
+
+function toggleWork(memberKeys: string[]) {
+  const next = !workCollapsed(memberKeys);
   for (const key of memberKeys) collapsed.value[`tools:${key}`] = next;
 }
 
@@ -920,33 +933,60 @@ async function onLand(strategy: string) {
         </button>
       </div>
       <template v-for="row in rows" :key="row.key">
-        <!-- Consecutive calls in one turn share one disclosure. -->
-        <div v-if="row.kind === 'tool_call_group'" class="block tool">
+        <!-- Consecutive tool calls and finished thinking in one turn share one
+             disclosure. -->
+        <div v-if="row.kind === 'work_group'" class="block tool">
           <div class="tool-line" role="button" tabindex="0"
-            :aria-expanded="!toolsCollapsed(row.memberKeys)"
-            @click="toggleTools(row.memberKeys)"
-            @keydown.enter.prevent="toggleTools(row.memberKeys)"
-            @keydown.space.prevent="toggleTools(row.memberKeys)">
-            <span class="status" :class="{ running: row.blocks.some((call) => call.status === 'running') }">{{
-              row.blocks.some((call) => call.status === 'running') ? 'running' : 'done'
+            :aria-expanded="!workCollapsed(row.memberKeys)"
+            @click="toggleWork(row.memberKeys)"
+            @keydown.enter.prevent="toggleWork(row.memberKeys)"
+            @keydown.space.prevent="toggleWork(row.memberKeys)">
+            <span class="status" :class="{ running: row.state === 'thinking' }">{{ row.state }}</span>
+            <span class="tool-title">worked</span>
+            <span class="tool-summary">{{
+              [
+                row.calls.length ? `${row.calls.length} ${row.calls.length === 1 ? 'tool call' : 'tool calls'}` : null,
+                row.thinkingTokens ? `${formatTokens(row.thinkingTokens)} thinking tokens` : null,
+              ].filter(Boolean).join(' · ') || 'done'
             }}</span>
-            <span class="tool-title">tool calls</span>
-            <span class="tool-summary">{{ row.blocks.length }} {{ row.blocks.length === 1 ? 'call' : 'calls' }}</span>
-            <CopyButton class="tool-copy" :text="row.blocks.map(toolCallCopyText).join('\n\n')" :label="`Copy ${row.blocks.length === 1 ? 'tool call' : row.blocks.length + ' tool calls'}`" />
-            <span class="chevron">{{ toolsCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
+            <CopyButton class="tool-copy" :text="row.blocks.map((member) => member.kind === 'tool_call' ? toolCallCopyText(member) : (member.text ?? '')).join('\n\n')" :label="`Copy ${row.blocks.length === 1 ? 'block' : row.blocks.length + ' blocks'}`" />
+            <span class="chevron">{{ workCollapsed(row.memberKeys) ? "▸" : "▾" }}</span>
           </div>
-          <div v-if="!toolsCollapsed(row.memberKeys)" class="tool-group-detail">
-            <div v-for="(call, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail">
-              <span class="status" :class="{ running: call.status === 'running' }">{{ call.status }}</span>
-              <strong>{{ call.title || call.tool_kind || 'tool' }}</strong>
-              <CopyButton class="tool-copy" :text="toolCallCopyText(call)" :label="`Copy ${call.title || call.tool_kind || 'tool call'}`" />
-              <div v-if="call.summary">{{ call.summary }}</div>
-              <ChatImages :block="call" :session-id="session.id" />
+          <div v-if="!workCollapsed(row.memberKeys)" class="tool-group-detail">
+            <div v-for="(member, j) in row.blocks" :key="row.memberKeys[j]" class="tool-detail">
+              <template v-if="member.kind === 'tool_call'">
+                <span class="status" :class="{ running: member.status === 'running' }">{{ member.status }}</span>
+                <strong>{{ member.title || member.tool_kind || 'tool' }}</strong>
+                <CopyButton class="tool-copy" :text="toolCallCopyText(member)" :label="`Copy ${member.title || member.tool_kind || 'tool call'}`" />
+                <div v-if="member.summary">{{ member.summary }}</div>
+              </template>
+              <template v-else>
+                <span class="tool-summary">{{ member.summary || (member.text ?? '').slice(0, 160) }}</span>
+                <div class="thought-body"><ChatMarkdown :text="member.text ?? ''" /></div>
+              </template>
+              <ChatImages :block="member" :session-id="session.id" />
             </div>
           </div>
         </div>
         <template v-else>
-        <template v-if="row.block.kind === 'thought'">
+        <!-- The live turn's trailing thought renders open while it is being
+             thought; it folds into the preceding group once the turn ends. -->
+        <template v-if="row.kind === 'live_thought'">
+          <div class="block thought">
+            <div class="tool-line" role="button" tabindex="0"
+              :aria-expanded="!isCollapsed(row.key)"
+              @click="toggle(row.key)"
+              @keydown.enter.prevent="toggle(row.key)"
+              @keydown.space.prevent="toggle(row.key)">
+              <span class="status running">thinking</span>
+              <span class="tool-summary">{{ row.block.summary || (row.block.text ?? '').slice(0, 160) }}</span>
+            </div>
+            <div v-if="!isCollapsed(row.key)" class="body thought-body">
+              <ChatMarkdown :text="row.block.text ?? ''" />
+            </div>
+          </div>
+        </template>
+        <template v-else-if="row.block.kind === 'thought'">
           <div class="block thought">
             <div class="tool-line" role="button" tabindex="0"
               :aria-expanded="!isCollapsed(row.key)"
