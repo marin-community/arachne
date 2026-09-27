@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch } from "vue";
+import { ref, onMounted, computed, watch, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import FleetSidebar from "./components/FleetSidebar.vue";
@@ -10,6 +10,7 @@ import NewThreadSheet from "./components/NewThreadSheet.vue";
 import NewTopicSheet from "./components/NewTopicSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
+import { clearDraftOnLaunch } from "./newTopicDraft";
 import {
   readTopicThreadMemory,
   rememberTopicThread,
@@ -253,6 +254,11 @@ async function selectSession(id: string) {
 }
 
 function selectTopic(id: string) {
+  // Selecting a topic while its composer sheet is open closes the sheet:
+  // the topic's chat takes the main pane, and the sheet (which also lives
+  // in grid-area main) would otherwise block it. The composer draft is
+  // snapshotted (localStorage) and restored when the sheet reopens.
+  showNewTopic.value = false;
   selectedTopicId.value = id;
   // The chat-first route (docs/design.md "Navigation"): the main pane is a
   // conversation whenever a Topic is open. The scoped dashboard remains an
@@ -397,14 +403,22 @@ async function launchTask(
 // owns richer card metadata (title/description) plus attachments and
 // resource mentions, all routed through launchTask so the wiring stays in
 // one place. Success closes the sheet and opens the live thread; failure
-// keeps the drafts for a retry.
+// keeps the drafts for a retry. A successful launch also drops the stored
+// composer draft — it became a real topic branch, so reopening the sheet
+// starts fresh rather than resurrecting an already-launched draft.
 function launchTopic(
   task: string,
   repo: string,
   meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
   launchTask(task, repo, meta, (success) => {
-    if (success) showNewTopic.value = false;
+    if (success) {
+      showNewTopic.value = false;
+      // Unmounting the sheet snapshots its draft (onUnmounted runs on
+      // this same flush); drop it a microtask later, after that snapshot
+      // has landed, so reopening the sheet starts fresh.
+      nextTick(() => clearDraftOnLaunch(localStorage));
+    }
   });
 }
 
