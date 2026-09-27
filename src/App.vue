@@ -574,7 +574,7 @@ const selectedTopic = computed(() => {
       :error="connError"
       :project="newThreadProject"
       @close="closeNewThread"
-      @launch="(task, repo, project) => launchTask(task, repo, project ? { project } : undefined)"
+      @launch="(task, repo, meta) => launchTask(task, repo, meta)"
     />
     <ThreadView
       v-else-if="viewMode === 'thread' && selectedId && selectedView"

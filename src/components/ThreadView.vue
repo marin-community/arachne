@@ -6,7 +6,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
 import SplitButton from "./SplitButton.vue";
 import ChangeReview from "./ChangeReview.vue";
-import { addAttachments, type FileAttachment } from "../attachments";
+import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import { groupDisplayBlocks, type ChatDisplayBlock } from "../chatRows";
@@ -69,8 +69,10 @@ function onFileInput(event: Event) {
   input.value = "";
 }
 function onComposerPaste(event: ClipboardEvent) {
-  if (!event.clipboardData?.files.length) return;
-  event.preventDefault(); void addFiles(event.clipboardData.files);
+  if (!event.clipboardData) return;
+  const files = filesFromClipboard(event.clipboardData);
+  if (!files.length) return;
+  event.preventDefault(); void addFiles(files);
 }
 interface MentionResource {
   id: string;
@@ -976,14 +978,15 @@ async function onLand(strategy: string) {
       </div>
       <div v-if="attachments.length || attachmentError || attachmentLoading" class="attachment-row composer-attachments">
         <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
           {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
         </span>
         <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
         <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
       </div>
       <div class="composer">
-      <label class="attachment-pick composer-attach" title="Attach files">+
-        <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files to message" @change="onFileInput" />
+      <label class="attachment-pick composer-attach" title="Attach files or images">+
+        <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files or images to message" @change="onFileInput" />
       </label>
       <textarea
         ref="composerEl"
