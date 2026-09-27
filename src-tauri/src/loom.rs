@@ -63,29 +63,16 @@ pub struct BranchSummaryView {
     #[serde(default)]
     pub title_provenance: String,
     pub repo_root: String,
-    #[serde(default)]
-    pub github: Option<GithubStatusView>,
-    #[serde(default)]
-    pub github_pr: Option<i64>,
-    #[serde(default)]
-    pub tags: Vec<TagView>,
     /// The branch's latest GitHub pull-request snapshot (link, review
     /// decision, check rollup), or `null` when GitHub polling is off, the
     /// repo has no remote PR, or `gh` is unavailable. Maintained by the
     /// loom poll loop.
     #[serde(default)]
     pub github: Option<GithubStatusView>,
-}
-
-/// The small part of Loom's cached PR snapshot the resource strip needs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct GithubStatusView {
-    pub pr_number: i64,
-    pub pr_url: String,
-    pub pr_state: String,
-    pub checks: Option<String>,
-    pub review_decision: Option<String>,
+    #[serde(default)]
+    pub github_pr: Option<i64>,
+    #[serde(default)]
+    pub tags: Vec<TagView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +106,13 @@ pub struct SessionSummaryView {
     /// streaming, so topic ordering by it stays still.
     #[serde(default)]
     pub last_user_message_at: Option<String>,
+    /// The session's checkout path and whether it still exists on the server
+    /// (archive removes the worktree). Lets resource surfaces offer
+    /// Open-in-Zed vs. Recover without fetching the full session view.
+    #[serde(default)]
+    pub work_dir: String,
+    #[serde(default)]
+    pub worktree_present: bool,
     pub branch: BranchSummaryView,
     pub placement: Option<SessionPlacementView>,
     pub github_repo: Option<String>,

@@ -710,7 +710,6 @@ body {
 .handoff-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 10px; }
 .handoff-actions span { margin-right: auto; color: var(--text-dim); font-size: 11px; }
 .home-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-
 button {
   background: var(--bg-raised);
   color: var(--text);
