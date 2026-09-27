@@ -1121,6 +1121,12 @@ button.accent { border-color: var(--accent); color: var(--accent); }
 }
 .chat-image-unavailable { color: var(--text-dim); font-size: 11px; }
 .thought-body { margin-top: 4px; }
+/* The live turn's trailing thought renders open while being thought. */
+.tool-line .status.running { animation: thinking-pulse 1.2s ease-in-out infinite; }
+@keyframes thinking-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
 .load-older { text-align: center; padding: 6px 0; }
 .load-older button {
   font-size: 11px;
