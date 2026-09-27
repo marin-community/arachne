@@ -11,12 +11,12 @@ const props = defineProps<{
   fleet: SessionSummary[];
   layout: SessionLayout | null;
   selectedId: string | null;
-  launching?: boolean;
+  showNewThread?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "select", id: string): void;
-  (e: "launch", task: string, repo: string): void;
+  (e: "new-thread"): void;
   (
     e: "reparent",
     sessionId: string,
@@ -27,18 +27,9 @@ const emit = defineEmits<{
   (e: "archive", id: string): void;
 }>();
 
-const task = ref("");
-const repo = ref("marin-community/arachne");
 const collapsed = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
-
-function submit() {
-  const t = task.value.trim();
-  if (!t) return;
-  emit("launch", t, repo.value.trim());
-  task.value = "";
-}
 
 // Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
 // (agent self-report) and `triage` (outside assessment) carry values
@@ -339,28 +330,11 @@ async function archiveRow(id: string) {
 
 <template>
   <aside class="sidebar">
-    <div class="new-task">
-      <input
-        v-model="task"
-        placeholder="New topic — describe the goal…"
-        @keydown.enter.prevent="submit"
-      />
-      <button
-        class="primary"
-        :disabled="!task.trim() || props.launching"
-        @click="submit"
-      >
-        {{ props.launching ? "…" : "Launch" }}
-      </button>
-    </div>
-    <div class="new-task" style="margin-top: -4px">
-      <input
-        v-model="repo"
-        placeholder="owner/name"
-        spellcheck="false"
-        style="font-family: var(--mono); font-size: 11px"
-      />
-    </div>
+    <!-- New threads are composed in the main panel (the thread home),
+         not here: this button opens the sheet. -->
+    <button class="new-thread-btn" :class="{ active: props.showNewThread }" @click="emit('new-thread')">
+      + New thread
+    </button>
 
     <div class="session-list">
       <template v-for="{ lane, rows } in laneRows" :key="lane.id">
@@ -461,7 +435,7 @@ async function archiveRow(id: string) {
         class="session-item"
         style="color: var(--text-dim)"
       >
-        No topics yet — launch one above.
+        No topics yet — start one above.
       </div>
     </div>
   </aside>

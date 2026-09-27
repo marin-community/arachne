@@ -77,22 +77,17 @@ body {
   flex-direction: column;
   overflow: hidden;
 }
-.sidebar .new-task {
+/* The sidebar's one launch affordance: opens the sheet in the main panel. */
+.sidebar .new-thread-btn {
   margin: 10px;
-  display: flex;
-  gap: 6px;
+  padding: 8px 10px;
+  font-weight: 600;
+  text-align: center;
 }
-.sidebar .new-task input {
-  flex: 1;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 6px 8px;
-  font-size: 12px;
-  outline: none;
+.sidebar .new-thread-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
 }
-.sidebar .new-task input:focus { border-color: var(--accent); }
 .session-list { flex: 1; overflow-y: auto; padding: 0 6px 10px; }
 
 .session-item {
@@ -593,6 +588,100 @@ button.danger:hover { border-color: var(--blocked); }
 .header .conn.clickable { cursor: pointer; }
 .header .conn.clickable:hover { color: var(--text); }
 
+/* --- New-thread sheet ----------------------------------------------- */
+/* Takes over the main display panel (same grid area as the thread home):
+   not a floating modal, a full takeover with room to compose. */
+.new-thread-sheet {
+  grid-area: main;
+  display: flex;
+  overflow-y: auto;
+  background: radial-gradient(
+      ellipse 80% 40% at 50% -10%,
+      rgba(110, 168, 254, 0.05),
+      transparent
+    ),
+    var(--bg);
+}
+.nts-inner {
+  width: min(680px, 100%);
+  margin: 0 auto;
+  padding: 28px 24px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.nts-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.nts-head h1 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.nts-close {
+  padding: 3px 9px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.nts-close:hover { color: var(--text); }
+.nts-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.nts-field-name {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.nts-field textarea {
+  resize: vertical;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 10px 12px;
+  font: 13px/1.5 inherit;
+  outline: none;
+  min-height: 120px;
+}
+.nts-field input {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 10px;
+  font-size: 13px;
+  outline: none;
+  font-family: var(--mono);
+}
+.nts-field textarea:focus,
+.nts-field input:focus { border-color: var(--accent); }
+.nts-hint {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+.nts-error {
+  color: var(--blocked);
+  font-size: 12.5px;
+  padding: 8px 12px;
+  border: 1px solid var(--blocked);
+  border-radius: 8px;
+  background: rgba(248, 81, 73, 0.06);
+  word-break: break-word;
+}
+.nts-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 /* --- Home (attention-first) ---------------------------------------- */
 
 .home {
@@ -610,12 +699,13 @@ button.danger:hover { border-color: var(--blocked); }
   margin: 0 auto;
   padding: 28px 24px 48px;
 }
-.home h1 {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text-dim);
-  margin: 0 0 4px;
+.home .home-top {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
+.home .home-top h1 { flex: 1; margin: 0; }
+.home .home-new { padding: 5px 12px; }
 .home .section { margin-top: 26px; }
 .home .section-title {
   font-size: 11px;
