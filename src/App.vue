@@ -679,6 +679,7 @@ const selectedTopic = computed(() => {
       @new-topic="openNewTopic"
       @open-zed="openTopicInZed"
       @home="onHome"
+      @error="connError = $event"
     />
     <TopicInspector v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId"
       @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openNewThread" />

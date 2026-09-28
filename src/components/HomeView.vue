@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import type { SessionLayout, SessionSummary } from "../App.vue";
 import { layoutProjects, topicProjectId } from "../projects";
-import { loudTag, pendingPermissionSummary } from "../topicInspector";
+import { dismissibleAttention, loudTag, pendingPermissionSummary } from "../topicInspector";
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -20,7 +21,27 @@ const emit = defineEmits<{
   (e: "new-topic"): void;
   (e: "open-zed", id: string): void;
   (e: "home"): void;
+  (e: "error", message: string): void;
 }>();
+
+// Dismiss without opening the thread: clear the loud tag axes on the
+// session's branch. The Needs You row is the person's inbox — a row is
+// handled by answering it in the thread, or by deciding it needs no reply
+// at all, and the latter should be one click, not a detour through the
+// conversation. Permission-raised attention offers no dismiss (see
+// dismissibleAttention); its row still opens the thread to answer.
+const dismissingId = ref<string | null>(null);
+async function dismiss(s: SessionSummary) {
+  if (dismissingId.value) return;
+  dismissingId.value = s.id;
+  try {
+    await invoke("clear_attention", { session: s.id });
+  } catch (error: any) {
+    emit("error", error?.message ?? String(error));
+  } finally {
+    dismissingId.value = null;
+  }
+}
 
 const restingOpen = ref(false);
 const projectIds = computed(() => new Set(layoutProjects(props.layout).map((p) => p.id)));
@@ -188,6 +209,17 @@ const readyGroups = computed(() => groupByProject(ready.value));
             @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
             <span class="level-dot" :class="level(s)"></span>
             <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
+            <button
+              v-if="section.kind === 'needs' && dismissibleAttention(s)"
+              class="home-row-dismiss"
+              type="button"
+              :title="`Dismiss attention on ${title(s)} — clears the flag without opening the thread`"
+              :aria-label="`Dismiss attention on ${title(s)}`"
+              :disabled="dismissingId === s.id"
+              @click.stop.prevent="dismiss(s)"
+              @keydown.enter.stop.prevent="dismiss(s)"
+              @keydown.space.stop.prevent="dismiss(s)"
+            >{{ dismissingId === s.id ? "…" : "✕" }}</button>
             <span class="row-when">{{ ago(s.last_activity_at) }}</span>
           </div>
         </template>

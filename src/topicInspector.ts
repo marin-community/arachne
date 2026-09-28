@@ -33,6 +33,24 @@ export function pendingPermissionSummary(s: SessionSummary): string | null {
     : `${pending.length} tool approvals: ${titles.join(" · ")}`;
 }
 
+/** Dismissal surface rule: a row can offer Dismiss only for TAG-raised
+ * attention — the `attention` self-report or the `triage` assessment.
+ * Permission-raised attention (unanswered ACP tool approvals) is not
+ * dismissable: the request stays live until someone answers its options,
+ * and hiding it would strand the agent mid-turn. Structural over the
+ * summary and view shapes (both carry `status` + `branch.tags`). */
+export function dismissibleAttention(s: {
+  status: string;
+  branch: { tags: { key: string; value: string }[] };
+}): boolean {
+  if (s.status === "archived") return false;
+  return s.branch.tags.some(
+    (t) =>
+      (t.key === "attention" || t.key === "triage") &&
+      (t.value === "attention" || t.value === "blocked"),
+  );
+}
+
 /** The quiet `idle` mark: running alone means alive, not working. */
 export function isIdle(s: SessionSummary): boolean {
   return s.branch.tags.some((t) => t.key === "idle");

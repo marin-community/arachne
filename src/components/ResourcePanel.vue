@@ -561,9 +561,15 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-item:hover, .resource-panel-item.selected { background: var(--bg-hover); }
 .resource-panel-icon { font-size: 17px; color: var(--accent); }
 /* PR status light: green = mergeable + CI passing, yellow = CI in progress
+<<<<<<< HEAD
    (or not yet known), red = failing or not mergeable. The dot rides the
    row's right edge; the glyph shares the light so the state is readable
    either way. */
+=======
+   (or not yet known), red = failing or not mergeable, purple = merged,
+   dim = closed without merging. The glyph itself carries the color; the
+   row's hover tooltip names the light. */
+>>>>>>> main
 .resource-panel-icon.pr-light-green { color: var(--ok); }
 .resource-panel-icon.pr-light-yellow { color: var(--attention); }
 .resource-panel-icon.pr-light-red { color: var(--blocked); }

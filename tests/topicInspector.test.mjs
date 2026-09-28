@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   badgeLabel,
+  dismissibleAttention,
   integrationCandidates,
   isIdle,
   isReadyCandidate,
@@ -107,6 +108,24 @@ test("row states: working spins, resting is quiet, loud tags keep badges", () =>
   assert.equal(badgeLabel(stopped), "stopped");
   const archived = session("arch", { status: "archived" });
   assert.equal(badgeLabel(archived), "done");
+});
+
+test("dismissal: tag-raised attention only, never permissions or archived", () => {
+  // Both loud keys and both loud values are dismissable.
+  assert.equal(dismissibleAttention(withTag(session("a"), "attention", "attention")), true);
+  assert.equal(dismissibleAttention(withTag(session("b"), "attention", "blocked")), true);
+  assert.equal(dismissibleAttention(withTag(session("t"), "triage", "blocked")), true);
+  // A calm value on a loud key is quiet — nothing to dismiss.
+  assert.equal(dismissibleAttention(withTag(session("c"), "attention", "ok")), false);
+  // Unanswered tool approvals raise attention but are NOT dismissable.
+  const approval = session("approval", { pending_permissions: [
+    { request_id: "req-1", title: "Allow Computer Use?" },
+  ] });
+  assert.equal(loudTag(approval)?.level, "attention");
+  assert.equal(dismissibleAttention(approval), false);
+  // Quiet rows and archived rows never offer the dismiss.
+  assert.equal(dismissibleAttention(session("plain")), false);
+  assert.equal(dismissibleAttention(session("idle", { status: "archived" })), false);
 });
 
 test("readiness requires explicit verified candidate state, not lifecycle", () => {

@@ -1088,6 +1088,35 @@ pub async fn update_session(
     Ok(view)
 }
 
+/// Dismiss a session's attention flag without opening the thread: clear
+/// the loud tag axes on its branch. Loom's tag semantics make absence the
+/// calm state (there is no stored `ok` tag — `clear` deletes the row), so
+/// after this the session leaves every Needs You bucket and its badge
+/// falls quiet. Both loud keys are cleared — `attention` (the agent's
+/// self-report) and `triage` (an outside assessment) raise the same
+/// badge, and a person dismissing one means the other stays gone too.
+/// Tool-approval attention (`pending_permissions`) is NOT touched: that is
+/// a live ACP request only its options can answer.
+#[tauri::command]
+pub async fn clear_attention(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    session: String,
+) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    for key in ["attention", "triage"] {
+        client.clear_tag(&session, key).await?;
+    }
+    // Fresh fleet snapshot, pushed so every surface (sidebar badges, Needs
+    // You buckets, inspector rows) drops the loud state at once. Tag
+    // changes also publish on the session's own SSE topic, but the push
+    // here keeps the UI instant even when that stream lags or is capped.
+    if let Ok(list) = client.list_sessions().await {
+        emit_fleet(&app, &client, list).await;
+    }
+    Ok(())
+}
+
 /// Build a Zed target from the authoritative Loom host and the session's
 /// server-side checkout path. The bootstrap control plane runs its sessions
 /// on the same host; a future multi-runner Loom view should supply the
