@@ -98,7 +98,11 @@ async function setConfig(option: ConfigOption, event: Event) {
     configBusy.value = null;
   }
 }
-const rows = computed(() => groupDisplayBlocks(blocks.value, turnLive.value ? snapshotLiveTurn.value : null));
+const rows = computed(() => groupDisplayBlocks(
+  blocks.value,
+  turnLive.value ? snapshotLiveTurn.value : null,
+  props.session.agent_kind === "pi",
+));
 const answeringPermission = ref<string | null>(null);
 const permissionError = ref<Record<string, string>>({});
 
