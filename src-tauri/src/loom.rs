@@ -750,6 +750,8 @@ pub struct SessionsLaunchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_guidance: Option<SessionLaunchGuidance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -759,6 +761,19 @@ pub struct SessionsLaunchInput {
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionLaunchGuidance {
+    pub root: String,
+    pub child: String,
+}
+
+pub fn topic_launch_guidance() -> SessionLaunchGuidance {
+    SessionLaunchGuidance {
+        root: "Arachne Topic coordinator: keep this thread for direction and review. Delegate bounded independent work early with a clear task and checks. Review worker results and integrate them into the Topic. Work directly when delegation would add overhead. A PR is a Land strategy; do not open one unless the user requests it, or an explicit Land action selects it.".into(),
+        child: "Arachne Topic worker: own the assigned scope in your worktree. Validate and commit or stabilize the result, then send your parent a concise result with the commit, checks, and risks. The parent integrates it. A PR is a Land strategy; do not open one unless the user or parent requests it, or an explicit Land action selects it.".into(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -790,6 +805,29 @@ mod scratch_upload_tests {
         assert_eq!(upload.content_base64, "aGk=");
         let value = serde_json::to_value(upload).unwrap();
         assert_eq!(value["content_base64"], "aGk=");
+    }
+}
+
+#[cfg(test)]
+mod launch_guidance_tests {
+    use super::{topic_launch_guidance, SessionsLaunchInput};
+
+    #[test]
+    fn topic_guidance_reaches_loom_launch_request() {
+        let request = SessionsLaunchInput {
+            goal: Some("Fix the editor".into()),
+            launch_guidance: Some(topic_launch_guidance()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert!(json["launch_guidance"]["root"]
+            .as_str()
+            .unwrap()
+            .contains("Topic coordinator"));
+        assert!(json["launch_guidance"]["child"]
+            .as_str()
+            .unwrap()
+            .contains("Topic worker"));
     }
 }
 
