@@ -1381,7 +1381,15 @@ struct GhPrView {
 pub async fn pr_status(url: String) -> Result<PrStatusView, UiError> {
     let (repo, number) = parse_pr_url(&url)
         .ok_or_else(|| resource_error(format!("not a github.com pull request URL: {url}")))?;
-    let output = tokio::process::Command::new("gh")
+    // GUI apps inherit launchd's minimal PATH (/usr/bin:/bin:...), which
+    // misses homebrew — where gh lives. Prefer the well-known absolute
+    // locations, falling back to PATH for custom setups.
+    let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .unwrap_or("gh");
+    let output = tokio::process::Command::new(gh)
+        .env("GH_PAGER", "")
         .args([
             "pr",
             "view",
