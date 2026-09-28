@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionLayout, SessionSummary } from "../App.vue";
+import { homeRowTitle } from "../homeRows";
 import { layoutProjects, topicProjectId } from "../projects";
 import { dismissibleAttention, loudTag, pendingPermissionSummary } from "../topicInspector";
 
@@ -85,10 +86,14 @@ function rootOf(s: SessionSummary): SessionSummary {
 }
 
 const title = (s: SessionSummary) => s.branch.title || s.branch.name;
+// Row naming per docs/design.md: on the aggregate home every row names its
+// Project and parent Topic; scoped views drop the parts the heading or the
+// dashboard already names. Pure logic lives in src/homeRows.ts.
 function rowTitle(s: SessionSummary): string {
-  const root = rootOf(s);
-  const thread = root.id === s.id ? "Coordinator thread" : title(s);
-  return props.topic ? thread : `${title(root)} · ${thread}`;
+  return homeRowTitle(s, rootOf(s), projectNameOf(s), {
+    topic: props.topic != null,
+    project: props.project?.id != null,
+  });
 }
 
 function level(s: SessionSummary): "blocked" | "attention" | "ok" {
