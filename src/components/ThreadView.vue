@@ -19,6 +19,7 @@ import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copy
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
+import { dismissibleAttention } from "../topicInspector";
 
 interface Cursor {
   turn: number;
@@ -74,6 +75,29 @@ const emit = defineEmits<{
   (e: "overview", id: string): void;
   (e: "home"): void;
 }>();
+
+// Dismiss this thread's attention flag: clear the loud tag axes on its
+// branch. Same clear_attention command as the home and sidebar rows —
+// here it answers the flag directly, at the conversation it came from.
+// The button's visibility tracks the LIVE fleet summary (tags update over
+// SSE), not the once-fetched SessionView — otherwise the button would
+// linger after a successful dismiss.
+const liveSummary = computed(
+  () => props.fleet.find((s) => s.id === props.session.id) ?? props.session,
+);
+const canDismiss = computed(() => dismissibleAttention(liveSummary.value));
+const dismissing = ref(false);
+async function dismissAttention() {
+  if (dismissing.value) return;
+  dismissing.value = true;
+  try {
+    await invoke("clear_attention", { session: props.session.id });
+  } catch (error: any) {
+    emit("error", error?.message ?? String(error));
+  } finally {
+    dismissing.value = false;
+  }
+}
 
 const blocks = ref<ChatDisplayBlock[]>([]);
 const metadata = ref<AcpMetadata | null>(null);
@@ -1072,6 +1096,13 @@ async function onLand(strategy: string) {
            explicit detour, not the default Topic view — the main pane stays a
            conversation whenever a Topic is open. -->
       <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
+      <button
+        v-if="canDismiss"
+        class="accent-dismiss"
+        title="Dismiss attention — clear this thread's flag"
+        :disabled="dismissing"
+        @click="dismissAttention"
+      >{{ dismissing ? "Dismissing…" : "Dismiss" }}</button>
       <CodeActions
         :checkout-path="zedTarget"
         :recovering="recovering"

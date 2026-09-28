@@ -798,6 +798,25 @@ impl LoomClient {
         Ok(())
     }
 
+    /// `sessions.tags.delete` — clear a tag, returning that axis to its
+    /// calm/default (absent) state. The loud keys (`attention`, `triage`)
+    /// carry the session's needs-a-person flag: clearing them is how a
+    /// person dismisses attention without opening the thread. Idempotent —
+    /// loom's clear is a no-op when the key is absent.
+    pub async fn clear_tag(&self, session: &str, key: &str) -> Result<(), LoomError> {
+        let _: serde_json::Value = self
+            .op(
+                "/api/sessions/tags/delete",
+                &serde_json::json!({
+                    "session": session,
+                    "key": key,
+                    "by": "arachne",
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// `sessions.archive` — tear down terminal + worktree, keep the branch.
     /// Not yet surfaced in the UI; kept for the next iteration.
     #[allow(dead_code)]

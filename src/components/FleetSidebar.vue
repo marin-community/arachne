@@ -10,7 +10,7 @@ import {
   visibleTopics,
 } from "../topicList";
 import { byTopicRecency, topicRecencyMap } from "../topicOrder";
-import { pendingPermissionSummary } from "../topicInspector";
+import { dismissibleAttention, pendingPermissionSummary } from "../topicInspector";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -597,6 +597,23 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
 // a misclick on a topic you meant to select shouldn't vanish it.
 const confirmId = ref<string | null>(null);
 
+// Dismiss a loud row without opening its thread — same clear_attention
+// command as the home's Needs You rows. Only TAG-raised attention offers
+// the dismiss; permission-raised (unanswered ACP approvals) must be
+// answered in the thread, not dismissed.
+const dismissingId = ref<string | null>(null);
+async function dismissAttention(id: string) {
+  if (dismissingId.value) return;
+  dismissingId.value = id;
+  try {
+    await invoke("clear_attention", { session: id });
+  } catch (e: any) {
+    console.error("clear_attention failed", e);
+  } finally {
+    dismissingId.value = null;
+  }
+}
+
 async function archiveRow(id: string) {
   if (confirmId.value === id) {
     emit("archive", id);
@@ -735,6 +752,15 @@ async function archiveRow(id: string) {
               >
                 {{ row.childCount }}
               </span>
+              <button
+                v-if="dismissibleAttention(row.session)"
+                class="row-dismiss"
+                type="button"
+                :title="`Dismiss attention — clears the flag without opening the thread`"
+                :aria-label="`Dismiss attention on ${row.session.branch.title || row.session.branch.name}`"
+                :disabled="dismissingId === row.session.id"
+                @click.stop="dismissAttention(row.session.id)"
+              >{{ dismissingId === row.session.id ? "…" : "●" }}</button>
               <button
                 v-if="row.session.status !== 'archived'"
                 class="row-archive"
@@ -939,6 +965,15 @@ async function archiveRow(id: string) {
                 :class="statusClass(t.session)"
                 >{{ badgeLabel(t.session) }}</span
               >
+              <button
+                v-if="dismissibleAttention(t.session)"
+                class="topic-dismiss"
+                type="button"
+                title="Dismiss attention — clears the flag without opening the thread"
+                :aria-label="`Dismiss attention on ${t.session.branch.title || t.session.branch.name}`"
+                :disabled="dismissingId === t.session.id"
+                @click.stop="dismissAttention(t.session.id)"
+              >{{ dismissingId === t.session.id ? "…" : "✕" }}</button>
             </div>
             <div class="topic-desc">{{
               t.session.branch.description ||
