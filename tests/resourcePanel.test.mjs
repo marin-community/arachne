@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { issueUrl, liveRows, repoLabel, repoUrl } from "../src/resourcePanel.ts";
+import { issueUrl, liveRows, prLight, repoLabel, repoUrl } from "../src/resourcePanel.ts";
 
 const topic = (overrides = {}) => ({
   worktree_present: true,
@@ -20,6 +20,7 @@ const pr = (session_id, session_name, number, overrides = {}) => ({
   is_draft: false,
   review_decision: null,
   checks: null,
+  mergeable: null,
   ...overrides,
 });
 
@@ -78,6 +79,31 @@ test("live rows cap PRs at 8 and issues at 12", () => {
   const rows = liveRows(topic(), "topic-1", prs, issues);
   assert.equal(rows.filter((row) => row.kind === "pr").length, 8);
   assert.equal(rows.filter((row) => row.kind === "issue").length, 12);
+});
+
+test("pr light: green only when mergeable and CI passing; red on conflict or failure; yellow while pending or unknown", () => {
+  // Green requires both known-good.
+  assert.equal(prLight(pr("t", "t", 1, { checks: "passing", mergeable: "MERGEABLE" })), "green");
+  assert.equal(prLight(pr("t", "t", 2, { checks: "passing", mergeable: null })), "yellow");
+  assert.equal(prLight(pr("t", "t", 3, { checks: null, mergeable: "MERGEABLE" })), "yellow");
+  // CI in progress is yellow even when mergeable.
+  assert.equal(prLight(pr("t", "t", 4, { checks: "pending", mergeable: "MERGEABLE" })), "yellow");
+  // Red: failing CI or a merge conflict, and either one wins over pending.
+  assert.equal(prLight(pr("t", "t", 5, { checks: "failing", mergeable: "MERGEABLE" })), "red");
+  assert.equal(prLight(pr("t", "t", 6, { checks: "pending", mergeable: "CONFLICTING" })), "red");
+  // A closed or merged PR is not green — its state is over.
+  assert.equal(prLight(pr("t", "t", 7, { pr_state: "MERGED", checks: "passing", mergeable: "MERGEABLE" })), "red");
+});
+
+test("live rows carry the status light", () => {
+  const rows = liveRows(
+    topic(),
+    "topic-1",
+    [pr("topic-1", "coordinator", 10, { checks: "passing", mergeable: "MERGEABLE" })],
+    [],
+  );
+  assert.equal(rows[1].kind, "pr");
+  assert.equal(rows[1].light, "green");
 });
 
 test("an issue with no github link still renders, just without a url", () => {
