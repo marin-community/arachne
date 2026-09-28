@@ -69,6 +69,39 @@ test("groups thoughts together with tool calls in the same turn", () => {
   );
 });
 
+test("joins old journal prose interrupted by a thought delta", () => {
+  const blocks = [
+    thought(5, 127, "reasoning"),
+    { kind: "agent_message", turn: 5, seq: 128, text: "Two" },
+    thought(5, 129, "."),
+    { kind: "agent_message", turn: 5, seq: 130, text: " distinct problems found." },
+    tool(5, 131),
+    { kind: "agent_message", turn: 5, seq: 132, text: "Next message" },
+  ];
+  const rows = groupDisplayBlocks(blocks, null, true);
+  assert.deepEqual(rows.map((row) => row.kind), ["work_group", "single", "work_group", "single"]);
+  assert.equal(rows[0].thoughts.length, 2);
+  assert.equal(rows[1].block.text, "Two distinct problems found.");
+  assert.equal(rows[1].key, "block:5:130");
+  assert.equal(rows[3].block.text, "Next message");
+  assert.equal(groupDisplayBlocks(blocks).filter((row) => row.kind === "single").length, 3);
+});
+
+test("does not join prose across turns or a tool boundary", () => {
+  const rows = groupDisplayBlocks([
+    { kind: "agent_message", turn: 1, seq: 1, text: "First" },
+    thought(1, 2, "thinking"),
+    tool(1, 3),
+    { kind: "agent_message", turn: 1, seq: 4, text: "Second" },
+    thought(2, 1, "new turn"),
+    { kind: "agent_message", turn: 2, seq: 2, text: "Third" },
+  ], null, true);
+  assert.deepEqual(
+    rows.filter((row) => row.kind === "single").map((row) => row.block.text),
+    ["First", "Second", "Third"],
+  );
+});
+
 test("the live turn's trailing thought stays its own open row", () => {
   const blocks = [
     thought(2, 1, "earlier thinking"),

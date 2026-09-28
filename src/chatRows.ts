@@ -157,11 +157,44 @@ export function copyCornerFor(hostTop: number, viewportTop: number): "top" | "bo
 export function groupDisplayBlocks<T extends ChatDisplayBlock>(
   blocks: readonly T[],
   liveTurn?: number | null,
+  repairInterruptedPiProse = false,
 ): ChatRow<T>[] {
   const rows: ChatRow<T>[] = [];
   const liveThought = liveThoughtIndex(blocks, liveTurn ?? null);
+  // Older Loom journals flushed agent prose whenever a thought delta arrived.
+  // Pi can send a stray thought between text deltas, leaving one sentence in
+  // several agent_message blocks. Join prose within the same uninterrupted
+  // assistant span; keep the thought blocks before the joined message.
+  const hiddenMessages = new Set<number>();
+  const joinedMessages = new Map<number, T>();
+  for (let start = 0; repairInterruptedPiProse && start < blocks.length;) {
+    const turn = blocks[start].turn;
+    if (turn == null || !["agent_message", "thought", "usage"].includes(blocks[start].kind)) {
+      start++;
+      continue;
+    }
+    let end = start;
+    const messages: number[] = [];
+    let hasThought = false;
+    while (end < blocks.length && blocks[end].turn === turn &&
+      ["agent_message", "thought", "usage"].includes(blocks[end].kind)) {
+      if (blocks[end].kind === "agent_message") messages.push(end);
+      if (blocks[end].kind === "thought") hasThought = true;
+      end++;
+    }
+    if (hasThought && messages.length > 1) {
+      const last = messages[messages.length - 1];
+      joinedMessages.set(last, {
+        ...blocks[last],
+        text: messages.map((index) => blocks[index].text ?? "").join(""),
+      });
+      for (const index of messages.slice(0, -1)) hiddenMessages.add(index);
+    }
+    start = end;
+  }
   for (let index = 0; index < blocks.length; index++) {
-    const block = blocks[index];
+    if (hiddenMessages.has(index)) continue;
+    const block = joinedMessages.get(index) ?? blocks[index];
     if (block.kind === "usage") continue;
     if (index === liveThought) {
       rows.push({ kind: "live_thought", key: `block:${blockKey(block, index)}`, block, index });
@@ -177,7 +210,7 @@ export function groupDisplayBlocks<T extends ChatDisplayBlock>(
     const memberKeys = [blockKey(block, index)];
     while (index + 1 < blocks.length) {
       let nextIndex = index + 1;
-      while (nextIndex === liveThought || blocks[nextIndex]?.kind === "usage") nextIndex++;
+      while (nextIndex === liveThought || hiddenMessages.has(nextIndex) || blocks[nextIndex]?.kind === "usage") nextIndex++;
       const next = blocks[nextIndex];
       if (!next) break;
       if (next.kind !== "tool_call" && next.kind !== "thought") break;
