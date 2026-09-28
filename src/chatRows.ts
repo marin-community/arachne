@@ -21,6 +21,12 @@ export interface ChatDisplayBlock {
   payload?: unknown;
 }
 
+export interface ContextUsage {
+  used: number;
+  size: number;
+  cost: { amount: number; currency: string } | null;
+}
+
 export type ChatRow<T extends ChatDisplayBlock = ChatDisplayBlock> =
   | {
       kind: "single";
@@ -111,6 +117,27 @@ export function toolCallCopyText(call: ChatDisplayBlock): string {
 export function countThinkingTokens(thoughts: readonly { text?: string }[]): number {
   const chars = thoughts.reduce((sum, thought) => sum + (thought.text ?? "").length, 0);
   return Math.round(chars / 4);
+}
+
+/** The newest journal usage block is the authoritative context gauge for the
+ * conversation. Loom's session summary can retain the adapter's initial
+ * `0/size` report even after later turns have journaled real usage. Preserve
+ * summary-only cost data, and fall back to the summary for older journals. */
+export function resolveContextUsage(
+  blocks: readonly ChatDisplayBlock[],
+  summary?: ContextUsage | null,
+): ContextUsage | null {
+  for (let index = blocks.length - 1; index >= 0; index--) {
+    const block = blocks[index];
+    if (
+      block.kind === "usage" &&
+      typeof block.used === "number" && Number.isFinite(block.used) && block.used >= 0 &&
+      typeof block.size === "number" && Number.isFinite(block.size) && block.size > 0
+    ) {
+      return { used: block.used, size: block.size, cost: summary?.cost ?? null };
+    }
+  }
+  return summary ?? null;
 }
 
 /** `123`, `12.5K`, `3.2M` — a human-friendly token count. */
