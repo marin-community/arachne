@@ -29,6 +29,7 @@ export interface PanelPr {
   is_draft: boolean;
   review_decision: string | null;
   checks: string | null;
+  mergeable: string | null;
 }
 
 /** The slice of a topic session the checkout row needs. */
@@ -42,8 +43,29 @@ export interface CheckoutSubject {
 /** A sorted, render-ready live row. `key` is unique and stable per row. */
 export type LiveRow =
   | { kind: "repository"; key: string; label: string; url: string | null }
-  | { kind: "pr"; key: string; pr: PanelPr; ownedByTopic: boolean }
+  | { kind: "pr"; key: string; pr: PanelPr; ownedByTopic: boolean; light: PrLight }
   | { kind: "issue"; key: string; issue: PanelIssue; url: string | null; open: boolean };
+
+/**
+ * The PR row's status light — the same three-way read a human does on the
+ * PR page. Red beats yellow beats green: a merge conflict or failing CI is
+ * actionable now, so it wins over in-progress; a green PR also requires the
+ * merge fit to be known (GitHub briefly reports UNKNOWN while it computes).
+ */
+export type PrLight = "green" | "yellow" | "red";
+
+export function prLight(pr: PanelPr): PrLight {
+  if (pr.pr_state !== "OPEN") return "red";
+  if (pr.mergeable === "CONFLICTING") return "red";
+  if (pr.checks === "failing") return "red";
+  if (pr.checks === "pending") return "yellow";
+  if (pr.pr_state === "OPEN" && pr.checks === "passing" && pr.mergeable === "MERGEABLE") {
+    return "green";
+  }
+  // No checks on the PR, or GitHub hasn't decided mergeability yet: nothing
+  // is known to be wrong, but not known to be good either — in progress.
+  return "yellow";
+}
 
 /**
  * The GitHub URL for an issue, when it carries a repo + number link.
@@ -97,6 +119,7 @@ export function liveRows(
       key: `pr:${pr.session_id}:${pr.pr_number}`,
       pr,
       ownedByTopic: pr.session_id === topicId,
+      light: prLight(pr),
     });
   }
   const sortedIssues = [...issues].sort(

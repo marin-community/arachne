@@ -44,6 +44,9 @@ pub struct GithubStatusView {
     /// One-word CI rollup (e.g. `success`), when known.
     #[serde(default)]
     pub checks: Option<String>,
+    /// GitHub's merge fit: `MERGEABLE` / `CONFLICTING` / `UNKNOWN`.
+    #[serde(default)]
+    pub mergeable: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2702,6 +2702,7 @@ mod resource_panel_tests {
             is_draft: false,
             review_decision: None,
             checks: None,
+            mergeable: None,
         });
         serde_json::from_value(serde_json::json!({
             "id": id, "status": "running", "profile": "default", "class": "interactive",

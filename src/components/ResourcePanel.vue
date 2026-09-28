@@ -67,6 +67,24 @@ function iconFor(kind: string) {
   }
 }
 
+/** The status light's one-line explanation, same order as the light rules. */
+function prLightLabel(light: "green" | "yellow" | "red") {
+  switch (light) {
+    case "green": return "Mergeable and CI passing";
+    case "yellow": return "CI in progress (or unknown yet)";
+    case "red": return "Failing or not mergeable";
+  }
+}
+
+/** Full hover text for a PR row: title plus the reasons behind the light. */
+function prTooltip(pr: PanelPr) {
+  const parts = [pr.pr_title];
+  if (pr.pr_state !== "OPEN") parts.push(`state ${pr.pr_state}`);
+  if (pr.mergeable && pr.mergeable !== "MERGEABLE") parts.push(`merge ${pr.mergeable.toLowerCase()}`);
+  if (pr.checks) parts.push(`CI ${pr.checks}`);
+  return parts.join(" · ");
+}
+
 // The topic's own checkout: open in Zed when present, otherwise recover
 // it via repos.worktrees.ensure (never resurrecting the agent) and open.
 const topicWorktree = ref(props.topic.worktree_present ? props.topic.work_dir : "");
@@ -305,14 +323,15 @@ async function onPreviewClick(event: MouseEvent) {
               <small>repository</small>
             </span>
           </div>
-          <button v-else-if="row.kind === 'pr'" class="resource-panel-item" :title="row.pr.pr_title" @click="openExternal(row.pr.pr_url)">
-            <span class="resource-panel-icon">⑂</span>
+          <button v-else-if="row.kind === 'pr'" class="resource-panel-item" :title="prTooltip(row.pr)" @click="openExternal(row.pr.pr_url)">
+            <span class="resource-panel-icon" :class="`pr-light-${row.light}`">⑂</span>
             <span class="resource-panel-item-text">
               <strong>PR #{{ row.pr.pr_number }}</strong>
               <small>
                 <template v-if="!row.ownedByTopic">{{ row.pr.session_name }} · </template>{{ row.pr.is_draft ? "draft" : row.pr.pr_state }}<template v-if="row.pr.review_decision"> · {{ row.pr.review_decision }}</template><template v-if="row.pr.checks"> · CI {{ row.pr.checks }}</template>
               </small>
             </span>
+            <span class="pr-status-dot" :class="`pr-light-${row.light}`" :title="prLightLabel(row.light)"></span>
           </button>
           <button v-else-if="row.kind === 'issue'" class="resource-panel-item" :title="row.issue.title" @click="row.url && openExternal(row.url)">
             <span class="resource-panel-icon">◉</span>
@@ -404,6 +423,20 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-item { width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; padding: 8px; }
 .resource-panel-item:hover, .resource-panel-item.selected { background: var(--bg-hover); }
 .resource-panel-icon { font-size: 17px; color: var(--accent); }
+/* PR status light: green = mergeable + CI passing, yellow = CI in progress
+   (or not yet known), red = failing or not mergeable. The dot rides the
+   row's right edge; the glyph shares the light so the state is readable
+   either way. */
+.pr-status-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  margin-left: auto; flex: none; align-self: center;
+}
+.pr-status-dot.pr-light-green { background: var(--ok); }
+.pr-status-dot.pr-light-yellow { background: var(--attention); }
+.pr-status-dot.pr-light-red { background: var(--blocked); }
+.resource-panel-icon.pr-light-green { color: var(--ok); }
+.resource-panel-icon.pr-light-yellow { color: var(--attention); }
+.resource-panel-icon.pr-light-red { color: var(--blocked); }
 .resource-panel-item-text { display: flex; flex-direction: column; min-width: 0; }
 .resource-panel-item-text strong, .resource-panel-item-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .resource-panel-item-text small, .resource-panel-empty, .resource-panel-location { color: var(--text-dim); font-size: 11px; }
