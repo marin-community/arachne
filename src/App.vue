@@ -310,6 +310,17 @@ function showTopicOverview(id: string) {
   viewMode.value = "topic";
 }
 
+// The explicit back-to-coordinator action (docs/design.md "Navigation"):
+// from a worker thread, open the topic's coordinator chat directly.
+// Unlike selectTopic/openTopicChat, this deliberately bypasses the
+// remembered-thread restoration — the user asked for the coordinator,
+// not for whichever thread they last opened inside this topic.
+async function openCoordinatorThread(topicId: string) {
+  const coordinator = fleet.value.find((session) => session.id === topicId) ?? topicRootOf(fleet.value, topicId);
+  if (!coordinator) return;
+  await selectSession(coordinator.id);
+}
+
 // Keep the last-opened-thread memory current while the user moves between
 // threads: entering a thread inside a topic records it for that topic. A
 // stale entry (thread deleted, archived, or reparented) is simply never
@@ -665,6 +676,7 @@ const selectedTopic = computed(() => {
       @refresh="selectSession"
       @open-topic="selectTopic"
       @overview="showTopicOverview"
+      @open-coordinator="openCoordinatorThread"
       @home="showTopicsHome"
     />
     <HomeView

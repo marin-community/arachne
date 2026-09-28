@@ -73,6 +73,7 @@ const emit = defineEmits<{
   (e: "refresh", id: string): void;
   (e: "open-topic", id: string): void;
   (e: "overview", id: string): void;
+  (e: "open-coordinator", id: string): void;
   (e: "home"): void;
 }>();
 
@@ -1096,6 +1097,14 @@ async function onLand(strategy: string) {
            explicit detour, not the default Topic view — the main pane stays a
            conversation whenever a Topic is open. -->
       <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
+      <!-- The explicit back-to-coordinator action (docs/design.md
+           "Navigation"): from a worker thread, jump to the topic's
+           coordinator chat without remembered-thread restoration. -->
+      <button
+        v-if="topic && session.id !== topic.id"
+        title="Back to this topic's coordinator thread"
+        @click="emit('open-coordinator', topic.id)"
+      >Coordinator</button>
       <button
         v-if="canDismiss"
         class="accent-dismiss"
