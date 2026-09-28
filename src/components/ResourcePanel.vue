@@ -78,9 +78,10 @@ function prLightLabel(light: "green" | "yellow" | "red" | "purple" | null) {
   }
 }
 
-/** Full hover text for a PR row: title plus the reasons behind the light. */
+/** Full hover text for a PR row: title, the light's one-line meaning, and
+ * the reasons behind it. */
 function prTooltip(pr: PanelPr) {
-  const parts = [pr.pr_title];
+  const parts = [pr.pr_title, prLightLabel(prLight(pr))];
   if (pr.pr_state !== "OPEN") parts.push(`state ${pr.pr_state}`);
   if (pr.mergeable && pr.mergeable !== "MERGEABLE") parts.push(`merge ${pr.mergeable.toLowerCase()}`);
   if (pr.checks) parts.push(`CI ${pr.checks}`);
@@ -376,7 +377,6 @@ async function onPreviewClick(event: MouseEvent) {
                 <template v-if="!row.ownedByTopic">{{ row.pr.session_name }} · </template>{{ row.pr.is_draft ? "draft" : row.pr.pr_state }}<template v-if="row.pr.review_decision"> · {{ row.pr.review_decision }}</template><template v-if="row.pr.checks"> · CI {{ row.pr.checks }}</template>
               </small>
             </span>
-            <span v-if="row.light" class="pr-status-dot" :class="`pr-light-${row.light}`" :title="prLightLabel(row.light)"></span>
           </button>
           <button v-else-if="row.kind === 'issue'" class="resource-panel-item" :title="row.issue.title" @click="row.url && openExternal(row.url)">
             <span class="resource-panel-icon">◉</span>
@@ -414,9 +414,6 @@ async function onPreviewClick(event: MouseEvent) {
           <strong>{{ resource.title }}</strong>
           <small>{{ resource.path || resource.url || resource.reference }}</small>
         </span>
-        <span v-if="resource.kind === 'pull_request' && prLight(attachedPr(resource)!)"
-          class="pr-status-dot" :class="`pr-light-${prLight(attachedPr(resource)!)}`"
-          :title="prLightLabel(prLight(attachedPr(resource)!))"></span>
       </button>
     </div>
     <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel attachment' : '+ Attach resource' }}</button>
@@ -476,14 +473,6 @@ async function onPreviewClick(event: MouseEvent) {
    (or not yet known), red = failing or not mergeable. The dot rides the
    row's right edge; the glyph shares the light so the state is readable
    either way. */
-.pr-status-dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  margin-left: auto; flex: none; align-self: center;
-}
-.pr-status-dot.pr-light-green { background: var(--ok); }
-.pr-status-dot.pr-light-yellow { background: var(--attention); }
-.pr-status-dot.pr-light-red { background: var(--blocked); }
-.pr-status-dot.pr-light-purple { background: var(--merged); }
 .resource-panel-icon.pr-light-green { color: var(--ok); }
 .resource-panel-icon.pr-light-yellow { color: var(--attention); }
 .resource-panel-icon.pr-light-red { color: var(--blocked); }
