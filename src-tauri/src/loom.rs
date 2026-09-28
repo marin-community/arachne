@@ -98,9 +98,9 @@ pub struct SessionSummaryView {
     pub created_by: Option<String>,
     pub created_at: String,
     pub last_activity_at: String,
-    /// Old Loom servers omit this; a pending ACP request is an attention item.
+    /// Old Loom servers omit this; each entry is an unanswered ACP request.
     #[serde(default)]
-    pub pending_permission: Option<PendingPermissionView>,
+    pub pending_permissions: Vec<PendingPermissionView>,
     /// When the newest `user_message` block was journaled (the last time a
     /// person or a delivery on their behalf steered the conversation), or
     /// `None` when the journal holds no user input — or when an older loom

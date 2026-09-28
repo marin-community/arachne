@@ -6,6 +6,7 @@ import {
   isIdle,
   isReadyCandidate,
   loudTag,
+  pendingPermissionSummary,
   statusClass,
   topicThreadRows,
 } from "../src/topicInspector.ts";
@@ -91,9 +92,13 @@ test("row states: working spins, resting is quiet, loud tags keep badges", () =>
   assert.deepEqual(loudTag(needsAttention), { level: "attention" });
   assert.equal(badgeLabel(needsAttention), "attention");
   assert.equal(statusClass(needsAttention), "attention");
-  const approval = session("approval", { pending_permission: { request_id: "req-1", title: "Allow Computer Use?" } });
+  const approval = session("approval", { pending_permissions: [
+    { request_id: "req-1", title: "Allow Computer Use?" },
+    { request_id: "req-2", title: "Allow file access?" },
+  ] });
   assert.deepEqual(loudTag(approval), { level: "attention" });
   assert.equal(badgeLabel(approval), "attention");
+  assert.equal(pendingPermissionSummary(approval), "2 tool approvals: Allow Computer Use? · Allow file access?");
   const blocked = withTag(session("b"), "triage", "blocked");
   assert.equal(statusClass(blocked), "error");
   const triage = withTag(session("t"), "triage", "ok");

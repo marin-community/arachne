@@ -2,7 +2,7 @@
 import { computed, ref } from "vue";
 import type { SessionLayout, SessionSummary } from "../App.vue";
 import { layoutProjects, topicProjectId } from "../projects";
-import { loudTag } from "../topicInspector";
+import { loudTag, pendingPermissionSummary } from "../topicInspector";
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -94,7 +94,8 @@ function ago(iso: string): string {
 }
 
 function description(s: SessionSummary): string {
-  if (s.pending_permission) return `Approve tool use: ${s.pending_permission.title || "permission requested"}`;
+  const permission = pendingPermissionSummary(s);
+  if (permission) return permission;
   if (s.status === "error") return "errored";
   const tag = s.branch.tags.find((t) => t.key === "attention" || t.key === "triage");
   return tag?.note || s.branch.description || s.branch.goal || "—";

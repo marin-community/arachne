@@ -19,8 +19,18 @@ export function loudTag(s: SessionSummary): { level: "attention" | "blocked" } |
       return { level: tag.value };
     }
   }
-  if (s.pending_permission && s.status !== "archived") return { level: "attention" };
+  if (s.pending_permissions?.length && s.status !== "archived") return { level: "attention" };
   return null;
+}
+
+/** Compact reason for a session with one or more unanswered tool approvals. */
+export function pendingPermissionSummary(s: SessionSummary): string | null {
+  const pending = s.pending_permissions ?? [];
+  if (!pending.length) return null;
+  const titles = pending.map((request) => request.title || "permission requested");
+  return pending.length === 1
+    ? `Approve tool use: ${titles[0]}`
+    : `${pending.length} tool approvals: ${titles.join(" · ")}`;
 }
 
 /** The quiet `idle` mark: running alone means alive, not working. */
