@@ -158,6 +158,22 @@ test("origin labels distinguish project from topic", () => {
   assert.equal(originLabel("topic"), "topic");
 });
 
+// --- Repository bindings (design.md: a project binds multiple repos) --------
+
+test("repository rows stay mentionable and hidden ones drop out", () => {
+  const rows = [
+    { id: "repository:/repos/a/loom", kind: "repository", title: "loom", repository: "/repos/a/loom", reference: null, path: null, url: null, origin: "project", hidden: false },
+    { id: "repository:/repos/a/arachne", kind: "repository", title: "arachne", repository: "/repos/a/arachne", reference: null, path: null, url: null, origin: "topic", hidden: false },
+    { id: "repository:/repos/a/gone", kind: "repository", title: "gone", repository: "/repos/a/gone", reference: null, path: null, url: null, origin: "project", hidden: true },
+  ];
+  const mentionable = mentionableRows(rows);
+  assert.deepEqual(
+    mentionable.map((row) => row.id),
+    ["repository:/repos/a/loom", "repository:/repos/a/arachne"],
+  );
+});
+
+
 // --- Unified GitHub picker ---------------------------------------------------
 
 test("kind of a picked GitHub search result comes from its URL", () => {

@@ -68,6 +68,7 @@ pub fn run() {
             commands::read_topic_resource,
             commands::open_topic_resource_in_zed,
             commands::project_bindings,
+            commands::managed_repos,
             commands::add_project_binding,
             commands::remove_project_binding,
             commands::topic_todos,

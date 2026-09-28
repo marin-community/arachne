@@ -386,7 +386,7 @@ function closeNewThreadSheet() {
   showNewThread.value = false;
 }
 
-// The project heading's ◇ button: manage that project's resource bindings
+// The project heading's ⚙ button: manage that project's resource bindings
 // (what new topics inherit) without creating a topic first.
 const projectResourcesProject = ref<{ id: string; name: string } | null>(null);
 function openProjectResources(project: { id: string | null; name: string }) {

@@ -90,13 +90,41 @@ watch(repo, () => void load());
 // --- Add / remove bindings ------------------------------------------------
 
 const showAttach = ref(false);
-const formKind = ref<"design_document" | "file" | "pull_request" | "issue">("design_document");
+const formKind = ref<"design_document" | "file" | "repository" | "pull_request" | "issue">("design_document");
 const formTitle = ref("Design document");
 const formPath = ref("");
 const formUrl = ref("");
 const isUrlKind = computed(() => formKind.value === "pull_request" || formKind.value === "issue");
+
+// Repository bindings pick their own repo (design.md: multiple
+// repositories per project) — the managed list, so the binding names a real
+// repo rather than a guess.
+const managedRepos = ref<string[]>([]);
+const formRepo = ref("");
+const repoOptions = computed(() => managedRepos.value);
+watch(repoOptions, (options) => {
+  if (!formRepo.value || !options.includes(formRepo.value)) formRepo.value = options[0] ?? "";
+}, { immediate: true });
+
+async function loadManagedRepos() {
+  try {
+    const repos = await invoke<{ slug: string }[] | null>("managed_repos");
+    managedRepos.value = Array.isArray(repos) ? repos.map((r) => r.slug) : [];
+  } catch {
+    managedRepos.value = [];
+  }
+}
+loadManagedRepos();
+
 const attachValid = computed(() =>
-  Boolean(formTitle.value.trim() && (isUrlKind.value ? formUrl.value.trim() : formPath.value.trim())),
+  Boolean(
+    formTitle.value.trim()
+    && (isUrlKind.value
+      ? formUrl.value.trim()
+      : formKind.value === "repository"
+        ? formRepo.value.trim()
+        : formPath.value.trim()),
+  ),
 );
 
 function chooseKind() {
@@ -117,6 +145,7 @@ async function attach() {
   const title = formTitle.value.trim();
   const path = formPath.value.trim();
   const url = formUrl.value.trim();
+  const targetRepo = formRepo.value.trim();
   if (!repoInput || saving.value || !attachValid.value) return;
   saving.value = true;
   error.value = "";
@@ -126,7 +155,9 @@ async function attach() {
       repo: repoInput,
       resource: isUrlKind.value
         ? { kind: formKind.value, title, repository: "", reference: null, path: null, url }
-        : { kind: formKind.value, title, repository: "", reference: null, path, url: null },
+        : formKind.value === "repository"
+          ? { kind: formKind.value, title, repository: targetRepo, reference: null, path: null, url: null }
+          : { kind: formKind.value, title, repository: "", reference: null, path, url: null },
       expectedRevision: revision.value,
     });
     bindings.value = view.bindings ?? [];
@@ -223,13 +254,21 @@ function onKeydown(event: KeyboardEvent) {
             <select v-model="formKind" @change="chooseKind">
               <option value="design_document">Design document</option>
               <option value="file">File</option>
+              <option value="repository">Repository</option>
               <option value="pull_request">Pull request</option>
               <option value="issue">Issue</option>
             </select>
           </label>
           <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
+          <!-- A repository binding names its own repo — the managed list;
+               this is how a project comes to span several repos. -->
+          <label v-if="formKind === 'repository'">Repository
+            <select v-model="formRepo">
+              <option v-for="repo in repoOptions" :key="repo" :value="repo">{{ repo }}</option>
+            </select>
+          </label>
           <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
-          <label v-else>Path in repo <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
+          <label v-else-if="formKind !== 'repository'">Path in repo <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
           <button type="button" class="primary" :disabled="saving || !attachValid" @click="attach">Bind to project</button>
         </div>
       </div>

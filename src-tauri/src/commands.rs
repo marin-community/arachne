@@ -2789,6 +2789,13 @@ async fn repo_branch_context(
     Ok(None)
 }
 
+/// One managed repository, for the repo pickers.
+#[derive(Debug, Clone, Serialize)]
+pub struct ManagedRepoView {
+    pub slug: String,
+    pub path: String,
+}
+
 /// The project-bindings view the sheet and the project home render.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProjectBindingsView {
@@ -2815,6 +2822,22 @@ pub async fn project_bindings(
         bindings: store.projects.get(&project_id).cloned().unwrap_or_default(),
         revision: store.revision,
     })
+}
+
+/// The managed repositories, for pickers that bind a repository by slug
+/// (project bindings, topic attachments). Slug + path so the frontend can
+/// offer the human-readable name while commands key by either.
+#[tauri::command]
+pub async fn managed_repos(
+    state: State<'_, LoomState>,
+) -> Result<Vec<ManagedRepoView>, UiError> {
+    let client = state_client(&state).await?;
+    let mut repos = client.list_repos().await?;
+    repos.sort_by(|a, b| a.slug.cmp(&b.slug));
+    Ok(repos
+        .into_iter()
+        .map(|r| ManagedRepoView { slug: r.slug, path: r.path })
+        .collect())
 }
 
 /// Resolve `repo` to the canonical repo root by finding a branch of it —
@@ -2870,7 +2893,18 @@ pub async fn add_project_binding(
         .await?
         .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
     let mut draft = resource;
-    draft.repository = repo_root.clone();
+    if draft.kind == ResourceKind::Repository {
+        // A repository binding points at its own repo: the picker sends a
+        // slug (or path), resolved to the canonical root the same way the
+        // host repo is, so identity matches what a topic attach produces.
+        draft.repository = repo_root_of(&client, &draft.repository)
+            .await?
+            .ok_or_else(|| {
+                resource_error("no loom branch exists for that repository yet")
+            })?;
+    } else {
+        draft.repository = repo_root.clone();
+    }
     let binding = ProjectBinding::validated_for_project(draft, &repo_root)
         .map_err(resource_error)?;
     let mut store = load_projects_store(&client, &context).await?;
@@ -2950,7 +2984,16 @@ pub async fn attach_topic_resource(
     if context.manifest.revision != expected_revision {
         return Err(resource_error("resources changed; reload before editing"));
     }
-    let resource = resource
+    let mut draft = resource;
+    if draft.kind == ResourceKind::Repository {
+        // A repository attachment names its own repo (a slug or path);
+        // canonicalize to the repo root a project binding would record so
+        // override/hide matching works across scopes.
+        draft.repository = repo_root_of(&client, &draft.repository)
+            .await?
+            .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
+    }
+    let resource = draft
         .validated(&topic.branch.repo_root, &topic.branch.branch)
         .map_err(resource_error)?;
     let mut manifest = context.manifest.clone();

@@ -149,7 +149,11 @@ impl ResourceDraft {
         if self.title.is_empty() || self.title.len() > 256 {
             return Err("resource title must contain 1–256 characters".into());
         }
-        if self.repository != topic_repo {
+        // A repository binding points at its OWN repo — often another one
+        // (design.md: a project can bind multiple repositories), so only
+        // the file-backed kinds are pinned to the topic's repo.
+        let repo_must_match = !matches!(self.kind, ResourceKind::Repository);
+        if repo_must_match && self.repository != topic_repo {
             return Err("resource repository must match the topic repository".into());
         }
         match self.kind {
@@ -168,7 +172,11 @@ impl ResourceDraft {
                     return Err("the URL must be on github.com".into());
                 }
             }
-            ResourceKind::Repository => {}
+            ResourceKind::Repository => {
+                if self.repository.is_empty() {
+                    return Err("repository binding needs a repository".into());
+                }
+            }
             ResourceKind::Worktree => {
                 if self.path.is_none() {
                     return Err("worktree path is required".into());
@@ -291,7 +299,12 @@ impl ProjectBinding {
         if draft.title.is_empty() || draft.title.len() > 256 {
             return Err("resource title must contain 1–256 characters".into());
         }
-        if draft.repository != repo_root {
+        // A repository binding points at its own repo — the point of the
+        // kind is binding ANOTHER repo (design.md: multiple repositories
+        // per project) — so it is exempt from the host-repo pin; the
+        // command layer stamps its canonical root so identity is stable.
+        let repo_must_match = !matches!(draft.kind, ResourceKind::Repository);
+        if repo_must_match && draft.repository != repo_root {
             return Err("resource repository must match the project repository".into());
         }
         match draft.kind {
@@ -307,7 +320,11 @@ impl ProjectBinding {
                     return Err("the URL must be on github.com".into());
                 }
             }
-            ResourceKind::Repository => {}
+            ResourceKind::Repository => {
+                if draft.repository.is_empty() {
+                    return Err("repository binding needs a repository".into());
+                }
+            }
             ResourceKind::Worktree => {
                 if draft.path.is_none() {
                     return Err("worktree path is required".into());
@@ -759,6 +776,90 @@ mod project_tests {
         assert_eq!(decoded.revision, 9);
         assert_eq!(decoded.projects.len(), 1);
         assert!(decoded.projects.contains_key("grp"));
+    }
+
+    // --- Repository bindings (design.md: a project can bind multiple
+    //     repositories) --------------------------------------------------
+
+    fn repo_binding(root: &str) -> ProjectBinding {
+        ProjectBinding::validated_for_project(
+            ResourceDraft {
+                kind: ResourceKind::Repository,
+                title: root.rsplit('/').next().unwrap().into(),
+                repository: root.into(),
+                reference: None,
+                path: None,
+                url: None,
+            },
+            "/host", // the store's host repo — different from the binding's
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn repository_bindings_may_point_at_other_repos() {
+        // The point of the kind: a project in one repo binds other repos.
+        let loom = repo_binding("/repos/marin-community/loom");
+        let arachne = repo_binding("/repos/marin-community/arachne");
+        assert_eq!(loom.id, "repository:/repos/marin-community/loom");
+        assert_ne!(loom.id, arachne.id);
+        // Multiple repositories coexist in one project's store.
+        let rows = merge_effective(
+            &[loom.clone(), arachne],
+            &topic_with(vec![], vec![]),
+            "topic",
+        );
+        assert_eq!(rows.len(), 2);
+        // And the merge does not retarget anything (no file reference).
+        assert_eq!(rows[0].resource.data.repository, "/repos/marin-community/loom");
+    }
+
+    #[test]
+    fn repository_binding_overrides_by_root_and_unhides_on_attach() {
+        let loom = repo_binding("/repos/marin-community/loom");
+        // A topic attach of the same repo overrides the inherited row.
+        let attached = ResourceDraft {
+            kind: ResourceKind::Repository,
+            title: "Loom".into(),
+            repository: "/repos/marin-community/loom".into(),
+            reference: None,
+            path: None,
+            url: None,
+        }
+        .validated("/repos/marin-community/arachne", "topic")
+        .unwrap();
+        assert_eq!(attached.id, loom.as_topic_resource("topic").id);
+        // A hide keyed by the binding key covers the inherited row.
+        let rows = merge_effective(&[loom], &topic_with(vec![], vec![&attached.binding_key()]), "topic");
+        assert_eq!(rows[0].hidden, true);
+    }
+
+    #[test]
+    fn repository_binding_requires_a_repo() {
+        assert!(ProjectBinding::validated_for_project(
+            ResourceDraft {
+                kind: ResourceKind::Repository,
+                title: "Nowhere".into(),
+                repository: "  ".into(),
+                reference: None,
+                path: None,
+                url: None,
+            },
+            "/host",
+        )
+        .is_err());
+        // And topic-side: a repository attach still validates with a repo
+        // that differs from the topic's own.
+        assert!(ResourceDraft {
+            kind: ResourceKind::Repository,
+            title: "Loom".into(),
+            repository: "/repos/marin-community/loom".into(),
+            reference: None,
+            path: None,
+            url: None,
+        }
+        .validated("/repos/marin-community/arachne", "topic")
+        .is_ok());
     }
 }
 

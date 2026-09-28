@@ -71,8 +71,17 @@ function iconFor(kind: string) {
     case "pull_request": return "⑂";
     case "issue": return "◉";
     case "artifact": return "◍";
+    case "repository": return "⌂";
     default: return "▤";
   }
+}
+
+/** A repository binding's GitHub URL, when its root carries a slug-shaped
+ *  tail (`owner/name`) — unmanaged roots simply have no link. */
+function bindingRepoUrl(resource: EffectiveRow): string | null {
+  const root = resource.repository || "";
+  const slug = root.split("/").filter(Boolean).slice(-2).join("/");
+  return /^[\w.-]+\/[\w.-]+$/.test(slug) ? `https://github.com/${slug}` : null;
 }
 
 /** The status light's one-line explanation, same order as the light rules. */
@@ -132,10 +141,10 @@ const reading = ref(false);
 const saving = ref(false);
 const showAttach = ref(false);
 const attachMenuOpen = ref(false);
-function chooseAttachKind(kind: "github" | "design_document" | "file") {
+function chooseAttachKind(kind: "github" | "design_document" | "file" | "repository") {
   formKind.value = kind;
   attachMenuOpen.value = false;
-  if (kind === "github") {
+  if (kind === "github" || kind === "repository") {
     formTitle.value = "";
     formPath.value = "";
   } else {
@@ -143,7 +152,7 @@ function chooseAttachKind(kind: "github" | "design_document" | "file") {
   }
   showAttach.value = true;
 }
-const formKind = ref<"github" | "design_document" | "file">("github");
+const formKind = ref<"github" | "design_document" | "file" | "repository">("github");
 const formTitle = ref("Design document");
 const formPath = ref("docs/design.md");
 const message = ref("");
@@ -326,6 +335,10 @@ async function refresh() {
 async function selectResource(id: string) {
   selectedId.value = id;
   content.value = "";
+  // Repository bindings carry no text to preview — the row's GitHub link
+  // is the affordance; selecting it just shows its metadata head.
+  const row = snapshot.value.resources.find((resource) => resource.id === id);
+  if (row?.kind === "repository") return;
   reading.value = true;
   try {
     const view = await invoke<TopicResourceContent>("read_topic_resource", { topicId: props.topic.id, resourceId: id });
@@ -368,33 +381,78 @@ function chooseKind() {
   }
 }
 
-const attachValid = computed(() => formTitle.value.trim() && formPath.value.trim());
+const attachValid = computed(() =>
+  formKind.value === "repository"
+    ? Boolean(formRepo.value.trim())
+    : Boolean(formTitle.value.trim() && formPath.value.trim()),
+);
+
+// --- Repository attachments (design.md: projects bind multiple repos) ---
+// The picker offers the managed repositories, plus the topic's own first.
+
+const managedRepos = ref<string[]>([]);
+const formRepo = ref("");
+const repoOptions = computed(() => {
+  const own = props.topic.github_repo;
+  const list = [...managedRepos.value];
+  if (own && !list.includes(own)) list.unshift(own);
+  return list;
+});
+watch(repoOptions, (options) => {
+  if (!formRepo.value || !options.includes(formRepo.value)) formRepo.value = options[0] ?? "";
+}, { immediate: true });
+
+async function loadManagedRepos() {
+  try {
+    const repos = await invoke<{ slug: string }[] | null>("managed_repos");
+    managedRepos.value = Array.isArray(repos) ? repos.map((r) => r.slug) : [];
+  } catch {
+    managedRepos.value = [];
+  }
+}
+loadManagedRepos();
 
 async function attach() {
   // The GitHub picker attaches straight from a search result (attachGhResult);
-  // this path serves the plain kinds: design document and file.
+  // this path serves the picked kinds: design document, file, repository.
   const title = formTitle.value.trim();
   const path = formPath.value.trim();
-  if (!title || saving.value || !attachValid.value) return;
+  const repo = formRepo.value.trim();
+  if (saving.value || !attachValid.value || (formKind.value !== "repository" && !title)) return;
   saving.value = true;
   message.value = "";
+  const before = new Set(snapshot.value.resources.map((resource) => resource.id));
   try {
+    // The draft's repository field carries the binding's own target: the
+    // topic repo for files (pinned by validation) or the picked repo for
+    // repository bindings (resolved to its canonical root command-side).
     const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
       topicId: props.topic.id,
-      resource: {
-        kind: formKind.value,
-        title,
-        repository: props.topic.branch.repo_root,
-        reference: props.topic.branch.branch,
-        path,
-        url: null,
-      },
+      resource: formKind.value === "repository"
+        ? {
+            // The slug doubles as the title — the row is its repo.
+            kind: formKind.value,
+            title: repo,
+            repository: repo,
+            reference: null,
+            path: null,
+            url: null,
+          }
+        : {
+            kind: formKind.value,
+            title,
+            repository: props.topic.branch.repo_root,
+            reference: props.topic.branch.branch,
+            path,
+            url: null,
+          },
       expectedRevision: snapshot.value.revision,
     });
     applyEffective(next);
-    const attached = next.resources.find(
-      (resource) => resource.kind === formKind.value && resource.path === path,
-    );
+    // The attached row is the new one (upsert by id; a repository binding's
+    // canonical root is resolved command-side, so diff, don't guess).
+    const attached = next.resources.find((resource) => !before.has(resource.id) && resource.kind === formKind.value)
+      ?? next.resources.find((resource) => resource.kind === formKind.value);
     selectedId.value = attached?.id ?? selectedId.value;
     showAttach.value = false;
     message.value = "Resource attached to this topic.";
@@ -566,7 +624,7 @@ async function onPreviewClick(event: MouseEvent) {
           :class="resource.kind === 'pull_request' && attachedPr(resource) ? (prLight(attachedPr(resource)!) ? `pr-light-${prLight(attachedPr(resource)!)}` : 'pr-light-none') : ''">{{ iconFor(resource.kind) }}</span>
         <span class="resource-panel-item-text">
           <strong>{{ resource.title }}</strong>
-          <small>{{ resource.path || resource.url || resource.reference }}</small>
+          <small>{{ resource.kind === 'repository' ? resource.repository : (resource.path || resource.url || resource.reference) }}</small>
         </span>
         <!-- Origin label (design.md: show each binding's origin): a chip the
              row's own actions key off too — only project-origin rows hide,
@@ -582,7 +640,7 @@ async function onPreviewClick(event: MouseEvent) {
           <span class="resource-panel-icon dimmed">{{ iconFor(resource.kind) }}</span>
           <span class="resource-panel-item-text">
             <strong class="dimmed">{{ resource.title }}</strong>
-            <small>{{ resource.path || resource.url || resource.reference }}</small>
+            <small>{{ resource.kind === 'repository' ? resource.repository : (resource.path || resource.url || resource.reference) }}</small>
           </span>
           <span class="resource-origin project" title="Hidden inherited binding">project</span>
           <button class="link" :disabled="saving" title="Restore this inherited resource" @click="unhide(resource)">Restore</button>
@@ -590,12 +648,15 @@ async function onPreviewClick(event: MouseEvent) {
       </template>
     </div>
     <div class="resource-panel-attach">
-      <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel' : (formKind === 'github' ? 'Find on GitHub…' : formKind === 'design_document' ? 'Design document…' : 'File…') }}</button>
+      <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel' : (formKind === 'github' ? 'Find on GitHub…' : formKind === 'design_document' ? 'Design document…' : formKind === 'repository' ? 'Repository…' : 'File…') }}</button>
       <button v-if="showAttach" class="resource-panel-add-caret" title="Choose kind" @click="attachMenuOpen = !attachMenuOpen">▾</button>
       <div v-if="attachMenuOpen" class="resource-panel-attach-menu">
         <button type="button" :class="{ current: formKind === 'github' }" @click="chooseAttachKind('github')">GitHub PR or issue</button>
         <button type="button" :class="{ current: formKind === 'design_document' }" @click="chooseAttachKind('design_document')">Design document</button>
         <button type="button" :class="{ current: formKind === 'file' }" @click="chooseAttachKind('file')">File</button>
+        <!-- Repository bindings (design.md: a topic can bring in another
+             repo; a project can bind several) — picked, not typed. -->
+        <button type="button" :class="{ current: formKind === 'repository' }" @click="chooseAttachKind('repository')">Repository</button>
       </div>
     </div>
     <div v-if="showAttach" class="resource-panel-form">
@@ -619,6 +680,17 @@ async function onPreviewClick(event: MouseEvent) {
         </div>
         <div v-else-if="ghQuery.trim()" class="resource-panel-empty">Nothing found.</div>
       </template>
+      <!-- Repository bindings pick their own repo (design.md: a project
+           binds multiple repositories); managed list + the topic's own.
+           The slug doubles as the title — the row is its repo. -->
+      <template v-else-if="formKind === 'repository'">
+        <label>Repository
+          <select v-model="formRepo">
+            <option v-for="repo in repoOptions" :key="repo" :value="repo">{{ repo }}</option>
+          </select>
+        </label>
+        <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
+      </template>
       <template v-else>
         <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
         <label>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
@@ -630,6 +702,7 @@ async function onPreviewClick(event: MouseEvent) {
       <div class="resource-panel-preview-head">
         <strong>{{ selected.title }}</strong>
         <button v-if="selected.url" title="Open in your browser" @click="openExternal(selected.url)">Open on GitHub</button>
+        <button v-else-if="selected.kind === 'repository' && bindingRepoUrl(selected)" title="Open in your browser" @click="openExternal(bindingRepoUrl(selected)!)">Open on GitHub</button>
         <button v-else :disabled="!selected.path" @click="openInZed(selected)">Open in Zed</button>
         <!-- Topic rows detach (their own addition); inherited rows hide
              (design.md: hide, not delete from the project). -->

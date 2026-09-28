@@ -194,7 +194,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
         </div>
         <!-- Project home: manage what this project's new topics inherit
              (design.md "Project defaults and resource inheritance"). The
-             sidebar heading offers the same affordance (◇); this is the
+             sidebar heading offers the same affordance (⚙); this is the
              home-surface entry point. -->
         <button
           v-if="project?.id"
@@ -202,7 +202,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
           :title="`Manage resources inherited by new topics in ${project.name}`"
           :aria-label="`Manage resources for project ${project.name}`"
           @click="emit('manage-project-resources', { id: project.id, name: project.name })"
-        >◇ Resources</button>
+        >⚙ Resources</button>
         <button class="home-new" title="Start a durable topic — title, description, goal" @click="emit('new-topic')">
           + New topic
         </button>
@@ -257,7 +257,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
                 :title="`Manage resources inherited by new topics in ${group.name}`"
                 :aria-label="`Manage resources for project ${group.name}`"
                 @click="emit('manage-project-resources', { id: group.id, name: group.name })"
-              >◇ resources</button>
+              >⚙ resources</button>
             </div>
             <div v-for="s in group.rows" :key="s.id" class="home-row" :class="section.kind === 'ready' ? 'ready' : level(s)"
               role="button" tabindex="0" :aria-label="`Open ${rowTitle(s)}: ${description(s)}`"

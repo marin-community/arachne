@@ -335,14 +335,39 @@ function toggleBinding(id: string, checked: boolean) {
 }
 
 const showProjectAttach = ref(false);
-const projectFormKind = ref<"design_document" | "file" | "pull_request" | "issue">("design_document");
+const projectFormKind = ref<"design_document" | "file" | "repository" | "pull_request" | "issue">("design_document");
 const projectFormTitle = ref("Design document");
 const projectFormPath = ref("");
 const projectFormUrl = ref("");
 const projectSaving = ref(false);
 const projectIsUrlKind = computed(() => projectFormKind.value === "pull_request" || projectFormKind.value === "issue");
+
+// Repository bindings pick their own repo — the managed list (design.md:
+// a project can bind multiple repositories).
+const projectManagedRepos = ref<string[]>([]);
+const projectFormRepo = ref("");
+const projectRepoOptions = computed(() => projectManagedRepos.value);
+watch(projectRepoOptions, (options) => {
+  if (!projectFormRepo.value || !options.includes(projectFormRepo.value)) projectFormRepo.value = options[0] ?? "";
+}, { immediate: true });
+
+async function loadProjectManagedRepos() {
+  try {
+    const repos = await invoke<{ slug: string }[] | null>("managed_repos");
+    projectManagedRepos.value = Array.isArray(repos) ? repos.map((r) => r.slug) : [];
+  } catch {
+    projectManagedRepos.value = [];
+  }
+}
+loadProjectManagedRepos();
+
 const projectAttachValid = computed(() =>
-  projectFormTitle.value.trim() && (projectIsUrlKind.value ? projectFormUrl.value.trim() : projectFormPath.value.trim()),
+  projectFormTitle.value.trim()
+  && (projectIsUrlKind.value
+    ? projectFormUrl.value.trim()
+    : projectFormKind.value === "repository"
+      ? projectFormRepo.value.trim()
+      : projectFormPath.value.trim()),
 );
 
 function chooseProjectKind() {
@@ -363,6 +388,7 @@ async function attachToProject() {
   const title = projectFormTitle.value.trim();
   const path = projectFormPath.value.trim();
   const url = projectFormUrl.value.trim();
+  const targetRepo = projectFormRepo.value.trim();
   if (!projectId || !repoInput || projectSaving.value || !projectAttachValid.value) return;
   projectSaving.value = true;
   projectBindingsError.value = "";
@@ -372,7 +398,9 @@ async function attachToProject() {
       repo: repoInput,
       resource: projectIsUrlKind.value
         ? { kind: projectFormKind.value, title, repository: "", reference: null, path: null, url }
-        : { kind: projectFormKind.value, title, repository: "", reference: null, path, url: null },
+        : projectFormKind.value === "repository"
+          ? { kind: projectFormKind.value, title, repository: targetRepo, reference: null, path: null, url: null }
+          : { kind: projectFormKind.value, title, repository: "", reference: null, path, url: null },
       expectedRevision: projectRevision.value,
     });
     projectBindings.value = view.bindings ?? [];
@@ -586,13 +614,21 @@ function submit() {
             <select v-model="projectFormKind" @change="chooseProjectKind">
               <option value="design_document">Design document</option>
               <option value="file">File</option>
+              <option value="repository">Repository</option>
               <option value="pull_request">Pull request</option>
               <option value="issue">Issue</option>
             </select>
           </label>
           <label>Title <input v-model="projectFormTitle" placeholder="Design document" /></label>
+          <!-- A repository binding names its own repo — how a project
+               comes to span several repositories. -->
+          <label v-if="projectFormKind === 'repository'">Repository
+            <select v-model="projectFormRepo">
+              <option v-for="repo in projectRepoOptions" :key="repo" :value="repo">{{ repo }}</option>
+            </select>
+          </label>
           <label v-if="projectIsUrlKind">GitHub URL <input v-model="projectFormUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
-          <label v-else>Path in repo <input v-model="projectFormPath" placeholder="docs/design.md" spellcheck="false" /></label>
+          <label v-else-if="projectFormKind !== 'repository'">Path in repo <input v-model="projectFormPath" placeholder="docs/design.md" spellcheck="false" /></label>
           <button type="button" class="primary" :disabled="projectSaving || !projectAttachValid" @click="attachToProject">Bind to project</button>
         </div>
       </div>

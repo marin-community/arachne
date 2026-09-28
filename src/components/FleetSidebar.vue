@@ -895,7 +895,7 @@ async function archiveRow(id: string) {
               :title="`Manage resources inherited by new topics in ${section.name}`"
               :aria-label="`Manage resources for project ${section.name}`"
               @click.stop="emit('manage-project-resources', { id: section.id, name: section.name })"
-            >◇</button>
+            >⚙</button>
             <button
               class="project-new-topic"
               type="button"
