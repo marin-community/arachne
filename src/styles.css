@@ -631,47 +631,6 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
-.resource-strip {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 30px;
-  padding: 4px 16px;
-  border-bottom: 1px solid var(--border);
-  color: var(--text-dim);
-  white-space: nowrap;
-  overflow: hidden;
-  font-size: 11px;
-}
-.resource-strip .resource-link {
-  flex: none;
-  border: 0;
-  background: transparent;
-  color: var(--accent);
-  padding: 0;
-  font-size: inherit;
-}
-.resource-strip .resource-link:hover { text-decoration: underline; }
-.resource-strip .resource-separator { opacity: .5; }
-.resource-strip .resource-item { overflow: hidden; text-overflow: ellipsis; }
-.resource-strip .resource-item.path { margin-left: auto; font-family: var(--mono); }
-.resource-link.recover { color: #e0af68; }
-.pr-badge {
-  font-size: 10px;
-  padding: 0 4px;
-  border-radius: 4px;
-  border: 1px solid var(--border);
-  margin-left: 2px;
-  font-family: var(--mono);
-}
-.pr-badge.pr-draft, .pr-badge[data-state="draft"] { color: #e0af68; border-color: #e0af6855; }
-.pr-badge[data-state="open"] { color: #9ece6a; border-color: #9ece6a55; }
-.pr-badge[data-state="closed"], .pr-badge[data-state="merged"] { color: #f7768e; border-color: #f7768e55; }
-.pr-badge.pr-review[data-decision="APPROVED"] { color: #9ece6a; border-color: #9ece6a55; }
-.pr-badge.pr-review[data-decision="CHANGES_REQUESTED"] { color: #f7768e; border-color: #f7768e55; }
-.pr-badge.pr-review[data-decision="REVIEW_REQUIRED"] { color: var(--text-dim); }
-.pr-badge.pr-checks[data-state="success"] { color: #9ece6a; }
-.pr-badge.pr-checks[data-state="failure"], .pr-badge.pr-checks[data-state="error"] { color: #f7768e; }
 .send-thread-box {
   display: grid;
   gap: 8px;

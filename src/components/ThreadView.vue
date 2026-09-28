@@ -8,6 +8,7 @@ import ContextTelemetry from "./ContextTelemetry.vue";
 import { useSlashCommands, type SlashCommand } from "../useSlashCommands";
 import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
+import CodeActions from "./CodeActions.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
@@ -732,14 +733,15 @@ async function openResource(url: string) {
   }
 }
 
-// --- Resource strip ---------------------------------------------------------
+// --- Code access ------------------------------------------------------------
 //
 // The spec's invariant: "If Arachne shows something referring to code, it
 // should be possible to reach an editable checkout of that code in one
-// action." The strip exposes the thread's repo, its PR, and a live path to
-// the checkout. When the worktree is gone (archive keeps the branch, not
-// the directory), Open-in-Zed becomes Recover: `repos.worktrees.ensure`
-// materializes a fresh checkout server-side, and the path updates to it.
+// action." The header keeps that action visible and puts repo, PR, branch,
+// path, Terminal, and change details in its adjacent disclosure. When the
+// worktree is gone (archive keeps the branch, not the directory), Open-in-Zed
+// becomes Recover: `repos.worktrees.ensure` materializes a fresh checkout
+// server-side, and the path updates to it.
 
 const pr = computed(() => props.session.branch.github ?? null);
 
@@ -1047,6 +1049,24 @@ async function onLand(strategy: string) {
            explicit detour, not the default Topic view — the main pane stays a
            conversation whenever a Topic is open. -->
       <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
+      <CodeActions
+        :checkout-path="zedTarget"
+        :recovering="recovering"
+        :repo-label="repoLabel"
+        :repo-url="repoUrl"
+        :pr-url="prUrl"
+        :pr-number="session.branch.github?.pr_number || session.branch.github_pr || null"
+        :pr-draft="pr?.is_draft"
+        :pr-state="pr?.pr_state"
+        :review-decision="pr?.review_decision"
+        :checks="pr?.checks"
+        :branch="session.branch.branch"
+        :integration-branch="isWorker && integrationTarget ? integrationTarget.branch.branch : null"
+        :work-summary="workSummary"
+        @open-checkout="zedTarget ? openInZed() : recover()"
+        @open-terminal="openTerminal"
+        @open-resource="openResource"
+      />
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
@@ -1078,54 +1098,6 @@ async function onLand(strategy: string) {
           {{ sendingToThread ? "Sending…" : "Send note" }}
         </button>
       </div>
-    </div>
-    <div class="resource-strip" aria-label="Thread resources">
-      <button v-if="repoUrl" class="resource-link" @click="openResource(repoUrl)">
-        {{ session.github_repo }}
-      </button>
-      <span v-else class="resource-item">{{ session.branch.repo_root || "Repository unavailable" }}</span>
-      <span class="resource-separator">·</span>
-      <button v-if="prUrl" class="resource-link" @click="openResource(prUrl)">
-        PR #{{ session.branch.github?.pr_number || session.branch.github_pr }}
-        <span v-if="pr && pr.is_draft" class="pr-badge pr-draft">draft</span>
-        <span v-if="pr && pr.pr_state" class="pr-badge" :data-state="pr.pr_state">{{ pr.pr_state }}</span>
-        <span v-if="pr && pr.review_decision" class="pr-badge pr-review" :data-decision="pr.review_decision">{{ pr.review_decision }}</span>
-        <span v-if="pr && pr.checks" class="pr-badge pr-checks" :data-state="pr.checks">CI {{ pr.checks }}</span>
-      </button>
-      <span v-else class="resource-item">No PR linked</span>
-      <span class="resource-separator">·</span>
-      <span class="resource-item" :title="session.work_dir">{{ session.branch.branch || "No branch" }}</span>
-      <span class="resource-separator">·</span>
-      <span class="resource-item path" :title="zedTarget || session.work_dir">{{ zedTarget || "No active checkout" }}</span>
-      <span class="resource-separator">·</span>
-      <button
-        v-if="zedTarget"
-        class="resource-link"
-        title="Open the checkout in Zed"
-        @click="openInZed"
-      >Open in Zed</button>
-      <button
-        v-else
-        class="resource-link recover"
-        :disabled="recovering"
-        title="The worktree is gone; materialize a checkout for this branch"
-        @click="recover"
-      >{{ recovering ? "Recovering…" : "Recover checkout" }}</button>
-      <span v-if="zedTarget" class="resource-separator">·</span>
-      <button
-        v-if="zedTarget"
-        class="resource-link"
-        title="Open a terminal at the checkout"
-        @click="openTerminal"
-      >Terminal</button>
-      <template v-if="isWorker && integrationTarget">
-        <span class="resource-separator">·</span>
-        <span class="resource-item" :title="`Integration target: ${integrationTarget.branch.repo_root} / ${integrationTarget.branch.branch}`">→ {{ integrationTarget.branch.branch }}</span>
-      </template>
-      <template v-if="workSummary">
-        <span class="resource-separator">·</span>
-        <span class="resource-item" title="Diff against the checkout's recorded base branch">{{ workSummary.files }} files · +{{ workSummary.additions }} −{{ workSummary.deletions }}</span>
-      </template>
     </div>
     <ChangeReview v-if="showChanges" :session-id="session.id" />
     <div v-if="showDelegate" class="delegate-box">
