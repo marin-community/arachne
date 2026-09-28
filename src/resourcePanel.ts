@@ -40,6 +40,38 @@ export interface CheckoutSubject {
   github_repo: string | null;
 }
 
+/** The `pr_status` reply for an attached PR URL: the same fields a live
+ * row gets from loom's snapshot, so both render the same light. */
+export interface AttachedPrStatus {
+  state: string;
+  mergeable: string | null;
+  checks: string | null;
+  title: string | null;
+}
+
+/** A `PanelPr`-shaped view over an attached PR resource, so `prLight` and the
+ * tooltip work on attached rows unchanged. */
+export function attachedAsPanelPr(url: string, status: AttachedPrStatus): PanelPr {
+  return {
+    session_id: "attached",
+    session_name: "attached",
+    pr_number: prNumberFromUrl(url) ?? 0,
+    pr_url: url,
+    pr_state: status.state,
+    pr_title: status.title ?? "Pull request",
+    is_draft: false,
+    review_decision: null,
+    checks: status.checks,
+    mergeable: status.mergeable,
+  };
+}
+
+/** `https://github.com/<owner>/<repo>/pull/<n>` → n. */
+export function prNumberFromUrl(url: string): number | null {
+  const m = url.match(/^https:\/\/(?:www\.)?github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  return m ? Number(m[3]) : null;
+}
+
 /** A sorted, render-ready live row. `key` is unique and stable per row. */
 export type LiveRow =
   | { kind: "repository"; key: string; label: string; url: string | null }

@@ -1198,6 +1198,218 @@ pub async fn recover_worktree(
         .map_err(Into::into)
 }
 
+/// The status a PR row needs to show its light, fetched straight from GitHub
+/// via the `gh` CLI — the same fields loom's poll loop snapshots. Used for
+/// *attached* PR resources (manifest rows carry only a URL), so they light up
+/// without waiting for loom's GitHub App credential. Fails soft: the row
+/// simply stays unlit, exactly like an unknown live state.
+#[derive(Debug, serde::Serialize)]
+pub struct PrStatusView {
+    pub state: String,
+    pub mergeable: Option<String>,
+    /// Loom's rollup verdict: `passing` / `failing` / `pending`, or null when
+    /// the PR has no checks at all.
+    pub checks: Option<String>,
+    pub title: Option<String>,
+}
+
+/// Parse `https://github.com/<owner>/<repo>/pull/<n>` into its parts.
+fn parse_pr_url(url: &str) -> Option<(String, i64)> {
+    let rest = url
+        .strip_prefix("https://github.com/")
+        .or_else(|| url.strip_prefix("https://www.github.com/"))?;
+    let mut parts = rest.trim_end_matches('/').splitn(3, '/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    let tail = parts.next()?;
+    let number = tail.strip_prefix("pull/")?.parse().ok()?;
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((format!("{owner}/{repo}"), number))
+}
+
+/// One entry of `gh pr view --json statusCheckRollup`, shaped like loom's
+/// `CheckJson`: either a modern check run (status + conclusion) or a legacy
+/// commit status (state). `__typename` distinguishes them.
+#[derive(Debug, serde::Deserialize)]
+struct GhCheck {
+    #[serde(default)]
+    __typename: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(rename = "startedAt", default)]
+    started_at: Option<String>,
+    #[serde(rename = "workflowName", default)]
+    workflow_name: Option<String>,
+    #[serde(rename = "checkSuite", default)]
+    check_suite: Option<GhCheckSuite>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhCheckSuite {
+    #[serde(rename = "workflowRun", default)]
+    workflow_run: Option<GhWorkflowRun>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhWorkflowRun {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    workflow: Option<GhWorkflow>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhWorkflow {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+impl GhCheck {
+    fn workflow_name(&self) -> &str {
+        self.workflow_name
+            .as_deref()
+            .or_else(|| {
+                self.check_suite
+                    .as_ref()?                    
+                    .workflow_run
+                    .as_ref()?
+                    .workflow
+                    .as_ref()?
+                    .name
+                    .as_deref()
+            })
+            .unwrap_or("")
+    }
+
+    fn event(&self) -> &str {
+        self.check_suite
+            .as_ref()
+            .and_then(|suite| suite.workflow_run.as_ref())
+            .and_then(|run| run.event.as_deref())
+            .unwrap_or("")
+    }
+
+    /// Logical check identity, matching `gh pr checks`: job name + workflow +
+    /// event, or the context for legacy statuses. Used to keep only the newest
+    /// attempt per check.
+    fn identity(&self) -> Option<String> {
+        if let Some(context) = self.context.as_deref() {
+            return Some(format!("context\0{context}"));
+        }
+        self.name
+            .as_deref()
+            .map(|name| format!("run\0{name}\0{}\0{}", self.workflow_name(), self.event()))
+    }
+}
+
+/// Keep only the newest attempt for each logical check (GitHub's rollup
+/// includes superseded runs), then roll up to one verdict exactly as loom's
+/// poll loop does: any failure ⇒ `failing`, else anything running ⇒ `pending`,
+/// else `passing`. None when the PR has no checks at all.
+fn rollup_checks(items: &[GhCheck]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut newest_first = items.iter().collect::<Vec<_>>();
+    newest_first.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+    let mut seen = std::collections::HashSet::new();
+    let mut any_pending = false;
+    let mut any_fail = false;
+    for it in newest_first {
+        if !it
+            .identity()
+            .is_none_or(|identity| seen.insert(identity))
+        {
+            continue;
+        }
+        if let Some(status) = it.status.as_deref() {
+            if status != "COMPLETED" {
+                any_pending = true;
+                continue;
+            }
+            match it.conclusion.as_deref().unwrap_or("") {
+                "SUCCESS" | "NEUTRAL" | "SKIPPED" | "CANCELLED" => {}
+                "ERROR" | "FAILURE" | "TIMED_OUT" | "ACTION_REQUIRED" => any_fail = true,
+                _ => any_pending = true,
+            }
+        } else if let Some(state) = it.state.as_deref() {
+            match state {
+                "SUCCESS" => {}
+                "PENDING" | "EXPECTED" => any_pending = true,
+                "FAILURE" | "ERROR" => any_fail = true,
+                _ => any_pending = true,
+            }
+        } else {
+            any_pending = true;
+        }
+    }
+    Some(
+        if any_fail {
+            "failing"
+        } else if any_pending {
+            "pending"
+        } else {
+            "passing"
+        }
+        .to_string(),
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhPrView {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    mergeable: Option<String>,
+    #[serde(rename = "statusCheckRollup", default)]
+    status_check_rollup: Vec<GhCheck>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+#[tauri::command]
+pub async fn pr_status(url: String) -> Result<PrStatusView, UiError> {
+    let (repo, number) = parse_pr_url(&url)
+        .ok_or_else(|| resource_error(format!("not a github.com pull request URL: {url}")))?;
+    let output = tokio::process::Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            "--repo",
+            &repo,
+            "--json",
+            "state,mergeable,statusCheckRollup,title",
+        ])
+        .arg(&number.to_string())
+        .output()
+        .await
+        .map_err(|e| resource_error(format!("launching gh: {e} (is gh installed and on PATH?)")))?;
+    if !output.status.success() {
+        return Err(resource_error(format!(
+            "gh pr view failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let view: GhPrView = serde_json::from_slice(&output.stdout)
+        .map_err(|e| resource_error(format!("parsing gh output: {e}")))?;
+    Ok(PrStatusView {
+        state: view.state.unwrap_or_default(),
+        mergeable: view.mergeable.filter(|v| !v.is_empty()),
+        checks: rollup_checks(&view.status_check_rollup),
+        title: view.title,
+    })
+}
+
 #[cfg(test)]
 mod zed_tests {
     use super::{thread_note_body, zed_target};
@@ -1206,6 +1418,78 @@ mod zed_tests {
     fn local_checkout_is_a_path() {
         assert_eq!(zed_target("127.0.0.1", "/tmp/a b").unwrap(), "/tmp/a b");
     }
+}
+
+#[cfg(test)]
+mod pr_status_tests {
+    use super::{parse_pr_url, rollup_checks, GhCheck};
+
+    fn check(name: &str, status: Option<&str>, conclusion: Option<&str>) -> GhCheck {
+        GhCheck {
+            __typename: Some("CheckRun".into()),
+            name: Some(name.into()),
+            context: None,
+            status: status.map(String::from),
+            conclusion: conclusion.map(String::from),
+            state: None,
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            workflow_name: None,
+            check_suite: None,
+        }
+    }
+
+    #[test]
+    fn parses_github_pr_urls() {
+        assert_eq!(
+            parse_pr_url("https://github.com/acme/app/pull/13"),
+            Some(("acme/app".into(), 13))
+        );
+        assert_eq!(
+            parse_pr_url("https://www.github.com/acme/app/pull/13/"),
+            Some(("acme/app".into(), 13))
+        );
+        assert_eq!(parse_pr_url("https://gitlab.com/acme/app/pull/13"), None);
+        assert_eq!(parse_pr_url("https://github.com/acme/app/issues/13"), None);
+    }
+
+    #[test]
+    fn rollup_matches_looms_semantics() {
+        // Empty rollup: no verdict at all, not "passing".
+        assert_eq!(rollup_checks(&[]), None);
+        // All terminal-success: passing.
+        assert_eq!(
+            rollup_checks(&[
+                check("ci", Some("COMPLETED"), Some("SUCCESS")),
+                check("lint", Some("COMPLETED"), Some("SKIPPED")),
+            ]),
+            Some("passing".into())
+        );
+        // Any failure beats in-progress.
+        assert_eq!(
+            rollup_checks(&[
+                check("ci", Some("COMPLETED"), Some("FAILURE")),
+                check("lint", Some("IN_PROGRESS"), None),
+            ]),
+            Some("failing".into())
+        );
+        // Running but nothing failed: pending.
+        assert_eq!(
+            rollup_checks(&[check("ci", Some("IN_PROGRESS"), None)]),
+            Some("pending".into())
+        );
+        // A superseded failed attempt is ignored when a newer attempt exists.
+        // The SUCCESS at 00:00:01 is the newest attempt for check "ci", so the
+        // FAILURE at 00:00:00 is superseded and does not count.
+        let mut passed = check("ci", Some("COMPLETED"), Some("SUCCESS"));
+        passed.started_at = Some("2026-01-01T00:00:01Z".into());
+        let mut failed = check("ci", Some("COMPLETED"), Some("FAILURE"));
+        failed.started_at = Some("2026-01-01T00:00:00Z".into());
+        assert_eq!(rollup_checks(&[failed, passed]), Some("passing".into()));
+    }
+}
+
+mod zed_tests_more {
+    use super::{thread_note_body, zed_target};
 
     #[test]
     fn remote_checkout_uses_ssh_and_encodes_path() {
