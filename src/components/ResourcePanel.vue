@@ -414,9 +414,6 @@ async function onPreviewClick(event: MouseEvent) {
           <strong>{{ resource.title }}</strong>
           <small>{{ resource.path || resource.url || resource.reference }}</small>
         </span>
-        <span v-if="resource.kind === 'pull_request' && prLight(attachedPr(resource)!)"
-          class="pr-status-dot" :class="`pr-light-${prLight(attachedPr(resource)!)}`"
-          :title="prLightLabel(prLight(attachedPr(resource)!))"></span>
       </button>
     </div>
     <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel attachment' : '+ Attach resource' }}</button>
