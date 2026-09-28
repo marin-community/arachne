@@ -92,7 +92,8 @@ test("pr light: green only when mergeable and CI passing; red on conflict or fai
   assert.equal(prLight(pr("t", "t", 5, { checks: "failing", mergeable: "MERGEABLE" })), "red");
   assert.equal(prLight(pr("t", "t", 6, { checks: "pending", mergeable: "CONFLICTING" })), "red");
   // A closed or merged PR is not green — its state is over.
-  assert.equal(prLight(pr("t", "t", 7, { pr_state: "MERGED", checks: "passing", mergeable: "MERGEABLE" })), "red");
+  assert.equal(prLight(pr("t", "t", 7, { pr_state: "MERGED", checks: "passing", mergeable: "MERGEABLE" })), "purple");
+  assert.equal(prLight(pr("t", "t", 8, { pr_state: "CLOSED", checks: "passing", mergeable: "MERGEABLE" })), null);
 });
 
 test("live rows carry the status light", () => {
@@ -104,6 +105,11 @@ test("live rows carry the status light", () => {
   );
   assert.equal(rows[1].kind, "pr");
   assert.equal(rows[1].light, "green");
+  // Merged shows purple; closed shows no light at all.
+  const merged = liveRows(topic(), "topic-1", [pr("topic-1", "coordinator", 11, { pr_state: "MERGED" })], []);
+  assert.equal(merged[1].light, "purple");
+  const closed = liveRows(topic(), "topic-1", [pr("topic-1", "coordinator", 12, { pr_state: "CLOSED" })], []);
+  assert.equal(closed[1].light, null);
 });
 
 test("an issue with no github link still renders, just without a url", () => {

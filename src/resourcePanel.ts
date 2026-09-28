@@ -47,15 +47,17 @@ export type LiveRow =
   | { kind: "issue"; key: string; issue: PanelIssue; url: string | null; open: boolean };
 
 /**
- * The PR row's status light — the same three-way read a human does on the
- * PR page. Red beats yellow beats green: a merge conflict or failing CI is
- * actionable now, so it wins over in-progress; a green PR also requires the
+ * The PR row's status light — the same read a human does on the PR page.
+ * Merged is a win (purple); closed is simply done, so it shows no dot at all.
+ * For open PRs, red beats yellow beats green: a merge conflict or failing CI
+ * is actionable now, so it wins over in-progress; a green PR also requires the
  * merge fit to be known (GitHub briefly reports UNKNOWN while it computes).
  */
-export type PrLight = "green" | "yellow" | "red";
+export type PrLight = "green" | "yellow" | "red" | "purple" | null;
 
 export function prLight(pr: PanelPr): PrLight {
-  if (pr.pr_state !== "OPEN") return "red";
+  if (pr.pr_state === "MERGED") return "purple";
+  if (pr.pr_state === "CLOSED") return null;
   if (pr.mergeable === "CONFLICTING") return "red";
   if (pr.checks === "failing") return "red";
   if (pr.checks === "pending") return "yellow";
