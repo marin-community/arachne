@@ -87,6 +87,22 @@ pub struct SessionPlacementView {
     pub session_id: Option<String>,
 }
 
+/// ACP's current model context and provider-reported cumulative session cost.
+/// These are not cumulative input/output/cache token totals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpUsageView {
+    pub used: u64,
+    pub size: u64,
+    #[serde(default)]
+    pub cost: Option<AcpCostView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpCostView {
+    pub amount: f64,
+    pub currency: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionSummaryView {
@@ -101,6 +117,9 @@ pub struct SessionSummaryView {
     /// Old Loom servers omit this; each entry is an unanswered ACP request.
     #[serde(default)]
     pub pending_permissions: Vec<PendingPermissionView>,
+    /// Latest ACP context report; absent before a provider reports usage.
+    #[serde(default)]
+    pub usage: Option<AcpUsageView>,
     /// When the newest `user_message` block was journaled (the last time a
     /// person or a delivery on their behalf steered the conversation), or
     /// `None` when the journal holds no user input — or when an older loom
@@ -165,6 +184,9 @@ pub struct SessionView {
     pub model: String,
     pub effort: String,
     pub protocol: String,
+    /// Latest ACP context report; reset to None on a provider handoff.
+    #[serde(default)]
+    pub usage: Option<AcpUsageView>,
     pub work_dir: String,
     pub term_session: String,
     /// True when the session's `work_dir` still exists on the server.
@@ -322,6 +344,22 @@ pub struct SessionChatView {
     pub live_turn: Option<i64>,
     pub pending_prompt: Option<String>,
     pub older_cursor: Option<ChatCursorView>,
+    #[serde(default)]
+    pub metadata: AcpMetadataView,
+}
+
+/// ACP-owned composer capabilities. Preserve JSON for config and mode
+/// variants so adapters can add fields without requiring an Arachne release.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AcpMetadataView {
+    #[serde(default)]
+    pub commands: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub config_options: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub modes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub steering_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

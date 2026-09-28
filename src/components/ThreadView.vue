@@ -4,8 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
+import ContextTelemetry from "./ContextTelemetry.vue";
+import { useSlashCommands, type SlashCommand } from "../useSlashCommands";
 import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
+import CodeActions from "./CodeActions.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
@@ -29,11 +32,23 @@ interface Cursor {
 // reload (the turn's opening message = start, newest block = progress).
 interface ChatSnapshot {
   blocks: ChatDisplayBlock[];
+  metadata: AcpMetadata;
   live_turn: number | null;
   pending_prompt: string | null;
   live_started_at: string | null;
   live_progress_at: string | null;
 }
+
+interface ConfigChoice { value: string; name: string; description?: string | null }
+interface ConfigOption {
+  id: string;
+  name: string;
+  category?: string | null;
+  type: string;
+  currentValue: string | boolean;
+  options?: (ConfigChoice | { group: string; name: string; options: ConfigChoice[] })[];
+}
+interface AcpMetadata { config_options: ConfigOption[]; commands: SlashCommand[]; modes: unknown[]; steering_supported: boolean }
 
 // One `loom://chat-event` frame: {topic, event, data}. On the chat topic
 // loom emits turn / block / delta / tool / queue (and resync when a
@@ -45,6 +60,10 @@ interface ChatEventFrame {
 }
 
 const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string }>();
+const currentUsage = computed(() => {
+  const summary = props.fleet.find((item) => item.id === props.session.id);
+  return summary ? summary.usage : props.session.usage;
+});
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
@@ -57,6 +76,28 @@ const emit = defineEmits<{
 }>();
 
 const blocks = ref<ChatDisplayBlock[]>([]);
+const metadata = ref<AcpMetadata | null>(null);
+const configBusy = ref<string | null>(null);
+const modelConfig = computed(() => metadata.value?.config_options.find((option) => option.type === "select" && (option.category === "model" || option.id === "model")));
+const effortConfig = computed(() => metadata.value?.config_options.find((option) => option.type === "select" && (option.category === "thought_level" || option.id === "thought_level" || option.id === "reasoning_effort")));
+function configChoices(option: ConfigOption): ConfigChoice[] {
+  return (option.options ?? []).flatMap((choice) => "group" in choice ? choice.options : [choice]);
+}
+async function setConfig(option: ConfigOption, event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value === option.currentValue || configBusy.value) return;
+  const id = props.session.id;
+  configBusy.value = option.id;
+  try {
+    const updated = await invoke<AcpMetadata>("set_session_config", { id, configId: option.id, value });
+    if (props.session.id === id) metadata.value = updated;
+  } catch (error: any) {
+    (event.target as HTMLSelectElement).value = String(option.currentValue);
+    emit("error", error?.message ?? String(error));
+  } finally {
+    configBusy.value = null;
+  }
+}
 const rows = computed(() => groupDisplayBlocks(blocks.value, turnLive.value ? snapshotLiveTurn.value : null));
 const answeringPermission = ref<string | null>(null);
 const permissionError = ref<Record<string, string>>({});
@@ -120,6 +161,8 @@ interface MentionResource {
   reference: string | null;
 }
 const composerEl = ref<HTMLTextAreaElement | null>(null);
+const slash = useSlashCommands(draft, computed(() => metadata.value?.commands ?? []), composerEl);
+const canCompact = computed(() => metadata.value?.commands.some((command) => command.name === "compact") ?? false);
 const mentionResources = ref<MentionResource[]>([]);
 const mentionLoading = ref(false);
 const mentionError = ref("");
@@ -176,6 +219,7 @@ function chooseMention(resource: MentionResource) {
 }
 
 function onComposerKeydown(event: KeyboardEvent) {
+  if (slash.onKeydown(event)) return;
   if (completion.onKeydown(event)) return;
   if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
@@ -297,6 +341,9 @@ function onChatFrame(frame: ChatEventFrame) {
       break;
     case "queue":
       pendingPrompt.value = (d.pending_prompt ?? "").trim() || null;
+      break;
+    case "metadata":
+      metadata.value = d as AcpMetadata;
       break;
   }
   scheduleReload();
@@ -457,6 +504,7 @@ async function reload() {
       id: props.session.id,
     });
     blocks.value = snap.blocks;
+    metadata.value = snap.metadata;
     if (snap.live_turn != null) snapshotLiveTurn.value = snap.live_turn;
     else if (!turnLive.value) snapshotLiveTurn.value = null;
     applyLive(snap, fetchedAt);
@@ -631,6 +679,25 @@ async function send() {
   }
 }
 
+async function compactContext() {
+  if (!canCompact.value || !canSend.value || turnLive.value || busy.value) return;
+  busy.value = true;
+  try {
+    await invoke("send_input", {
+      id: props.session.id,
+      text: "/compact",
+      topicId: props.topic?.id ?? null,
+      resourceIds: [],
+      attachments: [],
+    });
+    await reload();
+  } catch (error: any) {
+    emit("error", error?.message ?? String(error));
+  } finally {
+    busy.value = false;
+  }
+}
+
 
 async function interrupt() {
   if (!canInterrupt.value) return;
@@ -685,14 +752,15 @@ async function openResource(url: string) {
   }
 }
 
-// --- Resource strip ---------------------------------------------------------
+// --- Code access ------------------------------------------------------------
 //
 // The spec's invariant: "If Arachne shows something referring to code, it
 // should be possible to reach an editable checkout of that code in one
-// action." The strip exposes the thread's repo, its PR, and a live path to
-// the checkout. When the worktree is gone (archive keeps the branch, not
-// the directory), Open-in-Zed becomes Recover: `repos.worktrees.ensure`
-// materializes a fresh checkout server-side, and the path updates to it.
+// action." The header keeps that action visible and puts repo, PR, branch,
+// path, Terminal, and change details in its adjacent disclosure. When the
+// worktree is gone (archive keeps the branch, not the directory), Open-in-Zed
+// becomes Recover: `repos.worktrees.ensure` materializes a fresh checkout
+// server-side, and the path updates to it.
 
 const pr = computed(() => props.session.branch.github ?? null);
 
@@ -1000,6 +1068,24 @@ async function onLand(strategy: string) {
            explicit detour, not the default Topic view — the main pane stays a
            conversation whenever a Topic is open. -->
       <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
+      <CodeActions
+        :checkout-path="zedTarget"
+        :recovering="recovering"
+        :repo-label="repoLabel"
+        :repo-url="repoUrl"
+        :pr-url="prUrl"
+        :pr-number="session.branch.github?.pr_number || session.branch.github_pr || null"
+        :pr-draft="pr?.is_draft"
+        :pr-state="pr?.pr_state"
+        :review-decision="pr?.review_decision"
+        :checks="pr?.checks"
+        :branch="session.branch.branch"
+        :integration-branch="isWorker && integrationTarget ? integrationTarget.branch.branch : null"
+        :work-summary="workSummary"
+        @open-checkout="zedTarget ? openInZed() : recover()"
+        @open-terminal="openTerminal"
+        @open-resource="openResource"
+      />
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
@@ -1009,45 +1095,10 @@ async function onLand(strategy: string) {
         Delegate
       </button>
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
-      <button v-if="session.protocol === 'acp'" :disabled="!handoffAllowed" title="Switch runtime when the session is idle" @click="showHandoff = !showHandoff">Switch model…</button>
     </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
     <div v-if="isWorker && lastIntegration" class="integrate-note" :title="lastIntegration.note">
       Last integrated result: {{ lastIntegration.value }}<span v-if="lastIntegration.note"> · {{ lastIntegration.note }}</span>
-    </div>
-    <div v-if="showHandoff" class="handoff-box">
-      <div class="handoff-heading">Switch this thread’s runtime</div>
-      <div class="handoff-fields">
-        <label>Profile
-          <select v-model="handoffProfile" @change="chooseHandoffProfile">
-            <option v-for="p in launchOptions?.profiles ?? []" :key="p.name" :value="p.name">{{ p.name }}</option>
-          </select>
-        </label>
-        <label>Agent
-          <select v-model="handoffAgent" @change="chooseHandoffAgent">
-            <option value="">Profile default</option>
-            <option v-for="a in launchOptions?.agents ?? []" :key="a.kind" :value="a.kind">{{ a.label }}</option>
-          </select>
-        </label>
-        <label>Model
-          <select v-if="handoffAgentChoice && !handoffAgentChoice.accepts_raw_model && handoffAgentChoice.models.length" v-model="handoffModel">
-            <option value="">Agent default</option>
-            <option v-for="m in handoffAgentChoice.models" :key="m.id" :value="m.id">{{ m.label }}</option>
-          </select>
-          <input v-else v-model="handoffModel" placeholder="Agent default" spellcheck="false" />
-        </label>
-        <label>Effort
-          <select v-model="handoffEffort">
-            <option value="">Profile default</option>
-            <option v-for="e in handoffAgentChoice?.efforts ?? []" :key="e.id" :value="e.id">{{ e.label }}</option>
-          </select>
-        </label>
-      </div>
-      <div class="handoff-actions">
-        <span>Switching restarts the agent while keeping this thread and checkout.</span>
-        <button @click="showHandoff = false">Cancel</button>
-        <button class="primary" :disabled="!handoffAllowed || handingOff" @click="handoff">{{ handingOff ? "Switching…" : "Switch" }}</button>
-      </div>
     </div>
     <div v-if="showSendToThread" class="send-thread-box">
       <label>
@@ -1066,54 +1117,6 @@ async function onLand(strategy: string) {
           {{ sendingToThread ? "Sending…" : "Send note" }}
         </button>
       </div>
-    </div>
-    <div class="resource-strip" aria-label="Thread resources">
-      <button v-if="repoUrl" class="resource-link" @click="openResource(repoUrl)">
-        {{ session.github_repo }}
-      </button>
-      <span v-else class="resource-item">{{ session.branch.repo_root || "Repository unavailable" }}</span>
-      <span class="resource-separator">·</span>
-      <button v-if="prUrl" class="resource-link" @click="openResource(prUrl)">
-        PR #{{ session.branch.github?.pr_number || session.branch.github_pr }}
-        <span v-if="pr && pr.is_draft" class="pr-badge pr-draft">draft</span>
-        <span v-if="pr && pr.pr_state" class="pr-badge" :data-state="pr.pr_state">{{ pr.pr_state }}</span>
-        <span v-if="pr && pr.review_decision" class="pr-badge pr-review" :data-decision="pr.review_decision">{{ pr.review_decision }}</span>
-        <span v-if="pr && pr.checks" class="pr-badge pr-checks" :data-state="pr.checks">CI {{ pr.checks }}</span>
-      </button>
-      <span v-else class="resource-item">No PR linked</span>
-      <span class="resource-separator">·</span>
-      <span class="resource-item" :title="session.work_dir">{{ session.branch.branch || "No branch" }}</span>
-      <span class="resource-separator">·</span>
-      <span class="resource-item path" :title="zedTarget || session.work_dir">{{ zedTarget || "No active checkout" }}</span>
-      <span class="resource-separator">·</span>
-      <button
-        v-if="zedTarget"
-        class="resource-link"
-        title="Open the checkout in Zed"
-        @click="openInZed"
-      >Open in Zed</button>
-      <button
-        v-else
-        class="resource-link recover"
-        :disabled="recovering"
-        title="The worktree is gone; materialize a checkout for this branch"
-        @click="recover"
-      >{{ recovering ? "Recovering…" : "Recover checkout" }}</button>
-      <span v-if="zedTarget" class="resource-separator">·</span>
-      <button
-        v-if="zedTarget"
-        class="resource-link"
-        title="Open a terminal at the checkout"
-        @click="openTerminal"
-      >Terminal</button>
-      <template v-if="isWorker && integrationTarget">
-        <span class="resource-separator">·</span>
-        <span class="resource-item" :title="`Integration target: ${integrationTarget.branch.repo_root} / ${integrationTarget.branch.branch}`">→ {{ integrationTarget.branch.branch }}</span>
-      </template>
-      <template v-if="workSummary">
-        <span class="resource-separator">·</span>
-        <span class="resource-item" title="Diff against the checkout's recorded base branch">{{ workSummary.files }} files · +{{ workSummary.additions }} −{{ workSummary.deletions }}</span>
-      </template>
     </div>
     <ChangeReview v-if="showChanges" :session-id="session.id" />
     <div v-if="showDelegate" class="delegate-box">
@@ -1313,6 +1316,40 @@ async function onLand(strategy: string) {
       </div>
     </div>
     <div class="composer-wrap" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
+      <div v-if="showHandoff" class="handoff-box composer-handoff">
+        <div class="handoff-heading">Switch this thread’s runtime</div>
+        <div class="handoff-fields">
+          <label>Profile
+            <select v-model="handoffProfile" @change="chooseHandoffProfile">
+              <option v-for="p in launchOptions?.profiles ?? []" :key="p.name" :value="p.name">{{ p.name }}</option>
+            </select>
+          </label>
+          <label>Agent
+            <select v-model="handoffAgent" @change="chooseHandoffAgent">
+              <option value="">Profile default</option>
+              <option v-for="a in launchOptions?.agents ?? []" :key="a.kind" :value="a.kind">{{ a.label }}</option>
+            </select>
+          </label>
+          <label>Model
+            <select v-if="handoffAgentChoice && !handoffAgentChoice.accepts_raw_model && handoffAgentChoice.models.length" v-model="handoffModel">
+              <option value="">Agent default</option>
+              <option v-for="m in handoffAgentChoice.models" :key="m.id" :value="m.id">{{ m.label }}</option>
+            </select>
+            <input v-else v-model="handoffModel" placeholder="Agent default" spellcheck="false" />
+          </label>
+          <label>Effort
+            <select v-model="handoffEffort">
+              <option value="">Profile default</option>
+              <option v-for="e in handoffAgentChoice?.efforts ?? []" :key="e.id" :value="e.id">{{ e.label }}</option>
+            </select>
+          </label>
+        </div>
+        <div class="handoff-actions">
+          <span>Switching restarts the agent while keeping this thread and checkout.</span>
+          <button @click="showHandoff = false">Cancel</button>
+          <button class="primary" :disabled="!handoffAllowed || handingOff" @click="handoff">{{ handingOff ? "Switching…" : "Switch" }}</button>
+        </div>
+      </div>
       <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Topic resources">
         <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
         <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
@@ -1324,6 +1361,14 @@ async function onLand(strategy: string) {
           <small>{{ resource.path || resource.url || resource.reference || resource.kind }}</small>
         </button>
       </div>
+      <div v-if="slash.matches.value.length" class="mention-menu slash-menu" role="listbox" aria-label="Agent commands">
+        <button v-for="(command, index) in slash.matches.value" :key="command.name" type="button" role="option"
+          :aria-selected="index === slash.selected.value" :class="{ selected: index === slash.selected.value }"
+          @click="slash.choose(command)">
+          <strong>/{{ command.name }}</strong><small>{{ command.description }}</small>
+        </button>
+      </div>
+      <div class="composer-card">
       <div v-if="attachments.length || attachmentError || attachmentLoading" class="attachment-row composer-attachments">
         <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
           <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
@@ -1333,9 +1378,6 @@ async function onLand(strategy: string) {
         <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
       </div>
       <div class="composer">
-      <label class="attachment-pick composer-attach" title="Attach files or images">+
-        <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files or images to message" @change="onFileInput" />
-      </label>
       <div class="file-completion-anchor">
         <textarea
           ref="composerEl"
@@ -1344,7 +1386,7 @@ async function onLand(strategy: string) {
           :placeholder="
             turnLive
               ? 'Agent is working — your message will queue behind the current turn…'
-              : 'Message the agent…'
+              : `Ask ${session.agent_kind || 'the agent'} to implement, inspect, explain, or fix…${metadata?.commands.length ? ' Type / for commands.' : ''}`
           "
           @input="completion.updateCaret"
           @click="completion.updateCaret"
@@ -1371,9 +1413,49 @@ async function onLand(strategy: string) {
           </li>
         </ul>
       </div>
-      <button class="primary" :disabled="!canSend || (!draft.trim() && !attachments.length) || busy || attachmentLoading" @click="send">
-        {{ busy ? "…" : "Send" }}
-      </button>
+      </div>
+      <div v-if="slash.hint.value" class="slash-argument-hint">{{ slash.hint.value }}</div>
+      <div class="composer-utility-row">
+        <div class="composer-context-slot"><ContextTelemetry :session-id="session.id" :usage="currentUsage" /></div>
+        <button v-if="canCompact" class="composer-icon-button compact-button" type="button"
+          :disabled="!canSend || turnLive || busy" title="Compact context" aria-label="Compact context" @click="compactContext">↘</button>
+        <label v-if="modelConfig" class="composer-pill model-pill" :title="modelConfig.name">
+          <span aria-hidden="true">▣</span>
+          <select :value="String(modelConfig.currentValue)" :disabled="!!configBusy" aria-label="Model" @change="setConfig(modelConfig, $event)">
+            <option v-for="choice in configChoices(modelConfig)" :key="choice.value" :value="choice.value">{{ choice.name }}</option>
+          </select>
+          <span aria-hidden="true">⌄</span>
+        </label>
+        <button v-else-if="session.protocol === 'acp'" class="composer-pill model-pill" type="button"
+          :disabled="!handoffAllowed" :aria-expanded="showHandoff" title="Switch model when the session is idle"
+          @click="showHandoff = !showHandoff">
+          <span aria-hidden="true">▣</span><span class="composer-pill-label">{{ session.model || 'Agent default' }}</span><span aria-hidden="true">⌄</span>
+        </button>
+        <label v-if="effortConfig" class="composer-pill effort-pill" :title="effortConfig.name">
+          <span aria-hidden="true">◉</span>
+          <select :value="String(effortConfig.currentValue)" :disabled="!!configBusy" aria-label="Thinking effort" @change="setConfig(effortConfig, $event)">
+            <option v-for="choice in configChoices(effortConfig)" :key="choice.value" :value="choice.value">Thinking: {{ choice.name }}</option>
+          </select>
+          <span aria-hidden="true">⌄</span>
+        </label>
+        <button v-else-if="session.protocol === 'acp'" class="composer-pill effort-pill" type="button"
+          :disabled="!handoffAllowed" :aria-expanded="showHandoff" title="Switch thinking effort when the session is idle"
+          @click="showHandoff = !showHandoff">
+          <span aria-hidden="true">◉</span><span>Thinking: {{ session.effort || 'Default' }}</span><span aria-hidden="true">⌄</span>
+        </button>
+        <button v-if="repoUrl" class="composer-icon-button" type="button" :title="`Open ${session.github_repo} on GitHub`" aria-label="Open repository on GitHub" @click="openResource(repoUrl)">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 .8a11.2 11.2 0 0 0-3.54 21.82c.56.1.76-.24.76-.54v-1.9c-3.09.67-3.74-1.31-3.74-1.31-.51-1.28-1.24-1.62-1.24-1.62-1.01-.69.08-.68.08-.68 1.12.08 1.71 1.15 1.71 1.15 1 .1 1.66-.45 2.05-.82.1-.72.39-1.2.71-1.48-2.47-.28-5.07-1.24-5.07-5.53 0-1.22.44-2.22 1.15-3-.12-.28-.5-1.42.11-2.95 0 0 .94-.3 3.08 1.15A10.7 10.7 0 0 1 12 4.42c.95 0 1.9.13 2.79.38 2.14-1.45 3.08-1.15 3.08-1.15.61 1.53.23 2.67.11 2.95.72.78 1.15 1.78 1.15 3 0 4.3-2.6 5.25-5.08 5.53.4.35.76 1.02.76 2.06v2.89c0 .3.2.65.77.54A11.2 11.2 0 0 0 12 .8Z"/></svg>
+        </button>
+        <button v-else class="composer-icon-button" type="button" :disabled="recovering" :title="zedTarget ? 'Open checkout in Zed' : 'Recover checkout'" aria-label="Open repository checkout" @click="zedTarget ? openInZed() : recover()">⌂</button>
+        <label class="attachment-pick composer-attach" title="Attach files or images" aria-label="Attach files or images">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12.5 14.5 6a3 3 0 0 1 4.25 4.25l-8.5 8.5a5 5 0 0 1-7.07-7.07l8.5-8.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files or images to message" @change="onFileInput" />
+        </label>
+        <button v-if="metadata?.commands.length" class="composer-icon-button slash-button" type="button" title="Browse agent commands" aria-label="Browse agent commands" @click="slash.show">/</button>
+        <button class="composer-send" type="button" :disabled="!canSend || (!draft.trim() && !attachments.length) || busy || attachmentLoading" :title="busy ? 'Sending…' : 'Send message (⌘/Ctrl + Enter)'" aria-label="Send message" @click="send">
+          <span v-if="busy">…</span><span v-else aria-hidden="true">↑</span>
+        </button>
+      </div>
       </div>
       <div class="composer-hint">⌘/Ctrl + Enter to send · Enter for a new line</div>
     </div>

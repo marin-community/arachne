@@ -579,15 +579,25 @@ The macOS AgentDeck reference above is useful here.
 
 ---
 
-# Resource strip
+# Code access
 
 Every thread should expose its most relevant resources immediately.
 
 Example:
 
 ```text
-marin · PR #1842 · implication-reader · Open in Zed · Terminal
+[Open in Zed ▾]
+                   Repository   marin
+                   Pull request PR #1842 · open · CI success
+                   Branch       implication-reader
+                   Checkout     /path/to/worktree
+                   [Open Terminal]
 ```
+
+Keep the editable-checkout action visible in the thread header. Put verbose
+repository, PR, branch, path, change-summary, and secondary Terminal details
+behind its adjacent disclosure instead of reserving a permanent row for
+metadata that will usually be truncated.
 
 A central product invariant:
 
@@ -1298,7 +1308,7 @@ Add:
 
 - attention-first home;
 - native notifications;
-- resource strip;
+- compact code access and checkout details;
 - PR resources;
 - reliable “open the code” behavior;
 - basic Topics;

@@ -30,6 +30,7 @@ pub fn run() {
             commands::open_session,
             commands::chat_older_cursor,
             commands::fetch_chat,
+            commands::set_session_config,
             commands::complete_files,
             commands::load_session_image,
             commands::send_input,
