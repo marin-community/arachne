@@ -1378,17 +1378,93 @@ struct GhPrView {
 }
 
 #[tauri::command]
+/// Resolve the gh CLI by its well-known absolute paths — GUI apps inherit
+/// launchd's minimal PATH, which misses homebrew.
+fn gh_path() -> &'static str {
+    ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .unwrap_or("gh")
+}
+
+/// One result of the attach picker's GitHub search.
+#[derive(Debug, serde::Serialize)]
+pub struct GhSearchRow {
+    pub number: i64,
+    pub title: String,
+    /// OPEN / CLOSED / MERGED, GitHub's capitals.
+    pub state: String,
+    pub url: String,
+}
+
+/// Search a repo's issues or PRs for the attach picker: typed words fuzzy
+/// match titles (GitHub search), a bare number jumps straight to that item.
+/// Closed items are included — merged PRs are often what you want to attach.
+#[tauri::command]
+pub async fn gh_search(repo: String, kind: String, query: String) -> Result<Vec<GhSearchRow>, UiError> {
+    let is_pr = kind == "pull_request";
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let gh = gh_path();
+    let mut cmd = tokio::process::Command::new(gh);
+    cmd.env("GH_PAGER", "")
+        .args([
+            "search",
+            if is_pr { "prs" } else { "issues" },
+            "--repo",
+            &repo,
+            "--json",
+            "number,title,state,url",
+            "--limit",
+            "20",
+        ]);
+    if let Ok(number) = trimmed.parse::<i64>() {
+        // A bare number is a jump: search that exact number (`N in:number`).
+        cmd.arg(format!("{number} in:number"));
+    } else {
+        // No --state filter: open and closed both come back, so merged PRs
+        // are attachable. The state rides the row.
+        cmd.arg(trimmed);
+    }
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| resource_error(format!("launching gh: {e} (is gh installed?)")))?;
+    if !output.status.success() {
+        return Err(resource_error(format!(
+            "gh search failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    #[derive(Debug, serde::Deserialize)]
+    struct Row {
+        number: i64,
+        title: String,
+        state: String,
+        url: String,
+    }
+    let rows: Vec<Row> = serde_json::from_slice(&output.stdout)
+        .map_err(|e| resource_error(format!("parsing gh output: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| GhSearchRow {
+            number: row.number,
+            title: row.title,
+            state: row.state.to_uppercase(),
+            url: row.url,
+        })
+        .collect())
+}
+
+#[tauri::command]
 pub async fn pr_status(url: String) -> Result<PrStatusView, UiError> {
     let (repo, number) = parse_pr_url(&url)
         .ok_or_else(|| resource_error(format!("not a github.com pull request URL: {url}")))?;
-    // GUI apps inherit launchd's minimal PATH (/usr/bin:/bin:...), which
-    // misses homebrew — where gh lives. Prefer the well-known absolute
-    // locations, falling back to PATH for custom setups.
-    let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]
-        .into_iter()
-        .find(|path| std::path::Path::new(path).exists())
-        .unwrap_or("gh");
-    let output = tokio::process::Command::new(gh)
+    // GUI apps inherit launchd's minimal PATH, which misses homebrew —
+    // where gh lives; gh_path() prefers the well-known absolute locations.
+    let output = tokio::process::Command::new(gh_path())
         .env("GH_PAGER", "")
         .args([
             "pr",

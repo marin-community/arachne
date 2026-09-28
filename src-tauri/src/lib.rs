@@ -49,6 +49,7 @@ pub fn run() {
             commands::open_in_terminal,
             commands::recover_worktree,
             commands::pr_status,
+            commands::gh_search,
             commands::refresh_fleet,
             commands::reparent_session,
             commands::create_group,

@@ -129,6 +129,74 @@ const formPath = ref("docs/design.md");
 const formUrl = ref("");
 const message = ref("");
 
+// --- GitHub attach picker ----------------------------------------------
+// Typing a PR/issue number or words searches GitHub via `gh` (gh_search):
+// the repo defaults to the topic's own and is a dropdown so switching is one
+// click. Results are click-to-fill; the visible title stays editable.
+interface GhSearchRow {
+  number: number;
+  title: string;
+  state: string;
+  url: string;
+}
+const ghQuery = ref("");
+const ghResults = ref<GhSearchRow[]>([]);
+const ghSearching = ref(false);
+const ghError = ref("");
+let ghSearchSeq = 0;
+
+/** The repos the picker offers: the topic's repo first, then any other repo
+ * its subtree's issues touch. */
+const ghRepos = computed(() => {
+  const repos: string[] = [];
+  if (props.topic.github_repo) repos.push(props.topic.github_repo);
+  for (const issue of panelIssues.value) {
+    if (issue.github_repo && !repos.includes(issue.github_repo)) repos.push(issue.github_repo);
+  }
+  // Fallback when nothing carries a slug: derive one from the repo root.
+  if (!repos.length && props.topic.branch.repo_root) {
+    const parts = props.topic.branch.repo_root.split("/").filter(Boolean);
+    if (parts.length >= 2) repos.push(parts.slice(-2).join("/"));
+  }
+  return repos;
+});
+const ghRepo = ref("");
+watch(ghRepos, (repos) => {
+  if (!ghRepo.value || !repos.includes(ghRepo.value)) ghRepo.value = repos[0] ?? "";
+}, { immediate: true });
+
+async function runGhSearch() {
+  const repo = ghRepo.value;
+  const query = ghQuery.value.trim();
+  if (!repo || !query) {
+    ghResults.value = [];
+    return;
+  }
+  const seq = ++ghSearchSeq;
+  ghSearching.value = true;
+  ghError.value = "";
+  try {
+    const rows = await invoke<GhSearchRow[]>("gh_search", { repo, kind: formKind.value, query });
+    if (seq === ghSearchSeq) ghResults.value = rows;
+  } catch (error: any) {
+    if (seq === ghSearchSeq) {
+      ghResults.value = [];
+      ghError.value = error?.message ?? String(error);
+    }
+  } finally {
+    if (seq === ghSearchSeq) ghSearching.value = false;
+  }
+}
+
+/** Fill the form from a picked search result. */
+function pickGhResult(row: GhSearchRow) {
+  formUrl.value = row.url;
+  formTitle.value = row.title;
+  formKind.value = row.url.includes("/pull/") ? "pull_request" : "issue";
+  ghResults.value = [];
+  ghQuery.value = "";
+}
+
 const selected = computed(() => snapshot.value.resources.find((resource) => resource.id === selectedId.value) ?? null);
 const sortedResources = computed(() => [...snapshot.value.resources].sort((a, b) =>
   Number(b.kind === "design_document") - Number(a.kind === "design_document") || a.title.localeCompare(b.title),
@@ -221,6 +289,9 @@ watch(() => props.topic.id, () => {
   panelPrs.value = [];
   selectedId.value = null;
   content.value = "";
+  ghResults.value = [];
+  ghQuery.value = "";
+  ghError.value = "";
   void refresh();
 }, { immediate: true });
 watch(selectedId, (id) => {
@@ -427,6 +498,26 @@ async function onPreviewClick(event: MouseEvent) {
         </select>
       </label>
       <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
+      <label v-if="isUrlKind">Repo
+        <select v-model="ghRepo">
+          <option v-for="repo in ghRepos" :key="repo" :value="repo">{{ repo }}</option>
+        </select>
+      </label>
+      <label v-if="isUrlKind">Find on GitHub
+        <input v-model="ghQuery" placeholder="#27 or words from the title" spellcheck="false"
+          @input="runGhSearch" @keydown.enter.prevent="runGhSearch" />
+      </label>
+      <div v-if="isUrlKind && ghSearching" class="resource-panel-empty">Searching…</div>
+      <div v-else-if="isUrlKind && ghError" class="resource-panel-message">{{ ghError }}</div>
+      <div v-else-if="isUrlKind && ghResults.length" class="gh-results">
+        <button v-for="row in ghResults" :key="row.url" type="button" class="gh-result"
+          :title="row.title" @click="pickGhResult(row)">
+          <strong>#{{ row.number }}</strong>
+          <span class="gh-result-title">{{ row.title }}</span>
+          <small>{{ row.state.toLowerCase() }}</small>
+        </button>
+      </div>
+      <label v-if="isUrlKind">Title <input v-model="formTitle" placeholder="Pull request" /></label>
       <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
       <label v-else>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
       <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
@@ -486,6 +577,12 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-form { display: grid; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
 .resource-panel-form label { display: grid; gap: 3px; color: var(--text-dim); font-size: 11px; }
 .resource-panel-form input, .resource-panel-form select { width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 6px; }
+.gh-results { display: grid; gap: 2px; max-height: 180px; overflow-y: auto; }
+.gh-result { display: flex; align-items: baseline; gap: 6px; width: 100%; text-align: left; border: 0; background: transparent; padding: 5px 6px; border-radius: 5px; color: var(--text); }
+.gh-result:hover { background: var(--bg-hover); }
+.gh-result strong { flex: none; }
+.gh-result-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gh-result small { color: var(--text-dim); flex: none; }
 .resource-panel-message { padding: 6px 12px; color: var(--accent); font-size: 11px; }
 .resource-panel-preview { display: flex; flex-direction: column; min-height: 0; flex: 1; border-top: 1px solid var(--border); }
 .resource-panel-preview-head { display: flex; align-items: center; gap: 5px; padding: 10px; }
