@@ -15,7 +15,7 @@ import { pasteAsPlainText } from "../composerPaste";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
-import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, type ChatDisplayBlock } from "../chatRows";
+import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, resolveContextUsage, type ChatDisplayBlock } from "../chatRows";
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
@@ -62,7 +62,7 @@ interface ChatEventFrame {
 const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string }>();
 const currentUsage = computed(() => {
   const summary = props.fleet.find((item) => item.id === props.session.id);
-  return summary ? summary.usage : props.session.usage;
+  return resolveContextUsage(blocks.value, summary?.usage ?? props.session.usage);
 });
 const emit = defineEmits<{
   (e: "error", msg: string): void;

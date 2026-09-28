@@ -8,6 +8,7 @@ import {
   formatPlanEntries,
   formatTokens,
   groupDisplayBlocks,
+  resolveContextUsage,
   toolCallCopyText,
 } from "../src/chatRows.ts";
 
@@ -227,6 +228,29 @@ test("thinking token totals count only the group's own thoughts", () => {
   assert.equal(group.thinkingTokens, 110);
   // Directly: the estimate is chars/4 over exactly the given thoughts.
   assert.equal(countThinkingTokens([blocks[0], blocks[2]]), 110);
+});
+
+test("context usage prefers the newest journal report over a stale zero summary", () => {
+  const summary = { used: 0, size: 131_072, cost: { amount: 1.25, currency: "USD" } };
+  const usage = resolveContextUsage([
+    { kind: "usage", turn: 1, seq: 4, used: 18_000, size: 131_072 },
+    { kind: "agent_message", turn: 1, seq: 5, text: "done" },
+    { kind: "usage", turn: 2, seq: 7, used: 30_000, size: 131_072 },
+  ], summary);
+  assert.deepEqual(usage, {
+    used: 30_000,
+    size: 131_072,
+    cost: { amount: 1.25, currency: "USD" },
+  });
+});
+
+test("context usage falls back to the session summary for old or malformed journals", () => {
+  const summary = { used: 12_000, size: 64_000, cost: null };
+  assert.deepEqual(resolveContextUsage([], summary), summary);
+  assert.deepEqual(resolveContextUsage([
+    { kind: "usage", turn: 0, seq: 0 },
+    { kind: "usage", turn: 1, seq: 0, used: -1, size: 0 },
+  ], summary), summary);
 });
 
 test("formatTokens renders K and M human-friendly", () => {
