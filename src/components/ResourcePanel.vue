@@ -56,6 +56,17 @@ async function openExternal(url: string) {
   }
 }
 
+/** A row glyph per kind — files and URL-backed GitHub rows differ at a glance. */
+function iconFor(kind: string) {
+  switch (kind) {
+    case "design_document": return "◇";
+    case "pull_request": return "⑂";
+    case "issue": return "◉";
+    case "artifact": return "◍";
+    default: return "▤";
+  }
+}
+
 // The topic's own checkout: open in Zed when present, otherwise recover
 // it via repos.worktrees.ensure (never resurrecting the agent) and open.
 const topicWorktree = ref(props.topic.worktree_present ? props.topic.work_dir : "");
@@ -330,8 +341,10 @@ async function onPreviewClick(event: MouseEvent) {
         No resources attached yet. Attach a design document or file so it stays with this topic.
       </div>
       <button v-for="resource in sortedResources" :key="resource.id" class="resource-panel-item"
-        :class="{ selected: resource.id === selectedId }" @click="selectedId = resource.id">
-        <span class="resource-panel-icon">{{ resource.kind === 'design_document' ? '◇' : '▤' }}</span>
+        :class="{ selected: resource.id === selectedId }"
+        :title="resource.url ?? resource.path ?? ''"
+        @click="resource.url ? openExternal(resource.url) : (selectedId = resource.id)">
+        <span class="resource-panel-icon">{{ iconFor(resource.kind) }}</span>
         <span class="resource-panel-item-text">
           <strong>{{ resource.title }}</strong>
           <small>{{ resource.path || resource.url || resource.reference }}</small>
@@ -357,13 +370,18 @@ async function onPreviewClick(event: MouseEvent) {
     <div v-if="selected" class="resource-panel-preview">
       <div class="resource-panel-preview-head">
         <strong>{{ selected.title }}</strong>
-        <button :disabled="!selected.path" @click="openInZed(selected)">Open in Zed</button>
+        <button v-if="selected.url" title="Open in your browser" @click="openExternal(selected.url)">Open on GitHub</button>
+        <button v-else :disabled="!selected.path" @click="openInZed(selected)">Open in Zed</button>
         <button class="danger" :disabled="saving" title="Remove attachment; keep the file" @click="detach(selected)">Remove</button>
       </div>
-      <div class="resource-panel-location" :title="`${selected.repository} · ${selected.reference} · ${selected.path}`">
+      <div v-if="selected.url" class="resource-panel-location" :title="selected.url">
+        {{ selected.url }}
+      </div>
+      <div v-else class="resource-panel-location" :title="`${selected.repository} · ${selected.reference} · ${selected.path}`">
         {{ selected.reference }} · {{ selected.path }}
       </div>
       <div v-if="reading" class="resource-panel-empty">Loading preview…</div>
+      <div v-else-if="selected.url" class="resource-panel-empty">This resource lives on GitHub — open it there.</div>
       <div v-else class="resource-panel-content" @click="onPreviewClick" v-html="renderedContent"></div>
     </div>
   </aside>
