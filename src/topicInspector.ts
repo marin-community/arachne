@@ -19,6 +19,7 @@ export function loudTag(s: SessionSummary): { level: "attention" | "blocked" } |
       return { level: tag.value };
     }
   }
+  if (s.pending_permission && s.status !== "archived") return { level: "attention" };
   return null;
 }
 

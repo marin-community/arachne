@@ -542,6 +542,26 @@ impl LoomClient {
         Ok(())
     }
 
+    /// Answer one ACP tool permission using Loom's user-scoped operation.
+    pub async fn answer_permission(
+        &self,
+        session: &str,
+        request_id: &str,
+        option_id: &str,
+    ) -> Result<(), LoomError> {
+        let _: serde_json::Value = self
+            .op(
+                "/api/sessions/permissions/answer",
+                &serde_json::json!({
+                    "session": session,
+                    "request_id": request_id,
+                    "option_id": option_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Raw Scratch upload keeps file bytes on Loom's host, including when
     /// Arachne is connected over Tailscale to a remote runner.
     pub async fn upload_scratch(

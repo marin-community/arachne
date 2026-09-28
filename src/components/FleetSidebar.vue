@@ -71,10 +71,12 @@ function loudTag(s: SessionSummary): { level: "attention" | "blocked" } | null {
       return { level: tag.value };
     }
   }
+  if (s.pending_permission && s.status !== "archived") return { level: "attention" };
   return null;
 }
 
 function subtitle(s: SessionSummary): string {
+  if (s.pending_permission) return `Approve tool use: ${s.pending_permission.title || "permission requested"}`;
   return s.branch.description || s.branch.title || "—";
 }
 

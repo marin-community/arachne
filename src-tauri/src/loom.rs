@@ -98,6 +98,9 @@ pub struct SessionSummaryView {
     pub created_by: Option<String>,
     pub created_at: String,
     pub last_activity_at: String,
+    /// Old Loom servers omit this; a pending ACP request is an attention item.
+    #[serde(default)]
+    pub pending_permission: Option<PendingPermissionView>,
     /// When the newest `user_message` block was journaled (the last time a
     /// person or a delivery on their behalf steered the conversation), or
     /// `None` when the journal holds no user input — or when an older loom
@@ -118,6 +121,12 @@ pub struct SessionSummaryView {
     pub github_repo: Option<String>,
     pub parent_id: Option<String>,
     pub parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPermissionView {
+    pub request_id: String,
+    pub title: String,
 }
 
 impl SessionSummaryView {

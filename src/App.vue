@@ -68,6 +68,7 @@ export interface SessionSummary {
   created_by: string | null;
   created_at: string;
   last_activity_at: string;
+  pending_permission?: { request_id: string; title: string } | null;
   /** When the newest user message was journaled; null on older looms. */
   last_user_message_at?: string | null;
   // The topic's checkout path and whether it still exists on the server.

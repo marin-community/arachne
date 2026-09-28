@@ -43,6 +43,7 @@ const tab = ref<"threads" | "resources" | "integrations" | "todos">("threads");
 // topic subtree rather than the lane filing system.
 
 function subtitle(s: SessionSummary): string {
+  if (s.pending_permission) return `Approve tool use: ${s.pending_permission.title || "permission requested"}`;
   return s.branch.description || s.branch.title || "—";
 }
 
