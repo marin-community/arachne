@@ -131,16 +131,27 @@ const loading = ref(false);
 const reading = ref(false);
 const saving = ref(false);
 const showAttach = ref(false);
-const formKind = ref<"design_document" | "file" | "pull_request" | "issue">("design_document");
+const attachMenuOpen = ref(false);
+function chooseAttachKind(kind: "github" | "design_document" | "file") {
+  formKind.value = kind;
+  attachMenuOpen.value = false;
+  if (kind === "github") {
+    formTitle.value = "";
+    formPath.value = "";
+  } else {
+    chooseKind();
+  }
+  showAttach.value = true;
+}
+const formKind = ref<"github" | "design_document" | "file">("github");
 const formTitle = ref("Design document");
 const formPath = ref("docs/design.md");
-const formUrl = ref("");
 const message = ref("");
 
 // --- GitHub attach picker ----------------------------------------------
-// Typing a PR/issue number or words searches GitHub via `gh` (gh_search):
-// the repo defaults to the topic's own and is a dropdown so switching is one
-// click. Results are click-to-fill; the visible title stays editable.
+// Typing a PR/issue number or words searches GitHub via `gh` (gh_search);
+// results attach directly on click — no URL/title plumbing. The repo
+// defaults to the topic's own and sits as a dropdown next to the box.
 interface GhSearchRow {
   number: number;
   title: string;
@@ -184,7 +195,9 @@ async function runGhSearch() {
   ghSearching.value = true;
   ghError.value = "";
   try {
-    const rows = await invoke<GhSearchRow[]>("gh_search", { repo, kind: formKind.value, query });
+    // Unified search: GitHub treats PRs and issues as searchable either way,
+    // so one fetch covers both. The kind rides each result's URL.
+    const rows = await invoke<GhSearchRow[]>("gh_search", { repo, kind: "pull_request", query });
     if (seq === ghSearchSeq) ghResults.value = rows;
   } catch (error: any) {
     if (seq === ghSearchSeq) {
@@ -196,13 +209,38 @@ async function runGhSearch() {
   }
 }
 
-/** Fill the form from a picked search result. */
-function pickGhResult(row: GhSearchRow) {
-  formUrl.value = row.url;
-  formTitle.value = row.title;
-  formKind.value = row.url.includes("/pull/") ? "pull_request" : "issue";
-  ghResults.value = [];
-  ghQuery.value = "";
+/** Attach a search result straight away: the URL is the identity, the
+ * title rides the row, and the kind (PR vs issue) comes from the URL. */
+async function attachGhResult(row: GhSearchRow) {
+  if (saving.value) return;
+  saving.value = true;
+  message.value = "";
+  try {
+    const kind = row.url.includes("/pull/") ? "pull_request" : "issue";
+    const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
+      topicId: props.topic.id,
+      resource: {
+        kind,
+        title: row.title,
+        repository: props.topic.branch.repo_root,
+        reference: null,
+        path: null,
+        url: row.url,
+      },
+      expectedRevision: snapshot.value.revision,
+    });
+    applyEffective(next);
+    const attached = next.resources.find((resource: EffectiveRow) => resource.url === row.url);
+    selectedId.value = attached?.id ?? selectedId.value;
+    showAttach.value = false;
+    ghResults.value = [];
+    ghQuery.value = "";
+    message.value = "Resource attached to this topic.";
+  } catch (error: any) {
+    message.value = error?.message ?? String(error);
+  } finally {
+    saving.value = false;
+  }
 }
 
 const selected = computed(() => snapshot.value.resources.find((resource) => resource.id === selectedId.value) ?? null);
@@ -319,27 +357,23 @@ function chooseKind() {
   if (formKind.value === "design_document") {
     formTitle.value = "Design document";
     formPath.value = "docs/design.md";
-    formUrl.value = "";
-  } else if (formKind.value === "file") {
-    formTitle.value = "";
-    formPath.value = "";
-    formUrl.value = "";
   } else {
-    // PR / issue bindings are URL-backed.
     formTitle.value = "";
     formPath.value = "";
-    formUrl.value = "";
+  }
+  // Switching away from GitHub clears any pending search.
+  if (formKind.value !== "github") {
+    ghResults.value = [];
+    ghError.value = "";
   }
 }
 
-const isUrlKind = computed(() => formKind.value === "pull_request" || formKind.value === "issue");
-const attachValid = computed(() =>
-  formTitle.value.trim() && (isUrlKind.value ? formUrl.value.trim() : formPath.value.trim()),
-);
+const attachValid = computed(() => formTitle.value.trim() && formPath.value.trim());
 
 async function attach() {
+  // The GitHub picker attaches straight from a search result (attachGhResult);
+  // this path serves the plain kinds: design document and file.
   const title = formTitle.value.trim();
-  const url = formUrl.value.trim();
   const path = formPath.value.trim();
   if (!title || saving.value || !attachValid.value) return;
   saving.value = true;
@@ -347,28 +381,19 @@ async function attach() {
   try {
     const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
       topicId: props.topic.id,
-      resource: isUrlKind.value
-        ? {
-            kind: formKind.value,
-            title,
-            repository: props.topic.branch.repo_root,
-            reference: null,
-            path: null,
-            url,
-          }
-        : {
-            kind: formKind.value,
-            title,
-            repository: props.topic.branch.repo_root,
-            reference: props.topic.branch.branch,
-            path,
-            url: null,
-          },
+      resource: {
+        kind: formKind.value,
+        title,
+        repository: props.topic.branch.repo_root,
+        reference: props.topic.branch.branch,
+        path,
+        url: null,
+      },
       expectedRevision: snapshot.value.revision,
     });
     applyEffective(next);
     const attached = next.resources.find(
-      (resource) => resource.kind === formKind.value && (isUrlKind.value ? resource.url === url : resource.path === path),
+      (resource) => resource.kind === formKind.value && resource.path === path,
     );
     selectedId.value = attached?.id ?? selectedId.value;
     showAttach.value = false;
@@ -564,40 +589,41 @@ async function onPreviewClick(event: MouseEvent) {
         </div>
       </template>
     </div>
-    <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel attachment' : '+ Attach resource' }}</button>
-    <div v-if="showAttach" class="resource-panel-form">
-      <label>Kind
-        <select v-model="formKind" @change="chooseKind">
-          <option value="design_document">Design document</option>
-          <option value="file">File</option>
-          <option value="pull_request">Pull request</option>
-          <option value="issue">Issue</option>
-        </select>
-      </label>
-      <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
-      <label v-if="isUrlKind">Repo
-        <select v-model="ghRepo">
-          <option v-for="repo in ghRepos" :key="repo" :value="repo">{{ repo }}</option>
-        </select>
-      </label>
-      <label v-if="isUrlKind">Find on GitHub
-        <input v-model="ghQuery" placeholder="#27 or words from the title" spellcheck="false"
-          @input="runGhSearch" @keydown.enter.prevent="runGhSearch" />
-      </label>
-      <div v-if="isUrlKind && ghSearching" class="resource-panel-empty">Searching…</div>
-      <div v-else-if="isUrlKind && ghError" class="resource-panel-message">{{ ghError }}</div>
-      <div v-else-if="isUrlKind && ghResults.length" class="gh-results">
-        <button v-for="row in ghResults" :key="row.url" type="button" class="gh-result"
-          :title="row.title" @click="pickGhResult(row)">
-          <strong>#{{ row.number }}</strong>
-          <span class="gh-result-title">{{ row.title }}</span>
-          <small>{{ row.state.toLowerCase() }}</small>
-        </button>
+    <div class="resource-panel-attach">
+      <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel' : (formKind === 'github' ? 'Find on GitHub…' : formKind === 'design_document' ? 'Design document…' : 'File…') }}</button>
+      <button v-if="showAttach" class="resource-panel-add-caret" title="Choose kind" @click="attachMenuOpen = !attachMenuOpen">▾</button>
+      <div v-if="attachMenuOpen" class="resource-panel-attach-menu">
+        <button type="button" :class="{ current: formKind === 'github' }" @click="chooseAttachKind('github')">GitHub PR or issue</button>
+        <button type="button" :class="{ current: formKind === 'design_document' }" @click="chooseAttachKind('design_document')">Design document</button>
+        <button type="button" :class="{ current: formKind === 'file' }" @click="chooseAttachKind('file')">File</button>
       </div>
-      <label v-if="isUrlKind">Title <input v-model="formTitle" placeholder="Pull request" /></label>
-      <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
-      <label v-else>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
-      <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
+    </div>
+    <div v-if="showAttach" class="resource-panel-form">
+      <template v-if="formKind === 'github'">
+        <div class="gh-search-bar">
+          <select v-model="ghRepo" class="gh-repo" title="Search this repo">
+            <option v-for="repo in ghRepos" :key="repo" :value="repo">{{ repo }}</option>
+          </select>
+          <input v-model="ghQuery" placeholder="#27 or words from the title" spellcheck="false"
+            @input="runGhSearch" @keydown.enter.prevent="runGhSearch" />
+        </div>
+        <div v-if="ghSearching" class="resource-panel-empty">Searching…</div>
+        <div v-else-if="ghError" class="resource-panel-message">{{ ghError }}</div>
+        <div v-else-if="ghResults.length" class="gh-results">
+          <button v-for="row in ghResults" :key="row.url" type="button" class="gh-result"
+            :title="row.title" :disabled="saving" @click="attachGhResult(row)">
+            <strong>#{{ row.number }}</strong>
+            <span class="gh-result-title">{{ row.title }}</span>
+            <small>{{ row.state.toLowerCase() }}</small>
+          </button>
+        </div>
+        <div v-else-if="ghQuery.trim()" class="resource-panel-empty">Nothing found.</div>
+      </template>
+      <template v-else>
+        <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
+        <label>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
+        <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
+      </template>
     </div>
     <div v-if="message" class="resource-panel-message">{{ message }}</div>
     <div v-if="selected" class="resource-panel-preview">
@@ -664,7 +690,16 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-item-text strong, .resource-panel-item-text small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .resource-panel-item-text small, .resource-panel-empty, .resource-panel-location { color: var(--text-dim); font-size: 11px; }
 .resource-panel-empty { padding: 12px; }
-.resource-panel-add { margin: 6px 10px; }
+.resource-panel-attach { position: relative; margin: 6px 10px; display: flex; }
+.resource-panel-add { flex: 1; min-width: 0; }
+.resource-panel-add-caret { padding: 0 8px; }
+.resource-panel-attach-menu { position: absolute; top: calc(100% + 4px); right: 0; min-width: 190px; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); z-index: 30; overflow: hidden; display: grid; }
+.resource-panel-attach-menu button { display: block; width: 100%; text-align: left; padding: 7px 10px; font-size: 12px; border: 0; background: transparent; color: var(--text); }
+.resource-panel-attach-menu button:hover { background: var(--bg-hover); }
+.resource-panel-attach-menu button.current { color: var(--accent); }
+.gh-search-bar { display: flex; gap: 5px; }
+.gh-search-bar .gh-repo { width: auto; flex: none; max-width: 40%; }
+.gh-search-bar input { flex: 1; min-width: 0; }
 .resource-panel-form { display: grid; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
 .resource-panel-form label { display: grid; gap: 3px; color: var(--text-dim); font-size: 11px; }
 .resource-panel-form input, .resource-panel-form select { width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 6px; }

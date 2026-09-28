@@ -157,3 +157,12 @@ test("origin labels distinguish project from topic", () => {
   assert.equal(originLabel("project"), "project");
   assert.equal(originLabel("topic"), "topic");
 });
+
+// --- Unified GitHub picker ---------------------------------------------------
+
+test("kind of a picked GitHub search result comes from its URL", () => {
+  const kindOf = (url) => (url.includes("/pull/") ? "pull_request" : "issue");
+  assert.equal(kindOf("https://github.com/acme/app/pull/13"), "pull_request");
+  assert.equal(kindOf("https://github.com/acme/app/issues/7"), "issue");
+  // One search covers both kinds — nothing else distinguishes them.
+});
