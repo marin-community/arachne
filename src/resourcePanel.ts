@@ -6,6 +6,38 @@
 // them. Kept out of the component so it runs under plain `node --test`
 // (mirrors topicInspector.ts), with structural slices of App.vue's types.
 
+/** Where an attached-resource row came from (design.md: show each
+ *  binding's origin — Project, Topic, or Thread). */
+export type ResourceOrigin = "project" | "topic";
+
+/** A slice of the `topic_resources` reply's effective rows: the flat
+ *  binding plus origin. `hidden` is true only for hidden inherited
+ *  bindings (kept for the restore affordance). */
+export interface EffectiveRow {
+  id: string;
+  kind: string;
+  title: string;
+  repository: string;
+  reference: string | null;
+  path: string | null;
+  url: string | null;
+  origin: ResourceOrigin;
+  hidden?: boolean;
+}
+
+/** The rows the mention menus offer: effective rows only — hidden
+ *  inherited bindings never resolve (design.md: a Topic can hide an
+ *  inherited resource without deleting it from the Project). */
+export function mentionableRows(rows: EffectiveRow[]): EffectiveRow[] {
+  return rows.filter((row) => !row.hidden);
+}
+
+/** Origin label for the panel's attached list: what came from the
+ *  Project vs the Topic's own addition (design.md: the user can tell). */
+export function originLabel(origin: ResourceOrigin): string {
+  return origin === "project" ? "project" : "topic";
+}
+
 /** The slice of an `issues.board` row the panel renders. */
 export interface PanelIssue {
   id: number;

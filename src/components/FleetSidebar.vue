@@ -39,6 +39,10 @@ const emit = defineEmits<{
   // Topics [+] on a project heading: open NewTopicSheet preselected to
   // that project (null = the Ungrouped section).
   (e: "new-topic-in-project", project: ProjectRef | null): void;
+  // The heading's resources button: manage the project's resource
+  // bindings directly (ProjectSheet) — where the inheritance defaults
+  // are curated, not just overridden at topic creation.
+  (e: "manage-project-resources", project: ProjectRef): void;
   (
     e: "reparent",
     sessionId: string,
@@ -885,6 +889,13 @@ async function archiveRow(id: string) {
             >{{ isProjectCollapsed(section.id) ? "▸" : "▾" }}</button>
             <span class="project-name">{{ section.name }}</span>
             <span class="project-count" :title="`${section.topics.length} topics`">{{ section.topics.length }}</span>
+            <button
+              class="project-manage-resources"
+              type="button"
+              :title="`Manage resources inherited by new topics in ${section.name}`"
+              :aria-label="`Manage resources for project ${section.name}`"
+              @click.stop="emit('manage-project-resources', { id: section.id, name: section.name })"
+            >◇</button>
             <button
               class="project-new-topic"
               type="button"

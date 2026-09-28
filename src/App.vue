@@ -8,6 +8,7 @@ import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import NewThreadSheet from "./components/NewThreadSheet.vue";
 import NewTopicSheet from "./components/NewTopicSheet.vue";
+import ProjectSheet from "./components/ProjectSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
 import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
@@ -355,12 +356,14 @@ function openNewThread() {
   connError.value = null;
   showNewTopic.value = false;
   newTopicProject.value = null;
+  projectResourcesProject.value = null;
   showNewThread.value = true;
 }
 
 function openNewTopic() {
   connError.value = null;
   showNewThread.value = false;
+  projectResourcesProject.value = null;
   newTopicProject.value = null;
   showNewTopic.value = true;
 }
@@ -370,6 +373,7 @@ function openNewTopic() {
 // minimal handler.
 function openNewTopicInProject(project: { id: string | null; name: string } | null) {
   connError.value = null;
+  projectResourcesProject.value = null;
   newTopicProject.value = project;
   showNewThread.value = false;
   showNewTopic.value = true;
@@ -380,6 +384,23 @@ function closeNewTopic() {
 }
 function closeNewThreadSheet() {
   showNewThread.value = false;
+}
+
+// The project heading's ◇ button: manage that project's resource bindings
+// (what new topics inherit) without creating a topic first.
+const projectResourcesProject = ref<{ id: string; name: string } | null>(null);
+function openProjectResources(project: { id: string | null; name: string }) {
+  // Only real projects have bindings — Ungrouped (null id) never opens
+  // this sheet; the sidebar only emits for named headings anyway.
+  if (!project.id) return;
+  connError.value = null;
+  showNewTopic.value = false;
+  newTopicProject.value = null;
+  showNewThread.value = false;
+  projectResourcesProject.value = { id: project.id, name: project.name };
+}
+function closeProjectResources() {
+  projectResourcesProject.value = null;
 }
 
 // Selecting a project heading filters the main-pane home to that project's
@@ -400,7 +421,7 @@ function onHome() {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
   completed?: (success: boolean) => void,
 ) {
   launching.value = true;
@@ -418,6 +439,9 @@ async function launchTask(
       model: meta?.model || null,
       effort: meta?.effort || null,
       project: meta?.project ?? null,
+      // Unchecked project bindings → the topic's initial hides (design.md:
+      // the creation form overrides the project's defaults).
+      hiddenBindingKeys: meta?.hiddenBindingKeys ?? [],
     });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
@@ -445,7 +469,7 @@ async function launchTask(
 function launchTopic(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
 ) {
   launchTask(task, repo, meta, (success) => {
     if (success) {
@@ -637,6 +661,7 @@ const selectedTopic = computed(() => {
       @new-thread="openNewThread"
       @new-topic="openNewTopic"
       @new-topic-in-project="openNewTopicInProject"
+      @manage-project-resources="openProjectResources"
       @select-project="selectProject"
       @reparent="reparentSession"
       @delete-lane="deleteLane"
@@ -651,6 +676,12 @@ const selectedTopic = computed(() => {
       :project="newTopicProject"
       @close="closeNewTopic"
       @launch="launchTopic"
+    />
+    <ProjectSheet
+      v-if="projectResourcesProject"
+      :key="projectResourcesProject.id"
+      :project="projectResourcesProject"
+      @close="closeProjectResources"
     />
     <NewThreadSheet
       v-else-if="showNewThread"
@@ -691,6 +722,7 @@ const selectedTopic = computed(() => {
       @new-topic="openNewTopic"
       @open-zed="openTopicInZed"
       @home="onHome"
+      @manage-project-resources="openProjectResources"
       @error="connError = $event"
     />
     <TopicInspector v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId"

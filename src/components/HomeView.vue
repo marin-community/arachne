@@ -22,6 +22,7 @@ const emit = defineEmits<{
   (e: "new-topic"): void;
   (e: "open-zed", id: string): void;
   (e: "home"): void;
+  (e: "manage-project-resources", project: { id: string; name: string }): void;
   (e: "error", message: string): void;
 }>();
 
@@ -155,17 +156,21 @@ const sections = computed(() => [
 // shares one project — the grouping only matters on the aggregate home.
 interface ProjectGroup {
   name: string;
+  /** The layout-group id when the group is a real project — the id the
+   *   project-bindings store is keyed by; null for repo-derived groups. */
+  id: string | null;
   rows: SessionSummary[];
 }
 function groupByProject(rows: SessionSummary[]): ProjectGroup[] {
-  const groups = new Map<string, SessionSummary[]>();
+  const groups = new Map<string, ProjectGroup>();
   for (const row of rows) {
     const key = projectNameOf(row);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(row);
+    if (!groups.has(key)) {
+      groups.set(key, { name: key, id: projectIdOf(row), rows: [] });
+    }
+    groups.get(key)!.rows.push(row);
   }
-  return [...groups.entries()]
-    .map(([name, groupRows]) => ({ name, rows: groupRows }))
+  return [...groups.values()]
     .sort((a, b) => b.rows[0].last_activity_at.localeCompare(a.rows[0].last_activity_at));
 }
 const workingGroups = computed(() => groupByProject(working.value));
@@ -187,6 +192,17 @@ const readyGroups = computed(() => groupByProject(ready.value));
           </template>
           <h1 v-else>Topics home</h1>
         </div>
+        <!-- Project home: manage what this project's new topics inherit
+             (design.md "Project defaults and resource inheritance"). The
+             sidebar heading offers the same affordance (◇); this is the
+             home-surface entry point. -->
+        <button
+          v-if="project?.id"
+          class="home-manage-resources"
+          :title="`Manage resources inherited by new topics in ${project.name}`"
+          :aria-label="`Manage resources for project ${project.name}`"
+          @click="emit('manage-project-resources', { id: project.id, name: project.name })"
+        >◇ Resources</button>
         <button class="home-new" title="Start a durable topic — title, description, goal" @click="emit('new-topic')">
           + New topic
         </button>
@@ -230,7 +246,19 @@ const readyGroups = computed(() => groupByProject(ready.value));
         </template>
         <template v-else>
           <template v-for="group in section.kind === 'working' ? workingGroups : readyGroups" :key="group.name">
-            <div class="project-title">{{ group.name }}</div>
+            <!-- Aggregate home: each project group carries the same manage
+                 affordance as the filtered project home — real projects
+                 only (repo-derived groups have no binding store). -->
+            <div class="project-title">
+              {{ group.name }}
+              <button
+                v-if="group.id"
+                class="project-title-manage"
+                :title="`Manage resources inherited by new topics in ${group.name}`"
+                :aria-label="`Manage resources for project ${group.name}`"
+                @click="emit('manage-project-resources', { id: group.id, name: group.name })"
+              >◇ resources</button>
+            </div>
             <div v-for="s in group.rows" :key="s.id" class="home-row" :class="section.kind === 'ready' ? 'ready' : level(s)"
               role="button" tabindex="0" :aria-label="`Open ${rowTitle(s)}: ${description(s)}`"
               @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">

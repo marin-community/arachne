@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attachedAsPanelPr, issueUrl, liveRows, prLight, prNumberFromUrl, repoLabel, repoUrl } from "../src/resourcePanel.ts";
+import { attachedAsPanelPr, issueUrl, liveRows, mentionableRows, originLabel, prLight, prNumberFromUrl, repoLabel, repoUrl } from "../src/resourcePanel.ts";
 
 const topic = (overrides = {}) => ({
   worktree_present: true,
@@ -138,4 +138,22 @@ test("an attached PR URL + gh status renders through the same light as a live ro
   assert.equal(prLight(closed), null);
   assert.equal(closed.pr_number, 27);
   assert.equal(closed.pr_title, "Pull request");
+});
+
+// --- Project resource inheritance (design.md "Project defaults and resource
+//     inheritance") ----------------------------------------------------------
+
+test("mentionable rows exclude hidden inherited bindings", () => {
+  const rows = [
+    { id: "a", kind: "file", title: "Attached", repository: "/r", reference: "b", path: "p", url: null, origin: "topic" },
+    { id: "b", kind: "design_document", title: "Design", repository: "/r", reference: "b", path: "d", url: null, origin: "project" },
+    { id: "c", kind: "issue", title: "Hidden", repository: "/r", reference: null, path: null, url: "https://github.com/a/b/issues/1", origin: "project", hidden: true },
+  ];
+  const mentionable = mentionableRows(rows);
+  assert.deepEqual(mentionable.map((row) => row.id), ["a", "b"]);
+});
+
+test("origin labels distinguish project from topic", () => {
+  assert.equal(originLabel("project"), "project");
+  assert.equal(originLabel("topic"), "topic");
 });

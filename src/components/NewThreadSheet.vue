@@ -123,6 +123,8 @@ interface TopicMentionResource {
   path: string | null;
   url: string | null;
   repository: string;
+  /** Inherited rows the topic hid — never offerable as a mention. */
+  hidden?: boolean;
 }
 
 // Every top-level session is a topic whose resources can be mentioned.
@@ -158,7 +160,8 @@ async function loadMentionResources() {
   try {
     const views = await Promise.allSettled(topics.value.slice(0, 24).map(async ({ id }) => {
       const view = await invoke<{ resources: Omit<TopicMentionResource, "topicId">[] }>("topic_resources", { topicId: id });
-      return (view.resources ?? []).map((resource) => ({ ...resource, topicId: id }));
+      // Effective rows only: hidden inherited bindings never resolve.
+      return (view.resources ?? []).filter((resource) => !resource.hidden).map((resource) => ({ ...resource, topicId: id }));
     }));
     mentionResources.value = views.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     if (views.length && views.every((result) => result.status === "rejected")) {

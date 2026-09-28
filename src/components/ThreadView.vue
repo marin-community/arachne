@@ -188,6 +188,8 @@ interface MentionResource {
   path: string | null;
   url: string | null;
   reference: string | null;
+  /** Inherited rows the topic hid — never offerable as a mention. */
+  hidden?: boolean;
 }
 const composerEl = ref<HTMLTextAreaElement | null>(null);
 const slash = useSlashCommands(draft, computed(() => metadata.value?.commands ?? []), composerEl);
@@ -213,7 +215,8 @@ async function loadMentionResources() {
   mentionError.value = "";
   try {
     const view = await invoke<{ resources: MentionResource[] }>("topic_resources", { topicId });
-    if (props.topic?.id === topicId) mentionResources.value = view.resources ?? [];
+    // Effective rows only: hidden inherited bindings never resolve.
+    if (props.topic?.id === topicId) mentionResources.value = (view.resources ?? []).filter((resource) => !resource.hidden);
   } catch (error: any) {
     if (props.topic?.id === topicId) mentionError.value = error?.message ?? String(error);
   } finally {

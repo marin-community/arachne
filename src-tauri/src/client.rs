@@ -345,6 +345,44 @@ impl LoomClient {
         .await
     }
 
+    /// Repository-shared versioned artifact (`repo: true`) — the scope the
+    /// per-repo `arachne-projects` store lives in. `branch` is only the
+    /// access context (any branch id of the repo resolves it; loom keys
+    /// repo-shared artifacts on the branch's canonical `repo_root`), so the
+    /// same store is reachable from any session of the repository.
+    pub async fn repo_artifact(
+        &self,
+        branch: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, LoomError> {
+        self.op(
+            "/api/artifacts/get",
+            &serde_json::json!({ "branch": branch, "name": name, "repo": true }),
+        )
+        .await
+    }
+
+    /// Write the repository-shared artifact (`repo: true`), revision-checked
+    /// like every Arachne store (`base_rev` optimistic concurrency).
+    pub async fn write_repo_artifact(
+        &self,
+        branch: &str,
+        name: &str,
+        content: &str,
+        base_rev: i64,
+        title: &str,
+    ) -> Result<serde_json::Value, LoomError> {
+        self.op(
+            "/api/artifacts/write",
+            &serde_json::json!({
+                "branch": branch, "name": name, "content": content,
+                "title": title, "kind": "json",
+                "base_rev": base_rev, "repo": true,
+            }),
+        )
+        .await
+    }
+
     /// Read text from Loom's server-side worktree. Never interpret the path
     /// as a Mac-local filename, including when Loom runs on this machine.
     pub async fn worktree_text(&self, session: &str, path: &str) -> Result<String, LoomError> {

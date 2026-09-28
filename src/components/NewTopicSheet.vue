@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, reactive } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, nextTick, reactive } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
@@ -41,7 +41,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string } },
+    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
   ): void;
 }>();
 
@@ -179,6 +179,8 @@ interface TopicMentionResource {
   path: string | null;
   url: string | null;
   repository: string;
+  /** Inherited rows the topic hid — never offerable as a mention. */
+  hidden?: boolean;
 }
 
 // Every top-level session is a topic whose resources can be mentioned.
@@ -213,7 +215,8 @@ async function loadMentionResources() {
   try {
     const views = await Promise.allSettled(topics.value.slice(0, 24).map(async ({ id }) => {
       const view = await invoke<{ resources: Omit<TopicMentionResource, "topicId">[] }>("topic_resources", { topicId: id });
-      return (view.resources ?? []).map((resource) => ({ ...resource, topicId: id }));
+      // Effective rows only: hidden inherited bindings never resolve.
+      return (view.resources ?? []).filter((resource) => !resource.hidden).map((resource) => ({ ...resource, topicId: id }));
     }));
     mentionResources.value = views.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     if (views.length && views.every((result) => result.status === "rejected")) {
@@ -271,6 +274,153 @@ function onBodyKeydown(event: KeyboardEvent) {
   }
 }
 
+// --- Project resource bindings (design.md "Project defaults and resource
+//     inheritance") ----------------------------------------------------------
+//
+// A preselected project's bindings load here as a checklist — every binding
+// checked (inherited) by default; unchecking one overrides the inheritance
+// for THIS topic only (recorded as an initial hide, never removing it from
+// the project). "+ Add to project" files a new binding onto the project
+// itself, where every future topic inherits it.
+
+interface ProjectBinding {
+  id: string;
+  kind: string;
+  title: string;
+  repository: string;
+  reference: string | null;
+  path: string | null;
+  url: string | null;
+}
+
+const projectBindings = ref<ProjectBinding[]>([]);
+const projectRevision = ref(0);
+const projectBindingsLoading = ref(false);
+const projectBindingsError = ref("");
+/** Unchecked binding ids — the initial hides recorded at launch. */
+const uncheckedBindings = ref<Set<string>>(new Set());
+
+async function loadProjectBindings() {
+  const projectId = props.project?.id;
+  const repoInput = repo.value.trim();
+  if (!projectId || !repoInput) {
+    projectBindings.value = [];
+    uncheckedBindings.value = new Set();
+    return;
+  }
+  projectBindingsLoading.value = true;
+  projectBindingsError.value = "";
+  try {
+    const view = await invoke<{ bindings: ProjectBinding[]; revision: number }>("project_bindings", {
+      projectId,
+      repo: repoInput,
+    });
+    projectBindings.value = view.bindings ?? [];
+    projectRevision.value = view.revision ?? 0;
+    // Fresh fetch, fresh defaults: everything checked (inherited).
+    uncheckedBindings.value = new Set();
+  } catch (error: any) {
+    projectBindings.value = [];
+    projectBindingsError.value = error?.message ?? String(error);
+  } finally {
+    projectBindingsLoading.value = false;
+  }
+}
+
+function toggleBinding(id: string, checked: boolean) {
+  const next = new Set(uncheckedBindings.value);
+  if (checked) next.delete(id);
+  else next.add(id);
+  uncheckedBindings.value = next;
+}
+
+const showProjectAttach = ref(false);
+const projectFormKind = ref<"design_document" | "file" | "pull_request" | "issue">("design_document");
+const projectFormTitle = ref("Design document");
+const projectFormPath = ref("");
+const projectFormUrl = ref("");
+const projectSaving = ref(false);
+const projectIsUrlKind = computed(() => projectFormKind.value === "pull_request" || projectFormKind.value === "issue");
+const projectAttachValid = computed(() =>
+  projectFormTitle.value.trim() && (projectIsUrlKind.value ? projectFormUrl.value.trim() : projectFormPath.value.trim()),
+);
+
+function chooseProjectKind() {
+  if (projectFormKind.value === "design_document") {
+    projectFormTitle.value = "Design document";
+    projectFormPath.value = "docs/design.md";
+    projectFormUrl.value = "";
+  } else {
+    projectFormTitle.value = "";
+    projectFormPath.value = "";
+    projectFormUrl.value = "";
+  }
+}
+
+async function attachToProject() {
+  const projectId = props.project?.id;
+  const repoInput = repo.value.trim();
+  const title = projectFormTitle.value.trim();
+  const path = projectFormPath.value.trim();
+  const url = projectFormUrl.value.trim();
+  if (!projectId || !repoInput || projectSaving.value || !projectAttachValid.value) return;
+  projectSaving.value = true;
+  projectBindingsError.value = "";
+  try {
+    const view = await invoke<{ bindings: ProjectBinding[]; revision: number }>("add_project_binding", {
+      projectId,
+      repo: repoInput,
+      resource: projectIsUrlKind.value
+        ? { kind: projectFormKind.value, title, repository: "", reference: null, path: null, url }
+        : { kind: projectFormKind.value, title, repository: "", reference: null, path, url: null },
+      expectedRevision: projectRevision.value,
+    });
+    projectBindings.value = view.bindings ?? [];
+    projectRevision.value = view.revision ?? 0;
+    showProjectAttach.value = false;
+    projectFormTitle.value = "Design document";
+    projectFormPath.value = "";
+    projectFormUrl.value = "";
+    projectFormKind.value = "design_document";
+  } catch (error: any) {
+    await loadProjectBindings();
+    projectBindingsError.value = error?.message ?? String(error);
+  } finally {
+    projectSaving.value = false;
+  }
+}
+
+async function removeFromProject(binding: ProjectBinding) {
+  const projectId = props.project?.id;
+  const repoInput = repo.value.trim();
+  if (!projectId || !repoInput || projectSaving.value) return;
+  projectSaving.value = true;
+  projectBindingsError.value = "";
+  try {
+    const view = await invoke<{ bindings: ProjectBinding[]; revision: number }>("remove_project_binding", {
+      projectId,
+      repo: repoInput,
+      bindingId: binding.id,
+      expectedRevision: projectRevision.value,
+    });
+    projectBindings.value = view.bindings ?? [];
+    projectRevision.value = view.revision ?? 0;
+  } catch (error: any) {
+    await loadProjectBindings();
+    projectBindingsError.value = error?.message ?? String(error);
+  } finally {
+    projectSaving.value = false;
+  }
+}
+
+// The checklist reloads when the preselected project or the repo changes —
+// bindings are per-repo, so "arachne" vs "loom" carry different lists.
+watch(
+  () => [props.project?.id, repo.value.trim()] as const,
+  () => void loadProjectBindings(),
+  { immediate: true },
+);
+
 // --- Sheet lifecycle ---------------------------------------------------------------
 
 // Keyboard-first: focus the title on open, and Esc always closes — unless
@@ -317,6 +467,11 @@ function submit() {
     attachments: attachments.value,
     ...launchConfig(),
     project: props.project ?? undefined,
+    // Unchecked bindings become the topic's initial hides — the project's
+    // binding stays attached for every other topic (design.md).
+    hiddenBindingKeys: props.project?.id && uncheckedBindings.value.size
+      ? [...uncheckedBindings.value]
+      : undefined,
   });
 }
 </script>
@@ -383,6 +538,64 @@ function submit() {
       </label>
 
       <RepoBaseFields v-model:repo="repo" v-model:base="base" @submit="submit" />
+
+      <!-- Project resource bindings (design.md "Project defaults and resource
+           inheritance"): every binding inherited (checked) by default;
+           unchecking overrides the inheritance for this topic only. -->
+      <div v-if="props.project?.id" class="nts-field nts-project-bindings">
+        <span class="nts-field-name">Project resources <em class="nts-opt">inherited</em></span>
+        <div v-if="projectBindingsLoading" class="nts-project-hint">Loading project bindings…</div>
+        <template v-else-if="projectBindings.length">
+          <label v-for="binding in projectBindings" :key="binding.id" class="nts-binding-row">
+            <input
+              type="checkbox"
+              :checked="!uncheckedBindings.has(binding.id)"
+              @change="toggleBinding(binding.id, ($event.target as HTMLInputElement).checked)"
+            />
+            <span class="nts-binding-text">
+              <strong>{{ binding.title }}</strong>
+              <small>{{ binding.path || binding.url || binding.repository }}</small>
+            </span>
+            <button
+              type="button"
+              class="nts-binding-remove"
+              :aria-label="`Remove ${binding.title} from project ${props.project?.name}`"
+              :disabled="projectSaving"
+              title="Remove from the project (existing topics keep their own bindings)"
+              @click="removeFromProject(binding)"
+            >×</button>
+          </label>
+        </template>
+        <div v-else-if="!projectBindingsError" class="nts-project-hint">
+          No resources bound to {{ props.project.name }} yet — new topics inherit what you bind here.
+        </div>
+        <div v-if="projectBindingsError" class="nts-project-hint">{{ projectBindingsError }}</div>
+        <div class="nts-binding-actions">
+          <button
+            type="button"
+            class="link"
+            :disabled="projectSaving"
+            @click="showProjectAttach = !showProjectAttach"
+          >{{ showProjectAttach ? "Cancel" : "+ Bind a resource to this project" }}</button>
+        </div>
+        <!-- Binding a resource to the project: the same four kinds the topic
+             panel attaches, stored in the project's store (repo-shared
+             arachne-projects) rather than any topic's manifest. -->
+        <div v-if="showProjectAttach" class="nts-binding-form">
+          <label>Kind
+            <select v-model="projectFormKind" @change="chooseProjectKind">
+              <option value="design_document">Design document</option>
+              <option value="file">File</option>
+              <option value="pull_request">Pull request</option>
+              <option value="issue">Issue</option>
+            </select>
+          </label>
+          <label>Title <input v-model="projectFormTitle" placeholder="Design document" /></label>
+          <label v-if="projectIsUrlKind">GitHub URL <input v-model="projectFormUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
+          <label v-else>Path in repo <input v-model="projectFormPath" placeholder="docs/design.md" spellcheck="false" /></label>
+          <button type="button" class="primary" :disabled="projectSaving || !projectAttachValid" @click="attachToProject">Bind to project</button>
+        </div>
+      </div>
 
       <div
         class="attachment-row"

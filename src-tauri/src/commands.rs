@@ -24,8 +24,10 @@ use crate::client::{LoomClient, LoomError};
 use crate::landing::LocalLanding;
 use crate::loom::{LaunchOptionsView, SessionSummaryView, SessionView};
 use crate::resources::{
-    ResourceDraft, ResourceKind, ResourceMention, TodoItem, TodoListView, TodoTopicView,
-    TopicResource, TopicResourceContent, TopicResourcesView, MANIFEST_NAME, TODOS_NAME,
+    binding_key, merge_effective, EffectiveResource, ProjectBinding, ProjectInfo, ProjectsStore,
+    ResourceDraft, ResourceKind, ResourceMention, ResourceOrigin, TodoItem, TodoListView,
+    TodoTopicView, TopicEffectiveView, TopicResource, TopicResourceContent, TopicResourcesView,
+    MANIFEST_NAME, PROJECTS_NAME, TODOS_NAME,
 };
 
 #[derive(Default)]
@@ -809,6 +811,11 @@ pub async fn launch_session(
     // Project the thread was launched preselected to — the layout group
     // to file the new session into.
     project: Option<crate::loom::ProjectRef>,
+    // Project bindings the creation form unchecked (design.md: "A new Topic
+    // inherits these unless its creation form overrides them"). Recorded as
+    // the new topic's initial hides — the binding stays attached to the
+    // project and keeps supplying other topics.
+    hidden_binding_keys: Option<Vec<String>>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let parent_branch = match parent_id {
@@ -905,6 +912,26 @@ pub async fn launch_session(
         .filter(|id| !id.is_empty())
     {
         let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
+        // Project bindings keep supplying the topic live (design.md:
+        // "Project resource bindings may continue to supply shared
+        // references to existing Topics") — nothing is copied at creation.
+        // The creation form's unchecked bindings are recorded as the
+        // topic's initial hides, matched by reference-free binding key.
+        // The branch is brand new, so the manifest cannot exist yet:
+        // revision 0 creates it (base_rev == latest == 0).
+        let keys = hidden_binding_keys.unwrap_or_default();
+        if !keys.is_empty() {
+            let mut manifest = load_topic_resources(&client, &view.branch.id)
+                .await
+                .unwrap_or_default();
+            manifest.hidden.extend(keys);
+            manifest.hidden.sort();
+            manifest.hidden.dedup();
+            // Best-effort: a failed hide write must not fail the launch —
+            // the topic simply inherits everything until the user hides
+            // one from the panel.
+            let _ = save_topic_resources(&client, &view.branch.id, &manifest, 0).await;
+        }
     }
     // Loom does not publish a fleet event for description updates. Publish
     // the final launch state so the new topic card has its body immediately.
@@ -2308,12 +2335,14 @@ async fn resource_context(
         if !seen.insert((mention.topic_id.clone(), mention.resource_id.clone())) {
             continue;
         }
-        let topic = client.get_session(&mention.topic_id).await?;
-        let manifest = load_topic_resources(client, &topic.branch.id).await?;
-        let resource = manifest
-            .resources
-            .into_iter()
-            .find(|resource| resource.id == mention.resource_id)
+        // Mentions resolve against the CURRENT effective view — project
+        // bindings included (a project's shared reference keeps supplying
+        // existing topics) — and against the topic's current accepted
+        // branch, not the reference recorded when it was attached.
+        let context = load_topic_context(client, &mention.topic_id).await?;
+        let resource = context
+            .find_effective(&mention.resource_id)
+            .map(|row| row.resource)
             .ok_or_else(|| {
                 resource_error(format!(
                     "mentioned resource no longer exists: {}",
@@ -2361,6 +2390,182 @@ async fn save_topic_resources(
     Ok(saved)
 }
 
+// --- Project bindings --------------------------------------------------------
+//
+// A Project's resource bindings live in the repo-shared `arachne-projects`
+// artifact of the repository they target, keyed by the project's layout
+// group id (design.md "Project defaults and resource inheritance"). The
+// repo-shared scope is keyed on the branch's canonical repo root, so any
+// session/branch id of the repo is a valid access context — a topic's own
+// branch id is always available and always right. One artifact per repo →
+// one revision, so concurrent edits serialize through `base_rev` exactly
+// like the topic manifest and the todo list.
+
+async fn load_projects_store(
+    client: &LoomClient,
+    branch_id: &str,
+) -> Result<ProjectsStore, UiError> {
+    let artifact = match client.repo_artifact(branch_id, PROJECTS_NAME).await {
+        Ok(value) => value,
+        Err(LoomError::Api { status: 404, .. }) => return Ok(ProjectsStore::default()),
+        Err(error) => return Err(error.into()),
+    };
+    // A repo:true read always resolves the shared scope; a reply carrying a
+    // branch_id would mean something else claimed the name — refuse rather
+    // than read the wrong store.
+    if artifact
+        .get("meta")
+        .and_then(|v| v.get("branch_id"))
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        return Err(resource_error(
+            "projects store name is occupied by a branch-scoped artifact",
+        ));
+    }
+    let content = artifact
+        .get("content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| resource_error("projects store has no content"))?;
+    let mut store: ProjectsStore = serde_json::from_str(content)
+        .map_err(|e| resource_error(format!("invalid projects store: {e}")))?;
+    store.revision = artifact
+        .get("meta")
+        .and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| resource_error("projects store has no revision"))?;
+    Ok(store)
+}
+
+async fn save_projects_store(
+    client: &LoomClient,
+    branch_id: &str,
+    store: &ProjectsStore,
+    expected_revision: i64,
+) -> Result<ProjectsStore, UiError> {
+    let content = serde_json::to_string_pretty(store)
+        .map_err(|e| resource_error(format!("serializing project bindings: {e}")))?;
+    let artifact = client
+        .write_repo_artifact(
+            branch_id,
+            PROJECTS_NAME,
+            &content,
+            expected_revision,
+            "Arachne project bindings",
+        )
+        .await?;
+    if artifact
+        .get("meta")
+        .and_then(|v| v.get("branch_id"))
+        .and_then(|v| v.as_str())
+        .is_some()
+    {
+        return Err(resource_error(
+            "project bindings were not saved in the repository-shared scope",
+        ));
+    }
+    let mut saved = store.clone();
+    saved.revision = artifact
+        .get("meta")
+        .and_then(|v| v.get("rev"))
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| resource_error("saved project bindings have no revision"))?;
+    Ok(saved)
+}
+
+/// A topic's home project: its placement group when that group is a
+/// non-system group (the same model as src/projects.ts `topicProjectId` —
+/// placement is a live join, so a deleted group already reads as None).
+fn topic_project_of(topic: &SessionView) -> Option<(String, String)> {
+    let placement = topic.placement.as_ref()?;
+    let id = placement.group_id.as_deref()?;
+    if placement.group_system_key.is_some() {
+        return None;
+    }
+    Some((
+        id.to_owned(),
+        placement
+            .group_name
+            .clone()
+            .unwrap_or_else(|| "Project".into()),
+    ))
+}
+
+/// Everything the effective view of one topic's resources needs: the
+/// session, its manifest, and its project's bindings for the topic's repo.
+struct TopicContext {
+    topic: SessionView,
+    manifest: TopicResourcesView,
+    /// The topic's home project, if any, with the store's revision for
+    /// revision-checked project-binding edits.
+    project: Option<ProjectInfo>,
+    /// The project's bindings (empty when unfiled).
+    bindings: Vec<ProjectBinding>,
+}
+
+impl TopicContext {
+    /// The merged rows (design.md: Project → Topic overrides → hides), with
+    /// hidden project bindings flagged for the restore affordance.
+    fn merged(&self) -> Vec<EffectiveResource> {
+        merge_effective(&self.bindings, &self.manifest, &self.topic.branch.branch)
+    }
+
+    /// The effective view the panel and the mutation replies render.
+    fn effective_view(&self) -> TopicEffectiveView {
+        let mut resources = Vec::new();
+        let mut hidden_resources = Vec::new();
+        for row in self.merged() {
+            if row.hidden {
+                hidden_resources.push(row);
+            } else {
+                resources.push(row);
+            }
+        }
+        TopicEffectiveView {
+            resources,
+            hidden_resources,
+            revision: self.manifest.revision,
+            project: self.project.clone(),
+        }
+    }
+
+    /// Resolve one effective (non-hidden) row by resource id.
+    fn find_effective(&self, resource_id: &str) -> Option<EffectiveResource> {
+        self.merged()
+            .into_iter()
+            .find(|row| !row.hidden && row.resource.id == resource_id)
+    }
+}
+
+async fn load_topic_context(
+    client: &LoomClient,
+    topic_id: &str,
+) -> Result<TopicContext, UiError> {
+    let topic = client.get_session(topic_id).await?;
+    let manifest = load_topic_resources(&client, &topic.branch.id).await?;
+    let (project, bindings) = match topic_project_of(&topic) {
+        Some((id, name)) => {
+            let store = load_projects_store(&client, &topic.branch.id).await?;
+            let bindings = store.projects.get(&id).cloned().unwrap_or_default();
+            (
+                Some(ProjectInfo {
+                    id,
+                    name,
+                    revision: store.revision,
+                }),
+                bindings,
+            )
+        }
+        None => (None, Vec::new()),
+    };
+    Ok(TopicContext {
+        topic,
+        manifest,
+        project,
+        bindings,
+    })
+}
+
 /// The Resources panel's full view: the durable manifest plus the topic's
 /// live slice — GitHub issues its subtree works, and the PRs of every session
 /// in the subtree. Loom has no topic↔issue link, so the issues are scoped
@@ -2369,8 +2574,11 @@ async fn save_topic_resources(
 /// (`BranchSummaryView.github`, loom's poll loop), so they are always live.
 #[derive(Debug, Clone, Serialize)]
 pub struct TopicResourcesPanel {
+    /// The merged effective view (project bindings inherited, topic
+    /// overrides winning, hides flagged) — design.md "Project defaults and
+    /// resource inheritance".
     #[serde(flatten)]
-    pub manifest: TopicResourcesView,
+    pub effective: TopicEffectiveView,
     /// Issues the topic's subtree works, from `issues.board`.
     pub issues: Vec<crate::loom::IssueView>,
     /// Every session in the topic's subtree with a PR, coordinator first.
@@ -2504,8 +2712,7 @@ pub async fn topic_resources(
     topic_id: String,
 ) -> Result<TopicResourcesPanel, UiError> {
     let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
-    let manifest = load_topic_resources(&client, &topic.branch.id).await?;
+    let context = load_topic_context(&client, &topic_id).await?;
     // The live slice rides the same fetch: the fleet snapshot for the
     // subtree's PRs and branches, plus the issue board. A failed board fetch
     // must not take the manifest down with it — the panel degrades to the
@@ -2518,7 +2725,7 @@ pub async fn topic_resources(
         Ok(fleet) => {
             let subtree = topic_subtree(&fleet, &topic_id);
             let issues = match client.list_issues().await {
-                Ok(board) => topic_issues(board, &topic, &subtree),
+                Ok(board) => topic_issues(board, &context.topic, &subtree),
                 Err(_) => Vec::new(),
             };
             (issues, topic_prs(&subtree))
@@ -2526,55 +2733,360 @@ pub async fn topic_resources(
         Err(_) => (Vec::new(), Vec::new()),
     };
     Ok(TopicResourcesPanel {
-        manifest,
+        effective: context.effective_view(),
         issues,
         prs,
     })
 }
 
+/// Attach a resource to a topic (an explicit Topic addition — design.md's
+/// effective view). Attaching an object the topic already inherits from its
+/// project records the topic's own binding: a real override, so the
+/// reference stops following the project's binding. Attaching an object the
+/// topic inherited *hidden* un-hides it (the user changed their mind).
+// --- Project bindings (store access) ---------------------------------------
+
+/// Resolve a repository reference (slug or path, as typed in the launch
+/// sheet) to a branch id of that repository — the access context loom's
+/// repo-shared artifact API needs. Any branch of the repo works: the
+/// repo-shared scope is keyed on the branch's canonical repo root. Repos
+/// with no loom branch yet have no context (and no store to read — the
+/// first branch of a repo brings the first opportunity to create one).
+async fn repo_branch_context(
+    client: &LoomClient,
+    repo: &str,
+) -> Result<Option<String>, UiError> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return Ok(None);
+    }
+    // Candidate roots: the managed checkout path for a slug, and the raw
+    // value itself when it looks like a path. Branch rows record the
+    // canonical root loom provisioned, so an exact match is the normal
+    // case; the raw value covers paths typed directly into the sheet.
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(repos) = client.list_repos().await {
+        if let Some(managed) = repos.iter().find(|r| r.slug == repo) {
+            candidates.push(managed.path.clone());
+        }
+    }
+    if repo.contains('/') {
+        candidates.push(repo.to_owned());
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let branches = client.list_branches().await?;
+    for candidate in &candidates {
+        if let Some(id) = branches
+            .iter()
+            .filter(|b| b.get("repo_root").and_then(|v| v.as_str()) == Some(candidate.as_str()))
+            .find_map(|b| b.get("id").and_then(|v| v.as_str()))
+        {
+            return Ok(Some(id.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The project-bindings view the sheet and the project home render.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectBindingsView {
+    pub bindings: Vec<ProjectBinding>,
+    /// The store's revision for revision-checked edits.
+    pub revision: i64,
+}
+
+/// Load one project's bindings (design.md "Project defaults and resource
+/// inheritance") — the creation form's checklist and the project home's
+/// resource list. `repo` is the sheet's repository reference (slug or path).
+#[tauri::command]
+pub async fn project_bindings(
+    state: State<'_, LoomState>,
+    project_id: String,
+    repo: String,
+) -> Result<ProjectBindingsView, UiError> {
+    let client = state_client(&state).await?;
+    let context = repo_branch_context(&client, &repo)
+        .await?
+        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+    let store = load_projects_store(&client, &context).await?;
+    Ok(ProjectBindingsView {
+        bindings: store.projects.get(&project_id).cloned().unwrap_or_default(),
+        revision: store.revision,
+    })
+}
+
+/// Resolve `repo` to the canonical repo root by finding a branch of it —
+/// the same root the topic manifests and the project store are keyed on,
+/// so a binding's `repository` field matches what topics see.
+async fn repo_root_of(client: &LoomClient, repo: &str) -> Result<Option<String>, UiError> {
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return Ok(None);
+    }
+    let mut candidates: Vec<String> = Vec::new();
+    if let Ok(repos) = client.list_repos().await {
+        if let Some(managed) = repos.iter().find(|r| r.slug == repo) {
+            candidates.push(managed.path.clone());
+        }
+    }
+    if repo.contains('/') {
+        candidates.push(repo.to_owned());
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let branches = client.list_branches().await?;
+    for candidate in &candidates {
+        if let Some(root) = branches
+            .iter()
+            .filter(|b| b.get("repo_root").and_then(|v| v.as_str()) == Some(candidate.as_str()))
+            .find_map(|b| b.get("repo_root").and_then(|v| v.as_str()))
+        {
+            return Ok(Some(root.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// Add a resource binding to a project (design.md: projects bind
+/// repositories, design documents, and other resources; new topics inherit
+/// them). The binding's repository is stamped with the repo's canonical root
+/// — the sheet only knows a slug or path, never the root topics are keyed on.
+#[tauri::command]
+pub async fn add_project_binding(
+    state: State<'_, LoomState>,
+    project_id: String,
+    repo: String,
+    resource: ResourceDraft,
+    expected_revision: i64,
+) -> Result<ProjectBindingsView, UiError> {
+    let client = state_client(&state).await?;
+    let context = repo_branch_context(&client, &repo)
+        .await?
+        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+    let repo_root = repo_root_of(&client, &repo)
+        .await?
+        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+    let mut draft = resource;
+    draft.repository = repo_root.clone();
+    let binding = ProjectBinding::validated_for_project(draft, &repo_root)
+        .map_err(resource_error)?;
+    let mut store = load_projects_store(&client, &context).await?;
+    if store.revision != expected_revision {
+        return Err(resource_error("project bindings changed; reload before editing"));
+    }
+    let bindings = store.projects.entry(project_id.clone()).or_default();
+    let binding = ProjectBinding {
+        created_at: chrono_iso_now(),
+        ..binding
+    };
+    if let Some(existing) = bindings
+        .iter_mut()
+        .find(|b| b.id == binding.id)
+    {
+        *existing = binding;
+    } else {
+        bindings.push(binding);
+    }
+    let saved = save_projects_store(&client, &context, &store, expected_revision).await?;
+    Ok(ProjectBindingsView {
+        bindings: saved.projects.get(&project_id).cloned().unwrap_or_default(),
+        revision: saved.revision,
+    })
+}
+
+/// Remove a binding from a project. Existing topics keep their own additions
+/// and hides; the removed binding simply stops being inherited (live merge,
+/// never a copy-at-creation).
+#[tauri::command]
+pub async fn remove_project_binding(
+    state: State<'_, LoomState>,
+    project_id: String,
+    repo: String,
+    binding_id: String,
+    expected_revision: i64,
+) -> Result<ProjectBindingsView, UiError> {
+    let client = state_client(&state).await?;
+    let context = repo_branch_context(&client, &repo)
+        .await?
+        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+    let mut store = load_projects_store(&client, &context).await?;
+    if store.revision != expected_revision {
+        return Err(resource_error("project bindings changed; reload before editing"));
+    }
+    let bindings = store
+        .projects
+        .get_mut(&project_id)
+        .ok_or_else(|| resource_error("project has no bindings"))?;
+    let before = bindings.len();
+    bindings.retain(|b| b.id != binding_id);
+    if bindings.len() == before {
+        return Err(resource_error("binding not found"));
+    }
+    let saved = save_projects_store(&client, &context, &store, expected_revision).await?;
+    Ok(ProjectBindingsView {
+        bindings: saved.projects.get(&project_id).cloned().unwrap_or_default(),
+        revision: saved.revision,
+    })
+}
+
+/// Attach a resource to a topic (an explicit Topic addition — design.md's
+/// effective view). Attaching an object the topic already inherits from its
+/// project records the topic's own binding: a real override, so the
+/// reference stops following the project's binding. Attaching an object the
+/// topic inherited *hidden* un-hides it (the user changed their mind).
 #[tauri::command]
 pub async fn attach_topic_resource(
     state: State<'_, LoomState>,
     topic_id: String,
     resource: ResourceDraft,
     expected_revision: i64,
-) -> Result<TopicResourcesView, UiError> {
+) -> Result<TopicEffectiveView, UiError> {
     let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
+    let context = load_topic_context(&client, &topic_id).await?;
+    let topic = &context.topic;
+    if context.manifest.revision != expected_revision {
+        return Err(resource_error("resources changed; reload before editing"));
+    }
     let resource = resource
         .validated(&topic.branch.repo_root, &topic.branch.branch)
         .map_err(resource_error)?;
-    let mut manifest = load_topic_resources(&client, &topic.branch.id).await?;
-    if manifest.revision != expected_revision {
-        return Err(resource_error("resources changed; reload before editing"));
-    }
-    if let Some(existing) = manifest.resources.iter_mut().find(|r| r.id == resource.id) {
+    let mut manifest = context.manifest.clone();
+    let key = resource.binding_key();
+    if let Some(existing) = manifest
+        .resources
+        .iter_mut()
+        .find(|r| r.id == resource.id)
+    {
         *existing = resource;
     } else {
         manifest.resources.push(resource);
     }
-    save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await
+    // An explicit attach beats a recorded hide of the same backing object.
+    manifest.hidden.retain(|hidden| hidden != &key);
+    let saved = save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await?;
+    Ok(TopicContext {
+        topic: topic.clone(),
+        manifest: saved,
+        project: context.project,
+        bindings: context.bindings,
+    }
+    .effective_view())
 }
 
+/// Detach a topic's own binding. Inherited (project) bindings cannot be
+/// detached — hiding them is the topic-level opt-out (design.md: hide, not
+/// delete from the project).
 #[tauri::command]
 pub async fn detach_topic_resource(
     state: State<'_, LoomState>,
     topic_id: String,
     resource_id: String,
     expected_revision: i64,
-) -> Result<TopicResourcesView, UiError> {
+) -> Result<TopicEffectiveView, UiError> {
     let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
-    let mut manifest = load_topic_resources(&client, &topic.branch.id).await?;
-    if manifest.revision != expected_revision {
+    let context = load_topic_context(&client, &topic_id).await?;
+    if context.manifest.revision != expected_revision {
         return Err(resource_error("resources changed; reload before editing"));
     }
-    let before = manifest.resources.len();
+    let before = context.manifest.resources.len();
+    let mut manifest = context.manifest.clone();
     manifest.resources.retain(|r| r.id != resource_id);
     if manifest.resources.len() == before {
-        return Err(resource_error("resource not found"));
+        // Not a topic row: either an inherited binding (hide it instead) or
+        // nothing — both report the same error to the panel.
+        return Err(resource_error(
+            "resource not found on this topic; inherited bindings are hidden, not detached",
+        ));
     }
-    save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await
+    let saved = save_topic_resources(&client, &context.topic.branch.id, &manifest, expected_revision).await?;
+    Ok(TopicContext {
+        topic: context.topic,
+        manifest: saved,
+        project: context.project,
+        bindings: context.bindings,
+    }
+    .effective_view())
+}
+
+/// Hide an inherited project binding for this topic (design.md: allow a
+/// Topic to hide an inherited resource without deleting it from the
+/// Project). Hiding records the binding's key in the topic manifest's
+/// `hidden` list; a later attach of the same object overrides cleanly.
+#[tauri::command]
+pub async fn hide_topic_resource(
+    state: State<'_, LoomState>,
+    topic_id: String,
+    resource_id: String,
+    expected_revision: i64,
+) -> Result<TopicEffectiveView, UiError> {
+    let client = state_client(&state).await?;
+    let context = load_topic_context(&client, &topic_id).await?;
+    if context.manifest.revision != expected_revision {
+        return Err(resource_error("resources changed; reload before editing"));
+    }
+    let row = context
+        .find_effective(&resource_id)
+        .ok_or_else(|| resource_error("resource not found"))?;
+    if row.origin != ResourceOrigin::Project {
+        return Err(resource_error(
+            "only inherited resources can be hidden; detach your own bindings instead",
+        ));
+    }
+    let key = binding_key(&row.resource.data);
+    let mut manifest = context.manifest.clone();
+    if !manifest.hidden.iter().any(|hidden| hidden == &key) {
+        manifest.hidden.push(key);
+    }
+    let saved = save_topic_resources(&client, &context.topic.branch.id, &manifest, expected_revision).await?;
+    Ok(TopicContext {
+        topic: context.topic,
+        manifest: saved,
+        project: context.project,
+        bindings: context.bindings,
+    }
+    .effective_view())
+}
+
+/// Restore a hidden inherited binding.
+#[tauri::command]
+pub async fn unhide_topic_resource(
+    state: State<'_, LoomState>,
+    topic_id: String,
+    resource_id: String,
+    expected_revision: i64,
+) -> Result<TopicEffectiveView, UiError> {
+    let client = state_client(&state).await?;
+    let context = load_topic_context(&client, &topic_id).await?;
+    if context.manifest.revision != expected_revision {
+        return Err(resource_error("resources changed; reload before editing"));
+    }
+    // Hidden rows are kept in the view exactly so this can resolve them.
+    let row = context
+        .merged()
+        .into_iter()
+        .find(|row| row.resource.id == resource_id)
+        .ok_or_else(|| resource_error("resource not found"))?;
+    if !row.hidden {
+        return Ok(context.effective_view());
+    }
+    let key = binding_key(&row.resource.data);
+    let mut manifest = context.manifest.clone();
+    let before = manifest.hidden.len();
+    manifest.hidden.retain(|hidden| hidden != &key);
+    if manifest.hidden.len() == before {
+        return Ok(context.effective_view());
+    }
+    let saved = save_topic_resources(&client, &context.topic.branch.id, &manifest, expected_revision).await?;
+    Ok(TopicContext {
+        topic: context.topic,
+        manifest: saved,
+        project: context.project,
+        bindings: context.bindings,
+    }
+    .effective_view())
 }
 
 async fn resolve_topic_resource(
@@ -2582,14 +3094,15 @@ async fn resolve_topic_resource(
     topic_id: &str,
     resource_id: &str,
 ) -> Result<(SessionView, TopicResource), UiError> {
-    let topic = client.get_session(topic_id).await?;
-    let manifest = load_topic_resources(client, &topic.branch.id).await?;
-    let resource = manifest
-        .resources
-        .into_iter()
-        .find(|r| r.id == resource_id)
+    // Reads and opens resolve against the effective view — an inherited
+    // project binding's file reads from the topic's own branch (the merge
+    // retargeted it), and a hidden binding never resolves.
+    let context = load_topic_context(client, topic_id).await?;
+    let resource = context
+        .find_effective(resource_id)
+        .map(|row| row.resource)
         .ok_or_else(|| resource_error("resource not found"))?;
-    Ok((topic, resource))
+    Ok((context.topic, resource))
 }
 
 #[tauri::command]

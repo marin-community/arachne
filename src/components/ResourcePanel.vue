@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import type { SessionSummary } from "../App.vue";
-import { liveRows, prLight, prNumberFromUrl, type AttachedPrStatus, type PanelIssue, type PanelPr } from "../resourcePanel";
+import { liveRows, mentionableRows, originLabel, prLight, prNumberFromUrl, type AttachedPrStatus, type EffectiveRow, type PanelIssue, type PanelPr } from "../resourcePanel";
 
 interface TopicResource {
   id: string;
@@ -16,13 +16,19 @@ interface TopicResource {
   path: string | null;
   url: string | null;
 }
-interface TopicResourcesView {
-  resources: TopicResource[];
+// `topic_resources` reply: the merged effective view (project bindings
+// inherited, topic overrides winning, hides flagged — design.md "Project
+// defaults and resource inheritance") plus the topic's live slice (issues
+// its subtree works, PRs of every thread in the subtree).
+interface TopicEffectiveView {
+  resources: EffectiveRow[];
+  /** Inherited bindings this topic hid (kept for the restore affordance). */
+  hidden_resources: EffectiveRow[];
   revision: number;
+  /** The topic's home project, when it has one. */
+  project?: { id: string; name: string; revision: number } | null;
 }
-// `topic_resources` reply: the durable manifest plus the topic's live slice
-// (issues its subtree works, PRs of every thread in the subtree).
-interface TopicResourcesPanel extends TopicResourcesView {
+interface TopicResourcesPanel extends TopicEffectiveView {
   issues: PanelIssue[];
   prs: PanelPr[];
 }
@@ -33,7 +39,9 @@ interface TopicResourceContent {
 
 const props = defineProps<{ topic: SessionSummary; embedded?: boolean }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "error", message: string): void }>();
-const snapshot = ref<TopicResourcesView>({ resources: [], revision: 0 });
+const snapshot = ref<TopicResourcesPanel>({
+  resources: [], hidden_resources: [], revision: 0, issues: [], prs: [],
+});
 const selectedId = ref<string | null>(null);
 
 // --- Live topic resources --------------------------------------------
@@ -201,6 +209,13 @@ const selected = computed(() => snapshot.value.resources.find((resource) => reso
 const sortedResources = computed(() => [...snapshot.value.resources].sort((a, b) =>
   Number(b.kind === "design_document") - Number(a.kind === "design_document") || a.title.localeCompare(b.title),
 ));
+const hidden_resources = computed(() => [...snapshot.value.hidden_resources].sort((a, b) => a.title.localeCompare(b.title)));
+
+/** Apply a mutation reply (the effective view) without dropping the live
+ *  slice the same snapshot ref carries — mutations return no issues/prs. */
+function applyEffective(next: TopicEffectiveView) {
+  snapshot.value = { ...snapshot.value, ...next };
+}
 
 // Attached PR rows carry only a URL in the manifest, so their light is
 // fetched directly from GitHub (`pr_status` shells out to the local `gh`).
@@ -256,10 +271,11 @@ async function refresh() {
     panelIssues.value = next.issues ?? [];
     panelPrs.value = next.prs ?? [];
     void refreshAttachedStatuses(next.resources);
-    if (!next.resources.some((resource) => resource.id === selectedId.value)) {
+    const ids = new Set([...next.resources, ...(next.hidden_resources ?? [])].map((resource) => resource.id));
+    if (!ids.has(selectedId.value ?? "")) {
       selectedId.value = next.resources.find((resource) => resource.kind === "design_document")?.id
         ?? next.resources[0]?.id ?? null;
-    } else if (selectedId.value) {
+    } else if (selectedId.value && !next.hidden_resources?.some((resource) => resource.id === selectedId.value)) {
       void selectResource(selectedId.value);
     }
   } catch (error: any) {
@@ -284,7 +300,7 @@ async function selectResource(id: string) {
 }
 
 watch(() => props.topic.id, () => {
-  snapshot.value = { resources: [], revision: 0 };
+  snapshot.value = { resources: [], hidden_resources: [], revision: 0, issues: [], prs: [] };
   panelIssues.value = [];
   panelPrs.value = [];
   selectedId.value = null;
@@ -329,7 +345,7 @@ async function attach() {
   saving.value = true;
   message.value = "";
   try {
-    const next = await invoke<TopicResourcesView>("attach_topic_resource", {
+    const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
       topicId: props.topic.id,
       resource: isUrlKind.value
         ? {
@@ -350,7 +366,7 @@ async function attach() {
           },
       expectedRevision: snapshot.value.revision,
     });
-    snapshot.value = next;
+    applyEffective(next);
     const attached = next.resources.find(
       (resource) => resource.kind === formKind.value && (isUrlKind.value ? resource.url === url : resource.path === path),
     );
@@ -365,18 +381,60 @@ async function attach() {
   }
 }
 
-async function detach(resource: TopicResource) {
+async function detach(resource: EffectiveRow) {
   if (saving.value) return;
   saving.value = true;
   message.value = "";
   try {
-    snapshot.value = await invoke<TopicResourcesView>("detach_topic_resource", {
+    applyEffective(await invoke<TopicEffectiveView>("detach_topic_resource", {
       topicId: props.topic.id,
       resourceId: resource.id,
       expectedRevision: snapshot.value.revision,
-    });
+    }));
     if (selectedId.value === resource.id) selectedId.value = null;
     message.value = "Attachment removed; the file was not changed.";
+  } catch (error: any) {
+    await refresh();
+    message.value = error?.message ?? String(error);
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** Hide an inherited binding for this topic (design.md: hide, not delete
+ *  from the project — the project keeps supplying other topics). */
+async function hide(resource: EffectiveRow) {
+  if (saving.value) return;
+  saving.value = true;
+  message.value = "";
+  try {
+    applyEffective(await invoke<TopicEffectiveView>("hide_topic_resource", {
+      topicId: props.topic.id,
+      resourceId: resource.id,
+      expectedRevision: snapshot.value.revision,
+    }));
+    if (selectedId.value === resource.id) selectedId.value = null;
+    message.value = "Hidden for this topic; the project binding is unchanged.";
+  } catch (error: any) {
+    await refresh();
+    message.value = error?.message ?? String(error);
+  } finally {
+    saving.value = false;
+  }
+}
+
+/** Restore a hidden inherited binding. */
+async function unhide(resource: EffectiveRow) {
+  if (saving.value) return;
+  saving.value = true;
+  message.value = "";
+  try {
+    applyEffective(await invoke<TopicEffectiveView>("unhide_topic_resource", {
+      topicId: props.topic.id,
+      resourceId: resource.id,
+      expectedRevision: snapshot.value.revision,
+    }));
+    message.value = "Restored from the project binding.";
   } catch (error: any) {
     await refresh();
     message.value = error?.message ?? String(error);
@@ -485,7 +543,26 @@ async function onPreviewClick(event: MouseEvent) {
           <strong>{{ resource.title }}</strong>
           <small>{{ resource.path || resource.url || resource.reference }}</small>
         </span>
+        <!-- Origin label (design.md: show each binding's origin): a chip the
+             row's own actions key off too — only project-origin rows hide,
+             only topic rows detach. -->
+        <span class="resource-origin" :class="resource.origin" :title="resource.origin === 'project' ? `Inherited from project ${snapshot.project?.name ?? ''}` : 'Attached to this topic'">{{ originLabel(resource.origin) }}</span>
       </button>
+      <!-- Hidden inherited bindings (design.md: a Topic can hide an inherited
+           resource without deleting it from the Project): kept visible with a
+           restore affordance so the opt-out is discoverable and reversible. -->
+      <template v-if="hidden_resources.length">
+        <div class="resource-panel-subhead">Hidden from this topic</div>
+        <div v-for="resource in hidden_resources" :key="`hidden:${resource.id}`" class="resource-panel-item static">
+          <span class="resource-panel-icon dimmed">{{ iconFor(resource.kind) }}</span>
+          <span class="resource-panel-item-text">
+            <strong class="dimmed">{{ resource.title }}</strong>
+            <small>{{ resource.path || resource.url || resource.reference }}</small>
+          </span>
+          <span class="resource-origin project" title="Hidden inherited binding">project</span>
+          <button class="link" :disabled="saving" title="Restore this inherited resource" @click="unhide(resource)">Restore</button>
+        </div>
+      </template>
     </div>
     <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel attachment' : '+ Attach resource' }}</button>
     <div v-if="showAttach" class="resource-panel-form">
@@ -528,7 +605,10 @@ async function onPreviewClick(event: MouseEvent) {
         <strong>{{ selected.title }}</strong>
         <button v-if="selected.url" title="Open in your browser" @click="openExternal(selected.url)">Open on GitHub</button>
         <button v-else :disabled="!selected.path" @click="openInZed(selected)">Open in Zed</button>
-        <button class="danger" :disabled="saving" title="Remove attachment; keep the file" @click="detach(selected)">Remove</button>
+        <!-- Topic rows detach (their own addition); inherited rows hide
+             (design.md: hide, not delete from the project). -->
+        <button v-if="selected.origin === 'project'" class="danger" :disabled="saving" title="Hide this inherited resource for this topic; the project binding stays" @click="hide(selected)">Hide</button>
+        <button v-else class="danger" :disabled="saving" title="Remove attachment; keep the file" @click="detach(selected)">Remove</button>
       </div>
       <div v-if="selected.url" class="resource-panel-location" :title="selected.url">
         {{ selected.url }}
@@ -560,6 +640,17 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-item { width: 100%; display: flex; align-items: center; gap: 8px; text-align: left; border: 0; background: transparent; padding: 8px; }
 .resource-panel-item:hover, .resource-panel-item.selected { background: var(--bg-hover); }
 .resource-panel-icon { font-size: 17px; color: var(--accent); }
+.resource-panel-icon.dimmed { color: var(--text-dim); }
+.dimmed { color: var(--text-dim); }
+/* Origin chip (design.md: show each binding's origin): project-inherited
+   rows carry the project's tint; the topic's own additions stay plain. */
+.resource-origin {
+  margin-left: auto; flex: none; align-self: center;
+  font-size: 9px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase;
+  border-radius: 4px; padding: 2px 5px;
+  background: var(--bg-hover); color: var(--text-dim);
+}
+.resource-origin.project { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
 /* PR status light: green = mergeable + CI passing, yellow = CI in progress
    (or not yet known), red = failing or not mergeable, purple = merged,
    dim = closed without merging. The glyph itself carries the color; the

@@ -79,6 +79,12 @@ claimed:
 - **Identity is the URL.** A `pull_request`/`issue` binding's stable id is
   `pull_request:<url>` / `issue:<url>`. Re-attaching with a new title updates;
   it never duplicates.
+- **Preserve the manifest's other fields.** The manifest may carry a
+  `hidden` list (binding keys the topic opted out of inheriting from its
+  project — design.md "Project defaults and resource inheritance"). Copy it
+  through unchanged when you write a revision; entries are
+  `<kind>:<repository>:<path>` for files and `<kind>:<url>` for PRs/issues,
+  never resource ids.
 - **Claim what you work.** `loom issues add` claims it for your branch; a
   durable manifest binding is for the topic's memory. Both are correct when
   both apply.
