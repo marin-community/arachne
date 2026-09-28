@@ -5,7 +5,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import type { SessionSummary } from "../App.vue";
-import { liveRows, type PanelIssue, type PanelPr } from "../resourcePanel";
+import { liveRows, prLight, prNumberFromUrl, type AttachedPrStatus, type PanelIssue, type PanelPr } from "../resourcePanel";
 
 interface TopicResource {
   id: string;
@@ -133,6 +133,48 @@ const sortedResources = computed(() => [...snapshot.value.resources].sort((a, b)
   Number(b.kind === "design_document") - Number(a.kind === "design_document") || a.title.localeCompare(b.title),
 ));
 
+// Attached PR rows carry only a URL in the manifest, so their light is
+// fetched directly from GitHub (`pr_status` shells out to the local `gh`).
+// Failure leaves the row unlit, exactly like an unknown live state — it
+// must never block the panel.
+const attachedStatuses = ref<Record<string, AttachedPrStatus>>({});
+async function refreshAttachedStatuses(resources: TopicResource[]) {
+  const prUrls = resources
+    .filter((resource) => resource.kind === "pull_request" && resource.url)
+    .map((resource) => resource.url!);
+  const replies = await Promise.all(
+    prUrls.map(async (url) => {
+      try {
+        return [url, await invoke<AttachedPrStatus>("pr_status", { url })] as const;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const next: Record<string, AttachedPrStatus> = {};
+  for (const reply of replies) if (reply) next[reply[0]] = reply[1];
+  attachedStatuses.value = next;
+}
+
+/** An attached PR resource as a `PanelPr`, for `prLight`/`prTooltip`. */
+function attachedPr(resource: TopicResource): PanelPr | null {
+  const status = resource.url ? attachedStatuses.value[resource.url] : undefined;
+  return status && resource.url
+    ? {
+        session_id: "attached",
+        session_name: "attached",
+        pr_number: prNumberFromUrl(resource.url) ?? 0,
+        pr_url: resource.url,
+        pr_state: status.state,
+        pr_title: status.title ?? resource.title,
+        is_draft: false,
+        review_decision: null,
+        checks: status.checks,
+        mergeable: status.mergeable,
+      }
+    : null;
+}
+
 async function refresh() {
   const topicId = props.topic.id;
   loading.value = true;
@@ -144,6 +186,7 @@ async function refresh() {
     snapshot.value = next;
     panelIssues.value = next.issues ?? [];
     panelPrs.value = next.prs ?? [];
+    void refreshAttachedStatuses(next.resources);
     if (!next.resources.some((resource) => resource.id === selectedId.value)) {
       selectedId.value = next.resources.find((resource) => resource.kind === "design_document")?.id
         ?? next.resources[0]?.id ?? null;
@@ -363,13 +406,17 @@ async function onPreviewClick(event: MouseEvent) {
       </div>
       <button v-for="resource in sortedResources" :key="resource.id" class="resource-panel-item"
         :class="{ selected: resource.id === selectedId }"
-        :title="resource.url ?? resource.path ?? ''"
+        :title="resource.kind === 'pull_request' && attachedPr(resource) ? prTooltip(attachedPr(resource)!) : (resource.url ?? resource.path ?? '')"
         @click="resource.url ? openExternal(resource.url) : (selectedId = resource.id)">
-        <span class="resource-panel-icon">{{ iconFor(resource.kind) }}</span>
+        <span class="resource-panel-icon"
+          :class="resource.kind === 'pull_request' && attachedPr(resource) ? (prLight(attachedPr(resource)!) ? `pr-light-${prLight(attachedPr(resource)!)}` : 'pr-light-none') : ''">{{ iconFor(resource.kind) }}</span>
         <span class="resource-panel-item-text">
           <strong>{{ resource.title }}</strong>
           <small>{{ resource.path || resource.url || resource.reference }}</small>
         </span>
+        <span v-if="resource.kind === 'pull_request' && prLight(attachedPr(resource)!)"
+          class="pr-status-dot" :class="`pr-light-${prLight(attachedPr(resource)!)}`"
+          :title="prLightLabel(prLight(attachedPr(resource)!))"></span>
       </button>
     </div>
     <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel attachment' : '+ Attach resource' }}</button>

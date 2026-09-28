@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { issueUrl, liveRows, prLight, repoLabel, repoUrl } from "../src/resourcePanel.ts";
+import { attachedAsPanelPr, issueUrl, liveRows, prLight, prNumberFromUrl, repoLabel, repoUrl } from "../src/resourcePanel.ts";
 
 const topic = (overrides = {}) => ({
   worktree_present: true,
@@ -118,4 +118,24 @@ test("an issue with no github link still renders, just without a url", () => {
   assert.equal(row.kind, "issue");
   assert.equal(row.url, null);
   assert.equal(row.key, "issue:7");
+});
+
+test("an attached PR URL + gh status renders through the same light as a live row", () => {
+  // URL parse: number comes from the URL, not the manifest title.
+  assert.equal(prNumberFromUrl("https://github.com/acme/app/pull/24"), 24);
+  assert.equal(prNumberFromUrl("https://www.github.com/acme/app/pull/24/"), 24);
+  assert.equal(prNumberFromUrl("https://gitlab.com/acme/app/pull/24"), null);
+  assert.equal(prNumberFromUrl("https://github.com/acme/app/issues/24"), null);
+
+  // Merged attachment → purple, closed → no light, exactly like live rows.
+  const merged = attachedAsPanelPr("https://github.com/acme/app/pull/24", {
+    state: "MERGED", mergeable: "UNKNOWN", checks: null, title: "Home: group rows",
+  });
+  assert.equal(prLight(merged), "purple");
+  const closed = attachedAsPanelPr("https://github.com/acme/app/pull/27", {
+    state: "CLOSED", mergeable: "CONFLICTING", checks: null, title: null,
+  });
+  assert.equal(prLight(closed), null);
+  assert.equal(closed.pr_number, 27);
+  assert.equal(closed.pr_title, "Pull request");
 });
