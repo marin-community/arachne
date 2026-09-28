@@ -10,6 +10,9 @@ export interface ChatDisplayBlock {
   status?: string;
   summary?: string;
   content?: unknown[];
+  request_id?: string;
+  options?: { option_id: string; name: string; kind: string }[];
+  outcome?: { option_id?: string; cancelled?: boolean; by?: string } | null;
   entries?: [string, string][];
   used?: number | null;
   size?: number | null;

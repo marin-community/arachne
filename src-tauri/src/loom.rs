@@ -114,6 +114,9 @@ pub struct SessionSummaryView {
     pub created_by: Option<String>,
     pub created_at: String,
     pub last_activity_at: String,
+    /// Old Loom servers omit this; each entry is an unanswered ACP request.
+    #[serde(default)]
+    pub pending_permissions: Vec<PendingPermissionView>,
     /// Latest ACP context report; absent before a provider reports usage.
     #[serde(default)]
     pub usage: Option<AcpUsageView>,
@@ -137,6 +140,12 @@ pub struct SessionSummaryView {
     pub github_repo: Option<String>,
     pub parent_id: Option<String>,
     pub parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPermissionView {
+    pub request_id: String,
+    pub title: String,
 }
 
 impl SessionSummaryView {

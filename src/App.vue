@@ -73,6 +73,7 @@ export interface SessionSummary {
   created_by: string | null;
   created_at: string;
   last_activity_at: string;
+  pending_permissions?: { request_id: string; title: string }[];
   usage?: AcpUsage | null;
   /** When the newest user message was journaled; null on older looms. */
   last_user_message_at?: string | null;

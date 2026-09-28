@@ -99,6 +99,25 @@ async function setConfig(option: ConfigOption, event: Event) {
   }
 }
 const rows = computed(() => groupDisplayBlocks(blocks.value, turnLive.value ? snapshotLiveTurn.value : null));
+const answeringPermission = ref<string | null>(null);
+const permissionError = ref<Record<string, string>>({});
+
+async function answerPermission(block: ChatDisplayBlock, optionId: string) {
+  const requestId = block.request_id;
+  if (!requestId || answeringPermission.value) return;
+  answeringPermission.value = requestId;
+  permissionError.value = { ...permissionError.value, [requestId]: "" };
+  try {
+    await invoke("answer_permission", { id: props.session.id, requestId, optionId });
+    scheduleReload();
+  } catch (error: any) {
+    permissionError.value = { ...permissionError.value, [requestId]: error?.message ?? String(error) };
+    scheduleReload();
+  } finally {
+    answeringPermission.value = null;
+  }
+}
+
 const draft = ref("");
 const completion = useFileCompletion(draft, computed(() => props.session.id));
 const attachments = ref<FileAttachment[]>([]);
@@ -1193,6 +1212,21 @@ async function onLand(strategy: string) {
             </div>
           </div>
         </template>
+        <div v-else-if="row.block.kind === 'permission_request'" class="block permission-request" role="group" :aria-label="`Tool approval: ${row.block.title || 'permission requested'}`">
+          <div class="who">Tool approval</div>
+          <div class="body">
+            <div class="permission-title">{{ row.block.title || 'Permission requested' }}</div>
+            <div v-if="row.block.outcome" class="permission-receipt">
+              {{ row.block.outcome.cancelled ? 'Cancelled' : `Answered: ${row.block.outcome.option_id || 'resolved'}` }}
+            </div>
+            <div v-else class="permission-options">
+              <button v-for="option in row.block.options ?? []" :key="option.option_id"
+                :disabled="answeringPermission === row.block.request_id"
+                @click="answerPermission(row.block, option.option_id)">{{ option.name }}</button>
+            </div>
+            <div v-if="row.block.request_id && permissionError[row.block.request_id]" class="permission-error" role="alert">{{ permissionError[row.block.request_id] }}</div>
+          </div>
+        </div>
         <!-- Plans -->
         <div v-else-if="row.block.kind === 'plan'" class="block" :data-copy-host="row.key">
           <div class="who">plan</div>

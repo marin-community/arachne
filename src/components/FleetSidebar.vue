@@ -10,6 +10,7 @@ import {
   visibleTopics,
 } from "../topicList";
 import { byTopicRecency, topicRecencyMap } from "../topicOrder";
+import { pendingPermissionSummary } from "../topicInspector";
 
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -71,10 +72,13 @@ function loudTag(s: SessionSummary): { level: "attention" | "blocked" } | null {
       return { level: tag.value };
     }
   }
+  if (s.pending_permissions?.length && s.status !== "archived") return { level: "attention" };
   return null;
 }
 
 function subtitle(s: SessionSummary): string {
+  const permission = pendingPermissionSummary(s);
+  if (permission) return permission;
   return s.branch.description || s.branch.title || "—";
 }
 

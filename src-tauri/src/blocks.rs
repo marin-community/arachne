@@ -43,6 +43,14 @@ pub enum DisplayBlock {
         /// `mime_type`. The one-line summary intentionally skips binary data.
         content: Vec<Value>,
     },
+    PermissionRequest {
+        turn: i64,
+        seq: i64,
+        request_id: String,
+        title: String,
+        options: Vec<Value>,
+        outcome: Value,
+    },
     Plan {
         turn: i64,
         seq: i64,
@@ -157,6 +165,18 @@ impl DisplayBlock {
                         .unwrap_or_default(),
                 }
             }
+            "permission_request" => Self::PermissionRequest {
+                turn,
+                seq,
+                request_id: string_field(payload, "request_id").to_string(),
+                title: string_field(payload, "title").to_string(),
+                options: payload
+                    .get("options")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+                outcome: payload.get("outcome").cloned().unwrap_or(Value::Null),
+            },
             "plan" => {
                 let entries = payload
                     .get("entries")
@@ -238,6 +258,25 @@ mod tests {
         .unwrap();
         assert_eq!(display["summary"], "Inspecting files");
         assert_eq!(display["text"], "\n\n**Inspecting files**");
+    }
+
+    #[test]
+    fn permission_request_keeps_choices_and_resolution() {
+        let payload = json!({
+            "request_id": "req-7",
+            "title": "Allow Computer Use to use Arachne?",
+            "options": [{"option_id": "allow_once", "name": "Allow once", "kind": "allow_once"}],
+            "outcome": null,
+        });
+        let display = serde_json::to_value(DisplayBlock::from_view(&block(
+            "permission_request",
+            payload,
+        )))
+        .unwrap();
+        assert_eq!(display["kind"], "permission_request");
+        assert_eq!(display["request_id"], "req-7");
+        assert_eq!(display["options"][0]["option_id"], "allow_once");
+        assert!(display["outcome"].is_null());
     }
 
     #[test]

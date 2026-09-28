@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import type { SessionLayout, SessionSummary } from "../App.vue";
 import { layoutProjects, topicProjectId } from "../projects";
+import { loudTag, pendingPermissionSummary } from "../topicInspector";
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -71,13 +72,9 @@ function rowTitle(s: SessionSummary): string {
 
 function level(s: SessionSummary): "blocked" | "attention" | "ok" {
   if (s.status === "archived") return "ok";
-  let attention = false;
-  for (const key of ["attention", "triage"]) {
-    const value = s.branch.tags.find((tag) => tag.key === key)?.value;
-    if (value === "blocked") return "blocked";
-    if (value === "attention") attention = true;
-  }
-  return attention || s.status === "error" ? "attention" : "ok";
+  const loud = loudTag(s);
+  if (loud?.level === "blocked") return "blocked";
+  return loud || s.status === "error" ? "attention" : "ok";
 }
 
 const isIdle = (s: SessionSummary) => s.branch.tags.some((tag) => tag.key === "idle");
@@ -97,6 +94,8 @@ function ago(iso: string): string {
 }
 
 function description(s: SessionSummary): string {
+  const permission = pendingPermissionSummary(s);
+  if (permission) return permission;
   if (s.status === "error") return "errored";
   const tag = s.branch.tags.find((t) => t.key === "attention" || t.key === "triage");
   return tag?.note || s.branch.description || s.branch.goal || "—";

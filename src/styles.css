@@ -723,6 +723,15 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   border-color: rgba(248,81,73,.55);
   border-left: 2px solid var(--blocked);
 }
+.block.permission-request .who { color: var(--attention); }
+.block.permission-request .body {
+  border-left: 2px solid var(--attention);
+  background: rgba(210,153,34,.08);
+}
+.permission-title { font-weight: 600; }
+.permission-options { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.permission-receipt { color: var(--text-dim); margin-top: 6px; font-size: 12px; }
+.permission-error { color: var(--blocked); margin-top: 8px; font-size: 12px; }
 
 /* Rendered chat messages: modest Markdown spacing within the existing bubbles. */
 .chat-markdown { min-width: 0; white-space: normal; overflow-wrap: anywhere; }

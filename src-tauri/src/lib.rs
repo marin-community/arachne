@@ -34,6 +34,7 @@ pub fn run() {
             commands::complete_files,
             commands::load_session_image,
             commands::send_input,
+            commands::answer_permission,
             commands::send_to_thread,
             commands::interrupt,
             commands::launch_session,
