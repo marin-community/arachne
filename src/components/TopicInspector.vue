@@ -10,6 +10,7 @@ import {
   type IntegrationCandidate,
   isIdle,
   loudTag,
+  pendingPermissionSummary,
   statusClass,
   topicThreadRows,
 } from "../topicInspector";
@@ -43,6 +44,8 @@ const tab = ref<"threads" | "resources" | "integrations" | "todos">("threads");
 // topic subtree rather than the lane filing system.
 
 function subtitle(s: SessionSummary): string {
+  const permission = pendingPermissionSummary(s);
+  if (permission) return permission;
   return s.branch.description || s.branch.title || "—";
 }
 

@@ -90,6 +90,22 @@ pub struct SessionPlacementView {
     pub session_id: Option<String>,
 }
 
+/// ACP's current model context and provider-reported cumulative session cost.
+/// These are not cumulative input/output/cache token totals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpUsageView {
+    pub used: u64,
+    pub size: u64,
+    #[serde(default)]
+    pub cost: Option<AcpCostView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AcpCostView {
+    pub amount: f64,
+    pub currency: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SessionSummaryView {
@@ -101,6 +117,12 @@ pub struct SessionSummaryView {
     pub created_by: Option<String>,
     pub created_at: String,
     pub last_activity_at: String,
+    /// Old Loom servers omit this; each entry is an unanswered ACP request.
+    #[serde(default)]
+    pub pending_permissions: Vec<PendingPermissionView>,
+    /// Latest ACP context report; absent before a provider reports usage.
+    #[serde(default)]
+    pub usage: Option<AcpUsageView>,
     /// When the newest `user_message` block was journaled (the last time a
     /// person or a delivery on their behalf steered the conversation), or
     /// `None` when the journal holds no user input — or when an older loom
@@ -121,6 +143,12 @@ pub struct SessionSummaryView {
     pub github_repo: Option<String>,
     pub parent_id: Option<String>,
     pub parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingPermissionView {
+    pub request_id: String,
+    pub title: String,
 }
 
 impl SessionSummaryView {
@@ -159,6 +187,9 @@ pub struct SessionView {
     pub model: String,
     pub effort: String,
     pub protocol: String,
+    /// Latest ACP context report; reset to None on a provider handoff.
+    #[serde(default)]
+    pub usage: Option<AcpUsageView>,
     pub work_dir: String,
     pub term_session: String,
     /// True when the session's `work_dir` still exists on the server.
@@ -316,6 +347,22 @@ pub struct SessionChatView {
     pub live_turn: Option<i64>,
     pub pending_prompt: Option<String>,
     pub older_cursor: Option<ChatCursorView>,
+    #[serde(default)]
+    pub metadata: AcpMetadataView,
+}
+
+/// ACP-owned composer capabilities. Preserve JSON for config and mode
+/// variants so adapters can add fields without requiring an Arachne release.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AcpMetadataView {
+    #[serde(default)]
+    pub commands: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub config_options: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub modes: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub steering_supported: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -715,6 +762,8 @@ pub struct SessionsLaunchInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_guidance: Option<SessionLaunchGuidance>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
@@ -724,6 +773,19 @@ pub struct SessionsLaunchInput {
     pub protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionLaunchGuidance {
+    pub root: String,
+    pub child: String,
+}
+
+pub fn topic_launch_guidance() -> SessionLaunchGuidance {
+    SessionLaunchGuidance {
+        root: "Arachne Topic coordinator: keep this thread for direction and review. Delegate bounded independent work early with a clear task and checks. Review worker results and integrate them into the Topic. Work directly when delegation would add overhead. A PR is a Land strategy; do not open one unless the user requests it, or an explicit Land action selects it.".into(),
+        child: "Arachne Topic worker: own the assigned scope in your worktree. Validate and commit or stabilize the result, then send your parent a concise result with the commit, checks, and risks. The parent integrates it. A PR is a Land strategy; do not open one unless the user or parent requests it, or an explicit Land action selects it.".into(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -755,6 +817,29 @@ mod scratch_upload_tests {
         assert_eq!(upload.content_base64, "aGk=");
         let value = serde_json::to_value(upload).unwrap();
         assert_eq!(value["content_base64"], "aGk=");
+    }
+}
+
+#[cfg(test)]
+mod launch_guidance_tests {
+    use super::{topic_launch_guidance, SessionsLaunchInput};
+
+    #[test]
+    fn topic_guidance_reaches_loom_launch_request() {
+        let request = SessionsLaunchInput {
+            goal: Some("Fix the editor".into()),
+            launch_guidance: Some(topic_launch_guidance()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert!(json["launch_guidance"]["root"]
+            .as_str()
+            .unwrap()
+            .contains("Topic coordinator"));
+        assert!(json["launch_guidance"]["child"]
+            .as_str()
+            .unwrap()
+            .contains("Topic worker"));
     }
 }
 

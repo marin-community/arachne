@@ -8,6 +8,7 @@ import {
   formatPlanEntries,
   formatTokens,
   groupDisplayBlocks,
+  resolveContextUsage,
   toolCallCopyText,
 } from "../src/chatRows.ts";
 
@@ -66,6 +67,39 @@ test("groups thoughts together with tool calls in the same turn", () => {
   assert.deepEqual(
     rows.map((row) => row.kind),
     ["work_group", "single", "work_group"],
+  );
+});
+
+test("joins old journal prose interrupted by a thought delta", () => {
+  const blocks = [
+    thought(5, 127, "reasoning"),
+    { kind: "agent_message", turn: 5, seq: 128, text: "Two" },
+    thought(5, 129, "."),
+    { kind: "agent_message", turn: 5, seq: 130, text: " distinct problems found." },
+    tool(5, 131),
+    { kind: "agent_message", turn: 5, seq: 132, text: "Next message" },
+  ];
+  const rows = groupDisplayBlocks(blocks, null, true);
+  assert.deepEqual(rows.map((row) => row.kind), ["work_group", "single", "work_group", "single"]);
+  assert.equal(rows[0].thoughts.length, 2);
+  assert.equal(rows[1].block.text, "Two distinct problems found.");
+  assert.equal(rows[1].key, "block:5:130");
+  assert.equal(rows[3].block.text, "Next message");
+  assert.equal(groupDisplayBlocks(blocks).filter((row) => row.kind === "single").length, 3);
+});
+
+test("does not join prose across turns or a tool boundary", () => {
+  const rows = groupDisplayBlocks([
+    { kind: "agent_message", turn: 1, seq: 1, text: "First" },
+    thought(1, 2, "thinking"),
+    tool(1, 3),
+    { kind: "agent_message", turn: 1, seq: 4, text: "Second" },
+    thought(2, 1, "new turn"),
+    { kind: "agent_message", turn: 2, seq: 2, text: "Third" },
+  ], null, true);
+  assert.deepEqual(
+    rows.filter((row) => row.kind === "single").map((row) => row.block.text),
+    ["First", "Second", "Third"],
   );
 });
 
@@ -194,6 +228,29 @@ test("thinking token totals count only the group's own thoughts", () => {
   assert.equal(group.thinkingTokens, 110);
   // Directly: the estimate is chars/4 over exactly the given thoughts.
   assert.equal(countThinkingTokens([blocks[0], blocks[2]]), 110);
+});
+
+test("context usage prefers the newest journal report over a stale zero summary", () => {
+  const summary = { used: 0, size: 131_072, cost: { amount: 1.25, currency: "USD" } };
+  const usage = resolveContextUsage([
+    { kind: "usage", turn: 1, seq: 4, used: 18_000, size: 131_072 },
+    { kind: "agent_message", turn: 1, seq: 5, text: "done" },
+    { kind: "usage", turn: 2, seq: 7, used: 30_000, size: 131_072 },
+  ], summary);
+  assert.deepEqual(usage, {
+    used: 30_000,
+    size: 131_072,
+    cost: { amount: 1.25, currency: "USD" },
+  });
+});
+
+test("context usage falls back to the session summary for old or malformed journals", () => {
+  const summary = { used: 12_000, size: 64_000, cost: null };
+  assert.deepEqual(resolveContextUsage([], summary), summary);
+  assert.deepEqual(resolveContextUsage([
+    { kind: "usage", turn: 0, seq: 0 },
+    { kind: "usage", turn: 1, seq: 0, used: -1, size: 0 },
+  ], summary), summary);
 });
 
 test("formatTokens renders K and M human-friendly", () => {

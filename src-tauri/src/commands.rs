@@ -64,6 +64,7 @@ pub struct ChatSnapshot {
     pub pending_prompt: Option<String>,
     pub live_started_at: Option<String>,
     pub live_progress_at: Option<String>,
+    pub metadata: crate::loom::AcpMetadataView,
 }
 
 impl ChatSnapshot {
@@ -544,7 +545,24 @@ pub async fn fetch_chat(
         pending_prompt: chat.pending_prompt,
         live_started_at,
         live_progress_at,
+        metadata: chat.metadata,
     })
+}
+
+/// Set one live ACP selector (model, thinking level, mode, etc.). Its IDs and
+/// value shapes come from sessions.chat.metadata.config_options.
+#[tauri::command]
+pub async fn set_session_config(
+    state: State<'_, LoomState>,
+    id: String,
+    config_id: String,
+    value: serde_json::Value,
+) -> Result<crate::loom::AcpMetadataView, UiError> {
+    let client = state_client(&state).await?;
+    client
+        .set_session_config(&id, &config_id, value)
+        .await
+        .map_err(Into::into)
 }
 
 /// Complete file mentions from the session's checkout on the loom host.
@@ -613,6 +631,20 @@ pub async fn send_input(
     } else {
         client.send_prompt(&id, &prompt, &files).await?;
     }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn answer_permission(
+    state: State<'_, LoomState>,
+    id: String,
+    request_id: String,
+    option_id: String,
+) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    client
+        .answer_permission(&id, &request_id, &option_id)
+        .await?;
     Ok(())
 }
 
@@ -837,6 +869,7 @@ pub async fn launch_session(
             // Empty strings mean "inherit the server default" — filter to
             // None so loom sees omitted-vs-blank as intended.
             profile: profile.filter(|s| !s.is_empty()),
+            launch_guidance: Some(crate::loom::topic_launch_guidance()),
             agent: agent.filter(|s| !s.is_empty()),
             model: model.filter(|s| !s.is_empty()),
             effort: effort.filter(|s| !s.is_empty()),
@@ -901,7 +934,11 @@ pub async fn pick_topic_files(
         .filter(|s| s.github_repo.as_deref() == Some(repo.as_str()))
         .map(|s| s.branch.repo_root.as_str())
         .find(|path| std::path::Path::new(path).is_dir())
-        .or_else(|| std::path::Path::new(&repo).is_dir().then_some(repo.as_str()))
+        .or_else(|| {
+            std::path::Path::new(&repo)
+                .is_dir()
+                .then_some(repo.as_str())
+        })
         .ok_or_else(|| UiError {
             message: format!("no local checkout found for {repo}"),
             unreachable: false,
@@ -984,6 +1021,7 @@ pub async fn delegate_task(
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
             parent_branch: Some(parent.branch.id),
+            launch_guidance: Some(crate::loom::topic_launch_guidance()),
             // Launch overrides from the picker: empty strings mean "inherit
             // the server default", so filter them to None (loom's
             // omitted-vs-blank distinction).
@@ -1095,10 +1133,7 @@ pub async fn open_in_zed(
     })?;
     // A caller-supplied path (post `recover_worktree`) wins over the stale
     // session view: the recovery just materialized this checkout server-side.
-    let target = zed_target(
-        host,
-        work_dir.as_deref().unwrap_or(&view.work_dir),
-    )?;
+    let target = zed_target(host, work_dir.as_deref().unwrap_or(&view.work_dir))?;
     // GUI apps often inherit a minimal PATH without /usr/local/bin, where
     // Zed installs its CLI symlink. Prefer the app-bundled CLI on macOS.
     let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
@@ -1157,7 +1192,10 @@ pub async fn recover_worktree(
     branch: String,
 ) -> Result<crate::loom::RepoWorktreeView, UiError> {
     let client = state_client(&state).await?;
-    client.ensure_worktree(&repo_root, &branch).await.map_err(Into::into)
+    client
+        .ensure_worktree(&repo_root, &branch)
+        .await
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -2036,10 +2074,13 @@ fn topic_issues(
         .into_iter()
         .filter(|issue| issue.repo_root == topic.branch.repo_root)
         .filter(|issue| {
-            [issue.claimed_branch.as_deref(), issue.source_branch.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|branch| branch_names.contains(branch))
+            [
+                issue.claimed_branch.as_deref(),
+                issue.source_branch.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|branch| branch_names.contains(branch))
         })
         .collect()
 }
@@ -2693,7 +2734,12 @@ mod resource_panel_tests {
     use super::{topic_issues, topic_prs, topic_subtree};
     use crate::loom::{GithubStatusView, IssueView, SessionSummaryView};
 
-    fn session(id: &str, parent: Option<&str>, branch: &str, pr: Option<i64>) -> SessionSummaryView {
+    fn session(
+        id: &str,
+        parent: Option<&str>,
+        branch: &str,
+        pr: Option<i64>,
+    ) -> SessionSummaryView {
         let github = pr.map(|n| GithubStatusView {
             pr_number: n,
             pr_url: format!("https://github.com/acme/app/pull/{n}"),
@@ -2751,7 +2797,8 @@ mod resource_panel_tests {
             session("worker", Some("topic"), "weaver/worker", None),
             session("stranger", Some("nowhere"), "weaver/stranger", None),
         ];
-        let mut grandchild_value = serde_json::to_value(session("grandchild", None, "weaver/grandchild", None)).unwrap();
+        let mut grandchild_value =
+            serde_json::to_value(session("grandchild", None, "weaver/grandchild", None)).unwrap();
         grandchild_value["parent_id"] = "branch-worker".into();
         let mut fleet = fleet;
         fleet.push(serde_json::from_value(grandchild_value).unwrap());
@@ -2768,11 +2815,11 @@ mod resource_panel_tests {
         ];
         let subtree = topic_subtree(&fleet, "topic");
         let board = vec![
-            issue(1, "/repo", Some("weaver/worker"), None),   // claimed by subtree
-            issue(2, "/repo", None, Some("weaver/topic")),     // sourced by subtree
-            issue(3, "/repo", Some("weaver/other"), None),     // another topic's branch
-            issue(4, "/repo", None, None),                     // unclaimed backlog
-            issue(5, "/other", Some("weaver/topic"), None),    // wrong repo
+            issue(1, "/repo", Some("weaver/worker"), None), // claimed by subtree
+            issue(2, "/repo", None, Some("weaver/topic")),  // sourced by subtree
+            issue(3, "/repo", Some("weaver/other"), None),  // another topic's branch
+            issue(4, "/repo", None, None),                  // unclaimed backlog
+            issue(5, "/other", Some("weaver/topic"), None), // wrong repo
         ];
         let scoped = topic_issues(board, &topic_view(), &subtree);
         assert_eq!(scoped.iter().map(|i| i.id).collect::<Vec<_>>(), [1, 2]);
@@ -2787,7 +2834,10 @@ mod resource_panel_tests {
         ];
         let subtree = topic_subtree(&fleet, "topic");
         let prs = topic_prs(&subtree);
-        assert_eq!(prs.iter().map(|p| p.github.pr_number).collect::<Vec<_>>(), [10, 11]);
+        assert_eq!(
+            prs.iter().map(|p| p.github.pr_number).collect::<Vec<_>>(),
+            [10, 11]
+        );
         // Each row carries which thread the PR belongs to.
         assert_eq!(prs[1].session_id, "worker-a");
         assert_eq!(prs[1].session_name, "worker-a");
