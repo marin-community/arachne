@@ -935,6 +935,16 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .slash-button { font-weight: 700; font-size: 16px; }
 .composer-send { width: 31px; padding: 0; margin-left: auto; font-size: 20px; line-height: 1; }
 .composer-send:not(:disabled) { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+/* The idle/empty/flagged composer turns the send button into the dismiss
+   button: the same attention yellow as the flag it clears, with the app
+   background color for the checkmark so it reads as a filled affirmation
+   glyph, not an outline. */
+.composer-send.send-dismiss:not(:disabled) {
+  background: var(--attention);
+  border-color: var(--attention);
+  color: var(--bg);
+}
+.composer-send.send-dismiss svg { width: 18px; height: 18px; }
 .composer-handoff { margin: 0 0 8px; border: 1px solid var(--border); border-radius: 10px; }
 .composer-hint {
   padding: 4px 2px 0;

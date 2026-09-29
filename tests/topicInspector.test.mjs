@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   badgeLabel,
+  composerSendAsDismiss,
   dismissibleAttention,
   integrationCandidates,
   isIdle,
@@ -126,6 +127,18 @@ test("dismissal: tag-raised attention only, never permissions or archived", () =
   // Quiet rows and archived rows never offer the dismiss.
   assert.equal(dismissibleAttention(session("plain")), false);
   assert.equal(dismissibleAttention(session("idle", { status: "archived" })), false);
+});
+
+test("composer dismiss gating: flagged + resting + empty sends as dismiss", () => {
+  const base = { dismissible: true, working: false, hasContent: false };
+  // The happy path: flagged thread, agent resting, nothing to send.
+  assert.equal(composerSendAsDismiss(base), true);
+  // Any live work or queued send keeps it a Send.
+  assert.equal(composerSendAsDismiss({ ...base, working: true }), false);
+  // Typing (or attaching) reverts to Send immediately.
+  assert.equal(composerSendAsDismiss({ ...base, hasContent: true }), false);
+  // An unflagged thread never shows the dismiss.
+  assert.equal(composerSendAsDismiss({ ...base, dismissible: false }), false);
 });
 
 test("readiness requires explicit verified candidate state, not lifecycle", () => {

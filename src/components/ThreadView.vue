@@ -19,7 +19,7 @@ import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copy
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
-import { dismissibleAttention } from "../topicInspector";
+import { dismissibleAttention, composerSendAsDismiss } from "../topicInspector";
 
 interface Cursor {
   turn: number;
@@ -256,6 +256,9 @@ function onComposerKeydown(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
     if (mentionRange.value && matchingResources.value.length) chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
+    // Empty composer + idle agent + flagged thread: the send button is the
+    // dismiss button, so ⌘/Ctrl+Enter affirms the same way.
+    else if (sendAsDismiss.value) void dismissAttention();
     else void send();
     return;
   }
@@ -420,6 +423,24 @@ const currentStatus = computed(() =>
   props.fleet.find((s) => s.id === props.session.id)?.status ?? props.session.status,
 );
 const canSend = computed(() => currentStatus.value === "running" || currentStatus.value === "orphaned");
+// The composer's send button doubles as the dismiss button when the
+// thread is flagged, the agent is resting, and nothing is queued: the
+// yellow attention circle with a checkmark instead of the send arrow.
+// Typing (or attaching) reverts it to Send, so the affirmation never
+// hides the send path. "Working" is cross-protocol: turnLive for ACP,
+// and for terminal sessions the absence of loom's quiet `idle` mark
+// while running (the same rest/alive distinction the sidebar rows use).
+const idleMark = computed(() =>
+  liveSummary.value.branch.tags.some((tag) => tag.key === "idle"),
+);
+const sendAsDismiss = computed(() =>
+  composerSendAsDismiss({
+    dismissible: canDismiss.value,
+    working: turnLive.value || busy.value || pendingPrompt.value != null || attachmentLoading.value ||
+      (props.session.protocol !== "acp" && currentStatus.value === "running" && !idleMark.value),
+    hasContent: !!draft.value.trim() || attachments.value.length > 0,
+  }),
+);
 const canInterrupt = computed(() =>
   currentStatus.value === "running" && (props.session.protocol !== "acp" || turnLive.value),
 );
@@ -1499,8 +1520,18 @@ async function onLand(strategy: string) {
           <input type="file" multiple :disabled="!canSend || attachmentLoading" aria-label="Attach files or images to message" @change="onFileInput" />
         </label>
         <button v-if="metadata?.commands.length" class="composer-icon-button slash-button" type="button" title="Browse agent commands" aria-label="Browse agent commands" @click="slash.show">/</button>
-        <button class="composer-send" type="button" :disabled="!canSend || (!draft.trim() && !attachments.length) || busy || attachmentLoading" :title="busy ? 'Sending…' : 'Send message (⌘/Ctrl + Enter)'" aria-label="Send message" @click="send">
-          <span v-if="busy">…</span><span v-else aria-hidden="true">↑</span>
+        <button
+          class="composer-send"
+          :class="{ 'send-dismiss': sendAsDismiss }"
+          type="button"
+          :disabled="sendAsDismiss ? dismissing : (!canSend || (!draft.trim() && !attachments.length) || busy || attachmentLoading)"
+          :title="sendAsDismiss ? 'Dismiss attention — clear this thread\'s flag (⌘/Ctrl + Enter)' : busy ? 'Sending…' : 'Send message (⌘/Ctrl + Enter)'"
+          :aria-label="sendAsDismiss ? 'Dismiss attention' : 'Send message'"
+          @click="sendAsDismiss ? dismissAttention() : send()"
+        >
+          <span v-if="sendAsDismiss && dismissing">…</span>
+          <svg v-else-if="sendAsDismiss" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9.55 17.6 4.4 12.45l1.6-1.6 3.55 3.55 8.5-8.5 1.6 1.6Z"/></svg>
+          <span v-else-if="busy">…</span><span v-else aria-hidden="true">↑</span>
         </button>
       </div>
       </div>

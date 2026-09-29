@@ -51,6 +51,22 @@ export function dismissibleAttention(s: {
   );
 }
 
+/** The composer's send button doubles as the dismiss button when the
+ * thread is flagged, the agent is resting (not working), and nothing is
+ * queued to send. Pure gating so the decision is testable: the component
+ * supplies its own live working/queue signals (turn-in-flight, busy,
+ * queued prompt, attachments uploading) and the current draft/attachments
+ * so typing immediately reverts the button to Send. */
+export function composerSendAsDismiss(input: {
+  dismissible: boolean;
+  /** Any live work or queued send keeps the button a Send. */
+  working: boolean;
+  /** Draft text or attachments keep the button a Send. */
+  hasContent: boolean;
+}): boolean {
+  return input.dismissible && !input.working && !input.hasContent;
+}
+
 /** The quiet `idle` mark: running alone means alive, not working. */
 export function isIdle(s: SessionSummary): boolean {
   return s.branch.tags.some((t) => t.key === "idle");
