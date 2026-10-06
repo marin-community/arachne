@@ -13,6 +13,7 @@
 //! stream into the webview) — the browser's connection cap is exactly why
 //! loom multiplexes, and Arachne must not undo it from the other end.
 
+use futures_util::FutureExt;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -33,6 +34,7 @@ use crate::resources::{
 #[derive(Default)]
 pub struct LoomState {
     pub client: tokio::sync::RwLock<Option<Arc<LoomClient>>>,
+    open_generation: std::sync::atomic::AtomicU64,
     /// Cancels the current fleet poller so a reconnect can replace it.
     fleet_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
     /// Cancels the open session's chat forwarder so a switch can replace it.
@@ -96,6 +98,7 @@ impl ChatSnapshot {
 /// leader chat in one coherent render.
 #[derive(Debug, Clone, Serialize)]
 pub struct FleetSnapshot {
+    pub server_url: String,
     pub sessions: Vec<SessionSummaryView>,
     pub layout: crate::loom::SessionLayoutView,
 }
@@ -126,8 +129,8 @@ async fn state_client(state: &LoomState) -> Result<Arc<LoomClient>, UiError> {
 /// Persist the loom bearer token to the macOS Keychain. An empty token
 /// removes the stored credential.
 #[tauri::command]
-pub async fn save_token(token: String) -> Result<(), UiError> {
-    tokio::task::spawn_blocking(move || crate::secret::save(&token))
+pub async fn save_token(base_url: String, token: String) -> Result<(), UiError> {
+    tokio::task::spawn_blocking(move || crate::secret::save(&base_url, &token))
         .await
         .map_err(|e| UiError {
             message: format!("saving token: {e}"),
@@ -141,17 +144,22 @@ pub async fn save_token(token: String) -> Result<(), UiError> {
 
 /// Read the stored loom bearer token; `None` when nothing is stored.
 #[tauri::command]
-pub async fn load_token() -> Result<Option<String>, UiError> {
-    tokio::task::spawn_blocking(crate::secret::load)
-        .await
-        .map_err(|e| UiError {
-            message: format!("loading token: {e}"),
-            unreachable: false,
-        })?
-        .map_err(|e| UiError {
-            message: e,
-            unreachable: false,
-        })
+pub async fn load_token(
+    base_url: String,
+    migrate_legacy: Option<bool>,
+) -> Result<Option<String>, UiError> {
+    tokio::task::spawn_blocking(move || {
+        crate::secret::load(&base_url, migrate_legacy.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| UiError {
+        message: format!("loading token: {e}"),
+        unreachable: false,
+    })?
+    .map_err(|e| UiError {
+        message: e,
+        unreachable: false,
+    })
 }
 
 /// Connect to a loom server. Loopback needs no token; remote accepts a bearer
@@ -171,6 +179,9 @@ pub async fn connect(
     client.list_sessions().await?;
     client.session_layout().await?;
 
+    state
+        .open_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     // Replace any previous fleet poller (reconnect to a different loom).
     if let Some(old) = state.fleet_cancel.write().await.take() {
         old.cancel();
@@ -192,6 +203,18 @@ pub async fn connect(
 pub async fn launch_options(state: State<'_, LoomState>) -> Result<LaunchOptionsView, UiError> {
     let client = state_client(&state).await?;
     client.launch_options().await.map_err(Into::into)
+}
+
+/// Managed repositories on the currently connected Loom server.
+#[tauri::command]
+pub async fn list_repos(
+    state: State<'_, LoomState>,
+) -> Result<Vec<crate::loom::RepoView>, UiError> {
+    state_client(&state)
+        .await?
+        .list_repos()
+        .await
+        .map_err(Into::into)
 }
 
 /// `repos.branches` for the launch sheet's Base picker: the local git
@@ -243,6 +266,15 @@ pub async fn handoff_session(
         .map_err(Into::into)
 }
 
+fn emit_connection_error(
+    app: &AppHandle,
+    client: &LoomClient,
+    error: LoomError,
+) -> Result<(), tauri::Error> {
+    let error = UiError::from(error);
+    app.emit("loom://error", serde_json::json!({"message": error.message, "unreachable": error.unreachable, "server_url": client.server_url()}))
+}
+
 /// Fetch summaries + layout together and push them as a fleet snapshot.
 async fn emit_fleet(
     app: &AppHandle,
@@ -252,12 +284,19 @@ async fn emit_fleet(
     let layout = match client.session_layout().await {
         Ok(l) => l,
         Err(e) => {
-            let _ = app.emit("loom://error", UiError::from(e));
+            let _ = emit_connection_error(&app, &client, e);
             return;
         }
     };
     sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-    let _ = app.emit("loom://fleet", &FleetSnapshot { sessions, layout });
+    let _ = app.emit(
+        "loom://fleet",
+        &FleetSnapshot {
+            server_url: client.server_url(),
+            sessions,
+            layout,
+        },
+    );
 }
 
 /// `emit_fleet` with a caller-supplied layout (a mutation command already
@@ -274,7 +313,14 @@ async fn emit_fleet_with(
         Err(_) => return,
     };
     sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-    let _ = app.emit("loom://fleet", &FleetSnapshot { sessions, layout });
+    let _ = app.emit(
+        "loom://fleet",
+        &FleetSnapshot {
+            server_url: client.server_url(),
+            sessions,
+            layout,
+        },
+    );
 }
 
 fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: CancellationToken) {
@@ -286,7 +332,7 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
             let mut sessions = match client.list_sessions().await {
                 Ok(s) => s,
                 Err(e) => {
-                    let _ = app.emit("loom://error", UiError::from(e));
+                    let _ = emit_connection_error(&app, &client, e);
                     tokio::select! {
                         _ = cancel.cancelled() => return,
                         _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
@@ -294,40 +340,42 @@ fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: Cancellat
                     continue;
                 }
             };
-            // "layout" covers layout mutations, but attention/tag changes
-            // only publish on each session's own topic — so subscribe to the
-            // live sessions too (loom caps a multiplexed stream at 64 topics:
-            // layout + 63 newest sessions).
+            // Every live session gets an event subscription. Loom caps each stream at
+            // 64 topics, so shard instead of silently losing older workers' attention.
+            use futures_util::StreamExt;
             let topics = fleet_topics(&sessions);
             sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
             emit_fleet(&app, &client, sessions).await;
-            match client.subscribe(&topics).await {
-                Ok(mut rx) => loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => return,
-                        frame = rx.recv() => {
-                            let Some(_frame) = frame else { break };
-                            // Any tag/status/layout change re-snapshots the
-                            // fleet (tags publish on each session's own topic,
-                            // not on `layout`).
-                            match client.list_sessions().await {
-                                Ok(list) => {
-                                    let changed_topics = fleet_topics(&list) != topics;
-                                    emit_fleet(&app, &client, list).await;
-                                    // A launch/archive can change the set of session
-                                    // event topics. Reconnect immediately so the new
-                                    // session's attention changes are live as well.
-                                    if changed_topics { break; }
-                                }
-                                Err(e) => {
-                                    let _ = app.emit("loom://error", UiError::from(e));
-                                }
+            let mut streams = futures_util::stream::SelectAll::new();
+            for chunk in topics.chunks(64) {
+                match client.subscribe(chunk).await {
+                    Ok(rx) => streams.push(tokio_stream::wrappers::ReceiverStream::new(rx)),
+                    Err(e) => {
+                        let _ = emit_connection_error(&app, &client, e);
+                    }
+                }
+            }
+            loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    frame = streams.next() => {
+                        if frame.is_none() { break; }
+                        // Coalesce a burst into one authoritative snapshot; no periodic polling.
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                        }
+                        while streams.next().now_or_never().flatten().is_some() {}
+                        match client.list_sessions().await {
+                            Ok(list) => {
+                                let changed_topics = fleet_topics(&list) != topics;
+                                if cancel.is_cancelled() { return; }
+                                emit_fleet(&app, &client, list).await;
+                                if changed_topics { break; }
                             }
+                            Err(e) => { let _ = emit_connection_error(&app, &client, e); }
                         }
                     }
-                },
-                Err(e) => {
-                    let _ = app.emit("loom://error", UiError::from(e));
                 }
             }
             // Subscription dropped (loom restarted): pause, retry, unless cancelled.
@@ -344,14 +392,41 @@ fn fleet_topics(sessions: &[SessionSummaryView]) -> Vec<String> {
         .iter()
         .filter(|session| session.status != "archived")
         .collect();
-    live.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+    live.sort_by(|a, b| a.id.cmp(&b.id));
     let mut topics = vec!["layout".to_owned()];
     topics.extend(
         live.into_iter()
-            .take(63)
             .map(|session| format!("session:{}", session.id)),
     );
     topics
+}
+
+/// Promote a one-off conversation without relaunching it or moving its checkout.
+#[tauri::command]
+pub async fn convert_to_track(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    id: String,
+) -> Result<(), UiError> {
+    let client = state_client(&state).await?;
+    let view = client.get_session(&id).await?;
+    if view.status == "archived" {
+        return Err(resource_error(
+            "Reopen the thread before converting it to a track.",
+        ));
+    }
+    client
+        .set_tag(
+            &id,
+            "topic",
+            "true",
+            "Converted to a track; this conversation is its coordinator",
+        )
+        .await?;
+    if let Ok(list) = client.list_sessions().await {
+        emit_fleet(&app, &client, list).await;
+    }
+    Ok(())
 }
 
 /// Open a session and start its chat forwarder. A queued prompt in a lost ACP
@@ -362,6 +437,10 @@ pub async fn open_session(
     state: State<'_, LoomState>,
     id: String,
 ) -> Result<SessionView, UiError> {
+    let generation = state
+        .open_generation
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
     let client = state_client(&state).await?;
     let original = client.get_session(&id).await?;
     let view = match resume_queued_on_open(&client, &id, original.clone()).await {
@@ -381,11 +460,19 @@ pub async fn open_session(
 
     // Cancel the previous session's forwarder: its frames would interleave
     // with the new session's otherwise.
-    if let Some(old) = state.chat_cancel.write().await.take() {
+    let mut chat_cancel = state.chat_cancel.write().await;
+    if state
+        .open_generation
+        .load(std::sync::atomic::Ordering::SeqCst)
+        != generation
+    {
+        return Ok(view);
+    }
+    if let Some(old) = chat_cancel.take() {
         old.cancel();
     }
     let cancel = CancellationToken::new();
-    *state.chat_cancel.write().await = Some(cancel.clone());
+    *chat_cancel = Some(cancel.clone());
     spawn_chat_forwarder(app, client.clone(), id.clone(), cancel);
     state.older_cursor.write().await.take();
     Ok(view)
@@ -789,6 +876,30 @@ pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), Ui
     client.interrupt(&id).await.map_err(Into::into)
 }
 
+fn launch_repository(repository: &str) -> (Option<String>, String) {
+    let repository = repository.trim();
+    if std::path::Path::new(repository).is_absolute() {
+        (None, repository.to_owned())
+    } else {
+        (Some(repository.to_owned()), String::new())
+    }
+}
+
+#[cfg(test)]
+mod launch_repository_tests {
+    #[test]
+    fn local_checkout_uses_cwd_and_managed_repo_uses_slug() {
+        assert_eq!(
+            super::launch_repository(" /tmp/demo "),
+            (None, "/tmp/demo".into())
+        );
+        assert_eq!(
+            super::launch_repository("org/repo"),
+            (Some("org/repo".into()), String::new())
+        );
+    }
+}
+
 /// Launch a session. When `parent_id` is set this is a delegation: the
 /// child records the parent's branch as `parent_branch`, getting origin=agent
 /// and nesting under the parent in the sidebar.
@@ -816,8 +927,10 @@ pub async fn launch_session(
     // the new topic's initial hides — the binding stays attached to the
     // project and keeps supplying other topics.
     hidden_binding_keys: Option<Vec<String>>,
+    as_track: Option<bool>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
+    let (managed_repo, cwd) = launch_repository(&repo);
     let parent_branch = match parent_id {
         Some(id) if !id.is_empty() => {
             // Resolve the parent session to its branch id for the link.
@@ -864,7 +977,8 @@ pub async fn launch_session(
     }
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
-            repo: Some(repo),
+            repo: managed_repo,
+            cwd,
             base: base
                 .as_deref()
                 .map(str::trim)
@@ -876,7 +990,11 @@ pub async fn launch_session(
             // Empty strings mean "inherit the server default" — filter to
             // None so loom sees omitted-vs-blank as intended.
             profile: profile.filter(|s| !s.is_empty()),
-            launch_guidance: Some(crate::loom::topic_launch_guidance()),
+            launch_guidance: Some(if as_track.unwrap_or(true) {
+                crate::loom::topic_launch_guidance()
+            } else {
+                crate::loom::thread_launch_guidance()
+            }),
             agent: agent.filter(|s| !s.is_empty()),
             model: model.filter(|s| !s.is_empty()),
             effort: effort.filter(|s| !s.is_empty()),
@@ -901,7 +1019,20 @@ pub async fn launch_session(
     // so the topic card and inspector recognize them.
     if parent_branch.is_none() {
         let _ = client
-            .set_tag(&view.id, "topic", "true", "session is a topic")
+            .set_tag(
+                &view.id,
+                "topic",
+                if as_track.unwrap_or(true) {
+                    "true"
+                } else {
+                    "false"
+                },
+                if as_track.unwrap_or(true) {
+                    "Track coordinator"
+                } else {
+                    "Standalone thread"
+                },
+            )
             .await;
     }
     // File the new topic into its project when one was preselected (a
@@ -1336,7 +1467,7 @@ impl GhCheck {
             .as_deref()
             .or_else(|| {
                 self.check_suite
-                    .as_ref()?                    
+                    .as_ref()?
                     .workflow_run
                     .as_ref()?
                     .workflow
@@ -1382,10 +1513,7 @@ fn rollup_checks(items: &[GhCheck]) -> Option<String> {
     let mut any_pending = false;
     let mut any_fail = false;
     for it in newest_first {
-        if !it
-            .identity()
-            .is_none_or(|identity| seen.insert(identity))
-        {
+        if !it.identity().is_none_or(|identity| seen.insert(identity)) {
             continue;
         }
         if let Some(status) = it.status.as_deref() {
@@ -1457,7 +1585,11 @@ pub struct GhSearchRow {
 /// match titles (GitHub search), a bare number jumps straight to that item.
 /// Closed items are included — merged PRs are often what you want to attach.
 #[tauri::command]
-pub async fn gh_search(repo: String, kind: String, query: String) -> Result<Vec<GhSearchRow>, UiError> {
+pub async fn gh_search(
+    repo: String,
+    kind: String,
+    query: String,
+) -> Result<Vec<GhSearchRow>, UiError> {
     let is_pr = kind == "pull_request";
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -1465,17 +1597,16 @@ pub async fn gh_search(repo: String, kind: String, query: String) -> Result<Vec<
     }
     let gh = gh_path();
     let mut cmd = tokio::process::Command::new(gh);
-    cmd.env("GH_PAGER", "")
-        .args([
-            "search",
-            if is_pr { "prs" } else { "issues" },
-            "--repo",
-            &repo,
-            "--json",
-            "number,title,state,url",
-            "--limit",
-            "20",
-        ]);
+    cmd.env("GH_PAGER", "").args([
+        "search",
+        if is_pr { "prs" } else { "issues" },
+        "--repo",
+        &repo,
+        "--json",
+        "number,title,state,url",
+        "--limit",
+        "20",
+    ]);
     if let Ok(number) = trimmed.parse::<i64>() {
         // A bare number is a jump: search that exact number (`N in:number`).
         cmd.arg(format!("{number} in:number"));
@@ -1628,6 +1759,7 @@ mod pr_status_tests {
     }
 }
 
+#[cfg(test)]
 mod zed_tests_more {
     use super::{thread_note_body, zed_target};
 
@@ -1660,7 +1792,11 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
     let mut sessions = client.list_sessions().await?;
     sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
     let layout = client.session_layout().await?;
-    Ok(FleetSnapshot { sessions, layout })
+    Ok(FleetSnapshot {
+        server_url: client.server_url(),
+        sessions,
+        layout,
+    })
 }
 
 /// Create a project (a placement group in a space). Projects are filing
@@ -2175,6 +2311,14 @@ async fn land_topic_locally(
             unreachable: false,
         });
     }
+    if !view.work_dir.is_empty() && std::path::Path::new(&view.work_dir).exists() {
+        crate::landing::ensure_clean_source_checkout(
+            std::path::Path::new(&view.work_dir),
+            &view.branch.branch,
+        )
+        .await
+        .map_err(resource_error)?;
+    }
     let result = crate::landing::squash_into_primary_checkout(
         std::path::Path::new(&view.branch.repo_root),
         &view.branch.branch,
@@ -2537,10 +2681,7 @@ impl TopicContext {
     }
 }
 
-async fn load_topic_context(
-    client: &LoomClient,
-    topic_id: &str,
-) -> Result<TopicContext, UiError> {
+async fn load_topic_context(client: &LoomClient, topic_id: &str) -> Result<TopicContext, UiError> {
     let topic = client.get_session(topic_id).await?;
     let manifest = load_topic_resources(&client, &topic.branch.id).await?;
     let (project, bindings) = match topic_project_of(&topic) {
@@ -2752,10 +2893,7 @@ pub async fn topic_resources(
 /// repo-shared scope is keyed on the branch's canonical repo root. Repos
 /// with no loom branch yet have no context (and no store to read — the
 /// first branch of a repo brings the first opportunity to create one).
-async fn repo_branch_context(
-    client: &LoomClient,
-    repo: &str,
-) -> Result<Option<String>, UiError> {
+async fn repo_branch_context(client: &LoomClient, repo: &str) -> Result<Option<String>, UiError> {
     let repo = repo.trim();
     if repo.is_empty() {
         return Ok(None);
@@ -2905,21 +3043,20 @@ pub async fn add_project_binding(
     } else {
         draft.repository = repo_root.clone();
     }
-    let binding = ProjectBinding::validated_for_project(draft, &repo_root)
-        .map_err(resource_error)?;
+    let binding =
+        ProjectBinding::validated_for_project(draft, &repo_root).map_err(resource_error)?;
     let mut store = load_projects_store(&client, &context).await?;
     if store.revision != expected_revision {
-        return Err(resource_error("project bindings changed; reload before editing"));
+        return Err(resource_error(
+            "project bindings changed; reload before editing",
+        ));
     }
     let bindings = store.projects.entry(project_id.clone()).or_default();
     let binding = ProjectBinding {
         created_at: chrono_iso_now(),
         ..binding
     };
-    if let Some(existing) = bindings
-        .iter_mut()
-        .find(|b| b.id == binding.id)
-    {
+    if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
         *existing = binding;
     } else {
         bindings.push(binding);
@@ -2948,7 +3085,9 @@ pub async fn remove_project_binding(
         .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
     let mut store = load_projects_store(&client, &context).await?;
     if store.revision != expected_revision {
-        return Err(resource_error("project bindings changed; reload before editing"));
+        return Err(resource_error(
+            "project bindings changed; reload before editing",
+        ));
     }
     let bindings = store
         .projects
@@ -2998,18 +3137,15 @@ pub async fn attach_topic_resource(
         .map_err(resource_error)?;
     let mut manifest = context.manifest.clone();
     let key = resource.binding_key();
-    if let Some(existing) = manifest
-        .resources
-        .iter_mut()
-        .find(|r| r.id == resource.id)
-    {
+    if let Some(existing) = manifest.resources.iter_mut().find(|r| r.id == resource.id) {
         *existing = resource;
     } else {
         manifest.resources.push(resource);
     }
     // An explicit attach beats a recorded hide of the same backing object.
     manifest.hidden.retain(|hidden| hidden != &key);
-    let saved = save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await?;
+    let saved =
+        save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await?;
     Ok(TopicContext {
         topic: topic.clone(),
         manifest: saved,
@@ -3044,7 +3180,13 @@ pub async fn detach_topic_resource(
             "resource not found on this topic; inherited bindings are hidden, not detached",
         ));
     }
-    let saved = save_topic_resources(&client, &context.topic.branch.id, &manifest, expected_revision).await?;
+    let saved = save_topic_resources(
+        &client,
+        &context.topic.branch.id,
+        &manifest,
+        expected_revision,
+    )
+    .await?;
     Ok(TopicContext {
         topic: context.topic,
         manifest: saved,
@@ -3083,7 +3225,13 @@ pub async fn hide_topic_resource(
     if !manifest.hidden.iter().any(|hidden| hidden == &key) {
         manifest.hidden.push(key);
     }
-    let saved = save_topic_resources(&client, &context.topic.branch.id, &manifest, expected_revision).await?;
+    let saved = save_topic_resources(
+        &client,
+        &context.topic.branch.id,
+        &manifest,
+        expected_revision,
+    )
+    .await?;
     Ok(TopicContext {
         topic: context.topic,
         manifest: saved,
@@ -3122,7 +3270,13 @@ pub async fn unhide_topic_resource(
     if manifest.hidden.len() == before {
         return Ok(context.effective_view());
     }
-    let saved = save_topic_resources(&client, &context.topic.branch.id, &manifest, expected_revision).await?;
+    let saved = save_topic_resources(
+        &client,
+        &context.topic.branch.id,
+        &manifest,
+        expected_revision,
+    )
+    .await?;
     Ok(TopicContext {
         topic: context.topic,
         manifest: saved,
@@ -3366,6 +3520,138 @@ pub async fn topic_todos(
     Ok(load_todo_list(&client, &topic.branch.id)
         .await?
         .topic_view(&topic_id))
+}
+
+/// Open user Todos across visible Tracks. Discover existing manifests once
+/// per repository, then read only branches that actually contain a list.
+#[derive(Serialize)]
+pub struct UserTodoRow {
+    #[serde(flatten)]
+    todo: TodoItem,
+    revision: i64,
+}
+#[derive(Serialize)]
+pub struct UserTodosView {
+    todos: Vec<UserTodoRow>,
+    warnings: Vec<String>,
+}
+fn open_user_todos(list: TodoListView, topic_id: &str) -> Vec<UserTodoRow> {
+    list.todos
+        .into_iter()
+        .filter(|todo| !todo.done && todo.topic_id == topic_id)
+        .map(|todo| UserTodoRow {
+            todo,
+            revision: list.revision,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod user_todos_tests {
+    use super::*;
+    #[test]
+    fn only_open_owner_todos_carry_the_source_revision() {
+        let make = |id: &str, topic: &str, done: bool| TodoItem {
+            id: id.into(),
+            text: id.into(),
+            topic_id: topic.into(),
+            done,
+            created_at: String::new(),
+        };
+        let rows = open_user_todos(
+            TodoListView {
+                revision: 9,
+                todos: vec![
+                    make("open", "track", false),
+                    make("done", "track", true),
+                    make("foreign", "other", false),
+                ],
+            },
+            "track",
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].todo.id, "open");
+        assert_eq!(rows[0].revision, 9);
+    }
+}
+
+#[tauri::command]
+pub async fn user_todos(
+    state: State<'_, LoomState>,
+    topic_ids: Vec<String>,
+) -> Result<UserTodosView, UiError> {
+    use futures_util::{stream, StreamExt};
+    use std::collections::{HashMap, HashSet};
+    let client = state_client(&state).await?;
+    let wanted: HashSet<String> = topic_ids.into_iter().collect();
+    let sessions = client.list_sessions().await?;
+    let topics: Vec<_> = sessions
+        .into_iter()
+        .filter(|s| wanted.contains(&s.id) && s.status != "archived")
+        .collect();
+    let mut repositories = HashMap::new();
+    let by_branch: HashMap<_, _> = topics
+        .iter()
+        .map(|s| (s.branch.id.clone(), s.id.clone()))
+        .collect();
+    for topic in &topics {
+        repositories
+            .entry(topic.branch.repo_root.clone())
+            .or_insert(topic.branch.id.clone());
+    }
+    let mut warnings = Vec::new();
+    let mut existing = HashSet::new();
+    for (repo, branch) in repositories {
+        match client
+            .op::<Vec<serde_json::Value>>(
+                "/api/artifacts/list",
+                &serde_json::json!({ "branch": branch, "repo": true }),
+            )
+            .await
+        {
+            Ok(artifacts) => {
+                for artifact in artifacts {
+                    if artifact["name"] == TODOS_NAME {
+                        if let Some(branch) = artifact["branch_id"]
+                            .as_str()
+                            .filter(|id| by_branch.contains_key(*id))
+                        {
+                            existing.insert(branch.to_owned());
+                        }
+                    }
+                }
+            }
+            Err(error) => warnings.push(format!("Todos unavailable for {repo}: {error}")),
+        }
+    }
+    let pages = stream::iter(existing.into_iter().map(|branch| {
+        let client = client.clone();
+        async move {
+            let result = load_todo_list(&client, &branch).await;
+            (branch, result)
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+    let mut todos = Vec::new();
+    for (branch, result) in pages {
+        match result {
+            Ok(list) => {
+                if let Some(topic_id) = by_branch.get(&branch) {
+                    todos.extend(open_user_todos(list, topic_id));
+                }
+            }
+            Err(error) => warnings.push(format!("Todos unavailable: {}", error.message)),
+        }
+    }
+    todos.sort_by(|a, b| {
+        a.todo
+            .created_at
+            .cmp(&b.todo.created_at)
+            .then_with(|| a.todo.id.cmp(&b.todo.id))
+    });
+    Ok(UserTodosView { todos, warnings })
 }
 
 /// Toggle one todo's done state. Because the artifact is one list, the
@@ -3631,6 +3917,23 @@ mod integration_tests {
         );
     }
 
+    #[test]
+    fn fleet_subscriptions_cover_old_workers_and_do_not_churn_on_activity() {
+        let mut sessions: Vec<_> = (0..150)
+            .map(|i| session(&format!("s{i:03}"), "branch", "/repo", None, false))
+            .collect();
+        let topics = super::fleet_topics(&sessions);
+        assert_eq!(topics.len(), 151);
+        assert!(topics.contains(&"session:s000".to_owned()));
+        assert!(topics.contains(&"session:s149".to_owned()));
+        assert!(topics.chunks(64).all(|chunk| chunk.len() <= 64));
+        sessions[149].last_activity_at = "2099-01-01".into();
+        sessions.reverse();
+        assert_eq!(super::fleet_topics(&sessions), topics);
+        sessions[0].status = "archived".into();
+        assert_eq!(super::fleet_topics(&sessions).len(), 150);
+    }
+
     fn session(
         id: &str,
         branch: &str,
@@ -3836,4 +4139,65 @@ mod todo_command_tests {
             todo_id("Land Arachne topic", "t2")
         );
     }
+}
+
+#[derive(Serialize)]
+pub struct CheckoutFile {
+    content: String,
+    checkout: String,
+}
+
+async fn local_editor_checkout(state: &LoomState, session_id: &str) -> Result<String, UiError> {
+    let client = state_client(state).await?;
+    if !host_is_loopback(client.server_host().unwrap_or("")) {
+        return Err(resource_error(
+            "In-app editing currently requires a local Loom server",
+        ));
+    }
+    let view = client.get_session(session_id).await?;
+    if view.status == "archived" || view.work_dir.is_empty() {
+        return Err(resource_error(
+            "Recover this thread's checkout before editing",
+        ));
+    }
+    Ok(view.work_dir)
+}
+
+#[tauri::command]
+pub async fn read_checkout_file(
+    state: State<'_, LoomState>,
+    session_id: String,
+    path: String,
+) -> Result<CheckoutFile, UiError> {
+    let checkout = local_editor_checkout(&state, &session_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let content =
+            crate::editor::read(std::path::Path::new(&checkout), &path).map_err(resource_error)?;
+        Ok(CheckoutFile { content, checkout })
+    })
+    .await
+    .map_err(|e| resource_error(e.to_string()))?
+}
+
+#[tauri::command]
+pub async fn save_checkout_file(
+    state: State<'_, LoomState>,
+    session_id: String,
+    path: String,
+    checkout: String,
+    original: String,
+    content: String,
+) -> Result<(), UiError> {
+    let current = local_editor_checkout(&state, &session_id).await?;
+    if current != checkout {
+        return Err(resource_error(
+            "The thread's checkout moved. Reopen the file before saving.",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::editor::save(std::path::Path::new(&current), &path, &original, &content)
+            .map_err(resource_error)
+    })
+    .await
+    .map_err(|e| resource_error(e.to_string()))?
 }

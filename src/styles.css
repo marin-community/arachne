@@ -354,29 +354,6 @@ body {
 }
 .topic-move-menu button:hover { background: var(--bg-hover); }
 .topic-move-menu button.current { color: var(--text-dim); font-weight: 600; }
-.new-topic-overlay {
-  position: fixed;
-  inset: 28px 0 0;
-  z-index: 80;
-  display: flex;
-  justify-content: center;
-  align-items: flex-start;
-  padding: min(9vh, 72px) 20px 20px;
-  background: rgba(0, 0, 0, .62);
-}
-.new-topic-overlay .new-topic-card {
-  width: min(540px, 100%);
-  max-height: 85vh;
-  overflow-y: auto;
-  margin: 0;
-  padding: 18px;
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: 0 22px 70px rgba(0, 0, 0, .5);
-}
-.new-topic-heading { display: flex; justify-content: space-between; align-items: center; }
-.new-topic-heading button { font-size: 18px; padding: 0 7px; }
 
 .topic-list {
   flex: 1;
@@ -555,20 +532,7 @@ body {
   font-size: 12px;
 }
 
-/* New-topic form (Topics tab) */
-.new-topic-card {
-  margin: 10px 10px 0;
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.new-topic-heading { font-size: 14px; font-weight: 600; }
-.new-topic-card label { color: var(--text-dim); font-size: 11px; font-weight: 600; }
-.new-topic-card .field-optional { font-weight: 400; opacity: .75; }
-.topic-body-wrap { position: relative; }
-.topic-body-wrap textarea { display: block; }
-.new-topic-card input,
-.new-topic-card textarea,
+/* Inline topic card editing (the topic-card's edit affordance) */
 .topic-edit-title,
 .topic-edit-desc {
   background: var(--bg);
@@ -580,23 +544,13 @@ body {
   outline: none;
   width: 100%;
 }
-.new-topic-card textarea,
 .topic-edit-desc {
   resize: vertical;
   font: 12px/1.4 inherit;
   min-height: 44px;
 }
-.new-topic-card textarea { min-height: 112px; }
-.new-topic-card input:focus,
-.new-topic-card textarea:focus,
 .topic-edit-title:focus,
 .topic-edit-desc:focus { border-color: var(--accent); }
-.new-topic-foot {
-  display: flex;
-  gap: 6px;
-  align-items: center;
-}
-.new-topic-foot input { flex: 1; }
 
 /* Inline topic-card editing */
 .topic-edit-title { font-weight: 600; }
@@ -1527,7 +1481,7 @@ button.danger:hover { border-color: var(--blocked); }
 .nts-body-wrap { position: relative; }
 .nts-body-wrap textarea { display: block; width: 100%; }
 .mention-menu.nts-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
-/* Project context chip in the new-topic sheet header. */
+/* Project context chip in the new-track header. */
 .nts-project {
   font-size: 11px;
   font-weight: 600;
@@ -1594,6 +1548,40 @@ button.danger:hover { border-color: var(--blocked); }
   justify-content: flex-end;
   gap: 8px;
 }
+
+/* --- New-track chat ----------------------------------------------- */
+/* The chat-first New track view (src/components/NewTrackChat.vue): the
+   same .main shape as a live thread (header, conversation, composer),
+   with a setup card standing in for the messages that aren't sent yet. */
+.new-track .conversation { gap: 14px; }
+.new-track-setup .who em {
+  font-style: normal;
+  font-weight: 400;
+  text-transform: none;
+  letter-spacing: normal;
+  color: var(--text-dim);
+}
+.new-track-setup .body { padding: 14px; }
+.new-track-setup-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.new-track-setup-body .nts-field { gap: 6px; }
+/* The pills' text inputs (model override) inherit the pill look, unlike
+   the setup card's plain fields above. */
+.composer-pill input {
+  min-width: 60px;
+  max-width: 100%;
+  flex: 1;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+}
+.new-track-error { max-width: 860px; }
 
 /* --- Home (attention-first) ---------------------------------------- */
 
@@ -1995,3 +1983,11 @@ button.danger:hover { border-color: var(--blocked); }
   border: 1px solid var(--border); border-radius: 5px; padding: 5px 6px;
 }
 .nts-project-hint { color: var(--text-dim); font-size: 11px; }
+
+/* Global navigation stays compact and keyboard reachable. */
+.header-search { color: var(--text-dim); -webkit-app-region: no-drag; }
+.header-search kbd { margin-left: 24px; opacity: .7; }
+.header button.conn { border: 0; background: transparent; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-error { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); z-index: 120; display: flex; align-items: center; gap: 12px; max-width: 85vw; padding: 12px 16px; border: 1px solid var(--blocked); background: var(--bg-raised); border-radius: 10px; box-shadow: 0 8px 32px #0006; }
+.app-error span { overflow-wrap: anywhere; user-select: text; }
+button:focus-visible, [role="button"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

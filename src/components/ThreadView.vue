@@ -10,6 +10,7 @@ import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
 import CodeActions from "./CodeActions.vue";
 import ChangeReview from "./ChangeReview.vue";
+import { reviewIntegrationTarget } from "../reviewRequest";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
 import ChatMarkdown from "./ChatMarkdown.vue";
@@ -19,6 +20,7 @@ import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copy
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
+import { isStandalone } from "../threadKind";
 import { dismissibleAttention, composerSendAsDismiss } from "../topicInspector";
 
 interface Cursor {
@@ -68,7 +70,7 @@ const currentUsage = computed(() => {
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
-  (e: "delegate", parentId: string, task: string): void;
+  (e: "delegate", parentId: string, task: string, completed: (success: boolean) => void): void;
   (e: "handoff", id: string): void;
   (e: "refresh", id: string): void;
   (e: "open-topic", id: string): void;
@@ -188,7 +190,7 @@ interface MentionResource {
   path: string | null;
   url: string | null;
   reference: string | null;
-  /** Inherited rows the topic hid — never offerable as a mention. */
+  /** Inherited rows the track hid — never offerable as a mention. */
   hidden?: boolean;
 }
 const composerEl = ref<HTMLTextAreaElement | null>(null);
@@ -400,6 +402,9 @@ const progressAge = computed(() =>
 // under this row in the sidebar.
 const showDelegate = ref(false);
 const delegateTask = ref("");
+const delegateInput = ref<HTMLInputElement | null>(null);
+async function openDelegate() { showDelegate.value = true; await nextTick(); delegateInput.value?.focus(); }
+defineExpose({ openDelegate, refreshWorkSummary });
 const delegating = ref(false);
 
 const showSendToThread = ref(false);
@@ -519,10 +524,10 @@ function submitDelegate() {
   const t = delegateTask.value.trim();
   if (!t || delegating.value) return;
   delegating.value = true;
-  emit("delegate", props.session.id, t);
-  delegateTask.value = "";
-  showDelegate.value = false;
-  delegating.value = false;
+  emit("delegate", props.session.id, t, success => {
+    delegating.value = false;
+    if (success) { delegateTask.value = ""; showDelegate.value = false; }
+  });
 }
 
 // Auto-scroll only when the user is already at (or near) the bottom — never
@@ -663,6 +668,7 @@ onMounted(async () => {
   unlisteners.push(
     await listen("loom://chat-event", (event) => {
       const frame = event.payload as ChatEventFrame;
+      if (frame.topic === "connection" && frame.event === "resync") { scheduleReload(); return; }
       if (
         frame.topic.startsWith("chat:") ||
         frame.topic.startsWith("session:")
@@ -982,34 +988,24 @@ function messageAuthor(block: ChatDisplayBlock): string {
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
 const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id));
 const lastIntegration = computed(() => currentSummary.value?.branch.tags.find((tag) => tag.key === "integration_result"));
-const integrationTarget = computed(() => {
-  let current = currentSummary.value;
-  let nearest: SessionSummary | null = null;
-  const seen = new Set<string>();
-  while (current && !seen.has(current.id)) {
-    seen.add(current.id);
-    const parent: SessionSummary | undefined = props.fleet.find((s) =>
-      s.id === current?.parent_session_id || s.branch.id === current?.parent_id,
-    );
-    if (!parent) break;
-    if (parent.branch.repo_root === props.session.branch.repo_root && parent.status !== "archived") {
-      if (!nearest) nearest = parent;
-      if (parent.branch.tags.some((tag) => tag.key === "topic" && tag.value !== "false")) return parent;
-    }
-    current = parent;
-  }
-  return nearest;
-});
+const integrationTarget = computed(() => reviewIntegrationTarget(props.fleet, props.session.id));
 // Every root conversation is a topic, including older single-prompt launches
 // that predate the durable marker.
-const isTopic = computed(() => !isWorker.value);
+const isTopic = computed(() => !isWorker.value && !isStandalone(liveSummary.value));
+const converting = ref(false);
+async function convertToTrack() {
+  converting.value = true;
+  try { await invoke("convert_to_track", { id: props.session.id }); emit("refresh", props.session.id); }
+  catch (error: any) { emit("error", error?.message ?? String(error)); }
+  finally { converting.value = false; }
+}
 const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
 const allIntegrateOptions = [
-  { value: "squash", label: "Squash into topic" },
-  { value: "merge", label: "Merge into topic" },
-  { value: "rebase", label: "Rebase onto topic" },
+  { value: "squash", label: "Squash into track" },
+  { value: "merge", label: "Merge into track" },
+  { value: "rebase", label: "Rebase onto track" },
   { value: "cherry-pick", label: "Cherry-pick commits" },
-  { value: "open-pr", label: "Open PR into topic" },
+  { value: "open-pr", label: "Open PR into track" },
   { value: "ask", label: "Ask coordinator to decide" },
 ];
 const integrateOptions = computed(() => allIntegrateOptions.filter((option) =>
@@ -1022,7 +1018,7 @@ const integrateOptions = computed(() => allIntegrateOptions.filter((option) =>
 const loomIsLocal = computed(() => {
   try {
     const host = new URL(props.loomUrl).hostname;
-    return ["localhost", "127.0.0.1", "::1"].includes(host);
+    return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(host);
   } catch {
     return false;
   }
@@ -1032,7 +1028,7 @@ const landOptions = computed(() => [
   { value: "squash", label: "Squash into upstream" },
   { value: "merge", label: "Merge into upstream" },
   { value: "rebase", label: "Rebase / fast-forward" },
-  { value: "push", label: "Push topic branch" },
+  { value: "push", label: "Push track branch" },
   ...(loomIsLocal.value ? [{ value: "land-locally", label: "Squash into local checkout" }] : []),
 ]);
 interface IntegrationTarget {
@@ -1055,15 +1051,22 @@ const landing = ref(false);
 const integrationNote = ref("");
 const showChanges = ref(false);
 const workSummary = ref<{ files: number; additions: number; deletions: number; has_commits: boolean } | null>(null);
-watch(() => props.session.id, async (id) => {
-  showChanges.value = false;
-  workSummary.value = null;
+let workSummaryGeneration = 0;
+async function refreshWorkSummary(id = props.session.id) {
+  if (id !== props.session.id) return;
+  const generation = ++workSummaryGeneration;
   try {
     const summary = await invoke<{ files: number; additions: number; deletions: number; has_commits: boolean }>("work_summary", { sessionId: id });
-    if (props.session.id === id) workSummary.value = summary;
+    if (props.session.id === id && generation === workSummaryGeneration) workSummary.value = summary;
   } catch {
-    // A checkout may have been archived; integration can still use its branch.
+    // A checkout may have been archived; don't retain counts from an older diff.
+    if (props.session.id === id && generation === workSummaryGeneration) workSummary.value = null;
   }
+}
+watch(() => props.session.id, (id) => {
+  showChanges.value = false;
+  workSummary.value = null;
+  void refreshWorkSummary(id);
 }, { immediate: true });
 async function onIntegrate(strategy: string) {
   if (integrating.value) return;
@@ -1090,7 +1093,7 @@ async function onLand(strategy: string) {
       const { landing: done } = result;
       integrationNote.value = done.landed
         ? `Landed locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch} · ${done.commit}`
-        : `${done.target_branch} already contained this topic's changes — nothing to do.`;
+        : `${done.target_branch} already contained this track's changes — nothing to do.`;
     } else {
       integrationNote.value = "Landing request sent. Follow the result in this thread.";
     }
@@ -1105,28 +1108,28 @@ async function onLand(strategy: string) {
 <template>
   <section class="main">
     <div v-if="topic" class="thread-breadcrumb">
-      <button @click="emit('home')">Topics home</button><span> → </span>
+      <button @click="emit('home')">Tracks home</button><span> → </span>
       <button @click="emit('open-topic', topic.id)">{{ topic.branch.title || topic.branch.name }}</button>
       <span> → {{ session.branch.title || session.branch.name }}</span>
     </div>
     <div class="thread-header">
       <div class="meta">
-        <div class="name">{{ session.branch.name || session.id }}</div>
+        <div class="name">{{ session.branch.title || session.branch.name || session.id }}</div>
         <div class="sub">
           {{ session.agent_kind }} · {{ session.model || "auto" }} · turn
           {{ session.turn_count }}
         </div>
       </div>
       <!-- The scoped dashboard (Needs You / Working / Ready to Integrate) is an
-           explicit detour, not the default Topic view — the main pane stays a
-           conversation whenever a Topic is open. -->
-      <button v-if="topic" title="Open this topic's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
+           explicit detour, not the default Track view — the main pane stays a
+           conversation whenever a Track is open. -->
+      <button v-if="topic" title="Open this track's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
       <!-- The explicit back-to-coordinator action (docs/design.md
-           "Navigation"): from a worker thread, jump to the topic's
+           "Navigation"): from a worker thread, jump to the track's
            coordinator chat without remembered-thread restoration. -->
       <button
         v-if="topic && session.id !== topic.id"
-        title="Back to this topic's coordinator thread"
+        title="Back to this track's coordinator thread"
         @click="emit('open-coordinator', topic.id)"
       >Coordinator</button>
       <button
@@ -1157,9 +1160,10 @@ async function onLand(strategy: string) {
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
       <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
+      <button v-if="!isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
       <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
-      <button class="accent" @click="showDelegate = !showDelegate">
+      <button class="accent" @click="showDelegate ? showDelegate = false : openDelegate()">
         Delegate
       </button>
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
@@ -1186,9 +1190,10 @@ async function onLand(strategy: string) {
         </button>
       </div>
     </div>
-    <ChangeReview v-if="showChanges" :session-id="session.id" />
+    <ChangeReview v-if="showChanges" :session-id="session.id" :can-edit="loomIsLocal" :is-topic="isTopic" :integration-target="integrationTarget" @saved="refreshWorkSummary()" />
     <div v-if="showDelegate" class="delegate-box">
       <input
+        ref="delegateInput"
         v-model="delegateTask"
         placeholder="child task… e.g. “run the tests and report failures”"
         @keydown.enter.prevent="submitDelegate"
@@ -1197,10 +1202,10 @@ async function onLand(strategy: string) {
       <LaunchPreset />
       <button
         class="primary"
-        :disabled="!delegateTask.trim()"
+        :disabled="!delegateTask.trim() || delegating"
         @click="submitDelegate"
       >
-        Spawn child
+        {{ delegating ? "Delegating…" : "Start worker" }}
       </button>
     </div>
     <div class="conversation" ref="convEl" @scroll="onConversationScroll" @copy="onConversationCopy">
@@ -1418,7 +1423,7 @@ async function onLand(strategy: string) {
           <button class="primary" :disabled="!handoffAllowed || handingOff" @click="handoff">{{ handingOff ? "Switching…" : "Switch" }}</button>
         </div>
       </div>
-      <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Topic resources">
+      <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Track resources">
         <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
         <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
         <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
@@ -1502,7 +1507,7 @@ async function onLand(strategy: string) {
         <label v-if="effortConfig" class="composer-pill effort-pill" :title="effortConfig.name">
           <span aria-hidden="true">◉</span>
           <select :value="String(effortConfig.currentValue)" :disabled="!!configBusy" aria-label="Thinking effort" @change="setConfig(effortConfig, $event)">
-            <option v-for="choice in configChoices(effortConfig)" :key="choice.value" :value="choice.value">Thinking: {{ choice.name }}</option>
+            <option v-for="choice in configChoices(effortConfig)" :key="choice.value" :value="choice.value">Thinking: {{ choice.name.replace(/^thinking:\s*/i, "") }}</option>
           </select>
           <span aria-hidden="true">⌄</span>
         </label>

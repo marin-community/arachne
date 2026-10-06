@@ -13,14 +13,49 @@ import type { SessionSummary } from "./App.vue";
 // `attention` | `blocked`; absence is the calm/default state. `idle` is a
 // quiet resting mark. Mirrors FleetSidebar's helpers.
 export function loudTag(s: SessionSummary): { level: "attention" | "blocked" } | null {
-  for (const key of ["attention", "triage"]) {
-    const tag = s.branch.tags.find((t) => t.key === key);
-    if (tag && (tag.value === "attention" || tag.value === "blocked")) {
-      return { level: tag.value };
-    }
+  if (s.status === "archived") return null;
+  const tags = s.branch.tags.filter((t) => t.key === "attention" || t.key === "triage");
+  if (tags.some((t) => t.value === "blocked")) return { level: "blocked" };
+  if (tags.some((t) => t.value === "attention") || s.pending_permissions?.length) {
+    return { level: "attention" };
   }
-  if (s.pending_permissions?.length && s.status !== "archived") return { level: "attention" };
   return null;
+}
+
+/** Human-facing reason, never a stale note attached to a cleared tag. */
+export function attentionReason(s: SessionSummary): string | null {
+  if (s.status === "archived") return null;
+  const permission = pendingPermissionSummary(s);
+  if (permission) return permission;
+  const loud = loudTag(s);
+  if (loud) {
+    const tags = s.branch.tags.filter((t) =>
+      (t.key === "attention" || t.key === "triage") && t.value === loud.level,
+    );
+    const note = tags.find((t) => t.note?.trim())?.note?.trim();
+    return note || s.branch.description?.trim() ||
+      (loud.level === "blocked" ? "Agent is blocked. Open the thread to resolve the blocker."
+        : "Agent requested your input. Open the thread to review the request.");
+  }
+  if (s.status === "error") {
+    return "Agent stopped with an error. Open the thread to inspect and retry.";
+  }
+  return null;
+}
+
+export function attentionLevel(s: SessionSummary): "blocked" | "attention" | "ok" {
+  if (s.status === "archived") return "ok";
+  return loudTag(s)?.level ?? (s.status === "error" ? "attention" : "ok");
+}
+
+/** Label the concrete next step without assuming every open PR needs a human. */
+export function attentionAction(s: SessionSummary): string {
+  if (s.pending_permissions?.length) return "Review approval";
+  if (attentionLevel(s) === "blocked") return "Resolve blocker";
+  if (s.status === "error") return "Inspect error";
+  const pr = s.branch.github;
+  if (pr?.pr_state?.toLowerCase() === "open" && !pr.is_draft) return `Review PR #${pr.pr_number}`;
+  return "Review request";
 }
 
 /** Compact reason for a session with one or more unanswered tool approvals. */
@@ -74,7 +109,7 @@ export function isIdle(s: SessionSummary): boolean {
 
 export function statusClass(s: SessionSummary): string {
   const loud = loudTag(s);
-  if (loud?.level === "blocked") return "error";
+  if (s.status === "error" || loud?.level === "blocked") return "error";
   if (loud?.level === "attention") return "attention";
   return "done";
 }

@@ -70,6 +70,33 @@ struct PrimaryWorktree {
     bare: bool,
 }
 
+/// Local landing works from committed branch state. Refuse a source checkout
+/// with manual edits so an in-app save cannot be silently omitted from a land.
+pub async fn ensure_clean_source_checkout(checkout: &Path, branch: &str) -> Result<(), String> {
+    let timeout = Duration::from_secs(15);
+    let actual = git(
+        checkout,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        timeout,
+    )
+    .await?;
+    if actual.trim() != branch {
+        return Err(
+            "The source checkout changed branches. Refresh the thread before landing.".into(),
+        );
+    }
+    let status = git(
+        checkout,
+        &["status", "--porcelain", "--untracked-files=normal"],
+        timeout,
+    )
+    .await?;
+    if !status.trim().is_empty() {
+        return Err("This thread has uncommitted edits. Use Review → Prepare landing to validate and commit them before landing locally.".into());
+    }
+    Ok(())
+}
+
 /// Run git in `dir`, returning stdout on success. Failures carry git's own
 /// words (stderr preferred), collapsed to one bounded line for toasts.
 ///
@@ -498,6 +525,28 @@ worktree /repo/.worktrees/topic\nHEAD def\nbranch refs/heads/weaver/topic\n";
                 .stdout,
         )
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn source_preflight_rejects_uncommitted_editor_changes() {
+        let dir = repo_with_topic("source-edits");
+        sh(&dir, &["checkout", "-q", "weaver/topic"]);
+        assert!(super::ensure_clean_source_checkout(&dir, "weaver/topic")
+            .await
+            .is_ok());
+        std::fs::write(dir.join("topic.txt"), "manual edit\n").unwrap();
+        let error = super::ensure_clean_source_checkout(&dir, "weaver/topic")
+            .await
+            .unwrap_err();
+        assert!(error.contains("uncommitted edits"));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("topic.txt")).unwrap(),
+            "manual edit\n"
+        );
+        assert!(super::ensure_clean_source_checkout(&dir, "another-branch")
+            .await
+            .is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

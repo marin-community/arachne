@@ -10,7 +10,7 @@ import { homeRowTitle } from "../src/homeRows.ts";
 // A structural slice of SessionSummary: only the fields homeRowTitle reads.
 const session = (id, extra = {}) => ({
   id,
-  branch: { title: `Title ${id}`, name: `name-${id}` },
+  branch: { title: `Title ${id}`, name: `name-${id}`, tags: [] },
   ...extra,
 });
 
@@ -45,10 +45,17 @@ test("a topic home names the row alone", () => {
 });
 
 test("titles fall back to branch names and join with the row separator", () => {
-  const worker = session("w1", { branch: { title: "", name: "name-w1" } });
-  const root = session("root", { branch: { title: "", name: "name-root" } });
+  const worker = session("w1", { branch: { title: "", name: "name-w1", tags: [] } });
+  const root = session("root", { branch: { title: "", name: "name-root", tags: [] } });
   assert.equal(
     homeRowTitle(worker, root, "—", { topic: false, project: false }),
     "— · name-root · name-w1",
   );
+});
+
+
+test("standalone roots show their own title instead of coordinator", () => {
+  const root = session("one-off", { branch: { title: "Inspect a log", name: "one-off", tags: [{ key: "topic", value: "false" }] } });
+  assert.equal(homeRowTitle(root, root, "Alpha", { topic: false, project: false }), "Alpha · Inspect a log");
+  assert.equal(homeRowTitle(root, root, "Alpha", { topic: false, project: true }), "Inspect a log");
 });

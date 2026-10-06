@@ -183,3 +183,19 @@ test("candidate queue: verified ready first, integrated outcomes after, topic ex
   assert.ok(!candidates.some((c) => c.session.id === "stopped"));
   assert.ok(!candidates.some((c) => c.session.id === "sleeping"));
 });
+
+test("blocked assessment wins over attention; archived tags stay quiet", () => {
+  const both = withTag(withTag(session("a"), "attention", "attention"), "triage", "blocked");
+  assert.deepEqual(loudTag(both), { level: "blocked" });
+  assert.equal(loudTag(withTag(session("old", { status: "archived" }), "attention", "blocked")), null);
+});
+
+test("attention reasons ignore notes on cleared tags and prefer live approvals", async () => {
+  const { attentionReason, attentionAction } = await import("../src/topicInspector.ts");
+  const live = withTag(withTag(session("a"), "attention", "ok", "Old success"), "triage", "blocked", "Which target branch?");
+  assert.equal(attentionReason(live), "Which target branch?");
+  const pending = { ...live, pending_permissions: [{ request_id: "a", title: "Run deploy?" }] };
+  assert.equal(attentionReason(pending), "Approve tool use: Run deploy?");
+  assert.equal(attentionAction(pending), "Review approval");
+  assert.equal(attentionReason(withTag(session("a"), "attention", "ok", "Old success")), null);
+});

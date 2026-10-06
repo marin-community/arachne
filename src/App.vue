@@ -1,18 +1,21 @@
 <script setup lang="ts">
-import { ref, onMounted, computed, watch, nextTick } from "vue";
+import { ref, onMounted, onUnmounted, computed, watch, nextTick } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import CommandPalette from "./components/CommandPalette.vue";
+import AttentionBanner from "./components/AttentionBanner.vue";
+import { isStandalone } from "./threadKind";
 import FleetSidebar from "./components/FleetSidebar.vue";
 import ThreadView from "./components/ThreadView.vue";
 import HomeView from "./components/HomeView.vue";
 import SettingsSheet from "./components/SettingsSheet.vue";
 import NewThreadSheet from "./components/NewThreadSheet.vue";
-import NewTopicSheet from "./components/NewTopicSheet.vue";
+import NewTrackChat from "./components/NewTrackChat.vue";
 import ProjectSheet from "./components/ProjectSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
 import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
-import { clearDraftOnLaunch } from "./newTopicDraft";
+import { clearDraftOnLaunch, initializeDraftStorage } from "./newTopicDraft";
 import {
   readTopicThreadMemory,
   rememberTopicThread,
@@ -140,6 +143,7 @@ export interface SessionLayout {
   }[];
 }
 interface FleetSnapshot {
+  server_url: string;
   sessions: SessionSummary[];
   layout: SessionLayout;
 }
@@ -157,6 +161,8 @@ export interface LaunchOptions {
 
 // --- State ----------------------------------------------------------------
 
+initializeDraftStorage(localStorage);
+
 const DEFAULT_URL = "http://127.0.0.1:7878";
 const connected = ref(false);
 const connError = ref<string | null>(null);
@@ -172,12 +178,52 @@ const selectedView = ref<SessionView | null>(null);
 // not the sidebar. Takes over while open; a launch closes it and opens
 // the live thread (launchTask → selectSession).
 const showNewThread = ref(false);
-// The topic composer: same main-panel takeover as the thread sheet. A
-// topic is a leader chat with title/description metadata, so its launch
-// path (launchTopic) passes those through to launch_session.
+// The new-track chat: same main-panel takeover as the thread sheet, but
+// chat-first — it looks like the thread it will become, with the setup
+// choices (title, repo/base, project bindings) in the conversation area
+// and the first send launching the track (launchTopic).
 const showNewTopic = ref(false);
 const showSettings = ref(false);
-const showResources = ref(true);
+const showResources = ref(localStorage.getItem("arachne.inspector") !== "false");
+watch(showResources, value => localStorage.setItem("arachne.inspector", String(value)));
+const showSearch = ref(false);
+const settingsSaving = ref(false);
+const threadView = ref<InstanceType<typeof ThreadView> | null>(null);
+let connectionGeneration = 0;
+function closeLaunchers() { showNewTopic.value = false; showNewThread.value = false; projectResourcesProject.value = null; }
+async function openWorker() {
+  if (!selectedView.value && selectedTopic.value) await selectSession(selectedTopic.value.id);
+  await nextTick();
+  threadView.value?.openDelegate();
+}
+function command(action: string) {
+  if (action === "thread") openNewThread();
+  else if (action === "track") openNewTopic();
+  else if (action === "home") onHome();
+  else if (action === "delegate") openWorker();
+  else if (action === "inspector") showResources.value = !showResources.value;
+  else if (action === "settings") showSettings.value = true;
+}
+function onShortcut(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
+  if (event.key === "Escape") {
+    if (showSearch.value) showSearch.value = false;
+    else if (showSettings.value && !settingsSaving.value) showSettings.value = false;
+    else if (showNewTopic.value || showNewThread.value || projectResourcesProject.value) closeLaunchers();
+    else return;
+    event.preventDefault(); return;
+  }
+  if (!event.metaKey && !event.ctrlKey) return;
+  const key = event.key.toLowerCase();
+  if (key === "k") { showSearch.value = !showSearch.value; event.preventDefault(); }
+  else if (key === ",") { showSettings.value = true; event.preventDefault(); }
+  else if (key === "n") { command(event.shiftKey ? "track" : "thread"); event.preventDefault(); }
+  else if (event.shiftKey && ["h", "d", "e"].includes(key)) {
+    command(({h: "home", d: "delegate", e: "inspector"} as Record<string, string>)[key]); event.preventDefault();
+  }
+}
+onMounted(() => window.addEventListener("keydown", onShortcut));
+onUnmounted(() => window.removeEventListener("keydown", onShortcut));
 const settingsError = ref<string | null>(null);
 // URL is not a secret — localStorage is fine. The TOKEN is a credential:
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
@@ -192,20 +238,22 @@ onMounted(async () => {
   // Prefill the in-memory token from the Keychain (migration note: an old
   // build's localStorage token, if any, is stale and ignored).
   try {
-    loomToken.value = (await invoke<string | null>("load_token")) ?? "";
+    loomToken.value = (await invoke<string | null>("load_token", { baseUrl: loomUrl.value, migrateLegacy: true })) ?? "";
   } catch {
     // Keychain unavailable (rare); connect can still proceed tokenless.
   }
   // Register listeners BEFORE connecting, so the initial fleet snapshot
   // emitted right after connect is never missed.
   await listen<FleetSnapshot>("loom://fleet", (event) => {
+    if (event.payload.server_url.replace(/\/$/, "") !== loomUrl.value.replace(/\/$/, "")) return;
     fleet.value = event.payload.sessions;
     layout.value = event.payload.layout;
     connected.value = true;
     connError.value = null;
   });
   await listen("loom://error", (event) => {
-    const err = event.payload as { message: string; unreachable: boolean };
+    const err = event.payload as { message: string; unreachable: boolean; server_url?: string };
+    if (err.server_url && err.server_url.replace(/\/+$/, "") !== loomUrl.value.replace(/\/+$/, "")) return;
     if (err.unreachable) {
       connected.value = false;
       connError.value = err.message;
@@ -238,24 +286,62 @@ async function connect(url: string, token: string | null) {
 }
 
 async function saveSettings(url: string, token: string) {
-  settingsError.value = null;
-  try {
-    await invoke("save_token", { token });
-  } catch (e: any) {
-    settingsError.value = `Could not save the token in Keychain: ${e?.message ?? String(e)}`;
+  if (settingsSaving.value) return;
+  if (launching.value) {
+    settingsError.value = "Wait for the current launch or delegation to finish before switching servers.";
     return;
   }
-  loomUrl.value = url;
-  loomToken.value = token;
-  localStorage.setItem("loomUrl", url);
-  await connect(url, token || null);
-  if (connected.value) showSettings.value = false;
-  else settingsError.value = connError.value;
+  settingsSaving.value = true;
+  settingsError.value = null;
+  const previous = { url: loomUrl.value, token: loomToken.value, fleet: fleet.value, layout: layout.value, connected: connected.value, selectedId: selectedId.value, launchOptions: launchOptions.value, agents: launchAgents.value, profiles: launchProfiles.value, defaultAgent: launchDefaultAgent.value };
+  try {
+    const changed = url.replace(/\/+$/, "") !== loomUrl.value.replace(/\/+$/, "");
+    connectionGeneration++;
+    loomUrl.value = url;
+    loomToken.value = token;
+    if (changed) {
+      closeLaunchers(); showTopicsHome(); selectedProject.value = null;
+      fleet.value = []; layout.value = null; launchOptions.value = null;
+      launchAgents.value = []; launchProfiles.value = []; launchDefaultAgent.value = "";
+    }
+    connected.value = false;
+    await connect(url, token || null);
+    if (!connected.value) {
+      settingsError.value = connError.value;
+      // A failed health/auth check leaves the backend's old client intact.
+      // Its known-good credential has not been overwritten in Keychain.
+      loomUrl.value = previous.url; loomToken.value = previous.token;
+      fleet.value = previous.fleet; layout.value = previous.layout; connected.value = previous.connected;
+      launchOptions.value = previous.launchOptions; launchAgents.value = previous.agents; launchProfiles.value = previous.profiles; launchDefaultAgent.value = previous.defaultAgent;
+      return;
+    }
+    localStorage.setItem("loomUrl", url);
+    if (changed) {
+      // Runtime/model IDs belong to a server's catalog. A new server starts
+      // from its own defaults rather than inheriting hidden unsupported IDs.
+      launchSelection.value = { agent: "", model: "", effort: "" };
+    }
+    // Connecting cancels the chat stream even when only the token changed.
+    if (!changed && previous.selectedId) await selectSession(previous.selectedId);
+    try {
+      // Only a credential that passed Loom health/auth checks replaces the
+      // saved one. A Keychain failure leaves the established client usable.
+      await invoke("save_token", { baseUrl: url, token });
+    } catch (error: any) {
+      settingsError.value = `Connected, but could not save this server's token in Keychain: ${error?.message ?? String(error)}`;
+      return;
+    }
+    showSettings.value = false;
+  } catch (e: any) {
+    settingsError.value = e?.message ?? String(e);
+  } finally { settingsSaving.value = false; }
 }
 
 // --- Actions ----------------------------------------------------------------
 
 async function selectSession(id: string) {
+  closeLaunchers();
+  const generation = connectionGeneration;
   viewMode.value = "thread";
   selectedId.value = id;
   // Drop the stale view immediately: ThreadView is keyed by selectedId and
@@ -265,9 +351,9 @@ async function selectSession(id: string) {
   selectedView.value = null;
   try {
     const view = await invoke<SessionView>("open_session", { id });
-    if (viewMode.value === "thread" && selectedId.value === id) selectedView.value = view;
+    if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id) selectedView.value = view;
   } catch (e: any) {
-    if (viewMode.value === "thread" && selectedId.value === id)
+    if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id)
       connError.value = e?.message ?? String(e);
   }
 }
@@ -334,6 +420,7 @@ watch([selectedId, viewMode, fleet], () => {
 });
 
 function showTopicsHome() {
+  closeLaunchers();
   selectedId.value = null;
   selectedTopicId.value = null;
   selectedView.value = null;
@@ -421,7 +508,7 @@ function onHome() {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
+  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[]; asTrack?: boolean },
   completed?: (success: boolean) => void,
 ) {
   launching.value = true;
@@ -442,6 +529,7 @@ async function launchTask(
       // Unchecked project bindings → the topic's initial hides (design.md:
       // the creation form overrides the project's defaults).
       hiddenBindingKeys: meta?.hiddenBindingKeys ?? [],
+      asTrack: meta?.asTrack ?? false,
     });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
@@ -459,19 +547,21 @@ async function launchTask(
   }
 }
 
-// The topic sheet's launch: same signature as a thread launch — the sheet
-// owns richer card metadata (title/description) plus attachments and
-// resource mentions, all routed through launchTask so the wiring stays in
-// one place. Success closes the sheet and opens the live thread; failure
-// keeps the drafts for a retry. A successful launch also drops the stored
-// composer draft — it became a real topic branch, so reopening the sheet
-// starts fresh rather than resurrecting an already-launched draft.
+// The new-track chat's launch: the composer's first send launches the
+// track with the setup card's metadata (title/description, repo/base,
+// project bindings, launch config) plus attachments and resource
+// mentions, all routed through launchTask so the wiring stays in one
+// place. Success swaps this view for the live thread; failure keeps the
+// chat and its drafts for a retry. A successful launch also drops the
+// stored composer draft — it became a real topic branch, so reopening
+// the chat starts fresh rather than resurrecting an already-launched
+// draft.
 function launchTopic(
   task: string,
   repo: string,
   meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
 ) {
-  launchTask(task, repo, meta, (success) => {
+  launchTask(task, repo, { ...meta, asTrack: true }, (success) => {
     if (success) {
       closeNewTopic();
       // Unmounting the sheet snapshots its draft (onUnmounted runs on
@@ -484,8 +574,8 @@ function launchTopic(
 
 // The thread sheet's launch: the sheet's draft carries attachments,
 // resource mentions, and the launch config (the removed sidebar composer's
-// affordances). Project preselection lives on the topic sheet — a project
-// files topics, so its + opens that sheet.
+// affordances). Project preselection lives on the new-track chat — a
+// project files tracks, so its + opens that chat.
 function launchThread(
   task: string,
   repo: string,
@@ -518,7 +608,7 @@ async function updateTopic(
   }
 }
 
-async function delegateFromThread(parentId: string, task: string) {
+async function delegateFromThread(parentId: string, task: string, completed?: (success: boolean) => void) {
   launching.value = true;
   // The launch-preset picker's current selection rides along: the last
   // chosen harness/model/effort is the default for every delegation.
@@ -531,10 +621,12 @@ async function delegateFromThread(parentId: string, task: string) {
       model: sel.model || null,
       effort: sel.effort || null,
     });
+    completed?.(true);
     // Stay on the parent thread — the child appears nested under it in the
     // sidebar (and inherits the parent's topic) via the layout events.
   } catch (e: any) {
     connError.value = e?.message ?? String(e);
+    completed?.(false);
   } finally {
     launching.value = false;
   }
@@ -623,15 +715,16 @@ const selectedTopic = computed(() => {
     if (!parent) break;
     node = parent;
   }
-  return node;
+  return node && !isStandalone(node) ? node : null;
 });
 </script>
 
 <template>
-  <div class="app" :class="{ 'with-resources': !showNewThread && viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': !showNewThread && !showNewTopic && viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
-      <button class="title home-link" title="Show Topics home" @click="showTopicsHome">🕸 Arachne</button>
-      <span
+      <button class="title home-link" title="Show Tracks home" @click="onHome">🕸 Arachne</button>
+      <button class="header-search" title="Search and commands (⌘K)" @click="showSearch = true">Search <kbd>⌘K</kbd></button>
+      <button
         class="conn"
         :class="{ clickable: true }"
         @click="showSettings = true"
@@ -645,11 +738,12 @@ const selectedTopic = computed(() => {
               : `loom · ${loomUrl.replace("http://", "")}`
             : (connError ?? "connecting…")
         }}
-      </span>
+      </button>
       <button v-if="viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
-        title="Topic inspector" @click="showResources = !showResources">Inspector</button>
+        title="Track inspector (⌘⇧E)" @click="showResources = !showResources">Inspector</button>
     </header>
     <FleetSidebar
+      :key="loomUrl"
       :fleet="fleet"
       :layout="layout"
       :selected-id="selectedId ?? selectedTopicId"
@@ -667,7 +761,7 @@ const selectedTopic = computed(() => {
       @delete-lane="deleteLane"
       @archive="onArchived"
     />
-    <NewTopicSheet
+    <NewTrackChat
       v-if="showNewTopic"
       :fleet="fleet"
       :launching="launching"
@@ -678,7 +772,7 @@ const selectedTopic = computed(() => {
       @launch="launchTopic"
     />
     <ProjectSheet
-      v-if="projectResourcesProject"
+      v-else-if="projectResourcesProject"
       :key="projectResourcesProject.id"
       :project="projectResourcesProject"
       @close="closeProjectResources"
@@ -693,6 +787,7 @@ const selectedTopic = computed(() => {
       @launch="launchThread"
     />
     <ThreadView
+      ref="threadView"
       v-else-if="viewMode === 'thread' && selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
@@ -708,11 +803,11 @@ const selectedTopic = computed(() => {
       @open-topic="selectTopic"
       @overview="showTopicOverview"
       @open-coordinator="openCoordinatorThread"
-      @home="showTopicsHome"
+      @home="onHome"
     />
     <HomeView
       v-else
-      :key="viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'"
+      :key="`${loomUrl}:${viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'}`"
       :fleet="fleet"
       :topic="viewMode === 'topic' ? selectedTopic : null"
       :project="selectedProject"
@@ -725,14 +820,18 @@ const selectedTopic = computed(() => {
       @manage-project-resources="openProjectResources"
       @error="connError = $event"
     />
-    <TopicInspector v-if="!showNewThread && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId"
-      @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openNewThread" />
+    <TopicInspector v-if="!showNewThread && !showNewTopic && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
+      @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" />
+    <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
+    <CommandPalette v-if="showSearch" :fleet="fleet" @close="showSearch = false" @select="selectSession" @action="command" />
+    <div v-if="connError && !showSettings && !showNewThread && !showNewTopic" class="app-error" role="alert"><span>{{ connError }}</span><button @click="showSettings = true" v-if="!connected">Connection settings</button><button aria-label="Dismiss error" @click="connError = null">×</button></div>
     <SettingsSheet
       v-if="showSettings"
       :url="loomUrl"
       :token="loomToken"
       :connected="connected"
       :error="settingsError"
+      :saving="settingsSaving"
       @close="showSettings = false"
       @save="saveSettings"
     />

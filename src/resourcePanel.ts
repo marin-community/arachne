@@ -35,7 +35,7 @@ export function mentionableRows(rows: EffectiveRow[]): EffectiveRow[] {
 /** Origin label for the panel's attached list: what came from the
  *  Project vs the Topic's own addition (design.md: the user can tell). */
 export function originLabel(origin: ResourceOrigin): string {
-  return origin === "project" ? "project" : "topic";
+  return origin === "project" ? "project" : "track";
 }
 
 /** The slice of an `issues.board` row the panel renders. */

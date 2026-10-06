@@ -155,7 +155,7 @@ test("mentionable rows exclude hidden inherited bindings", () => {
 
 test("origin labels distinguish project from topic", () => {
   assert.equal(originLabel("project"), "project");
-  assert.equal(originLabel("topic"), "topic");
+  assert.equal(originLabel("topic"), "track");
 });
 
 // --- Repository bindings (design.md: a project binds multiple repos) --------

@@ -35,6 +35,10 @@ export interface TopicThreadStorage {
 
 /** Last-opened-thread memory: topicId -> threadId. */
 export type TopicThreadMemory = Record<string, string>;
+function memoryKey(storage: TopicThreadStorage): string {
+  const server = storage.getItem("loomUrl");
+  return server ? `${TOPIC_THREAD_STORAGE_KEY}@${server.replace(/\/+$/, "")}` : TOPIC_THREAD_STORAGE_KEY;
+}
 
 /** Why a topic view resolved to a particular thread. */
 export type TopicThreadSource = "current" | "remembered" | "coordinator";
@@ -52,6 +56,33 @@ export interface ResolveTopicThreadInput {
   currentThreadId?: string | null;
   /** The thread last opened in this topic, read from the memory map. */
   rememberedThreadId?: string | null;
+}
+
+/**
+ * The ancestor chain of `sessionId`, nearest first, excluding the session
+ * itself. Cycles and dangling links stop the walk; an unknown id yields
+ * an empty chain.
+ */
+export function threadAncestors<T extends FleetThread>(
+  fleet: readonly T[],
+  sessionId: string | null | undefined,
+): T[] {
+  if (!sessionId) return [];
+  let node = fleet.find((session) => session.id === sessionId);
+  if (!node) return [];
+  const ancestors: T[] = [];
+  const seen = new Set<string>([node.id]);
+  while (node) {
+    const parent = fleet.find(
+      (session) =>
+        session.id === node?.parent_session_id || session.branch.id === node?.parent_id,
+    );
+    if (!parent || seen.has(parent.id)) break;
+    seen.add(parent.id);
+    ancestors.push(parent);
+    node = parent;
+  }
+  return ancestors;
 }
 
 /**
@@ -138,7 +169,7 @@ export function readTopicThreadMemory(
 ): TopicThreadMemory {
   let raw: string | null = null;
   try {
-    raw = storage?.getItem(TOPIC_THREAD_STORAGE_KEY) ?? null;
+    raw = storage ? storage.getItem(memoryKey(storage)) : null;
   } catch {
     return {};
   }
@@ -168,7 +199,7 @@ export function rememberTopicThread(
   if (memory[topicId] === threadId) return;
   memory[topicId] = threadId;
   try {
-    storage.setItem(TOPIC_THREAD_STORAGE_KEY, JSON.stringify(memory));
+    storage.setItem(memoryKey(storage), JSON.stringify(memory));
   } catch {
     // A full or blocked store must never break navigation.
   }

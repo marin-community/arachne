@@ -5,6 +5,7 @@ import {
   readTopicThreadMemory,
   rememberTopicThread,
   resolveTopicThread,
+  threadAncestors,
   threadBelongsToTopic,
   topicRootOf,
 } from "../src/topic-view.ts";
@@ -52,6 +53,30 @@ test("topicRootOf stops at cycles instead of hanging", () => {
   a.parent_session_id = "b";
   b.parent_session_id = "a";
   assert.equal(topicRootOf([a, b], "a").id, "a");
+});
+
+test("threadAncestors lists the chain nearest-first, excluding the session itself", () => {
+  assert.deepEqual(
+    threadAncestors(fleet, "grandchild").map((s) => s.id),
+    ["workerA", "coordinator"],
+  );
+  assert.deepEqual(
+    threadAncestors(fleet, "workerA").map((s) => s.id),
+    ["coordinator"],
+  );
+  // A root's own chain is empty, and unknown ids yield nothing.
+  assert.deepEqual(threadAncestors(fleet, "coordinator"), []);
+  assert.deepEqual(threadAncestors(fleet, "missing"), []);
+  assert.deepEqual(threadAncestors(fleet, null), []);
+});
+
+test("threadAncestors stops at cycles instead of hanging", () => {
+  const a = session("a");
+  const b = session("b");
+  a.parent_session_id = "b";
+  b.parent_session_id = "a";
+  const ids = threadAncestors([a, b], "a").map((s) => s.id);
+  assert.deepEqual([...ids].sort(), ["b"]);
 });
 
 test("threadBelongsToTopic scopes membership to the topic subtree", () => {

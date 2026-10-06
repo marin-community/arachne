@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
+import CheckoutEditor from "./CheckoutEditor.vue";
 import type { SessionSummary } from "../App.vue";
 import { liveRows, mentionableRows, originLabel, prLight, prNumberFromUrl, type AttachedPrStatus, type EffectiveRow, type PanelIssue, type PanelPr } from "../resourcePanel";
 
@@ -22,7 +23,7 @@ interface TopicResource {
 // its subtree works, PRs of every thread in the subtree).
 interface TopicEffectiveView {
   resources: EffectiveRow[];
-  /** Inherited bindings this topic hid (kept for the restore affordance). */
+  /** Inherited bindings this track hid (kept for the restore affordance). */
   hidden_resources: EffectiveRow[];
   revision: number;
   /** The topic's home project, when it has one. */
@@ -37,12 +38,13 @@ interface TopicResourceContent {
   content: string;
 }
 
-const props = defineProps<{ topic: SessionSummary; embedded?: boolean }>();
-const emit = defineEmits<{ (e: "close"): void; (e: "error", message: string): void }>();
+const props = defineProps<{ topic: SessionSummary; embedded?: boolean; canEdit?: boolean }>();
+const emit = defineEmits<{ (e: "close"): void; (e: "error", message: string): void; (e: "checkout-saved", sessionId: string): void }>();
 const snapshot = ref<TopicResourcesPanel>({
   resources: [], hidden_resources: [], revision: 0, issues: [], prs: [],
 });
 const selectedId = ref<string | null>(null);
+const editPath = ref<string | null>(null);
 
 // --- Live topic resources --------------------------------------------
 // The spec's resource strip invariant applies to the inspector too: the
@@ -244,7 +246,7 @@ async function attachGhResult(row: GhSearchRow) {
     showAttach.value = false;
     ghResults.value = [];
     ghQuery.value = "";
-    message.value = "Resource attached to this topic.";
+    message.value = "Resource attached to this track.";
   } catch (error: any) {
     message.value = error?.message ?? String(error);
   } finally {
@@ -332,6 +334,11 @@ async function refresh() {
   }
 }
 
+function onCheckoutSaved() {
+  emit("checkout-saved", props.topic.id);
+  if (selectedId.value) void selectResource(selectedId.value);
+}
+
 async function selectResource(id: string) {
   selectedId.value = id;
   content.value = "";
@@ -355,6 +362,7 @@ watch(() => props.topic.id, () => {
   panelIssues.value = [];
   panelPrs.value = [];
   selectedId.value = null;
+  editPath.value = null;
   content.value = "";
   ghResults.value = [];
   ghQuery.value = "";
@@ -455,7 +463,7 @@ async function attach() {
       ?? next.resources.find((resource) => resource.kind === formKind.value);
     selectedId.value = attached?.id ?? selectedId.value;
     showAttach.value = false;
-    message.value = "Resource attached to this topic.";
+    message.value = "Resource attached to this track.";
   } catch (error: any) {
     await refresh();
     message.value = error?.message ?? String(error);
@@ -484,7 +492,7 @@ async function detach(resource: EffectiveRow) {
   }
 }
 
-/** Hide an inherited binding for this topic (design.md: hide, not delete
+/** Hide an inherited binding for this track (design.md: hide, not delete
  *  from the project — the project keeps supplying other topics). */
 async function hide(resource: EffectiveRow) {
   if (saving.value) return;
@@ -497,7 +505,7 @@ async function hide(resource: EffectiveRow) {
       expectedRevision: snapshot.value.revision,
     }));
     if (selectedId.value === resource.id) selectedId.value = null;
-    message.value = "Hidden for this topic; the project binding is unchanged.";
+    message.value = "Hidden for this track; the project binding is unchanged.";
   } catch (error: any) {
     await refresh();
     message.value = error?.message ?? String(error);
@@ -552,7 +560,7 @@ async function onPreviewClick(event: MouseEvent) {
 </script>
 
 <template>
-  <aside class="resource-panel" :class="{ embedded }" :aria-label="embedded ? 'Topic resources tab' : 'Topic resources'">
+  <aside class="resource-panel" :class="{ embedded }" :aria-label="embedded ? 'Track resources tab' : 'Track resources'">
     <header v-if="!embedded" class="resource-panel-head">
       <div>
         <strong>Resources</strong>
@@ -565,7 +573,7 @@ async function onPreviewClick(event: MouseEvent) {
       <!-- Live topic resources (design.md "Resource slice"): the repo, the
            PRs of every thread in the topic's subtree, the issues its subtree
            works, and the checkout — always first, always actionable. -->
-      <section class="resource-panel-live" aria-label="Topic repository, PRs, issues, and checkout">
+      <section class="resource-panel-live" aria-label="Track repository, PRs, issues, and checkout">
         <template v-for="row in rows" :key="row.key">
           <button v-if="row.kind === 'repository' && row.url" class="resource-panel-item" title="Open the repository on GitHub" @click="openExternal(row.url)">
             <span class="resource-panel-icon">⌂</span>
@@ -614,7 +622,7 @@ async function onPreviewClick(event: MouseEvent) {
       <div class="resource-panel-subhead">Attached</div>
       <div v-if="loading && !snapshot.resources.length" class="resource-panel-empty">Loading…</div>
       <div v-else-if="!snapshot.resources.length" class="resource-panel-empty">
-        No resources attached yet. Attach a design document or file so it stays with this topic.
+        No resources attached yet. Attach a design document or file so it stays with this track.
       </div>
       <button v-for="resource in sortedResources" :key="resource.id" class="resource-panel-item"
         :class="{ selected: resource.id === selectedId }"
@@ -629,13 +637,13 @@ async function onPreviewClick(event: MouseEvent) {
         <!-- Origin label (design.md: show each binding's origin): a chip the
              row's own actions key off too — only project-origin rows hide,
              only topic rows detach. -->
-        <span class="resource-origin" :class="resource.origin" :title="resource.origin === 'project' ? `Inherited from project ${snapshot.project?.name ?? ''}` : 'Attached to this topic'">{{ originLabel(resource.origin) }}</span>
+        <span class="resource-origin" :class="resource.origin" :title="resource.origin === 'project' ? `Inherited from project ${snapshot.project?.name ?? ''}` : 'Attached to this track'">{{ originLabel(resource.origin) }}</span>
       </button>
       <!-- Hidden inherited bindings (design.md: a Topic can hide an inherited
            resource without deleting it from the Project): kept visible with a
            restore affordance so the opt-out is discoverable and reversible. -->
       <template v-if="hidden_resources.length">
-        <div class="resource-panel-subhead">Hidden from this topic</div>
+        <div class="resource-panel-subhead">Hidden from this track</div>
         <div v-for="resource in hidden_resources" :key="`hidden:${resource.id}`" class="resource-panel-item static">
           <span class="resource-panel-icon dimmed">{{ iconFor(resource.kind) }}</span>
           <span class="resource-panel-item-text">
@@ -693,7 +701,7 @@ async function onPreviewClick(event: MouseEvent) {
       </template>
       <template v-else>
         <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
-        <label>Path in topic branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
+        <label>Path in track branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
         <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
       </template>
     </div>
@@ -701,12 +709,13 @@ async function onPreviewClick(event: MouseEvent) {
     <div v-if="selected" class="resource-panel-preview">
       <div class="resource-panel-preview-head">
         <strong>{{ selected.title }}</strong>
+        <button v-if="canEdit && selected.path && ['file', 'design_document'].includes(selected.kind) && selected.repository === topic.branch.repo_root && selected.reference === topic.branch.branch" @click="editPath = selected.path">Edit</button>
         <button v-if="selected.url" title="Open in your browser" @click="openExternal(selected.url)">Open on GitHub</button>
         <button v-else-if="selected.kind === 'repository' && bindingRepoUrl(selected)" title="Open in your browser" @click="openExternal(bindingRepoUrl(selected)!)">Open on GitHub</button>
         <button v-else :disabled="!selected.path" @click="openInZed(selected)">Open in Zed</button>
         <!-- Topic rows detach (their own addition); inherited rows hide
              (design.md: hide, not delete from the project). -->
-        <button v-if="selected.origin === 'project'" class="danger" :disabled="saving" title="Hide this inherited resource for this topic; the project binding stays" @click="hide(selected)">Hide</button>
+        <button v-if="selected.origin === 'project'" class="danger" :disabled="saving" title="Hide this inherited resource for this track; the project binding stays" @click="hide(selected)">Hide</button>
         <button v-else class="danger" :disabled="saving" title="Remove attachment; keep the file" @click="detach(selected)">Remove</button>
       </div>
       <div v-if="selected.url" class="resource-panel-location" :title="selected.url">
@@ -719,6 +728,7 @@ async function onPreviewClick(event: MouseEvent) {
       <div v-else-if="selected.url" class="resource-panel-empty">This resource lives on GitHub — open it there.</div>
       <div v-else class="resource-panel-content" @click="onPreviewClick" v-html="renderedContent"></div>
     </div>
+    <CheckoutEditor v-if="editPath" :key="`${topic.id}:${editPath}`" :session-id="topic.id" :path="editPath" @close="editPath = null" @saved="onCheckoutSaved" />
   </aside>
 </template>
 

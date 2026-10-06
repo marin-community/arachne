@@ -1,10 +1,10 @@
-// Decode harness: wire-format regression tests against captured loom responses.
+// Decode harness: wire-format regression tests against representative Loom responses.
 use arachne_lib::loom::{SessionChatView, SessionSummaryView, SessionView};
 
 #[test]
 fn decode_launch_response() {
-    let data = std::fs::read_to_string("/tmp/launch-resp.json").unwrap();
-    let v: SessionView = serde_json::from_str(&data).expect("SessionView decode");
+    let data = include_str!("fixtures/launch-response.json");
+    let v: SessionView = serde_json::from_str(data).expect("SessionView decode");
     assert_eq!(v.protocol, "acp");
     assert_eq!(
         v.work_dir,

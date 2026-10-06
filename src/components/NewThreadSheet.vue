@@ -4,6 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
+import { recentRepositories, rememberRepository } from "../launchDefaults";
+import { launchSelection } from "../launch";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-thread sheet: composing a thread happens in the main display
@@ -16,7 +18,7 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 // The draft carries the same affordances the chat composer has: file
 // attachments (uploaded into the new session's Scratch directory) and
 // @-mentions of existing topic resources (the same `topic_resources`
-// menu the thread composer and the topic sheet use), plus the launch
+// menu the thread composer and the new-track chat use), plus the launch
 // config (profile/agent/model/effort). These moved here when the
 // sidebar's single-prompt composer was removed — this sheet is now the
 // only single-prompt launch surface.
@@ -39,7 +41,8 @@ const emit = defineEmits<{
 }>();
 
 const task = ref("");
-const repo = ref("marin-community/arachne");
+const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
+const repo = ref(recentRepositories(localStorage)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : ""));
 const base = ref("");
 const taskEl = ref<HTMLTextAreaElement | null>(null);
 const attachments = ref<FileAttachment[]>([]);
@@ -83,9 +86,9 @@ function onPaste(event: ClipboardEvent) {
 // --- Launch config -----------------------------------------------------------
 
 const profile = ref("default");
-const agent = ref("");
-const model = ref("");
-const effort = ref("");
+const agent = ref(launchSelection.value.agent);
+const model = ref(launchSelection.value.model);
+const effort = ref(launchSelection.value.effort);
 const profiles = computed(() => props.launchOptions?.profiles.filter((p) => p.class === "interactive") ?? []);
 const selectedProfile = computed(() => profiles.value.find((p) => p.name === profile.value));
 const selectedAgent = computed(() => props.launchOptions?.agents.find((a) => a.kind === (agent.value || selectedProfile.value?.agent_kind || props.launchOptions?.default_agent)));
@@ -165,7 +168,7 @@ async function loadMentionResources() {
     }));
     mentionResources.value = views.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     if (views.length && views.every((result) => result.status === "rejected")) {
-      mentionError.value = "Could not load topic resources";
+      mentionError.value = "Could not load track resources";
     }
   } finally {
     mentionLoading.value = false;
@@ -219,6 +222,7 @@ function submit() {
   if ((!t && !attachments.value.length) || props.launching || attachmentLoading.value) return;
   // The draft is deliberately not cleared: success unmounts the sheet
   // (App closes it), while failure keeps the text for a retry.
+  rememberRepository(localStorage, repo.value);
   emit("launch", t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     ...launchConfig(),
     base: base.value.trim() || undefined,
@@ -242,7 +246,7 @@ function onGoalKeydown(event: KeyboardEvent) {
     return;
   }
   if (!mentionRange.value) return;
-  if (event.key === "Escape") { event.preventDefault(); mentionRange.value = null; }
+  if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); mentionRange.value = null; }
   else if (event.key === "ArrowDown" && matchingResources.value.length) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value + 1) % matchingResources.value.length;
   } else if (event.key === "ArrowUp" && matchingResources.value.length) {
@@ -279,7 +283,7 @@ function onGoalKeydown(event: KeyboardEvent) {
             @keydown="onGoalKeydown"
             @paste="onPaste"
           ></textarea>
-          <div v-if="mentionRange" class="mention-menu nts-mention-menu" role="listbox" aria-label="Existing topic resources">
+          <div v-if="mentionRange" class="mention-menu nts-mention-menu" role="listbox" aria-label="Existing track resources">
             <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
             <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
             <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
@@ -309,7 +313,7 @@ function onGoalKeydown(event: KeyboardEvent) {
         <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
       </div>
 
-      <RepoBaseFields v-model:repo="repo" v-model:base="base" @submit="submit" />
+      <RepoBaseFields v-model:repo="repo" v-model:base="base" :repositories="repositorySuggestions" @submit="submit" />
 
       <div class="nts-field">
         <span class="nts-field-name">Launch config <em class="nts-opt">optional</em></span>
@@ -362,7 +366,7 @@ function onGoalKeydown(event: KeyboardEvent) {
 
 <style scoped>
 /* Launch config row (profile/agent/model/effort) — same look as the
-   topic sheet's controls. */
+   new-track chat's controls. */
 .launch-controls {
   display: flex;
   flex-wrap: wrap;

@@ -3,6 +3,9 @@ import { computed, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary } from "../App.vue";
 import ResourcePanel from "./ResourcePanel.vue";
+import ChangeReview from "./ChangeReview.vue";
+import { reviewIntegrationTarget } from "../reviewRequest";
+import TrackActivity from "./TrackActivity.vue";
 import SplitButton from "./SplitButton.vue";
 import {
   badgeLabel,
@@ -25,6 +28,7 @@ const props = defineProps<{
   topic: SessionSummary;
   fleet: SessionSummary[];
   selectedId: string | null;
+  loomUrl?: string;
 }>();
 
 const emit = defineEmits<{
@@ -32,9 +36,16 @@ const emit = defineEmits<{
   (e: "error", message: string): void;
   (e: "select", id: string): void;
   (e: "new-thread"): void;
+  (e: "checkout-saved", sessionId: string): void;
 }>();
 
-const tab = ref<"threads" | "resources" | "integrations" | "todos">("threads");
+const tab = ref<"threads" | "review" | "resources" | "integrations" | "todos" | "activity">("threads");
+const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId) ?? props.topic);
+const canEdit = computed(() => {
+  try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(props.loomUrl ?? "").hostname); }
+  catch { return false; }
+});
+function reviewCandidate(id: string) { emit("select", id); tab.value = "review"; }
 
 // --- Threads tab -----------------------------------------------------------
 //
@@ -66,14 +77,14 @@ function toggle(id: string) {
 // is not sufficient evidence"). Workers with a recorded `integration_result`
 // are shown as integrated outcomes. Land is not here — it is a Topic action.
 
-const candidates = computed(() => integrationCandidates(topicRows.value, props.topic.id));
+const candidates = computed(() => integrationCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id));
 
 const integrateOptions = [
-  { value: "squash", label: "Squash into topic" },
-  { value: "merge", label: "Merge into topic" },
-  { value: "rebase", label: "Rebase onto topic" },
+  { value: "squash", label: "Squash into track" },
+  { value: "merge", label: "Merge into track" },
+  { value: "rebase", label: "Rebase onto track" },
   { value: "cherry-pick", label: "Cherry-pick commits" },
-  { value: "open-pr", label: "Open PR into topic" },
+  { value: "open-pr", label: "Open PR into track" },
   { value: "ask", label: "Ask coordinator to decide" },
 ];
 
@@ -212,7 +223,7 @@ watch(() => props.topic.id, () => {
 </script>
 
 <template>
-  <aside class="topic-inspector" aria-label="Topic inspector">
+  <aside class="topic-inspector" aria-label="Track inspector">
     <header class="topic-inspector-head">
       <div class="topic-inspector-topic">
         <strong>{{ topic.branch.title || topic.branch.name }}</strong>
@@ -221,6 +232,8 @@ watch(() => props.topic.id, () => {
     </header>
     <div class="tab-bar inspector-tab-bar" role="tablist">
       <button class="tab" :class="{ active: tab === 'threads' }" role="tab" :aria-selected="tab === 'threads'" @click="tab = 'threads'">Threads</button>
+      <button class="tab" :class="{ active: tab === 'review' }" role="tab" :aria-selected="tab === 'review'" @click="tab = 'review'">Review</button>
+      <button class="tab" :class="{ active: tab === 'activity' }" role="tab" :aria-selected="tab === 'activity'" @click="tab = 'activity'">Activity</button>
       <button class="tab" :class="{ active: tab === 'resources' }" role="tab" :aria-selected="tab === 'resources'" @click="tab = 'resources'">Resources</button>
       <button class="tab" :class="{ active: tab === 'integrations' }" role="tab" :aria-selected="tab === 'integrations'" @click="tab = 'integrations'">Integrations</button>
       <button class="tab" :class="{ active: tab === 'todos' }" role="tab" :aria-selected="tab === 'todos'" @click="tab = 'todos'">Todos</button>
@@ -261,14 +274,19 @@ watch(() => props.topic.id, () => {
           </div>
           <div class="title">{{ subtitle(row.session) }}</div>
         </div>
-        <div v-if="!topicRows.length" class="inspector-empty">No threads in this topic yet.</div>
+        <div v-if="!topicRows.length" class="inspector-empty">No threads in this track yet.</div>
       </div>
     </div>
 
     <!-- Resources: the topic's attached resources and refs (ResourcePanel's
          content embedded here as the tab body). -->
+    <div v-else-if="tab === 'review'" class="inspector-body inspector-body-flush">
+      <div class="inspector-review-context">{{ reviewSession.branch.title || reviewSession.branch.name }}</div>
+      <ChangeReview :session-id="reviewSession.id" :is-topic="reviewSession.id === topic.id" :integration-target="reviewIntegrationTarget(fleet, reviewSession.id)" :can-edit="canEdit" embedded @saved="emit('checkout-saved', reviewSession.id)" />
+    </div>
+    <div v-else-if="tab === 'activity'" class="inspector-body inspector-body-flush"><TrackActivity :topic="topic" @select="emit('select', $event)" /></div>
     <div v-else-if="tab === 'resources'" class="inspector-body inspector-body-flush">
-      <ResourcePanel :topic="topic" embedded @error="(message: string) => emit('error', message)" />
+      <ResourcePanel :topic="topic" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
     </div>
 
     <!-- Integrations: the Topic-owned candidate queue. Only verified
@@ -291,7 +309,7 @@ watch(() => props.topic.id, () => {
           {{ candidate.note || candidate.session.branch.branch }}
         </div>
         <div class="inspector-candidate-actions">
-          <button class="link" @click="emit('select', candidate.session.id)">Review</button>
+          <button class="link" @click="reviewCandidate(candidate.session.id)">Review</button>
           <SplitButton
             v-if="candidate.state === 'ready'"
             kind="integrate"
@@ -311,7 +329,7 @@ watch(() => props.topic.id, () => {
       <div class="todo-form">
         <input
           v-model="todoDraft"
-          placeholder="Add a todo for this topic…"
+          placeholder="Add a todo for this track…"
           aria-label="Add a todo"
           :disabled="todoBusy"
           @keydown.enter.prevent="addTodo"
@@ -333,3 +351,9 @@ watch(() => props.topic.id, () => {
     </div>
   </aside>
 </template>
+
+<style scoped>
+.inspector-tab-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.inspector-tab-bar .tab { padding: 7px 6px; }
+.inspector-review-context { padding: 8px 12px; font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+</style>

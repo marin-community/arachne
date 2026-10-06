@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, useId } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { recentRepositories, rememberRepository } from "../launchDefaults";
 
 // The launch sheets' Repository + Base pair. Repository is half the row;
 // Base is the other half — a combobox populated with the chosen repo's
@@ -10,10 +11,13 @@ import { invoke } from "@tauri-apps/api/core";
 // branch list. Leaving it empty forks from the repo's default base
 // (loom's origin/<default branch>), so Base is genuinely optional.
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   repo: string;
   base: string;
-}>();
+  repositories?: string[];
+  showBase?: boolean;
+  disabled?: boolean;
+}>(), { showBase: true });
 
 const emit = defineEmits<{
   (e: "update:repo", repo: string): void;
@@ -27,6 +31,25 @@ interface RepoBranch {
   current: boolean;
 }
 
+const pickerId = useId();
+const recentRepos = ref(recentRepositories(localStorage));
+const managedRepos = ref<string[]>([]);
+onMounted(async () => {
+  try {
+    const rows = await invoke<{ slug: string; path: string }[]>("list_repos");
+    managedRepos.value = (rows ?? []).flatMap((row) => [row.slug, row.path]).filter(Boolean);
+    if (!props.repo && rows?.length === 1) emit("update:repo", rows[0].slug || rows[0].path);
+  } catch { /* Typed paths and fleet suggestions still work offline. */ }
+});
+const repoSuggestions = computed(() => [...new Set([...managedRepos.value, ...(props.repositories ?? []), ...recentRepos.value])].filter(Boolean));
+function rememberRepo() {
+  rememberRepository(localStorage, props.repo);
+  recentRepos.value = recentRepositories(localStorage);
+}
+function editRepo(event: Event) {
+  emit("update:base", "");
+  emit("update:repo", (event.target as HTMLInputElement).value);
+}
 const branches = ref<RepoBranch[]>([]);
 const branchesLoading = ref(false);
 const branchesError = ref("");
@@ -41,10 +64,13 @@ const highlighted = ref(0);
 
 // --- Branch loading -------------------------------------------------------
 
+let branchRequest = 0;
 async function loadBranches() {
+  const request = ++branchRequest;
   const repo = props.repo.trim();
   if (!repo) {
     branches.value = [];
+    branchesLoading.value = false;
     return;
   }
   branchesLoading.value = true;
@@ -53,12 +79,14 @@ async function loadBranches() {
     // Guard the wire shape: a null/undefined payload decodes as null, and
     // every downstream consumer (fuzzy filter, menu) assumes an array.
     const result = await invoke<RepoBranch[] | null>("repo_branches", { repo });
+    if (request !== branchRequest || repo !== props.repo.trim()) return;
     branches.value = Array.isArray(result) ? result : [];
   } catch (error: any) {
+    if (request !== branchRequest || repo !== props.repo.trim()) return;
     branches.value = [];
     branchesError.value = error?.message ?? String(error);
   } finally {
-    branchesLoading.value = false;
+    if (request === branchRequest) branchesLoading.value = false;
   }
 }
 
@@ -69,12 +97,19 @@ let loadTimer: ReturnType<typeof setTimeout> | null = null;
 watch(
   () => props.repo,
   () => {
+    branchRequest++;
+    branches.value = [];
+    branchesError.value = "";
+    branchesLoading.value = false;
+    open.value = false;
     if (loadTimer) clearTimeout(loadTimer);
+    if (props.showBase === false) return;
     loadTimer = setTimeout(loadBranches, 400);
   },
   { immediate: true },
 );
 onUnmounted(() => {
+  branchRequest++;
   if (loadTimer) clearTimeout(loadTimer);
 });
 
@@ -138,7 +173,7 @@ function choose(entry: { branch: RepoBranch }) {
   setBase(entry.branch.name);
   open.value = false;
   query.value = "";
-  inputEl.value?.focus();
+  inputEl.value?.blur();
 }
 
 // Restore the remembered default when the repo changes and no base is
@@ -177,6 +212,7 @@ function onInputClick() {
 }
 
 function onInputBlur() {
+  if (query.value.trim()) setBase(query.value.trim());
   // A click on a menu item fires before the blur if we let it; the menu's
   // buttons use @mousedown.prevent, so blur only fires on a real exit.
   open.value = false;
@@ -215,9 +251,9 @@ function onKeydown(event: KeyboardEvent) {
     event.preventDefault();
     choose(list[highlighted.value] ?? list[0]);
   } else if (event.key === "Enter") {
-    // No match / empty list: Enter falls through to launching the sheet,
-    // same as the Repository field's convention.
-    emit("submit");
+    event.preventDefault();
+    setBase(query.value.trim());
+    open.value = false;
   }
 }
 
@@ -225,13 +261,14 @@ function onKeydown(event: KeyboardEvent) {
 watch(highlighted, () => {
   const menu = menuEl.value;
   if (!menu) return;
-  const row = menu.children[highlighted.value] as HTMLElement | undefined;
+  const row = menu.querySelectorAll('[role="option"]')[highlighted.value] as HTMLElement | undefined;
   row?.scrollIntoView({ block: "nearest" });
 });
 
 // Close on outside click while open.
 function onDocMousedown(e: MouseEvent) {
   if (open.value && rootEl.value && !rootEl.value.contains(e.target as Node)) {
+    if (query.value.trim()) setBase(query.value.trim());
     open.value = false;
     query.value = "";
   }
@@ -246,19 +283,29 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocMousedown));
       <span class="nts-field-name">Repository</span>
       <input
         :value="props.repo"
+        :list="`${pickerId}-repos`"
+        :disabled="disabled"
+        autocomplete="off"
         placeholder="owner/name"
         spellcheck="false"
-        @input="emit('update:repo', ($event.target as HTMLInputElement).value)"
+        @input="editRepo"
+        @change="rememberRepo"
         @keydown.enter.prevent="emit('submit')"
       />
-      <span class="nts-hint">A fresh worktree + branch is created from this repo.</span>
+      <datalist :id="`${pickerId}-repos`">
+        <option v-for="suggestion in repoSuggestions" :key="suggestion" :value="suggestion" />
+      </datalist>
+      <span class="nts-hint">{{ showBase === false ? 'Repository holding these project resources.' : 'Choose a repository or enter a checkout path.' }}</span>
     </label>
 
-    <div ref="rootEl" class="nts-field nts-base-field">
+    <div v-if="showBase !== false" ref="rootEl" class="nts-field nts-base-field">
       <span class="nts-field-name">Base <em class="nts-opt">optional</em></span>
       <div class="nts-base-wrap">
         <input
           ref="inputEl"
+          :disabled="disabled"
+          :aria-controls="`${pickerId}-branches`"
+          :aria-activedescendant="open && matching.length ? `${pickerId}-branch-${highlighted}` : undefined"
           :value="open ? query : props.base"
           placeholder="Branch to fork from"
           spellcheck="false"
@@ -274,6 +321,7 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocMousedown));
         />
         <div
           v-if="open"
+          :id="`${pickerId}-branches`"
           ref="menuEl"
           class="nts-base-menu mention-menu"
           role="listbox"
@@ -281,10 +329,12 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocMousedown));
         >
           <div v-if="branchesLoading" class="mention-hint">Loading branches…</div>
           <div v-else-if="branchesError" class="mention-hint">{{ branchesError }}</div>
-          <div v-else-if="!matching.length" class="mention-hint">No matching branches</div>
+          <div v-else-if="!matching.length" class="mention-hint">{{ query.trim() ? 'Press Enter to use this branch or ref' : 'No branches found; enter a branch or ref' }}</div>
+          <button type="button" @mousedown.prevent="setBase(''); open = false; query = ''; inputEl?.blur()">Use repository default</button>
           <button
             v-for="(entry, index) in matching"
             :key="entry.branch.name"
+            :id="`${pickerId}-branch-${index}`"
             type="button"
             role="option"
             :aria-selected="index === highlighted"
@@ -293,7 +343,7 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocMousedown));
             @mousedown.prevent="choose(entry)"
             @mousemove="highlighted = index"
           >
-            <strong><template v-for="(part, i) in highlightLabel(entry.branch.name, entry.hits)" :key="i">{{ part.text }}</template></strong>
+            <strong><template v-for="(part, i) in highlightLabel(entry.branch.name, entry.hits)" :key="i"><mark v-if="part.hit">{{ part.text }}</mark><template v-else>{{ part.text }}</template></template></strong>
             <small v-if="entry.branch.current">current · </small><small v-if="entry.branch.worktree">has worktree</small>
           </button>
         </div>

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  NEW_TOPIC_DRAFT_KEY as DRAFT_STORAGE_KEY,
+  NEW_TOPIC_DRAFT_KEY,
+  draftStorageKey,
+  initializeDraftStorage,
   clearDraft,
   draftHasContent,
   emptyDraft,
@@ -19,9 +21,11 @@ const store = () => {
   };
 };
 
+const DRAFT_STORAGE_KEY = draftStorageKey(store());
+
 test("emptyDraft has the launch-sheet defaults", () => {
   assert.deepEqual(emptyDraft(), {
-    title: "", body: "", repo: "marin-community/arachne", base: "",
+    title: "", body: "", repo: "", base: "",
     profile: "default", agent: "", model: "", effort: "",
     mentions: [], attachments: [],
   });
@@ -72,7 +76,7 @@ test("readDraft accepts string scalars and drops nulls", () => {
     mentions: null, attachments: null,
   }));
   assert.deepEqual(readDraft(s), {
-    title: "t", body: "", repo: "marin-community/arachne", base: "",
+    title: "t", body: "", repo: "", base: "",
     profile: "default", agent: "", model: "", effort: "",
     mentions: [], attachments: [],
   });
@@ -89,7 +93,7 @@ test("readDraft keeps only attachment fields the launch path needs", () => {
   assert.deepEqual(attachments, [attachment]);
 });
 
-test("mergeLaunchConfig selects the last profile and keeps unrelated selects", () => {
+test("mergeLaunchConfig selects the default profile and keeps unrelated selects", () => {
   const s = store();
   saveDraft(s, {
     ...emptyDraft(),
@@ -103,7 +107,7 @@ test("mergeLaunchConfig selects the last profile and keeps unrelated selects", (
     { name: "claude", class: "interactive", agent_kind: "claude-code", model: "", effort: "" },
   ], agents: [{ kind: "pi" }, { kind: "codex" }], default_agent: "pi" };
   assert.deepEqual(mergeLaunchConfig(readDraft(s), options), {
-    profile: "claude", agent: "codex", model: "gpt-5.2", effort: "high",
+    profile: "default", agent: "codex", model: "gpt-5.2", effort: "high",
   });
   // No options at all (still loading / loom unreachable): nothing is
   // reconciled — the typed profile stays rather than silently relaunching
@@ -136,4 +140,21 @@ test("clearDraft wipes the stored payload", () => {
   saveDraft(s, { ...emptyDraft(), title: "x" });
   clearDraft(s);
   assert.deepEqual(readDraft(s), emptyDraft());
+});
+
+
+test("drafts stay scoped to their server and legacy migration belongs to startup server", () => {
+  const s = store();
+  s.setItem("loomUrl", "http://first:7878");
+  s.setItem(NEW_TOPIC_DRAFT_KEY, JSON.stringify({ ...emptyDraft(), body: "legacy work", mentions: [{ token: "@{doc}", topicId: "first-track", resourceId: "first-resource" }] }));
+  initializeDraftStorage(s);
+  assert.equal(readDraft(s).body, "legacy work");
+  assert.equal(s.getItem(NEW_TOPIC_DRAFT_KEY), null);
+  s.setItem("loomUrl", "http://second:7878");
+  assert.deepEqual(readDraft(s), emptyDraft());
+  saveDraft(s, { ...emptyDraft(), body: "second work" });
+  clearDraft(s);
+  s.setItem("loomUrl", "http://first:7878/");
+  assert.equal(readDraft(s).body, "legacy work");
+  assert.equal(readDraft(s).mentions[0].resourceId, "first-resource");
 });

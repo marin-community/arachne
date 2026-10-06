@@ -427,8 +427,7 @@ pub fn merge_effective(
     for resource in &topic.resources {
         claimed.insert(resource.binding_key());
     }
-    let hidden: std::collections::HashSet<&str> =
-        topic.hidden.iter().map(String::as_str).collect();
+    let hidden: std::collections::HashSet<&str> = topic.hidden.iter().map(String::as_str).collect();
     for binding in bindings {
         // A topic row with the same backing object overrides the project's.
         if !claimed.insert(binding.id.clone()) {
@@ -645,7 +644,11 @@ mod project_tests {
 
     #[test]
     fn project_binding_id_is_the_reference_free_key() {
-        let a = binding(ResourceKind::DesignDocument, "docs/design.md", Some("weaver/old"));
+        let a = binding(
+            ResourceKind::DesignDocument,
+            "docs/design.md",
+            Some("weaver/old"),
+        );
         let b = binding(ResourceKind::DesignDocument, "docs/design.md", None);
         // Same backing object (kind + repo + path): the same identity,
         // regardless of the recorded default reference.
@@ -672,7 +675,11 @@ mod project_tests {
 
     #[test]
     fn merge_topic_row_overrides_project_binding() {
-        let bindings = [binding(ResourceKind::DesignDocument, "docs/design.md", None)];
+        let bindings = [binding(
+            ResourceKind::DesignDocument,
+            "docs/design.md",
+            None,
+        )];
         let topic = topic_with(
             vec![ResourceDraft {
                 kind: ResourceKind::DesignDocument,
@@ -692,7 +699,11 @@ mod project_tests {
 
     #[test]
     fn merge_hidden_project_binding_stays_but_flags_hidden() {
-        let bindings = [binding(ResourceKind::DesignDocument, "docs/design.md", None)];
+        let bindings = [binding(
+            ResourceKind::DesignDocument,
+            "docs/design.md",
+            None,
+        )];
         let topic = topic_with(vec![], vec![bindings[0].id.as_str()]);
         let rows = merge_effective(&bindings, &topic, "topic");
         assert_eq!(rows.len(), 1);
@@ -705,7 +716,11 @@ mod project_tests {
         // A hide is not an override: once the topic attaches its own copy of
         // the same backing object, the binding no longer appears (topic wins),
         // and the stale hide entry is simply irrelevant.
-        let bindings = [binding(ResourceKind::DesignDocument, "docs/design.md", None)];
+        let bindings = [binding(
+            ResourceKind::DesignDocument,
+            "docs/design.md",
+            None,
+        )];
         let key = bindings[0].id.clone();
         let topic = topic_with(
             vec![ResourceDraft {
@@ -728,7 +743,11 @@ mod project_tests {
     fn inherited_row_has_the_id_a_topic_attach_would_produce() {
         // A mention of the inherited row must keep resolving even after the
         // topic attaches its own copy — the override carries the same id.
-        let bindings = [binding(ResourceKind::DesignDocument, "docs/design.md", None)];
+        let bindings = [binding(
+            ResourceKind::DesignDocument,
+            "docs/design.md",
+            None,
+        )];
         let rows = merge_effective(&bindings, &topic_with(vec![], vec![]), "topic");
         let inherited_id = rows[0].resource.id.clone();
         let attached = ResourceDraft {
@@ -748,7 +767,10 @@ mod project_tests {
     fn issue_url_bindings_keep_github_identity() {
         let bindings = [issue_binding("https://github.com/acme/app/issues/12")];
         let rows = merge_effective(&bindings, &topic_with(vec![], vec![]), "topic");
-        assert_eq!(rows[0].resource.id, "issue:https://github.com/acme/app/issues/12");
+        assert_eq!(
+            rows[0].resource.id,
+            "issue:https://github.com/acme/app/issues/12"
+        );
         assert!(ProjectBinding::validated_for_project(
             ResourceDraft {
                 kind: ResourceKind::Issue,
@@ -766,9 +788,10 @@ mod project_tests {
     #[test]
     fn store_round_trips_through_json() {
         let mut store = ProjectsStore::default();
-        store
-            .projects
-            .insert("grp".into(), vec![binding(ResourceKind::File, "a.md", None)]);
+        store.projects.insert(
+            "grp".into(),
+            vec![binding(ResourceKind::File, "a.md", None)],
+        );
         store.revision = 9;
         let value = serde_json::to_value(&store).unwrap();
         assert_eq!(value["projects"]["grp"][0]["title"], "File");

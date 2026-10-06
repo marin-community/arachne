@@ -17,8 +17,25 @@ import type { FileAttachment } from "./attachments";
 /** localStorage key holding the new-topic draft. */
 export const NEW_TOPIC_DRAFT_KEY = "arachne.newTopicDraft";
 
+/** Call once at app startup, before server switching is possible. */
+export function initializeDraftStorage(storage: DraftStorage): void {
+  try {
+    const legacy = storage.getItem(NEW_TOPIC_DRAFT_KEY);
+    if (legacy) {
+      const key = draftStorageKey(storage);
+      if (!storage.getItem(key)) storage.setItem(key, legacy);
+      storage.removeItem(NEW_TOPIC_DRAFT_KEY);
+    }
+  } catch { /* Keep the legacy draft intact if migration cannot be saved. */ }
+}
+
+export function draftStorageKey(storage: DraftStorage): string {
+  const server = (storage.getItem("loomUrl") || "http://127.0.0.1:7878").replace(/\/+$/, "");
+  return `${NEW_TOPIC_DRAFT_KEY}@${server}`;
+}
+
 /** Default repo, same default the sheet ships with. */
-export const DEFAULT_REPO = "marin-community/arachne";
+export const DEFAULT_REPO = "";
 
 /** The draft shape the New-topic sheet edits in place. */
 export interface NewTopicDraft {
@@ -77,7 +94,7 @@ export function readDraft(storage: DraftStorage): NewTopicDraft {
   const empty = emptyDraft();
   let raw: string | null = null;
   try {
-    raw = storage.getItem(NEW_TOPIC_DRAFT_KEY);
+    raw = storage.getItem(draftStorageKey(storage));
   } catch {
     return empty; // storage unavailable — same as no draft
   }
@@ -124,7 +141,7 @@ export function readDraft(storage: DraftStorage): NewTopicDraft {
  */
 export function saveDraft(storage: DraftStorage, draft: NewTopicDraft): void {
   try {
-    storage.setItem(NEW_TOPIC_DRAFT_KEY, JSON.stringify(draft));
+    storage.setItem(draftStorageKey(storage), JSON.stringify(draft));
   } catch {
     // Quota exceeded or storage disabled — the draft lives for this
     // session only; better a silent skip than a crash on close.
@@ -134,7 +151,7 @@ export function saveDraft(storage: DraftStorage, draft: NewTopicDraft): void {
 /** Drop the draft (launch succeeded or the user explicitly cleared it). */
 export function clearDraft(storage: DraftStorage): void {
   try {
-    storage.removeItem(NEW_TOPIC_DRAFT_KEY);
+    storage.removeItem(draftStorageKey(storage));
   } catch {
     /* storage unavailable */
   }
@@ -165,8 +182,8 @@ export function draftHasContent(draft: NewTopicDraft): boolean {
 /**
  * Reconcile a stored draft's launch config with the profiles and agents
  * the server reports right now. The selection model keeps every select
- * non-empty and valid, so a vanished profile falls back to the last
- * profile that still exists (falling all the way back to the default
+ * non-empty and valid, so a vanished profile falls back to the default
+ * profile when available (falling all the way back to the default
  * route) and a vanished agent resets to the runtime default — launching
  * with a stale id would only fail at launch, after the user has lost the
  * sheet. Model and effort stay as typed: model is a free-form field with
@@ -187,7 +204,7 @@ export function mergeLaunchConfig(
   return {
     profile: profiles.some((p) => p.name === draft.profile)
       ? draft.profile
-      : profiles.length ? profiles[profiles.length - 1].name : empty.profile,
+      : profiles.some((p) => p.name === "default") ? "default" : profiles[0]?.name ?? empty.profile,
     agent: !draft.agent || launchOptions.agents == null || launchOptions.agents.some((a) => a.kind === draft.agent)
       ? draft.agent
       : empty.agent,

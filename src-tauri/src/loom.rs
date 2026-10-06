@@ -783,8 +783,16 @@ pub struct SessionLaunchGuidance {
 
 pub fn topic_launch_guidance() -> SessionLaunchGuidance {
     SessionLaunchGuidance {
-        root: "Arachne Topic coordinator: keep this thread for direction and review. Delegate bounded independent work early with a clear task and checks. Review worker results and integrate them into the Topic. Work directly when delegation would add overhead. A PR is a Land strategy; do not open one unless the user requests it, or an explicit Land action selects it.".into(),
-        child: "Arachne Topic worker: own the assigned scope in your worktree. Validate and commit or stabilize the result, then send your parent a concise result with the commit, checks, and risks. The parent integrates it. A PR is a Land strategy; do not open one unless the user or parent requests it, or an explicit Land action selects it.".into(),
+        root: "Arachne Track coordinator: keep this thread for direction and review. Delegate bounded independent work early with a clear task and checks. Review worker results and integrate them into the Track. Work directly when delegation would add overhead. A PR is a Land strategy; do not open one unless the user requests it, or an explicit Land action selects it.".into(),
+        child: "Arachne Track worker: own the assigned scope in your worktree. Validate and commit or stabilize the result, then send your parent a concise result with the commit, checks, and risks. The parent integrates it. A PR is a Land strategy; do not open one unless the user or parent requests it, or an explicit Land action selects it.".into(),
+    }
+}
+
+/// One-off conversations stay direct; the durable marker permits later promotion.
+pub fn thread_launch_guidance() -> SessionLaunchGuidance {
+    SessionLaunchGuidance {
+        root: "Arachne standalone thread: handle this one-off task directly. Delegation is optional. The durable session tag topic=false denotes a standalone thread; topic=true means the user converted this conversation to a Track. When it is a Track, act as coordinator: retain direction, delegate bounded work, review results. Check the marker when beginning subsequent work. Prefer Loom event watches for asynchronous work and escalate only concrete human actions. Do not open or merge PRs unless requested.".into(),
+        child: topic_launch_guidance().child,
     }
 }
 
@@ -835,11 +843,11 @@ mod launch_guidance_tests {
         assert!(json["launch_guidance"]["root"]
             .as_str()
             .unwrap()
-            .contains("Topic coordinator"));
+            .contains("Track coordinator"));
         assert!(json["launch_guidance"]["child"]
             .as_str()
             .unwrap()
-            .contains("Topic worker"));
+            .contains("Track worker"));
     }
 }
 

@@ -11,9 +11,11 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+pub mod activity;
 pub mod blocks;
 pub mod client;
 pub mod commands;
+pub mod editor;
 pub mod landing;
 pub mod loom;
 pub mod resources;
@@ -25,6 +27,7 @@ pub fn run() {
         .manage(commands::LoomState::default())
         .invoke_handler(tauri::generate_handler![
             commands::connect,
+            commands::convert_to_track,
             commands::save_token,
             commands::load_token,
             commands::open_session,
@@ -41,6 +44,7 @@ pub fn run() {
             commands::pick_topic_files,
             commands::launch_options,
             commands::repo_branches,
+            commands::list_repos,
             commands::handoff_session,
             commands::delegate_task,
             commands::archive_session,
@@ -60,6 +64,9 @@ pub fn run() {
             commands::land_topic,
             commands::work_summary,
             commands::work_changes,
+            activity::track_activity,
+            commands::read_checkout_file,
+            commands::save_checkout_file,
             commands::topic_resources,
             commands::attach_topic_resource,
             commands::detach_topic_resource,
@@ -72,6 +79,7 @@ pub fn run() {
             commands::add_project_binding,
             commands::remove_project_binding,
             commands::topic_todos,
+            commands::user_todos,
             commands::add_todo,
             commands::toggle_todo,
             commands::remove_todo,

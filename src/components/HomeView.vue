@@ -1,16 +1,17 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionLayout, SessionSummary } from "../App.vue";
 import { homeRowTitle } from "../homeRows";
 import { layoutProjects, topicProjectId } from "../projects";
-import { dismissibleAttention, loudTag, pendingPermissionSummary } from "../topicInspector";
+import { attentionAction, attentionLevel, attentionReason, dismissibleAttention } from "../topicInspector";
 
 const props = defineProps<{
   fleet: SessionSummary[];
   topic?: SessionSummary | null;
   /** Selected project (from the sidebar's Topics tab): filters the home to
-   *  that project's topics. `null` = the aggregate Topics home. */
+   *  that project's topics. `null` = the aggregate Tracks home. */
   project?: { id: string | null; name: string } | null;
   /** The session layout (from the fleet snapshot) — supplies the project
    *  group ids. A project is a non-system layout group (src/projects.ts). */
@@ -97,12 +98,7 @@ function rowTitle(s: SessionSummary): string {
   });
 }
 
-function level(s: SessionSummary): "blocked" | "attention" | "ok" {
-  if (s.status === "archived") return "ok";
-  const loud = loudTag(s);
-  if (loud?.level === "blocked") return "blocked";
-  return loud || s.status === "error" ? "attention" : "ok";
-}
+const level = attentionLevel;
 
 const isIdle = (s: SessionSummary) => s.branch.tags.some((tag) => tag.key === "idle");
 // Do not infer readiness from a stopped worker. Loom must report it explicitly.
@@ -121,11 +117,7 @@ function ago(iso: string): string {
 }
 
 function description(s: SessionSummary): string {
-  const permission = pendingPermissionSummary(s);
-  if (permission) return permission;
-  if (s.status === "error") return "errored";
-  const tag = s.branch.tags.find((t) => t.key === "attention" || t.key === "triage");
-  return tag?.note || s.branch.description || s.branch.goal || "—";
+  return attentionReason(s) || s.branch.description || s.branch.goal || "—";
 }
 
 const scoped = computed(() => props.fleet.filter((s) =>
@@ -143,6 +135,61 @@ const ready = computed(() => scoped.value.filter((s) => level(s) === "ok" && isR
 const resting = computed(() => scoped.value.filter((s) =>
   level(s) === "ok" && !isReady(s) && (s.status !== "running" || isIdle(s)),
 ).sort(byRecency));
+interface UserTodo { id: string; text: string; topic_id: string; revision: number }
+const userTodos = ref<UserTodo[]>([]);
+const todoWarnings = ref<string[]>([]);
+const todoBusy = ref<string | null>(null);
+const todosLoading = ref(false);
+let todoTimer: ReturnType<typeof setTimeout> | undefined;
+let todoUnlisten: UnlistenFn | undefined;
+let todosDisposed = false;
+let todoRequest = 0;
+let todosDirty = false;
+const todoTopicIds = computed(() => [...new Set(scoped.value.map((s) => rootOf(s).id))].sort());
+const visibleTodos = computed(() => userTodos.value.filter((todo) => todoTopicIds.value.includes(todo.topic_id)));
+async function refreshUserTodos() {
+  if (todosDisposed) return;
+  if (todosLoading.value) { todosDirty = true; return; }
+  const request = ++todoRequest;
+  todosLoading.value = true;
+  try {
+    const result = await invoke<{ todos: UserTodo[]; warnings: string[] }>("user_todos", { topicIds: todoTopicIds.value });
+    if (todosDisposed || request !== todoRequest) return;
+    userTodos.value = result.todos;
+    todoWarnings.value = result.warnings;
+  } catch (error: any) {
+    if (!todosDisposed) todoWarnings.value = [`Could not load user Todos: ${error?.message ?? String(error)}`];
+  } finally {
+    todosLoading.value = false;
+    if (todosDirty && !todosDisposed) { todosDirty = false; scheduleTodos(); }
+  }
+}
+function scheduleTodos() {
+  if (todoTimer || todosDisposed) return;
+  todoTimer = setTimeout(() => { todoTimer = undefined; void refreshUserTodos(); }, 600);
+}
+async function completeTodo(todo: UserTodo) {
+  if (todoBusy.value) return;
+  todoBusy.value = todo.id;
+  try {
+    await invoke("toggle_todo", { topicId: todo.topic_id, todoId: todo.id, expectedRevision: todo.revision });
+    userTodos.value = userTodos.value.filter((row) => row.id !== todo.id);
+    await refreshUserTodos();
+  } catch (error: any) {
+    await refreshUserTodos();
+    todoWarnings.value = [...todoWarnings.value, error?.message ?? String(error)];
+  } finally { todoBusy.value = null; }
+}
+onMounted(async () => {
+  void refreshUserTodos();
+  try {
+    const stop = await listen("loom://fleet", scheduleTodos);
+    if (todosDisposed) stop(); else todoUnlisten = stop;
+  } catch { /* Manual refresh remains available without the event bridge. */ }
+});
+onUnmounted(() => { todosDisposed = true; todoRequest++; todoUnlisten?.(); if (todoTimer) clearTimeout(todoTimer); });
+watch(() => todoTopicIds.value.join(","), scheduleTodos);
+
 const sections = computed(() => [
   { name: "Needs You", rows: needs.value, kind: "needs" },
   { name: "Working", rows: working.value, kind: "working" },
@@ -183,14 +230,14 @@ const readyGroups = computed(() => groupByProject(ready.value));
       <div class="home-top">
         <div class="home-heading">
           <template v-if="topic">
-            <div class="home-breadcrumb"><button @click="emit('home')">Topics home</button> → {{ title(topic) }}</div>
+            <div class="home-breadcrumb"><button @click="emit('home')">Tracks home</button> → {{ title(topic) }}</div>
             <h1 class="topic-dashboard-title">{{ title(topic) }}</h1>
           </template>
           <template v-else-if="project">
-            <div class="home-breadcrumb"><button @click="emit('home')">Topics home</button> → {{ project.name }}</div>
+            <div class="home-breadcrumb"><button @click="emit('home')">Tracks home</button> → {{ project.name }}</div>
             <h1 class="project-dashboard-title">{{ project.name }}</h1>
           </template>
-          <h1 v-else>Topics home</h1>
+          <h1 v-else>Tracks home</h1>
         </div>
         <!-- Project home: manage what this project's new topics inherit
              (design.md "Project defaults and resource inheritance"). The
@@ -199,14 +246,14 @@ const readyGroups = computed(() => groupByProject(ready.value));
         <button
           v-if="project?.id"
           class="home-manage-resources"
-          :title="`Manage resources inherited by new topics in ${project.name}`"
+          :title="`Manage resources inherited by new tracks in ${project.name}`"
           :aria-label="`Manage resources for project ${project.name}`"
           @click="emit('manage-project-resources', { id: project.id, name: project.name })"
-        >⚙ Resources</button>
-        <button class="home-new" title="Start a durable topic — title, description, goal" @click="emit('new-topic')">
-          + New topic
+        >◇ Resources</button>
+        <button class="primary home-new" title="Start a durable track — title, description, goal" @click="emit('new-topic')">
+          + New track
         </button>
-        <button class="primary home-new" @click="emit('new-thread')">+ New thread</button>
+        <button class="home-new" @click="emit('new-thread')">+ New thread</button>
       </div>
       <template v-if="topic">
         <p v-if="topic.branch.description || topic.branch.goal" class="topic-dashboard-summary">{{ topic.branch.description || topic.branch.goal }}</p>
@@ -218,8 +265,8 @@ const readyGroups = computed(() => groupByProject(ready.value));
       </template>
 
       <div v-for="section in sections" :key="section.kind" class="section" :class="`${section.kind}-section`">
-        <div class="section-title">{{ section.name }}</div>
-        <div v-if="!section.rows.length" :class="section.kind === 'needs' ? 'all-calm compact-calm' : 'home-section-empty'">
+        <div class="section-title">{{ section.name }} <span class="home-section-count">{{ section.rows.length }}</span></div>
+        <div v-if="!section.rows.length && (section.kind !== 'needs' || (!visibleTodos.length && !todosLoading && !todoWarnings.length))" :class="section.kind === 'needs' ? 'all-calm compact-calm' : 'home-section-empty'">
           {{ section.kind === "needs" ? "Nothing needs you." : section.kind === "ready" ? "No candidates reported by Loom yet." : "No threads working." }}
         </div>
         <!-- Needs You stays flat: it's the priority inbox, one glance. The
@@ -230,6 +277,11 @@ const readyGroups = computed(() => groupByProject(ready.value));
             @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
             <span class="level-dot" :class="level(s)"></span>
             <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
+            <span class="home-action-label">{{ attentionAction(s) }}</span>
+            <button v-if="rootOf(s).id !== s.id" class="home-coordinator-link"
+              :title="`Open the coordinator for ${title(rootOf(s))}`"
+              @click.stop="emit('select', rootOf(s).id)"
+              @keydown.enter.stop @keydown.space.stop>Coordinator</button>
             <button
               v-if="section.kind === 'needs' && dismissibleAttention(s)"
               class="home-row-dismiss"
@@ -243,6 +295,17 @@ const readyGroups = computed(() => groupByProject(ready.value));
             >{{ dismissingId === s.id ? "…" : "✕" }}</button>
             <span class="row-when">{{ ago(s.last_activity_at) }}</span>
           </div>
+          <section class="home-user-todos section" aria-label="Your Todos">
+            <div class="home-todos-heading"><div class="section-title">Your Todos <span class="home-section-count">{{ visibleTodos.length }}</span></div>
+              <button type="button" :disabled="todosLoading" @click="refreshUserTodos">{{ todosLoading ? "Loading…" : "Refresh" }}</button></div>
+            <p v-for="warning in todoWarnings" :key="warning" class="home-todo-error" role="alert">{{ warning }}</p>
+            <div v-if="!visibleTodos.length && !todosLoading && !todoWarnings.length" class="home-section-empty">No open user Todos.</div>
+            <div v-for="todo in visibleTodos" :key="todo.id" class="home-todo-row">
+              <button type="button" class="home-todo-complete" :disabled="todoBusy !== null" :aria-label="`Complete ${todo.text}`" title="Mark complete" @click="completeTodo(todo)">{{ todoBusy === todo.id ? "…" : "✓" }}</button>
+              <div class="row-main"><div>{{ todo.text }}</div><button class="home-todo-track" type="button" @click="emit('select', todo.topic_id)">{{ byId.get(todo.topic_id)?.branch.title || byId.get(todo.topic_id)?.branch.name || "Open Track" }}</button></div>
+            </div>
+          </section>
+
         </template>
         <template v-else>
           <template v-for="group in section.kind === 'working' ? workingGroups : readyGroups" :key="group.name">
@@ -254,7 +317,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
               <button
                 v-if="group.id"
                 class="project-title-manage"
-                :title="`Manage resources inherited by new topics in ${group.name}`"
+                :title="`Manage resources inherited by new tracks in ${group.name}`"
                 :aria-label="`Manage resources for project ${group.name}`"
                 @click="emit('manage-project-resources', { id: group.id, name: group.name })"
               >⚙ resources</button>
@@ -285,3 +348,16 @@ const readyGroups = computed(() => groupByProject(ready.value));
     </div>
   </section>
 </template>
+
+<style scoped>
+.home-todos-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.home-todos-heading button { font-size: 11px; padding: 3px 7px; }
+.home-todo-row { display: flex; gap: 10px; align-items: flex-start; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.home-todo-complete { flex-shrink: 0; padding: 3px 7px; }
+.home-todo-track { border: 0; background: transparent; padding: 2px 0; color: var(--accent); font-size: 11px; }
+.home-todo-error { color: var(--blocked); font-size: 12px; }
+.home-section-count { margin-left: 6px; font-variant-numeric: tabular-nums; opacity: .65; }
+.home-action-label { flex-shrink: 0; font-size: 11px; color: var(--text-dim); }
+.home-coordinator-link { flex-shrink: 0; padding: 4px 7px; font-size: 11px; }
+@media (max-width: 850px) { .home-action-label { display: none; } }
+</style>

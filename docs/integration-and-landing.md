@@ -3,10 +3,10 @@
 ## Purpose
 
 Arachne should make it easy to take work produced by one Thread/worker and
-incorporate it into its Topic's accepted state without requiring the user to
+incorporate it into its Track's accepted state without requiring the user to
 manually manage branches, worktrees, cherry-picks, merges, or PR creation.
 Recursive integration through a parent Thread remains possible, but the normal
-user-facing flow is worker → Topic.
+user-facing flow is worker → Track.
 
 The central idea is:
 
@@ -24,11 +24,11 @@ Agents handle conflicts, failed validation, ambiguity, and product decisions.
 
 # Terminology
 
-## Topic
+## Track
 
 A durable unit of work.
 
-A Topic may contain:
+A Track may contain:
 
 - a coordinator Thread;
 - worker Threads;
@@ -38,21 +38,24 @@ A Topic may contain:
 - one or more repositories.
 - integration candidates, queue, and outcomes.
 
-For each code repository, a Topic may define a **topic branch/ref** representing
+For each code repository, a Track may define a **track branch/ref** representing
 accepted/integrated state. It has no single universal branch across repos.
 
 Example:
 
 ```text
-Topic: Arachne
+Track: Arachne
 
 repository: arachne
-topic branch: arachne/dev
+track branch: arachne/dev
 ```
 
 ## Thread
 
-A conversational/execution context.
+A conversational/execution context. New thread can be a standalone one-off;
+Convert to track retains its history while making it the coordinator of a
+longer effort. Track terminology is user-facing; existing `topic` API names
+and metadata keys remain compatible.
 
 A worker Thread may create commits on its own branch/worktree.
 
@@ -67,21 +70,21 @@ worker branch
     ↓
 Integrate
     ↓
-topic branch (or explicit parent scope)
+track branch (or explicit parent scope)
 ```
 
-Integration may be recursive, but worker → Topic is the default visible path.
+Integration may be recursive, but worker → Track is the default visible path.
 
-A child worker may integrate into its parent worker, which may later integrate into the Topic.
+A child worker may integrate into its parent worker, which may later integrate into the Track.
 
 ## Land
 
-Move the Topic's accepted state into an external/upstream target.
+Move the Track's accepted state into an external/upstream target.
 
 Usually:
 
 ```text
-topic branch
+track branch
     ↓
 Land
     ↓
@@ -113,10 +116,10 @@ The user may inspect the result or immediately integrate it.
 
 The coordinator may also choose to integrate workers autonomously when policy allows.
 
-The Topic inspector's **Integrations** tab should show its queue: each
+The Track inspector's **Integrations** tab should show its queue: each
 candidate's source, target repo/ref, readiness and conflict status,
 validation, and outcome. The worker Thread can expose a link or action near
-its result without owning the queue. Selecting a Topic opens its coordinator
+its result without owning the queue. Selecting a Track opens its coordinator
 chat (or last-opened Thread), not this queue.
 
 ---
@@ -148,11 +151,11 @@ The dropdown should expose applicable strategies.
 Initial set:
 
 ```text
-Squash into topic
-Merge into topic
-Rebase onto topic
+Squash into track
+Merge into track
+Rebase onto track
 Cherry-pick commits
-Open PR into topic
+Open PR into track
 Ask coordinator to decide
 ```
 
@@ -168,8 +171,8 @@ Integration strategy should be remembered.
 
 Suggested precedence:
 
-1. explicit Topic integration configuration;
-2. last-used strategy for this repository within this Topic;
+1. explicit Track integration configuration;
+2. last-used strategy for this repository within this Track;
 3. last-used strategy for this repository generally;
 4. repository convention/configuration;
 5. conservative fallback: `Ask coordinator to decide`.
@@ -194,7 +197,7 @@ The app should remember this naturally after use.
 
 The strategy selected by the user is an **intent constraint**, not an instruction to execute one raw git command blindly.
 
-## Squash into topic
+## Squash into track
 
 Intent:
 
@@ -209,7 +212,7 @@ The coordinator/integration skill may:
 - create the squash commit;
 - update the target branch.
 
-## Merge into topic
+## Merge into track
 
 Intent:
 
@@ -217,7 +220,7 @@ Intent:
 
 Normally produces a merge commit where appropriate.
 
-## Rebase onto topic
+## Rebase onto track
 
 Intent:
 
@@ -233,11 +236,11 @@ Intent:
 
 The integration skill may ask for clarification if the worker contains multiple commits and no obvious selection exists.
 
-## Open PR into topic
+## Open PR into track
 
 Intent:
 
-> Do not directly modify the target branch. Create a PR from the worker branch into the topic branch.
+> Do not directly modify the target branch. Create a PR from the worker branch into the track branch.
 
 Useful for repositories where review should happen through GitHub.
 
@@ -266,7 +269,7 @@ These should be equivalent:
 and:
 
 ```text
-"Integrate the Zed worker into the Arachne topic."
+"Integrate the Zed worker into the Arachne track."
 ```
 
 The underlying request should be structured.
@@ -293,13 +296,13 @@ Exact API/schema is implementation-defined.
 
 A worker stopping is not enough to make its result Ready. A coding worker
 should normally stabilize/commit changes, run required validation, summarize
-the result, and preflight mergeability against the current Topic ref. The UI
+the result, and preflight mergeability against the current Track ref. The UI
 can then show `Ready · clean against Arachne@789abc`. Readiness records the
 target revision and validation evidence; it is not a timeless property of the
 worker branch. The worker can sleep while the candidate remains Ready.
 
 Loom should deterministically re-run conflict preflight for sleeping Ready
-candidates when Topic state advances. A clean candidate records the new target
+candidates when Track state advances. A clean candidate records the new target
 revision and stays asleep. A new
 conflict becomes an Event, with the original worker preferred for reconciliation
 against the updated ref. Worker lifecycle and integration lifecycle are
@@ -312,10 +315,10 @@ strategy in the disposable worktree and validating it remain authoritative.
 
 For a clean candidate with a configured strategy and validation policy:
 
-1. Create a disposable integration worktree at the expected Topic revision.
+1. Create a disposable integration worktree at the expected Track revision.
 2. Apply the selected strategy there.
 3. Run required validation and record evidence.
-4. Advance the Topic ref only if its expected revision still matches.
+4. Advance the Track ref only if its expected revision still matches.
 5. Record the resulting commit/PR and clean up the temporary checkout.
 
 An unsuccessful attempt leaves the canonical checkout and ref intact. If the
@@ -323,7 +326,7 @@ ref moved, refresh preflight and retry within policy or mark the candidate
 stale. Conflicts, failing tests, ambiguity, or product judgment route to the
 original worker, coordinator, or an integration worker. Failed temporary
 checkouts may be retained briefly for diagnosis under a bounded cleanup
-policy, but are not the human-facing Topic checkout.
+policy, but are not the human-facing Track checkout.
 
 ---
 
@@ -347,7 +350,7 @@ The skill should tell the agent to:
 
 The skill should not assume every repository uses the same workflow.
 
-Repository/Topic configuration may provide:
+Repository/Track configuration may provide:
 
 ```text
 target branch
@@ -370,7 +373,7 @@ Example:
 User chooses:
 
 ```text
-Squash into topic
+Squash into track
 ```
 
 but the target branch has diverged.
@@ -380,7 +383,7 @@ Correct behavior:
 ```text
 Integrating Zed remote support…
 
-The topic branch changed since this worker started.
+The track branch changed since this worker started.
 Resolving conflicts in:
   src/resources.ts
   src/zed.ts
@@ -404,13 +407,13 @@ Example:
 
 ```text
 worker A ─┐
-          ├─> integration worker ─> topic branch
+          ├─> integration worker ─> track branch
 worker B ─┘
 ```
 
 The integration worker receives:
 
-- target Topic/resource;
+- target Track/resource;
 - source branch(es)/worktree(s);
 - selected integration strategy;
 - repository integration policy;
@@ -438,11 +441,11 @@ Do not assume Thread ancestry equals git ancestry.
 
 Default behavior:
 
-> Integrate into the Topic's canonical ref for the relevant repository.
+> Integrate into the Track's canonical ref for the relevant repository.
 
 Recursive worker → parent worker integration is an explicit path when the
 parent owns an intermediate accepted ref; it does not change the normal
-Topic-level queue. If the Topic has no canonical ref for that repository,
+Track-level queue. If the Track has no canonical ref for that repository,
 Arachne must establish or select a target before claiming readiness.
 
 The target should always be inspectable/overrideable.
@@ -458,34 +461,34 @@ Advanced users should be able to choose another target if necessary.
 
 ---
 
-# Topic branches
+# Track branches
 
-A Topic may define one canonical branch/reference per repository.
+A Track may define one canonical branch/reference per repository.
 Its home Project can supply the repository set, branch creation policy, and
-integration defaults when the Topic is created. The selected per-repository
-refs and policies belong to the Topic thereafter. Changing a Project default
-does not silently retarget an active Topic or its pending integration queue;
-applying such a change requires an explicit, reviewable Topic update.
+integration defaults when the Track is created. The selected per-repository
+refs and policies belong to the Track thereafter. Changing a Project default
+does not silently retarget an active Track or its pending integration queue;
+applying such a change requires an explicit, reviewable Track update.
 
 Example:
 
 ```text
-Topic: Arachne
+Track: Arachne
 
 Resources
 
 arachne
-  topic branch: arachne-dev
+  track branch: arachne-dev
 
 marin-community/loom
-  topic branch: arachne
+  track branch: arachne
 ```
 
-A Topic therefore does not have one universal git branch.
+A Track therefore does not have one universal git branch.
 
 It may span multiple repositories, each with its own accepted state.
 
-Workers should normally fork from the current Topic branch for the relevant repository.
+Workers should normally fork from the current Track branch for the relevant repository.
 
 Important:
 
@@ -497,7 +500,7 @@ Default:
 
 ```text
 new coding worker
-→ fork from current topic branch
+→ fork from current track branch
 ```
 
 Explicit alternative:
@@ -510,23 +513,23 @@ branch from this worker
 
 # Integration worktree
 
-A Topic may have an attached **integration worktree** for a repository.
+A Track may have an attached **integration worktree** for a repository.
 
-This is a concrete checkout of the Topic branch.
+This is a concrete checkout of the Track branch.
 
 Example:
 
 ```text
-Topic: Arachne
+Track: Arachne
 
 repo: arachne
-topic branch: arachne-dev
+track branch: arachne-dev
 integration worktree:
   runner: DGX
   path: /...
 ```
 
-The integration worktree is a Resource, not the Topic itself.
+The integration worktree is a Resource, not the Track itself.
 
 It may be deleted and reconstructed.
 
@@ -534,11 +537,11 @@ The durable canonical object is the branch/ref.
 
 Default policy:
 
-> Ordinary workers should not directly write to the Topic integration worktree.
+> Ordinary workers should not directly write to the Track integration worktree.
 
 They receive isolated worktrees.
 
-Integration is the operation that moves their work into accepted Topic state.
+Integration is the operation that moves their work into accepted Track state.
 
 ---
 
@@ -556,7 +559,7 @@ The worker/thread should notice or at least accurately report the changed git st
 
 ## Editing integration worktree
 
-Uncommitted manual changes are pending checkout state, not accepted Topic ref
+Uncommitted manual changes are pending checkout state, not accepted Track ref
 state. Committing and advancing the ref changes canonical state. Before
 integrating another worker, Arachne/Loom must detect checkout dirtiness and
 refresh/reconcile the target ref rather than assuming the integration worktree
@@ -567,7 +570,7 @@ from disturbing human edits.
 
 # Land UI
 
-At the Topic level, use a separate split button:
+At the Track level, use a separate split button:
 
 ```text
 [ Land ▼ ]
@@ -575,7 +578,7 @@ At the Topic level, use a separate split button:
 
 Land means:
 
-> Move this Topic's accepted state into its upstream/external destination.
+> Move this Track's accepted state into its upstream/external destination.
 
 Possible strategies:
 
@@ -584,12 +587,12 @@ Open PR
 Squash into main
 Merge into main
 Rebase / fast-forward into main
-Push topic branch
+Push track branch
 Squash into local checkout (land-locally)
 ```
 
 Again, available options depend on repository policy.
-The Topic's coordinator receives the Land request, so asking it to decide is
+The Track's coordinator receives the Land request, so asking it to decide is
 not a distinct strategy. If policy does not set a default, the conservative
 primary action is **Open PR**. The coordinator can still escalate a genuine
 decision it encounters while carrying out a chosen strategy.
@@ -597,28 +600,28 @@ decision it encounters while carrying out a chosen strategy.
 ### Land locally
 
 `land-locally` is the exception to "the coordinator receives the request":
-Arachne itself squash-merges the topic's branch into the primary checkout's
+Arachne itself squash-merges the track's branch into the primary checkout's
 currently checked out branch — deterministically, with no agent turn. It is
 offered only when the Loom server is loopback (its checkout paths are then
 local paths; a remote server's paths mean nothing on this machine), and it
 lands into the branch the primary checkout has checked out *right now*, not
 a remembered target. The fast path refuses rather than reconciles anything
 that would need judgment: a conflicted merge, a detached primary, a primary
-already on the topic branch, staged changes, or another in-progress
+already on the track branch, staged changes, or another in-progress
 operation (merge/rebase/cherry-pick/revert/bisect) — in every refusal case
 the checkout is left untouched, and a failed squash is unwound with
 `git reset --merge`, which preserves the user's unrelated unstaged changes
 and untracked files. The outcome is reported synchronously (commit, target
-branch, squashed count) and stamped on the topic's branch as an
+branch, squashed count) and stamped on the track's branch as an
 `integration_result` tag, the same durable signal an agent-mediated
 integration writes.
 
 Example:
 
 ```text
-Topic: Arachne
+Track: Arachne
 
-topic branch: arachne-dev
+track branch: arachne-dev
 upstream: main
 
 [ Land ▼ ]
@@ -673,7 +676,7 @@ Possible configuration:
 worker integration:
   default: squash
 
-topic branch:
+track branch:
   arachne-dev
 
 landing:
@@ -703,7 +706,7 @@ Possible configuration:
 worker integration:
   default: merge or cherry-pick
 
-topic branch:
+track branch:
   arachne
 
 landing:
@@ -725,7 +728,7 @@ Individual changes may later be upstreamed to Loom main intentionally.
 # Thread UI
 
 A completed coding worker should expose integration near the result.
-Its Topic's Integrations tab is the persistent place to inspect all candidates
+Its Track's Integrations tab is the persistent place to inspect all candidates
 and outcomes while the main pane remains this Thread's conversation.
 
 Example:
@@ -760,14 +763,14 @@ The button should no longer imply outstanding work.
 
 ---
 
-# Topic integration queue and coordinator UX
+# Track integration queue and coordinator UX
 
 The right-side Integrations tab should show queued candidates and outcomes
-across the Topic's workers, including target revision, preflight status, and
+across the Track's workers, including target revision, preflight status, and
 validation. The top-level coordinator Thread also receives integration Events
 in its timeline. An Event can update the queue without immediately waking
-the coordinator. A deliberate Topic Overview may summarize the same queue;
-it is not the default landing surface when selecting the Topic.
+the coordinator. A deliberate Track Overview may summarize the same queue;
+it is not the default landing surface when selecting the Track.
 
 Example:
 
@@ -797,7 +800,7 @@ Validation:
   ✓ cargo test
 ```
 
-This should become part of durable Topic history.
+This should become part of durable Track history.
 
 ---
 
@@ -805,7 +808,7 @@ This should become part of durable Topic history.
 
 Eventually a coordinator may integrate workers without explicit user clicks.
 
-This should be governed by Topic/repository policy.
+This should be governed by Track/repository policy.
 
 Example:
 
@@ -882,8 +885,8 @@ After successful integration:
 - target Resource records resulting commit;
 - PR association updates if appropriate;
 - worker result is marked integrated;
-- Topic canonical state advances;
-- future workers should fork from the updated Topic state.
+- Track canonical state advances;
+- future workers should fork from the updated Track state.
 
 Do not delete the worker immediately.
 
@@ -893,8 +896,8 @@ Archival/cleanup is a separate lifecycle concern.
 
 # Todo integration
 
-Arachne should eventually maintain a durable cross-topic user-facing Todo
-list, separate from each Topic's plan/backlog and from worker-internal todos.
+Arachne should eventually maintain a durable cross-track user-facing Todo
+list, separate from each Track's plan/backlog and from worker-internal todos.
 
 Integration actions may generate/remove user todos.
 
@@ -903,7 +906,7 @@ Examples:
 ```text
 □ Review attention UI worker
 □ Decide whether to integrate Loom API change
-□ Land Arachne topic
+□ Land Arachne track
 ```
 
 After an action completes:
@@ -923,7 +926,7 @@ For first dogfooding, keep this narrow.
 Required:
 
 1. completed worker knows its source branch/worktree;
-2. Topic knows its target branch per repo;
+2. Track knows its target branch per repo;
 3. show `Integrate` split button;
 4. support at least:
    - squash;
@@ -936,9 +939,9 @@ Required:
 6. button sends a structured integration request to Loom;
 7. the coordinator skill handles nontrivial cases while clean cases can use a
    deterministic temporary-worktree path;
-8. integration result appears in Topic queue and Thread history;
+8. integration result appears in Track queue and Thread history;
 9. target git state updates;
-10. future workers fork from updated Topic state;
+10. future workers fork from updated Track state;
 11. non-PR landing strategies resolve the primary checkout's current branch
     (`main` fallback) and carry the target origin in the request.
 
@@ -966,8 +969,8 @@ Use this immediately for Arachne development.
 Expected workflow:
 
 ```text
-Topic: Arachne
-topic branch: arachne-dev
+Track: Arachne
+track branch: arachne-dev
 
 Workers:
   ✓ Tauri bootstrap
@@ -985,8 +988,8 @@ User can:
 5. click `Integrate`;
 6. choose squash/merge/etc.;
 7. let the coordinator perform and validate integration;
-8. see the Topic branch advance;
-9. launch subsequent workers from that updated Topic state;
-10. eventually click `Land` to open/merge the Topic into main.
+8. see the Track branch advance;
+9. launch subsequent workers from that updated Track state;
+10. eventually click `Land` to open/merge the Track into main.
 
 If this flow is smooth, Arachne should remove most of the branch/worktree bookkeeping currently required when developing with several agents in parallel.

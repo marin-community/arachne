@@ -7,7 +7,7 @@
 The near-term goal is not to build a general multi-agent framework. It is to build something that feels as immediate as Codex Desktop for day-to-day coding, but with a better model for:
 
 - many concurrent workers;
-- persistent long-lived topics;
+- persistent long-lived tracks;
 - local versus remote execution;
 - multiple inference providers/accounts;
 - worktrees and pull requests as navigable resources;
@@ -15,6 +15,12 @@ The near-term goal is not to build a general multi-agent framework. It is to bui
 - escalation based on **what needs human attention**.
 
 Arachne should use **Loom** as its execution/control-plane substrate rather than replacing Loom.
+
+Keep Loom generic: Track semantics, project-manager guidance, Arachne resource
+names, and UI attention policy belong in Arachne. Backend additions should expose
+reusable session, event, channel, artifact, or repository operations without
+encoding Arachne-specific conventions. The local dogfood pass requires no Loom
+source changes.
 
 The immediate priority is to get to a **self-hosting bootstrap loop** quickly: use an early Arachne build to supervise the agents that are developing Arachne itself.
 
@@ -99,7 +105,7 @@ Especially relevant:
 
 https://github.com/asheshgoplani/agent-deck/tree/main/docs/conductor
 
-The Conductor is conceptually close to Arachne's longer-term **topic coordinator**: a persistent logical agent supervising workers and escalating only what it cannot resolve.
+The Conductor is conceptually close to Arachne's longer-term **track coordinator**: a persistent logical agent supervising workers and escalating only what it cannot resolve.
 
 Do not necessarily adopt its heartbeat/polling implementation. Arachne should prefer real events wherever possible.
 
@@ -159,7 +165,7 @@ Arachne should not expose Loom's entire control-plane vocabulary directly.
 
 The user-facing model is approximately:
 
-**Projects → Topics → Threads/Workers → Resources → Events → Attention**
+**Projects → Tracks → Threads/Workers → Resources → Events → Attention**
 
 Loom implements much of the machinery underneath.
 
@@ -179,15 +185,15 @@ Loom runs sessions, manages worktrees/runtimes, stores durable state, receives e
 
 ## Project
 
-A lightweight home for related Topics and their shared context. A Project
+A lightweight home for related Tracks and their shared context. A Project
 bundles default Resources and launch settings: for example, two repositories,
 a design document, a primary repository, a runner, an agent and inference
-route, and a Topic branch policy. It is an organizer and source of defaults,
+route, and a Track branch policy. It is an organizer and source of defaults,
 not an execution object: it has no coordinator, mailbox, agent, or workers.
-Each Topic has one home Project and may explicitly bind Resources from another
+Each Track has one home Project and may explicitly bind Resources from another
 Project. A Project can span repositories; it is not synonymous with a repo.
 
-## Topic
+## Track
 
 A durable unit of intent, context, resources, Todos, subscriptions,
 mailbox, coordinator Thread, workers, and integration state.
@@ -200,7 +206,7 @@ Examples:
 - “Science After Reproducibility”
 - “Personal automation”
 
-A topic may last hours, days, or months.
+A track may last hours, days, or months.
 
 It can:
 
@@ -214,12 +220,15 @@ It can:
 - wake later;
 - escalate something to human attention.
 
-A topic is **not a worktree** and is **not necessarily a continuously running model process**.
+A track is **not a worktree** and is **not necessarily a continuously running model process**.
 It may span multiple repositories. Each attached repository may have its own
-canonical Topic branch/ref for accepted code state; there is no universal
-Topic branch. A human-facing checkout is optional and reconstructible from its
-ref. Every new top-level conversation, including a single-prompt launch, is
-a Topic and may acquire workers later.
+canonical Track branch/ref for accepted code state; there is no universal
+Track branch. A human-facing checkout is optional and reconstructible from its
+ref. New track opens a chat immediately (setup card above the chat box,
+gone at launch). New thread creates a standalone
+one-off conversation; Convert to track promotes it when the work grows, keeping
+its history and resource associations. Existing internal `topic` identifiers
+remain compatible with Loom.
 
 Long term, think of it as a durable actor with a mailbox that occasionally invokes an LLM.
 
@@ -229,11 +238,11 @@ The conversation/UI surface through which the user interacts with one execution 
 
 Initially, a Thread can map closely to a Loom session.
 
-A topic's coordinator has a thread. Workers also have threads.
+A track's coordinator has a thread. Workers also have threads.
 
 ## Worker
 
-An execution acting on behalf of a parent thread/topic.
+An execution acting on behalf of a parent thread/track.
 
 “Worker” describes hierarchy, not intelligence.
 
@@ -261,19 +270,19 @@ Resources include:
 - eventually W&B runs/projects, datasets, issues, services, etc.
 
 Resources should have identity independent of the session that happened to create them.
-Bindings to Projects, Topics, and Threads should preserve that identity and
+Bindings to Projects, Tracks, and Threads should preserve that identity and
 show where each binding came from.
 
 ## Todo
 
-A durable, cross-topic action for the person. The user Todo list is separate
-from a Topic's plan/backlog and from worker-internal checklists. Integration
+A durable, cross-track action for the person. The user Todo list is separate
+from a Track's plan/backlog and from worker-internal checklists. Integration
 and review decisions may create user Todos.
 
 ## Event
 
 An immutable fact that something happened. Its Source is the emitter; a
-Subscription selects which Events a Topic or Thread cares about; its Mailbox
+Subscription selects which Events a Track or Thread cares about; its Mailbox
 holds pending Events/messages durably; a Wake is the decision to invoke an
 agent because of queued Events. Delivery alone does not imply a Wake.
 
@@ -288,7 +297,7 @@ Examples:
 - W&B alert;
 - heartbeat, timer, or cron;
 - webhook;
-- integration conflict after Topic state advances;
+- integration conflict after Track state advances;
 - a runner becoming available.
 
 Events can be coalesced, handled deterministically, or held until a later
@@ -351,7 +360,7 @@ The Mac eventually becomes a runner and local-resource gateway, not another auth
 This avoids distributed-state/replication problems around:
 
 - conversations;
-- topic state;
+- track state;
 - attention;
 - worker ancestry;
 - resource bindings;
@@ -493,7 +502,7 @@ Roughly:
 
 ```text
 ┌─────────────────┬───────────────────────────────┬────────────────────┐
-│ PROJECTS/TOPICS │ Topic · current Thread        │ Threads            │
+│ PROJECTS/TOPICS │ Track · current Thread        │ Threads            │
 │ Arachne         │                               │ Resources          │
 │   UI            │      conversation             │ Integrations       │
 │   Integration   │                               │ Todos              │
@@ -503,46 +512,51 @@ Roughly:
 └─────────────────┴───────────────────────────────┴────────────────────┘
 ```
 
-The default **Topics home** screen should answer:
+The default **Tracks home** screen should answer:
 
 > What is happening across everything, and what needs my attention?
 
-Topics home aggregates all Topics across all Projects. The sidebar groups
-Topics beneath Projects, with **Topics [+]** opening the optional creation
+Tracks home aggregates all Tracks across all Projects. The sidebar groups
+Tracks beneath Projects, with **Tracks [+]** opening the optional creation
 form in a sheet or popover for the current Project. Every aggregate row names
-its Project and parent Topic and opens that Thread. Clicking a Project shows
-the same status groups filtered to its Topics; it does not open a Project
-chat. Inbox may remain a separate attention/review tab, but Topics home still
+its Project and parent Track and opens that Thread. Clicking a Project shows
+the same status groups filtered to its Tracks; it does not open a Project
+chat. Inbox may remain a separate attention/review tab, but Tracks home still
 includes all cross-Project Needs You items.
 
-Selecting a Topic normally opens its **coordinator conversation** in the main
-pane, making the coordinator the Topic's voice. First visit opens the
-coordinator. Subsequent visits restore the last-opened Thread for that Topic
+Selecting a Track normally opens its **coordinator conversation** in the main
+pane, making the coordinator the Track's voice. First visit opens the
+coordinator. Subsequent visits restore the last-opened Thread for that Track
 if available, falling back to the coordinator. Clicking the already-selected
-Topic keeps the current Thread. The Threads tab and chat header provide an
+Track keeps the current Thread. The Threads tab and chat header provide an
 explicit Coordinator action. The main pane should almost always be a chat;
-Topics and Threads are levels of context, not peer destinations.
+Tracks and Threads are levels of context, not peer destinations.
 
-The right pane is the Topic inspector: **Threads | Resources | Integrations |
+The right pane is the Track inspector: **Threads | Resources | Integrations |
 Todos**. Threads lists the coordinator and workers and switches the main chat;
-New Thread belongs there. Resources includes Topic refs and checkouts plus
+New Thread belongs there. Resources includes Track refs and checkouts plus
 distinguishable Thread resources, with Open in Zed prominent there or in the
-header. Integrations shows the Topic-owned candidate queue, readiness,
-conflicts, review, and Integrate actions. Todos is a Topic-filtered view of
-the durable cross-topic user Todo list, distinct from a Topic plan or worker
+header. Integrations shows the Track-owned candidate queue, readiness,
+conflicts, review, and Integrate actions. Todos is a Track-filtered view of
+the durable cross-track user Todo list, distinct from a Track plan or worker
 checklist. Events should feed the appropriate tab and Attention, not become a
 top-level tab until a real workflow needs one.
 
 The aggregate home keeps **Needs You**, **Working**, **Ready to Integrate**,
 and de-emphasized/collapsible **Waiting / Resting**. A deliberately opened
-**Topic Overview** scopes those same groups to one Topic and adds summary and
-resources. It is accessible from the Topic/coordinator header, not the
+**Track Overview** scopes those same groups to one Track and adds summary and
+resources. It is accessible from the Track/coordinator header, not the
 default destination. The Ready group contains only verified integration
 candidates; an idle or completed worker is not automatically Ready.
 
-Single-prompt creation starts a Topic in the selected or default Project via
-the New thread sheet. Topic selection still opens its coordinator chat on first
-visit, then restores the last-opened Thread when available.
+The New thread sheet starts a standalone one-off conversation. New track
+opens a chat immediately — setup choices (title, repo/base, inherited
+project resources) sit in a card above the chat box and disappear at
+launch; the first send delivers the message and launches the track in the
+selected or default Project. Convert to
+track promotes a thread when it needs durable coordination and workers. Track
+selection opens its coordinator chat on first visit, then restores the
+last-opened Thread when available.
 
 Example:
 
@@ -657,22 +671,22 @@ The data model should eventually distinguish resources explicitly.
 
 ## Binding and defaults
 
-Resources can be bound at three scopes: **Project → Topic → Thread**. A Project
+Resources can be bound at three scopes: **Project → Track → Thread**. A Project
 supplies reusable repository, design document, and other Resource bindings
-plus launch defaults. A Topic inherits those bindings, adds or overrides its
+plus launch defaults. A Track inherits those bindings, adds or overrides its
 own, and may hide one for its own context without removing it from the
-Project. A Thread inherits the effective Topic context and adds its own
+Project. A Thread inherits the effective Track context and adds its own
 worktree, PR, file, or artifact. The UI should show the origin of each binding
 and avoid duplicating the underlying Resource object.
-Project bindings can continue to supply shared references to existing Topics;
-Topic additions, overrides, and hides remain in effect.
+Project bindings can continue to supply shared references to existing Tracks;
+Track additions, overrides, and hides remain in effect.
 
-New Topics inherit the Project's current runner, agent, inference route,
+New Tracks inherit the Project's current runner, agent, inference route,
 primary repo, branch creation policy, and integration policy unless the user
 overrides them. Record the chosen execution settings and canonical refs on
-the Topic. Changing Project defaults must not silently change active Topic
+the Track. Changing Project defaults must not silently change active Track
 branches, runners, or integration targets; applying a change to an existing
-Topic is explicit and reviewable. Inheritance of a Resource is context, not
+Track is explicit and reviewable. Inheritance of a Resource is context, not
 ownership of a checkout or permission to edit it.
 
 ## Repository
@@ -714,7 +728,7 @@ external
 ```
 
 - **ephemeral**: worker-owned; safe to remove when done;
-- **attached**: explicitly retained by a topic;
+- **attached**: explicitly retained by a track;
 - **external**: existing checkout Loom did not create.
 
 ## Pull request
@@ -795,7 +809,7 @@ Keep worktree
 
 or equivalent.
 
-It is then attached to the topic as a durable Resource.
+It is then attached to the track as a durable Resource.
 
 Also track which worker is using a resource.
 
@@ -814,12 +828,12 @@ When another writer wants the same state, prefer creating another worktree.
 
 ---
 
-# Topics and workers
+# Tracks and workers
 
-A topic can contain a coordinating thread and workers:
+A track can contain a coordinating thread and workers:
 
 ```text
-Implication reader                   Topic
+Implication reader                   Track
 │
 ├── coordinator                      Thread
 │
@@ -847,7 +861,7 @@ The terminal Agent Deck's Conductor is a useful reference for this shape.
 A child finishing should not require its parent to reread the full child transcript.
 Finishing is not the same as being ready to integrate. A coding worker should
 normally stabilize/commit its result, run required validation, summarize it,
-and preflight mergeability against a specific Topic ref before becoming Ready.
+and preflight mergeability against a specific Track ref before becoming Ready.
 Readiness records the target revision. The worker may sleep while its separate
 integration state remains Ready, stale, conflicting, or integrated.
 
@@ -869,9 +883,9 @@ Loom's existing channels/results can be the initial transport. Do not block boot
 
 ---
 
-# Topics should sleep
+# Tracks should sleep
 
-Long-term, a topic should not require a continuously-running LLM.
+Long-term, a track should not require a continuously-running LLM.
 
 Think:
 
@@ -902,7 +916,7 @@ This is preferable to continuously consuming a session or having agents poll.
 # Events
 
 The control plane records an immutable **Event** from a **Source**, routes it
-through a **Subscription** to a Topic or Thread's durable **Mailbox**, and
+through a **Subscription** to a Track or Thread's durable **Mailbox**, and
 makes a separate **Wake** decision. Sources include manual messages, other
 Threads, worker completion, integration conflict, GitHub/CI/PR review, W&B,
 heartbeats/timers/cron, and runner availability. A delivery can update state,
@@ -931,7 +945,7 @@ GitHub event
 → Loom
 → relevant mailbox
 → coalesce or update state
-→ wake relevant thread/topic when needed
+→ wake relevant thread/track when needed
 ```
 
 Likewise:
@@ -960,27 +974,27 @@ Extend these toward the event model instead of creating a parallel scheduler.
 
 # Automations
 
-An automation should eventually be understood mostly as a **subscription that sends events to a topic**, not as a completely separate class of thing.
+An automation should eventually be understood mostly as a **subscription that sends events to a track**, not as a completely separate class of thing.
 
 Examples:
 
 ```text
 Every morning
-→ personal topic
+→ personal track
 → scan inbox
 → update Obsidian todos
 ```
 
 ```text
 PR review submitted
-→ Arachne topic
+→ Arachne track
 → cheap worker handles obvious comments
 → escalate difficult comments to coordinator
 ```
 
 ```text
 W&B run alerts
-→ research topic
+→ research track
 → inspect failure
 ```
 
@@ -1190,24 +1204,24 @@ Agents must not spawn unbounded workers.
 
 Limits may exist per:
 
-- topic;
+- track;
 - runner;
 - inference account;
 - provider.
 
 ## Integration
 
-Integration belongs to the Topic. Each repository attached to it may have a
+Integration belongs to the Track. Each repository attached to it may have a
 canonical ref for accepted state. Worker results are candidates against that
-ref, and the Topic view should expose their queue and status. The normal flow
-is worker → Topic; nested workers may integrate recursively when useful.
-**Integrate** absorbs work into Topic state. **Land** separately moves accepted
-Topic state upstream — non-PR strategies target the primary local checkout's
+ref, and the Track view should expose their queue and status. The normal flow
+is worker → Track; nested workers may integrate recursively when useful.
+**Integrate** absorbs work into Track state. **Land** separately moves accepted
+Track state upstream — non-PR strategies target the primary local checkout's
 currently checked out branch (`main` as fallback); `open-pr` targets the
 remote's default branch.
 
 Preflight conflict preview (for example, `git merge-tree`) and readiness are
-relative to a target revision. When the Topic ref advances, Loom should
+relative to a target revision. When the Track ref advances, Loom should
 deterministically recheck sleeping Ready candidates. Clean ones get a refreshed
 readiness revision and stay asleep;
 new conflicts emit Events and preferentially wake their original workers to
@@ -1216,7 +1230,7 @@ reconcile. Worker lifecycle and integration state remain independent.
 The operation carries source, target, strategy, revision, and validation
 policy. Strategies include squash, merge, rebase, cherry-pick, PR, and ask
 coordinator. A clean, unambiguous integration should use a disposable worktree:
-prepare, apply, validate, atomically advance the Topic ref, then clean up.
+prepare, apply, validate, atomically advance the Track ref, then clean up.
 Failure must not disturb the canonical checkout/ref. Conflicts, failing tests,
 ambiguity, or product judgment can wake the original worker, coordinator, or
 an integration worker. Do not force an LLM turn for a clean mechanical merge,
@@ -1271,7 +1285,7 @@ Explicit non-priorities for bootstrap:
 - sophisticated provider scheduler;
 - public webhook ingress;
 - elaborate swarm visualization;
-- generalized topic memory system.
+- generalized track memory system.
 
 Use the simplest version compatible with future extension.
 
@@ -1311,7 +1325,7 @@ Add:
 - compact code access and checkout details;
 - PR resources;
 - reliable “open the code” behavior;
-- basic Topics;
+- basic Tracks;
 - Project grouping and inherited resource/launch defaults;
 - resource attachment;
 - design-document resources;
@@ -1371,7 +1385,7 @@ Use Arachne for real work first.
 
 The architecture after Phase 0 should be informed by actual recurring friction, especially around:
 
-- topic creation;
+- track creation;
 - worktree persistence;
 - attention;
 - worker delegation;
@@ -1382,3 +1396,13 @@ The architecture after Phase 0 should be informed by actual recurring friction, 
 The guiding principle is:
 
 > Build enough architecture to preserve the direction, but get Arachne into its own development loop before solving the whole problem.
+
+## October 2026 local dogfood note
+
+The product calls durable coordinated efforts **Tracks**. Standalone Threads
+remain available for small one-off tasks and can become Tracks explicitly.
+API names and durable tags using `topic` keep their existing wire semantics.
+The narrative scenarios in [user-scenarios.md](user-scenarios.md) separate
+current source support from the remaining event-driven coordination work.
+Named Loom server switching and local project launch defaults are conveniences;
+remote Loom validation is outside this dogfood pass.

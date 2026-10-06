@@ -51,6 +51,10 @@ impl LoomClient {
     /// Host of the authoritative Loom server. For the bootstrap deployment
     /// this is also the runner's SSH host; no host-side path is ever treated
     /// as a local Mac path when the connection is remote.
+    pub fn server_url(&self) -> String {
+        self.base.as_str().trim_end_matches('/').to_owned()
+    }
+
     pub fn server_host(&self) -> Option<&str> {
         self.base.host_str()
     }
@@ -68,7 +72,7 @@ impl LoomClient {
         Ok(Self { http, base, token })
     }
 
-    async fn op<T: DeserializeOwned>(
+    pub(crate) async fn op<T: DeserializeOwned>(
         &self,
         path: &str,
         body: &impl serde::Serialize,
@@ -915,16 +919,33 @@ impl LoomClient {
                     req = req.bearer_auth(token);
                 }
                 let mut ok = false;
-                if let Ok(resp) = req.send().await {
+                let response = tokio::select! {
+                    _ = tx.closed() => return,
+                    response = req.send() => response,
+                };
+                if let Ok(resp) = response {
                     if resp.status().is_success() {
                         ok = true;
                         backoff = Duration::from_millis(250);
+                        // A reconnect may have missed events: ask consumers to reconcile.
+                        if tx
+                            .send(EventFrame {
+                                topic: "connection".into(),
+                                event: "resync".into(),
+                                data: serde_json::Value::Null,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                         // Read the body as bytes and decode SSE textually.
                         use futures_util::StreamExt;
                         let mut stream = resp.bytes_stream();
                         let mut buf = String::new();
                         loop {
-                            match stream.next().await {
+                            match tokio::select! { _ = tx.closed() => return, frame = stream.next() => frame }
+                            {
                                 Some(Ok(chunk)) => {
                                     buf.push_str(&String::from_utf8_lossy(&chunk));
                                     // Process complete SSE events: blank-line
@@ -962,7 +983,7 @@ impl LoomClient {
                 if tx.is_closed() {
                     return;
                 }
-                tokio::time::sleep(backoff).await;
+                tokio::select! { _ = tx.closed() => return, _ = tokio::time::sleep(backoff) => {} }
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
         });

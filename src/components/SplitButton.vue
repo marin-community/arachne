@@ -80,7 +80,7 @@ const selectedLabel = computed(
   () =>
     props.options.find((o) => o.value === selected.value)?.label ??
     props.options[0]?.label ??
-    props.kind === "land" ? "Open PR" : "Ask coordinator to decide",
+    (props.kind === "land" ? "Open PR" : "Ask coordinator to decide"),
 );
 </script>
 

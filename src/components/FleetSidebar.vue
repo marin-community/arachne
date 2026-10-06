@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, computed, nextTick } from "vue";
+import { ref, computed, nextTick, watch } from "vue";
+import { isStandalone } from "../threadKind";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
@@ -11,7 +12,7 @@ import {
 } from "../topicList";
 import { byTopicRecency, topicRecencyMap } from "../topicOrder";
 import { dismissibleAttention, pendingPermissionSummary } from "../topicInspector";
-
+import { topicRootOf, threadAncestors } from "../topic-view";
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
 // (loom sessions launch / the Delegate button) nest under it. Lanes below
@@ -36,8 +37,8 @@ const emit = defineEmits<{
   ): void;
   (e: "new-thread"): void;
   (e: "new-topic"): void;
-  // Topics [+] on a project heading: open NewTopicSheet preselected to
-  // that project (null = the Ungrouped section).
+  // Tracks [+] on a project heading: open the new-track chat preselected
+  // to that project (null = the Ungrouped section).
   (e: "new-topic-in-project", project: ProjectRef | null): void;
   // The heading's resources button: manage the project's resource
   // bindings directly (ProjectSheet) — where the inheritance defaults
@@ -52,16 +53,21 @@ const emit = defineEmits<{
   (e: "delete-lane", laneId: string): void;
   (e: "archive", id: string): void;
   // Selecting a project heading filters the main-pane home to that
-  // project's topics (null = the unfiltered Topics home).
+  // project's topics (null = the unfiltered Tracks home).
   (e: "select-project", project: ProjectRef | null): void;
 }>();
 
+// Track folders are collapsed by default: a track's subthreads stay
+// hidden until the chevron opens them. Nested subthreads inside an
+// open track keep the inverse default (expanded), so opening a track
+// shows its full shape; only the root chevron collapses the folder.
 const collapsed = ref(new Set<string>());
+const expandedTopics = ref(new Set<string>());
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
 
 // The Archived filter (topics toolbar): archived leaders disappear from
-// the Topics list by default; this toggle shows them again. See the topic
+// the Tracks list by default; this toggle shows them again. See the topic
 // list block below for the model.
 const showArchived = ref(false);
 
@@ -104,7 +110,7 @@ function badgeLabel(s: SessionSummary): string | null {
   return s.status;
 }
 
-// --- Topic tree --------------------------------------------------------------
+// --- Track tree --------------------------------------------------------------
 
 interface TreeNode {
   session: SessionSummary;
@@ -194,7 +200,7 @@ function buildLanes(): Lane[] {
           : -1
         : -1;
   // Roots are topics: order by when a person last steered them, not by
-  // agent busyness (the same rule as the Topics tab, src/topicOrder.ts).
+  // agent busyness (the same rule as the Tracks tab, src/topicOrder.ts).
   // Workers nested under a leader keep the activity sort — sibling order
   // within a topic is thread-level, and a busy worker bubbling up among
   // its own siblings is informative, not disruptive.
@@ -270,7 +276,7 @@ interface Row {
 }
 
 function selectRow(row: Row) {
-  if (row.depth === 0) emit("select-topic", row.session.id);
+  if (row.depth === 0 && !isStandalone(row.session)) emit("select-topic", row.session.id);
   else emit("select", row.session.id);
 }
 
@@ -287,15 +293,43 @@ const laneRows = computed<{ lane: Lane; rows: Row[] }[]>(() =>
       });
       if (!isCollapsed) node.children.forEach((c) => walk(c, depth + 1));
     };
-    lane.trees.forEach((t) => walk(t, 0));
-    return { lane, rows: out };
-  }),
+    lane.trees.filter(t => isStandalone(t.session)).forEach((t) => walk(t, 0));
+    return { lane: { ...lane, count: out.length }, rows: out };
+  }).filter(entry => entry.rows.length > 0),
 );
 
 function toggle(id: string) {
   if (collapsed.value.has(id)) collapsed.value.delete(id);
   else collapsed.value.add(id);
 }
+
+// The track card's chevron: opening a track folder shows its subthreads
+// under the coordinator; closing hides them again.
+function toggleTopicExpanded(id: string) {
+  const next = new Set(expandedTopics.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  expandedTopics.value = next;
+}
+
+// Selecting a nested worker expands the track folders along the way so
+// the selected row is visible: a worker buried under a collapsed folder
+// would otherwise highlight nothing the eye can see. Selecting the
+// coordinator itself leaves its folder as the user set it — collapsed by
+// default, per the folder model above.
+watch(() => [props.selectedId, props.fleet] as const, ([id]) => {
+  const ancestors = threadAncestors(props.fleet, id);
+  if (!ancestors.length) return;
+  const next = new Set(expandedTopics.value);
+  let grew = false;
+  for (const ancestor of ancestors) {
+    if (!next.has(ancestor.id)) {
+      next.add(ancestor.id);
+      grew = true;
+    }
+  }
+  if (grew) expandedTopics.value = next;
+});
 
 // The user-space Inbox: where "unfile" drops and lane deletes send chats.
 const userInboxId = computed(() => {
@@ -311,21 +345,25 @@ const userInboxId = computed(() => {
 // --- Tabs --------------------------------------------------------------------
 
 // The sidebar's two surfaces: the Inbox (the filing lanes + delegation tree)
-// and Topics (the per-topic card list with title/description/config).
+// and Tracks (the per-topic card list with title/description/config).
 const tab = ref<"inbox" | "topics">("topics");
+watch(() => [props.selectedId, props.fleet] as const, ([id]) => {
+  const root = topicRootOf(props.fleet, id);
+  if (root) tab.value = isStandalone(root) ? "inbox" : "topics";
+});
 
-// --- Topics tab --------------------------------------------------------------
+// --- Tracks tab --------------------------------------------------------------
 
-// The Topics tab groups the same topic cards by Project: a non-system
-// layout group (projects.ts). The project heading carries the Topics [+]
+// The Tracks tab groups the same topic cards by Project: a non-system
+// layout group (projects.ts). The project heading carries the Tracks [+]
 // affordance; clicking it opens NewThreadSheet preselected to that project.
 
 // Which project's heading is selected (filters the main-pane home). `null`
-// means nothing selected — the aggregate Topics home.
+// means nothing selected — the aggregate Tracks home.
 const selectedProjectId = ref<string | null | undefined>(undefined);
 function selectProject(project: ProjectRef): void {
   // Clicking an already-selected project clears the filter (a toggle, like
-  // the Topics home link).
+  // the Tracks home link).
   selectedProjectId.value = selectedProjectId.value === project.id ? undefined : project.id;
   emit("select-project", selectedProjectId.value === undefined ? null : project);
 }
@@ -341,15 +379,15 @@ function selectProject(project: ProjectRef): void {
 // (tests/topicList.test.mjs).
 const topicRecency = computed(() => topicRecencyMap(props.fleet));
 const allTopics = computed(() =>
-  buildTopicList(props.fleet, byTopicRecency(topicRecency.value)),
+  buildTopicList(props.fleet, byTopicRecency(topicRecency.value)).filter(t => !isStandalone(t.session)),
 );
 // Archived leaders are dropped unless the Archived toggle is on.
 const topics = computed(() => visibleTopics(allTopics.value, showArchived.value));
 // Archived leaders hidden by the default filter — surfaced in the empty
-// state so "everything is archived" never reads as "no topics exist".
+// state so "everything is archived" never reads as "no tracks exist".
 const archivedCount = computed(() => countArchivedTopics(allTopics.value));
 
-// Topics filed under their project (a non-system layout group, per the
+// Tracks filed under their project (a non-system layout group, per the
 // design's Project model). Sections keep layout order and empty projects
 // still render — a project is a place to file, not a topic count.
 // Ungrouped (and any empty section) starts collapsed by default; the user's
@@ -399,7 +437,7 @@ function visibleTopicChildren(rootId: string): TopicThreadRow[] {
     }
   };
   // The same Archived filter as the leaders: archived child threads
-  // disappear from the Topics list by default (they return, dimmed, with
+  // disappear from the Tracks list by default (they return, dimmed, with
   // the toggle).
   walk(rootId, 1);
   return showArchived.value
@@ -642,7 +680,7 @@ async function archiveRow(id: string) {
         :aria-selected="tab === 'topics'"
         @click="tab = 'topics'"
       >
-        Topics
+        Tracks
       </button>
       <button
         class="tab"
@@ -651,7 +689,7 @@ async function archiveRow(id: string) {
         :aria-selected="tab === 'inbox'"
         @click="tab = 'inbox'"
       >
-        Inbox
+        Threads
       </button>
     </div>
     <!-- Inbox tab: the filing lanes + delegation tree. -->
@@ -660,7 +698,7 @@ async function archiveRow(id: string) {
         + New thread
       </button>
       <button class="new-thread-btn" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">
-        + New topic
+        + New track
       </button>
 
       <div class="session-list">
@@ -783,28 +821,28 @@ async function archiveRow(id: string) {
           </div>
         </template>
         <div
-          v-if="lanes.length === 0"
+          v-if="laneRows.length === 0"
           class="session-item"
           style="color: var(--text-dim)"
         >
-          No topics yet — start one above.
+          No one-off threads yet — start one above.
         </div>
       </div>
     </template>
 
-    <!-- Topics tab: one card per topic (leader chat) with title, description,
+    <!-- Tracks tab: one card per topic (leader chat) with title, description,
          and a config placeholder. -->
     <template v-else>
       <div class="topics-toolbar">
-        <span>Topics</span>
+        <span>Tracks</span>
         <div class="topics-toolbar-actions">
           <button
             type="button"
             class="toolbar-filter"
             :class="{ on: showArchived }"
             :aria-pressed="showArchived"
-            title="Show archived topics (they stay hidden by default — archiving tears down the checkout)"
-            aria-label="Show archived topics"
+            title="Show archived tracks (they stay hidden by default — archiving tears down the checkout)"
+            aria-label="Show archived tracks"
             @click="showArchived = !showArchived"
           >
             Archived
@@ -812,16 +850,16 @@ async function archiveRow(id: string) {
           <button
             type="button"
             class="toolbar-new-project"
-            :title="'New project (a place to file topics)'"
+            :title="'New project (a place to file tracks)'"
             :aria-expanded="showNewProject"
             aria-controls="new-project-card"
             @click="showNewProject ? (showNewProject = false) : openNewProject()"
           >
             + Project
           </button>
-          <!-- Composing a new topic takes over the main panel (like the
+          <!-- Composing a new track takes over the main panel (like the
                new-thread sheet), not a floating overlay here. -->
-          <button type="button" aria-label="New topic" title="New topic" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">+</button>
+          <button type="button" aria-label="New track" title="New track" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">+</button>
         </div>
       </div>
       <div v-if="showNewProject" class="new-project-card" id="new-project-card" role="dialog" aria-modal="false" aria-label="New project">
@@ -839,7 +877,7 @@ async function archiveRow(id: string) {
         />
         <div v-if="newProjectError" class="new-project-error">{{ newProjectError }}</div>
         <div class="new-project-foot">
-          <span class="new-project-hint">A place to file related topics.</span>
+          <span class="new-project-hint">A place to file related tracks.</span>
           <button type="button" class="primary" :disabled="!newProjectName.trim()" @click="submitNewProject">Create</button>
         </div>
       </div>
@@ -855,7 +893,7 @@ async function archiveRow(id: string) {
           @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
         >
           <!-- Project heading: select filters the main-pane home to this
-               project's topics; the + opens NewTopicSheet preselected to
+               project's topics; the + opens the new-track chat preselected to
                it; the chevron collapses the section. The whole section
                (this heading, its cards, and its empty space) is the drop
                target for filing, not just the thin header strip. -->
@@ -875,7 +913,7 @@ async function archiveRow(id: string) {
             role="button"
             tabindex="0"
             :aria-expanded="!isProjectCollapsed(section.id)"
-            :aria-label="`Project ${section.name}${section.topics.length ? `, ${section.topics.length} topics` : ', no topics'}`"
+            :aria-label="`Project ${section.name}${section.topics.length ? `, ${section.topics.length} tracks` : ', no tracks'}`"
             @click="selectProject({ id: section.id, name: section.name })"
             @keydown.enter.self="selectProject({ id: section.id, name: section.name })"
             @keydown.space.self.prevent="selectProject({ id: section.id, name: section.name })"
@@ -888,19 +926,19 @@ async function archiveRow(id: string) {
               @click.stop="toggleProject(section.id)"
             >{{ isProjectCollapsed(section.id) ? "▸" : "▾" }}</button>
             <span class="project-name">{{ section.name }}</span>
-            <span class="project-count" :title="`${section.topics.length} topics`">{{ section.topics.length }}</span>
+            <span class="project-count" :title="`${section.topics.length} tracks`">{{ section.topics.length }}</span>
             <button
               class="project-manage-resources"
               type="button"
-              :title="`Manage resources inherited by new topics in ${section.name}`"
+              :title="`Manage resources inherited by new tracks in ${section.name}`"
               :aria-label="`Manage resources for project ${section.name}`"
               @click.stop="emit('manage-project-resources', { id: section.id, name: section.name })"
             >⚙</button>
             <button
               class="project-new-topic"
               type="button"
-              :title="`New topic in ${section.name}`"
-              :aria-label="`New topic in ${section.name}`"
+              :title="`New track in ${section.name}`"
+              :aria-label="`New track in ${section.name}`"
               @click.stop="emit('new-topic-in-project', { id: section.id, name: section.name })"
             >+</button>
           </div>
@@ -952,9 +990,9 @@ async function archiveRow(id: string) {
           <template v-else>
             <div class="topic-head">
               <button v-if="filteredChildCount(t.session.id)" class="topic-chevron" type="button"
-                :aria-label="`${collapsed.has(t.session.id) ? 'Expand' : 'Collapse'} threads in ${t.session.branch.title || t.session.branch.name}`"
-                :aria-expanded="!collapsed.has(t.session.id)"
-                @click.stop="toggle(t.session.id)">{{ collapsed.has(t.session.id) ? '▸' : '▾' }}</button>
+                :aria-label="`${expandedTopics.has(t.session.id) ? 'Expand' : 'Collapse'} threads in ${t.session.branch.title || t.session.branch.name}`"
+                :aria-expanded="expandedTopics.has(t.session.id)"
+                @click.stop="toggleTopicExpanded(t.session.id)">{{ expandedTopics.has(t.session.id) ? '▾' : '▸' }}</button>
               <span class="topic-title">{{
                 t.session.branch.title || t.session.branch.name
               }}</span>
@@ -1030,7 +1068,7 @@ async function archiveRow(id: string) {
             </div>
           </template>
         </div>
-        <div v-for="child in visibleTopicChildren(t.session.id)" :key="child.session.id"
+        <div v-for="child in expandedTopics.has(t.session.id) ? visibleTopicChildren(t.session.id) : []" :key="child.session.id"
           class="topic-thread" :class="{ selected: child.session.id === selectedId, archived: child.session.status === 'archived' }"
           :style="{ marginLeft: `${8 + child.depth * 15}px` }"
           role="button" tabindex="0"
@@ -1047,16 +1085,16 @@ async function archiveRow(id: string) {
           <span v-else-if="badgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ badgeLabel(child.session) }}</span>
         </div>
         </template>
-          <div v-if="!section.topics.length" class="project-empty">No topics in this project yet.</div>
+          <div v-if="!section.topics.length" class="project-empty">No tracks in this project yet.</div>
           </template>
         </div>
         <div v-if="topics.length === 0" class="topic-empty">
           <template v-if="archivedCount > 0">
-            No active topics — {{ archivedCount }} archived. Turn on
+            No active tracks — {{ archivedCount }} archived. Turn on
             <button type="button" class="topic-empty-toggle" @click="showArchived = true">Archived</button>
             to see them.
           </template>
-          <template v-else>No topics yet — use + to create one.</template>
+          <template v-else>No tracks yet — use + to create one.</template>
         </div>
       </div>
     </template>
