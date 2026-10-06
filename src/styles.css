@@ -1554,6 +1554,44 @@ button.danger:hover { border-color: var(--blocked); }
    same .main shape as a live thread (header, conversation, composer),
    with a setup card standing in for the messages that aren't sent yet. */
 .new-track .conversation { gap: 14px; }
+
+/* The header title is the track's title field: it renders with the
+   header name's weight and size, sits on a transparent borderless field,
+   and only reveals a border + the ✎ affordance on hover/focus. With a
+   typed title the ✎ stays faintly visible so "this is editable" is
+   discoverable without hovering; empty, it hides until hover. */
+.ntc-title-field { position: relative; display: flex; align-items: center; }
+.ntc-title-input {
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 3px 26px 3px 6px;
+  width: 100%;
+  max-width: 420px;
+  outline: none;
+  font-family: inherit;
+}
+.ntc-title-input::placeholder { color: var(--text); opacity: 0.55; }
+.ntc-title-input:hover, .ntc-title-input:focus {
+  border-color: var(--border);
+  background: var(--bg-raised);
+}
+.ntc-title-input:focus { border-color: var(--accent); }
+.ntc-title-edit {
+  position: absolute;
+  right: 8px;
+  color: var(--text-dim);
+  font-size: 11px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.ntc-title-field:hover .ntc-title-edit,
+.ntc-title-field:focus-within .ntc-title-edit,
+.ntc-title-field.has-title .ntc-title-edit { opacity: 1; }
 .new-track-setup .who em {
   font-style: normal;
   font-weight: 400;

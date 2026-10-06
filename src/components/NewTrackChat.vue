@@ -15,7 +15,9 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 //
 // The setup choices the old sheet carried (title, repository/base, project
 // resource bindings) sit in a setup card inside the conversation area,
-// above the composer, where the first messages will land. The whole view
+// above the composer, where the first messages will land — except the
+// title, which lives where a chat's title belongs: the header, as an
+// editable field showing "New track" until you type one (✎ marks it). The whole view
 // is replaced by the live thread on launch, so the setup disappears the
 // moment the model starts. Everything that belongs to a chat box stays in
 // the composer: the message text, attachments, @-mentions of existing
@@ -490,9 +492,26 @@ function onComposerKeydown(event: KeyboardEvent) {
 
 <template>
   <section class="main new-track" aria-label="New track">
+    <!-- The header's name is the title field itself: the chat reads as
+         "New track" until you type, and editing is discoverable by the
+         placeholder + the ✎ affordance that appears when the (empty)
+         field is focused or hovered — the same quiet-editable convention
+         as topic cards. Focus stays on the composer per the chat-first
+         rule; the title is reached by a deliberate click. -->
     <div class="thread-header">
       <div class="meta">
-        <div class="name">New track</div>
+        <label class="ntc-title-field" :class="{ 'has-title': !!title }">
+          <input
+            v-model="title"
+            class="ntc-title-input"
+            placeholder="New track"
+            spellcheck="false"
+            aria-label="Track title"
+            title="Track title — shows in the sidebar and track cards"
+            @keydown.enter.prevent="($event.target as HTMLInputElement).blur(); bodyEl?.focus()"
+          />
+          <span class="ntc-title-edit" aria-hidden="true">✎</span>
+        </label>
         <div class="sub">
           {{ props.project ? `project ${props.project.name} · ` : "" }}first send launches the track
         </div>
@@ -514,17 +533,6 @@ function onComposerKeydown(event: KeyboardEvent) {
       <div class="block new-track-setup">
         <div class="who">Track setup <em>· goes away at launch</em></div>
         <div class="body new-track-setup-body">
-          <label class="nts-field">
-            <span class="nts-field-name">Title <em class="nts-opt">optional</em></span>
-            <input
-              v-model="title"
-              placeholder="What is this work about?"
-              spellcheck="false"
-              @keydown.enter.prevent="bodyEl?.focus()"
-            />
-            <span class="nts-hint">The sidebar and track cards show this label.</span>
-          </label>
-
           <!-- Enter never launches here (the chat convention): only
                ⌘/Ctrl+Enter or the send button does, so the setup card's
                fields are safe to type through. -->
