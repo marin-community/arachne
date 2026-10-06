@@ -838,6 +838,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   padding: 14px 16px;
   font: 13px/1.5 inherit;
   outline: none;
+  width: 100%;
   min-height: 108px;
   max-height: 240px;
 }
