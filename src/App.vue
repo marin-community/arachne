@@ -767,6 +767,7 @@ const selectedTopic = computed(() => {
       :launching="launching"
       :error="connError"
       :launch-options="launchOptions"
+      :layout="layout"
       :project="newTopicProject"
       @close="closeNewTopic"
       @launch="launchTopic"

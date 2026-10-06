@@ -25,6 +25,7 @@ const DRAFT_STORAGE_KEY = draftStorageKey(store());
 
 test("emptyDraft has the launch-sheet defaults", () => {
   assert.deepEqual(emptyDraft(), {
+    project: null,
     title: "", body: "", repo: "", base: "",
     profile: "default", agent: "", model: "", effort: "",
     mentions: [], attachments: [],
@@ -46,9 +47,21 @@ test("readDraft tolerates absent/garbage/partial payloads field by field", () =>
   assert.deepEqual(readDraft(s), { ...emptyDraft(), title: "kept" });
 });
 
+test("readDraft accepts a project preselection and drops malformed ones", () => {
+  const s = store();
+  const project = { id: "grp-1", name: "Arachne" };
+  s.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ ...emptyDraft(), project }));
+  assert.deepEqual(readDraft(s).project, project);
+  for (const bad of [null, "x", [], {}, { id: "" }, { id: 7, name: "Arachne" }, { id: "grp-1" }]) {
+    s.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ ...emptyDraft(), project: bad }));
+    assert.equal(readDraft(s).project, null);
+  }
+});
+
 test("saveDraft + readDraft round-trip (ignoring transient fields)", () => {
   const s = store();
   const draft = {
+    project: null,
     title: "Ship the sheet",
     body: "Fix the flow\n\n@{design doc}",
     repo: "marin-community/arachne",
@@ -71,11 +84,13 @@ test("saveDraft + readDraft round-trip (ignoring transient fields)", () => {
 test("readDraft accepts string scalars and drops nulls", () => {
   const s = store();
   s.setItem(DRAFT_STORAGE_KEY, JSON.stringify({
+    project: { id: "g", name: "n" },
     title: "t", body: null, repo: null, base: 42,
     profile: null, agent: null, model: null, effort: null,
     mentions: null, attachments: null,
   }));
   assert.deepEqual(readDraft(s), {
+    project: { id: "g", name: "n" },
     title: "t", body: "", repo: "", base: "",
     profile: "default", agent: "", model: "", effort: "",
     mentions: [], attachments: [],

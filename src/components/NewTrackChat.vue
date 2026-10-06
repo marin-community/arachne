@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, reactive } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
+import type { LaunchOptions, ResourceMention, SessionLayout, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
 import { readDraft, saveDraft, mergeLaunchConfig, type NewTopicDraft } from "../newTopicDraft";
 import { recentRepositories, rememberRepository, readProjectDefaults } from "../launchDefaults";
+import { layoutProjects } from "../projects";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-track chat (docs/design.md "Navigation"): New track opens a chat
@@ -37,6 +38,8 @@ const props = defineProps<{
   launching?: boolean;
   error?: string | null;
   launchOptions: LaunchOptions | null;
+  /** Layout groups — the project picker's options. */
+  layout?: SessionLayout | null;
   project?: { id: string | null; name: string } | null;
 }>();
 
@@ -70,12 +73,70 @@ const draftStorage = {
 };
 const draft: NewTopicDraft = reactive(readDraft(draftStorage));
 const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
-const inheritedDefaults = props.project?.id ? readProjectDefaults(localStorage, props.project.id) : null;
-// Preserve a composed draft; project defaults apply only to a fresh launch.
+
+// The project picker: the layout's non-system groups, "No project" first.
+// The prop is a preseed from the sidebar's per-project + — it wins over a
+// saved draft's project only when the user came in through that entry
+// point, so a reopen restores the project they picked themselves.
+const projectChoices = computed(() => layoutProjects(props.layout));
+const project = computed({
+  get: () => draft.project,
+  set: (value: NewTopicDraft["project"]) => { draft.project = value; },
+});
+watch(() => props.project, (preseed) => {
+  // A preseed arriving (or changing) after the chat is open retargets the
+  // picker — the sidebar's + is the user's explicit choice (App's
+  // openNewTopic passes null, which correctly does nothing here).
+  if (preseed?.id) draft.project = { id: preseed.id, name: preseed.name };
+}, { immediate: true });
+
+// The project whose id exists in the current layout — a stale draft project
+// (group deleted while the chat sat closed) files nowhere rather than into
+// a phantom group. The picker offers layout projects only, so a stale id
+// reads as "No project" there.
+const liveProject = computed(() => {
+  if (!project.value) return null;
+  // Unknown layout (still loading): trust the selection — the sidebar's
+  // preseed came from the live layout, and the picker reconciles the name
+  // once the layout arrives.
+  if (!projectChoices.value.length) return project.value;
+  return projectChoices.value.some((choice) => choice.id === project.value!.id) ? project.value : null;
+});
+
+// The selected project's saved launch defaults, for the setup card's hint
+// (the defaults themselves were seeded above at first mount).
+const projectDefaults = computed(() => project.value?.id ? readProjectDefaults(localStorage, project.value.id) : null);
+
+// Repo/base defaults for a fresh launch: the selected project's saved
+// launch defaults, falling back to the remembered repo. A composed draft
+// (restored) keeps its own repo/base — defaults only seed a blank one.
 if (!draft.title && !draft.body && !draft.attachments.length && !draft.mentions.length) {
-  if (inheritedDefaults) Object.assign(draft, inheritedDefaults);
-  else if (!draft.repo) draft.repo = recentRepositories(localStorage)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : "");
+  if (draft.project?.id) {
+    const inherited = readProjectDefaults(localStorage, draft.project.id);
+    if (inherited) { draft.repo = draft.repo || inherited.repo; draft.base = draft.base || inherited.base; }
+  }
+  if (!draft.repo) draft.repo = recentRepositories(localStorage)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : "");
 }
+// A fresh empty draft switching projects retargets repo/base to the
+// project's saved defaults; an empty project (No project) keeps them.
+const fresh = computed(() => !draft.title && !draft.body && !draft.attachments.length && !draft.mentions.length);
+watch(project, (current, previous) => {
+  if (!previous && !current) return;
+  if (!fresh.value || !current?.id) return;
+  const inherited = readProjectDefaults(localStorage, current.id);
+  if (inherited) {
+    // The previous project's defaults (or the remembered repo) may be
+    // sitting in the fields — replace, don't merge, so switching projects
+    // swaps the whole default rather than mixing two projects' settings.
+    const previousDefaults = previous?.id ? readProjectDefaults(localStorage, previous.id) : null;
+    if (!draft.repo || draft.repo === previousDefaults?.repo || draft.repo === inherited.repo) {
+      draft.repo = inherited.repo;
+    }
+    if (!draft.base || draft.base === previousDefaults?.base || draft.base === inherited.base) {
+      draft.base = inherited.base;
+    }
+  }
+});
 const title = computed({
   get: () => draft.title,
   set: (value: string) => { draft.title = value; },
@@ -300,7 +361,7 @@ const uncheckedBindings = ref<Set<string>>(new Set());
 let bindingsRequest = 0;
 async function loadProjectBindings() {
   const request = ++bindingsRequest;
-  const projectId = props.project?.id;
+  const projectId = project.value?.id;
   const repoInput = repo.value.trim();
   if (!projectId || !repoInput) {
     projectBindings.value = [];
@@ -315,13 +376,13 @@ async function loadProjectBindings() {
       projectId,
       repo: repoInput,
     });
-    if (request !== bindingsRequest || projectId !== props.project?.id || repoInput !== repo.value.trim()) return;
+    if (request !== bindingsRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
     projectBindings.value = view.bindings ?? [];
     projectRevision.value = view.revision ?? 0;
     // Fresh fetch, fresh defaults: everything checked (inherited).
     uncheckedBindings.value = new Set();
   } catch (error: any) {
-    if (request !== bindingsRequest || repoInput !== repo.value.trim()) return;
+    if (request !== bindingsRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
     projectBindings.value = [];
     projectBindingsError.value = error?.message ?? String(error);
   } finally {
@@ -360,7 +421,7 @@ function chooseProjectKind() {
 }
 
 async function attachToProject() {
-  const projectId = props.project?.id;
+  const projectId = project.value?.id;
   const repoInput = repo.value.trim();
   const title = projectFormTitle.value.trim();
   const path = projectFormPath.value.trim();
@@ -393,7 +454,7 @@ async function attachToProject() {
 }
 
 async function removeFromProject(binding: ProjectBinding) {
-  const projectId = props.project?.id;
+  const projectId = project.value?.id;
   const repoInput = repo.value.trim();
   if (!projectId || !repoInput || projectSaving.value) return;
   projectSaving.value = true;
@@ -415,10 +476,10 @@ async function removeFromProject(binding: ProjectBinding) {
   }
 }
 
-// The checklist reloads when the preselected project or the repo changes —
+// The checklist reloads when the selected project or the repo changes —
 // bindings are per-repo, so "arachne" vs "loom" carry different lists.
 watch(
-  () => [props.project?.id, repo.value.trim()] as const,
+  () => [project.value?.id, repo.value.trim()] as const,
   () => void loadProjectBindings(),
   { immediate: true },
 );
@@ -458,10 +519,12 @@ function send() {
       .map(({ topicId, resourceId }) => ({ topicId, resourceId })),
     attachments: attachments.value,
     ...launchConfig(),
-    project: props.project ?? undefined,
+    // The picked project files the launched track; the launch itself
+    // carries it (App → launchTask → launch_session's `project` param).
+    project: liveProject.value ?? undefined,
     // Unchecked bindings become the track's initial hides — the project's
     // binding stays attached for every other track (design.md).
-    hiddenBindingKeys: props.project?.id && uncheckedBindings.value.size
+    hiddenBindingKeys: liveProject.value?.id && uncheckedBindings.value.size
       ? [...uncheckedBindings.value]
       : undefined,
   });
@@ -513,7 +576,7 @@ function onComposerKeydown(event: KeyboardEvent) {
           <span class="ntc-title-edit" aria-hidden="true">✎</span>
         </label>
         <div class="sub">
-          {{ props.project ? `project ${props.project.name} · ` : "" }}first send launches the track
+          {{ project ? `project ${project.name} · ` : "" }}first send launches the track
         </div>
       </div>
       <button
@@ -536,14 +599,28 @@ function onComposerKeydown(event: KeyboardEvent) {
           <!-- Enter never launches here (the chat convention): only
                ⌘/Ctrl+Enter or the send button does, so the setup card's
                fields are safe to type through. -->
+          <!-- Project picker: files the track into a layout group. The
+               top-bar "+ New track" carries no project (App's
+               openNewTopic passes null) — before this picker existed that
+               was the ONLY way in with no project at all; the sidebar's
+               per-project + preseeds it. Changing the picker swaps the
+               inherited-bindings checklist below. -->
+          <label class="nts-field ntc-project-field">
+            <span class="nts-field-name">Project <em class="nts-opt">optional</em></span>
+            <select :value="project?.id ?? ''" @change="project = projectChoices.find((p) => p.id === ($event.target as HTMLSelectElement).value) ?? null">
+              <option value="">No project — unfiled</option>
+              <option v-for="choice in projectChoices" :key="choice.id" :value="choice.id">{{ choice.name }}</option>
+            </select>
+            <span class="nts-hint">New tracks inherit the project's resource bindings.</span>
+          </label>
           <RepoBaseFields v-model:repo="repo" v-model:base="base" :repositories="repositorySuggestions" />
-          <span v-if="inheritedDefaults" class="nts-hint">Repository and base default to this project’s saved settings on this device.</span>
+          <span v-if="projectDefaults" class="nts-hint">Repository and base default to this project’s saved settings on this device.</span>
 
           <!-- Project resource bindings (design.md "Project defaults and
                resource inheritance"): every binding inherited (checked) by
                default; unchecking overrides the inheritance for this track
                only. -->
-          <div v-if="props.project?.id" class="nts-field nts-project-bindings">
+          <div v-if="project?.id" class="nts-field nts-project-bindings">
             <span class="nts-field-name">Project resources <em class="nts-opt">inherited</em></span>
             <div v-if="projectBindingsLoading" class="nts-project-hint">Loading project bindings…</div>
             <template v-else-if="projectBindings.length">
@@ -560,7 +637,7 @@ function onComposerKeydown(event: KeyboardEvent) {
                 <button
                   type="button"
                   class="nts-binding-remove"
-                  :aria-label="`Remove ${binding.title} from project ${props.project?.name}`"
+                  :aria-label="`Remove ${binding.title} from project ${project?.name}`"
                   :disabled="projectSaving"
                   title="Remove from the project (existing tracks keep their own bindings)"
                   @click="removeFromProject(binding)"
@@ -568,7 +645,7 @@ function onComposerKeydown(event: KeyboardEvent) {
               </label>
             </template>
             <div v-else-if="!projectBindingsError" class="nts-project-hint">
-              No resources bound to {{ props.project.name }} yet — new tracks inherit what you bind here.
+              No resources bound to {{ project?.name }} yet — new tracks inherit what you bind here.
             </div>
             <div v-if="projectBindingsError" class="nts-project-hint">{{ projectBindingsError }}</div>
             <div class="nts-binding-actions">

@@ -39,6 +39,8 @@ export const DEFAULT_REPO = "";
 
 /** The draft shape the New-topic sheet edits in place. */
 export interface NewTopicDraft {
+  /** Project (layout group) to file the launched track into; null = unfiled. */
+  project: { id: string; name: string } | null;
   /** Optional card label; empty until typed. */
   title: string;
   /** The body: the agent's opening message and durable topic description. */
@@ -61,6 +63,7 @@ export interface NewTopicDraft {
 /** A fresh draft — the exact field defaults the sheet starts with. */
 export function emptyDraft(): NewTopicDraft {
   return {
+    project: null,
     title: "",
     body: "",
     repo: DEFAULT_REPO,
@@ -85,6 +88,17 @@ function str(value: unknown, fallback = ""): string {
   return typeof value === "string" ? value : fallback;
 }
 
+/** The project preselection: a layout group {id, name}, or null. Garbage
+ *  and half-formed values fall back to null (unfiled). */
+function parseProject(value: unknown): NewTopicDraft["project"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const id = (value as { id?: unknown }).id;
+  const name = (value as { name?: unknown }).name;
+  return typeof id === "string" && id && typeof name === "string" && name
+    ? { id, name }
+    : null;
+}
+
 /**
  * Read the draft, tolerating anything (absent key, corrupt JSON, a payload
  * from an older build): every field falls back to the empty-draft default,
@@ -103,6 +117,7 @@ export function readDraft(storage: DraftStorage): NewTopicDraft {
     const parsed = JSON.parse(raw) as Partial<NewTopicDraft> | null;
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return empty;
     return {
+      project: parseProject(parsed.project),
       title: str(parsed.title),
       body: str(parsed.body),
       repo: str(parsed.repo, empty.repo),
