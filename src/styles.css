@@ -707,6 +707,17 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 }
 .block.user .who { color: var(--accent); }
 .block.agent .body { border-left: 2px solid var(--ok); }
+/* pi-acp answers slash commands locally (the model never runs) and journals
+   the reply as a plain agent_message. Style those turns as system output:
+   mono, dim, no agent accent — clearly not agent work. */
+.block.system .who { color: var(--text-dim); font-family: var(--mono); }
+.block.system .body {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  border-left: 2px solid var(--border);
+  background: var(--bg);
+}
 .block.thought .body { color: var(--text-dim); font-style: italic; border-left: 2px solid var(--border); }
 .block.tool .body { font-family: var(--mono); font-size: 11.5px; color: var(--text-dim); }
 .block.tool .status { color: var(--ok); }
