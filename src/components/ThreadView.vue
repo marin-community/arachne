@@ -16,7 +16,7 @@ import { pasteAsPlainText } from "../composerPaste";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
-import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, resolveContextUsage, type ChatDisplayBlock } from "../chatRows";
+import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, resolveContextUsage, commandReplyTurns, type ChatDisplayBlock } from "../chatRows";
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
@@ -130,6 +130,12 @@ const rows = computed(() => groupDisplayBlocks(
   turnLive.value ? snapshotLiveTurn.value : null,
   props.session.agent_kind === "pi",
 ));
+// Turn number → the command pi-acp's interceptor answered locally. Those
+// turns' replies are system output (stats, receipts), not agent prose.
+const commandTurns = computed(() => commandReplyTurns(blocks.value, metadata.value?.commands.map((c) => c.name) ?? []));
+/** The block is an interceptor reply (not the user's command, not prose). */
+const isCommandReply = (block: ChatDisplayBlock) =>
+  block.kind === "agent_message" && commandTurns.value.has(block.turn ?? -1);
 const answeringPermission = ref<string | null>(null);
 const permissionError = ref<Record<string, string>>({});
 
@@ -1310,20 +1316,23 @@ async function onLand(strategy: string) {
           </div>
           <CopyButton :corner="cornerOf(row.key)" :text="blockCopyText(row.block)" label="Copy plan" />
         </div>
-        <!-- User / agent messages -->
+        <!-- User / agent messages. A slash-command reply (pi-acp's interceptor
+             answered locally — stats, receipts, confirmations) renders as a
+             system message, distinct from agent prose. -->
         <div
           v-else-if="row.block.kind === 'user_message' || row.block.kind === 'agent_message'"
           class="block"
           :class="{
             user: row.block.kind === 'user_message',
-            agent: row.block.kind === 'agent_message',
+            agent: row.block.kind === 'agent_message' && !isCommandReply(row.block),
+            system: isCommandReply(row.block),
           }"
           :data-copy-host="row.key"
         >
           <div class="who">
-            {{ messageAuthor(row.block) }}
+            {{ isCommandReply(row.block) ? `system · /${commandTurns.get(row.block.turn ?? -1)}` : messageAuthor(row.block) }}
           </div>
-          <CopyButton :corner="cornerOf(row.key)" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : 'reply'}`" />
+          <CopyButton :corner="cornerOf(row.key)" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : isCommandReply(row.block) ? 'output' : 'reply'}`" />
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
                transcript, but collapse the boilerplate behind a disclosure
@@ -1346,6 +1355,7 @@ async function onLand(strategy: string) {
               </div>
             </div>
           </template>
+          <div v-else-if="isCommandReply(row.block)" class="body">{{ row.block.text ?? "" }}</div>
           <div v-else class="body"><ChatMarkdown :text="row.block.text ?? ''" /></div>
           <ChatImages :block="row.block" :session-id="session.id" />
         </div>

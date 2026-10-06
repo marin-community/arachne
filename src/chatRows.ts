@@ -153,6 +153,46 @@ export function formatTokens(tokens: number): string {
   return String(tokens);
 }
 
+/** The turns pi-acp's command interceptor answered locally: the turn's
+ * opening user message names a slash command from the session's catalog
+ * (only the leading word matters — `/compact keep tests` compacts), and the
+ * turn holds nothing but that message, the reply, and its turn_end. The
+ * adapter answers such prompts without the model — no thoughts, tool
+ * calls, or usage reports — so the journaled agent_message text is
+ * interceptor output (stats, usage receipts, confirmations), not agent
+ * prose. File commands (`.pi/commands/*.md`) share the catalog but expand
+ * into prompts the model answers, and model turns always journal work or
+ * usage, which the shape filter excludes. The UI can style these replies
+ * as system messages. Returns turn number → command name. */
+export function commandReplyTurns(
+  blocks: readonly ChatDisplayBlock[],
+  commands: readonly string[],
+): Map<number, string> {
+  const names = new Set(commands);
+  const turns = new Map<number, string>();
+  if (!names.size) return turns;
+  // The opening user message settles a turn: it is journaled before any
+  // reply, so the first one seen decides. A turn whose opening message is
+  // not a catalog command can still hold later /command text (steering) —
+  // that is model-facing prose, not an interceptor turn.
+  const settled = new Set<number>();
+  const foreign = new Set<number>();
+  for (const block of blocks) {
+    if (block.turn == null) continue;
+    if (block.kind !== "user_message" && block.kind !== "agent_message" && block.kind !== "turn_end") {
+      foreign.add(block.turn);
+    }
+    if (block.kind !== "user_message" || settled.has(block.turn)) continue;
+    settled.add(block.turn);
+    const name = (block.text ?? "").match(/^\s*\/(\S+)/)?.[1] ?? "";
+    if (names.has(name)) turns.set(block.turn, name);
+  }
+  for (const turn of [...turns.keys()]) {
+    if (foreign.has(turn)) turns.delete(turn);
+  }
+  return turns;
+}
+
 /** The thought still being thought, if any: the trailing non-usage block of
  * the live turn. Once tool calls or messages follow, thinking is over. */
 function liveThoughtIndex(blocks: readonly ChatDisplayBlock[], liveTurn: number | null): number | null {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   blockKey,
+  commandReplyTurns,
   blockCopyText,
   copyCornerFor,
   countThinkingTokens,
@@ -274,4 +275,72 @@ test("work group summary counts calls and thinking tokens", () => {
   assert.equal(group.kind, "work_group");
   assert.equal(group.calls.length, 2);
   assert.equal(group.state, "done");
+});
+
+// -- commandReplyTurns -------------------------------------------------------
+
+test("commandReplyTurns marks interceptor-answered slash command turns", () => {
+  const commands = ["compact", "session", "export"];
+  // /session: user command → interceptor reply, no model work. A usage
+  // block inside the turn would mean the model ran — excluded by shape.
+  const rows = commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "/session" },
+    { kind: "agent_message", turn: 1, seq: 1, text: "Session: abc" },
+    { kind: "turn_end", turn: 1, seq: 2, stop_reason: "end_turn" },
+  ], commands);
+  assert.deepEqual([...rows.entries()], [[1, "session"]]);
+});
+
+test("commandReplyTurns accepts commands with args (pi-acp splits on the first space)", () => {
+  const rows = commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "/compact keep the test context" },
+    { kind: "agent_message", turn: 1, seq: 1, text: "Compaction completed." },
+  ], ["compact"]);
+  assert.deepEqual([...rows.entries()], [[1, "compact"]]);
+});
+
+test("commandReplyTurns drops turns with model work — usage, thoughts, or tool calls", () => {
+  // File commands (.pi/commands/*.md) expand into prompts the model
+  // answers; usage reports appear on every model turn.
+  assert.equal(commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "/review" },
+    { kind: "thought", turn: 1, seq: 1, text: "running the review" },
+    { kind: "tool_call", turn: 1, seq: 2, title: "run" },
+    { kind: "agent_message", turn: 1, seq: 3, text: "review output" },
+  ], ["review"]).size, 0);
+  // A pure-prose model turn still journals usage — codex always reports it.
+  assert.equal(commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "/status" },
+    { kind: "usage", turn: 1, seq: 1, used: 100, size: 200 },
+    { kind: "agent_message", turn: 1, seq: 2, text: "status output" },
+    { kind: "turn_end", turn: 1, seq: 3, stop_reason: "end_turn" },
+  ], ["status"]).size, 0);
+});
+
+test("commandReplyTurns ignores unknown commands and plain prompts", () => {
+  assert.equal(commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "/not-a-command" },
+    { kind: "agent_message", turn: 1, seq: 1, text: "hi" },
+  ], ["session"]).size, 0);
+  assert.equal(commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "explain /compact" },
+    { kind: "agent_message", turn: 1, seq: 1, text: "sure" },
+  ], ["compact"]).size, 0);
+  assert.equal(commandReplyTurns([], ["compact"]).size, 0);
+  assert.equal(commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "/compact" },
+  ], []).size, 0);
+});
+
+test("commandReplyTurns only the turn's opening message counts", () => {
+  // A steering message sent mid-turn carries /command text but is model-
+  // facing prose journaled as its own user_message; only the message that
+  // opens the turn can name the interceptor command.
+  const rows = commandReplyTurns([
+    { kind: "user_message", turn: 1, seq: 0, text: "please compact the context" },
+    { kind: "agent_message", turn: 1, seq: 1, text: "ok" },
+    { kind: "user_message", turn: 2, seq: 0, text: "/session" },
+    { kind: "agent_message", turn: 2, seq: 1, text: "Session: x" },
+  ], ["session"]);
+  assert.deepEqual([...rows.entries()], [[2, "session"]]);
 });
