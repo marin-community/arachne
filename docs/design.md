@@ -197,8 +197,14 @@ passes Loom resource links with the prompt. The composer also accepts dropped
 or pasted files, including screenshots and other raster images; image
 attachments show a local thumbnail before send. Vision-capable agents such as
 Codex can consume those image resources, while other agents retain the same
-file attachment fallback. Scratch files are session inputs, while track
-resource bindings are durable references to repository files and artifacts.
+file attachment fallback. Scratch files are also track resources from the
+first moment: a launch attachment is recorded in the new track's resource
+manifest as a File binding at `scratch/<name>` — the track starts with what
+you attached, listed in the Resources panel and mentionable — while the
+bytes themselves stay Scratch session inputs (the preview reads the
+worktree, so it follows the file, not a commit). Scratch files are session
+inputs, while track resource bindings are durable references to repository
+files and artifacts.
 
 Later resource types should be added only when a real workflow needs them.
 The next likely additions are a retained integration checkout and a PR that
