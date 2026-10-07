@@ -371,10 +371,13 @@ function selectTopic(id: string) {
   openTopicChat(id);
 }
 
-// Which thread to show when a Topic opens: the current one when it belongs
-// to the Topic (clicking an already-selected Topic keeps the open chat),
-// otherwise the thread last opened within it while it is still available,
-// else the coordinator. Pure decision logic lives in src/topic-view.ts.
+// Which thread to show when a Topic opens: keep the coordinator when it
+// is already open (clicking an already-selected Topic), open the
+// coordinator when one of its threads is open (the click asked for the
+// Topic, not the thread already on screen — otherwise the click would be
+// a no-op with no way back to the Topic's own chat), otherwise the thread
+// last opened within it while it is still available, else the
+// coordinator. Pure decision logic lives in src/topic-view.ts.
 async function openTopicChat(id: string) {
   const choice = resolveTopicThread({
     topicId: id,
@@ -382,7 +385,10 @@ async function openTopicChat(id: string) {
     currentThreadId: viewMode.value === "thread" ? selectedId.value : null,
     rememberedThreadId: readTopicThreadMemory(localStorage)[id] ?? null,
   });
-  if (choice.source !== "current") rememberTopicThread(localStorage, id, choice.threadId);
+  // Record what opened, except the coordinator: like the watch below, the
+  // coordinator is the Topic's default voice, not the person's place in
+  // it — visiting it must not evict the remembered worker thread.
+  if (choice.threadId !== id) rememberTopicThread(localStorage, id, choice.threadId);
   await selectSession(choice.threadId);
 }
 

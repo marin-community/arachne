@@ -56,11 +56,14 @@ Selecting a Track opens a **chat**, normally its coordinator Thread. The
 coordinator is the Track's voice, not one item buried in a dashboard. On a
 first visit, open the coordinator; on later visits, restore the last Thread
 opened within that Track if it is still available, otherwise return to the
-coordinator. Clicking an already-selected Track keeps the current Thread.
-The coordinator row in the Threads inspector and a header action provide an
-explicit way back to it. The legible hierarchy is global home → Project →
-Track → Thread, while the main pane remains a conversation and composer
-whenever a Track is open.
+coordinator. Clicking a Track while its coordinator is already open keeps
+it; clicking a Track while one of its worker Threads is open opens the
+coordinator — the worker is already on screen, so the click must go
+somewhere else, and the Track's own chat is where it goes. The coordinator
+row in the Threads inspector and a header action provide an explicit way
+back to it. The legible hierarchy is global home → Project → Track →
+Thread, while the main pane remains a conversation and composer whenever
+a Track is open.
 
 The right pane is a **Track inspector** with tabs:
 

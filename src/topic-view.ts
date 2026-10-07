@@ -2,10 +2,12 @@
 //
 // Selecting a Topic opens a chat: the coordinator thread on a first
 // visit, the last thread opened within that Topic on later visits (when
-// it is still available and still part of the Topic), and the currently
-// open thread is kept when the Topic is already selected. The scoped
-// dashboard stays reachable as an explicit Overview detour, never as the
-// default route.
+// it is still available and still part of the Topic), the coordinator
+// again when one of the Topic's threads is already on screen (the click
+// asked for the Topic, not the thread already showing), and the open
+// chat is kept when the Topic itself — its coordinator — is selected.
+// The scoped dashboard stays reachable as an explicit Overview detour,
+// never as the default route.
 //
 // Everything here is pure and free of .vue imports so the decision logic
 // runs under plain `node --test` with no build step
@@ -52,7 +54,9 @@ export interface ResolveTopicThreadInput {
   /** The topic (root/coordinator session) being opened. */
   topicId: string;
   fleet: readonly FleetThread[];
-  /** The thread currently open, if any — kept when it belongs to the topic. */
+  /** The thread currently open, if any — the Topic keeps it only when it is
+   *  the Topic's own coordinator; a worker sends the click to the
+   *  coordinator instead. */
   currentThreadId?: string | null;
   /** The thread last opened in this topic, read from the memory map. */
   rememberedThreadId?: string | null;
@@ -125,24 +129,29 @@ export function threadBelongsToTopic(
 /**
  * Decide which thread a Topic selection opens.
  *
- * 1. The current thread wins when it belongs to the Topic — clicking an
- *    already-selected Topic keeps the open chat (no refetch, no remount).
- *    The coordinator itself always qualifies, even if the fleet snapshot
- *    has not caught up with it yet.
- * 2. Otherwise restore the thread last opened within the Topic, but only
- *    if it is still available (present and not archived — the home and
- *    dashboard surfaces treat archived workers as finished) and still
- *    belongs to this Topic (it may have been reparented or removed).
- * 3. Otherwise open the coordinator: the Topic's voice, not one item
+ * 1. The coordinator is already open: clicking the Topic again keeps it.
+ *    It always qualifies, even if the fleet snapshot has not caught up
+ *    with it yet.
+ * 2. A thread of this Topic is already open: the click asked for the
+ *    Topic, and that thread is already on screen — open the coordinator,
+ *    the Topic's voice, so the click always goes somewhere. (Resolving
+ *    to the open worker instead would make the click a no-op with no
+ *    way to reach the Topic's own chat.)
+ * 3. Entering from elsewhere: restore the thread last opened within the
+ *    Topic, but only if it is still available (present and not archived
+ *    — the home and dashboard surfaces treat archived workers as
+ *    finished) and still belongs to this Topic (it may have been
+ *    reparented or removed).
+ * 4. Otherwise open the coordinator: the Topic's voice, not one item
  *    buried in a dashboard.
  */
 export function resolveTopicThread(input: ResolveTopicThreadInput): TopicThreadChoice {
   const { topicId, fleet, currentThreadId, rememberedThreadId } = input;
-  if (
-    currentThreadId &&
-    (currentThreadId === topicId || threadBelongsToTopic(fleet, topicId, currentThreadId))
-  ) {
+  if (currentThreadId && currentThreadId === topicId) {
     return { threadId: currentThreadId, source: "current" };
+  }
+  if (currentThreadId && threadBelongsToTopic(fleet, topicId, currentThreadId)) {
+    return { threadId: topicId, source: "coordinator" };
   }
   if (rememberedThreadId && isRestorable(fleet, topicId, rememberedThreadId)) {
     return { threadId: rememberedThreadId, source: "remembered" };
