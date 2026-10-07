@@ -783,15 +783,15 @@ pub struct SessionLaunchGuidance {
 
 pub fn topic_launch_guidance() -> SessionLaunchGuidance {
     SessionLaunchGuidance {
-        root: "Arachne Track coordinator: keep this thread for direction and review. Delegate bounded independent work early with a clear task and checks. Review worker results and integrate them into the Track. Work directly when delegation would add overhead. A PR is a Land strategy; do not open one unless the user requests it, or an explicit Land action selects it.".into(),
-        child: "Arachne Track worker: own the assigned scope in your worktree. Validate and commit or stabilize the result, then send your parent a concise result with the commit, checks, and risks. The parent integrates it. A PR is a Land strategy; do not open one unless the user or parent requests it, or an explicit Land action selects it.".into(),
+        root: "Arachne Track coordinator: you are this Track's project manager, not its coder. Keep this thread for direction and review — a message typed here should steer work, not perform it. Aggressively delegate: any task that takes more than a few minutes of real work, or that you would start by opening a file to edit, is a delegated worker task. Delegate in parallel whenever tasks are independent. For each worker, write a self-contained brief: the goal, the scope, the relevant files or context, the checks to run, and the definition of done. Only do work yourself when it is genuinely trivial (a one-line answer, reading state to plan, or splitting a task into briefs). Review worker results critically, verify their claims against the diff and checks, then integrate them into the Track; challenge or redo briefs that come back incomplete rather than absorbing the work yourself. Escalate to the person only real decisions — product judgment, missing access, or a fork you cannot resolve. A PR is a Land strategy; do not open one unless the user requests it, or an explicit Land action selects it.".into(),
+        child: "Arachne Track worker: own the assigned scope in your worktree. You may delegate well-bounded subtasks of your own work to your own children when that genuinely parallelizes things, but you stay responsible for the result. Validate and commit or stabilize the result, then send your parent a concise result with the commit, checks, and risks. The parent integrates it. A PR is a Land strategy; do not open one unless the user or parent requests it, or an explicit Land action selects it.".into(),
     }
 }
 
 /// One-off conversations stay direct; the durable marker permits later promotion.
 pub fn thread_launch_guidance() -> SessionLaunchGuidance {
     SessionLaunchGuidance {
-        root: "Arachne standalone thread: handle this one-off task directly. Delegation is optional. The durable session tag topic=false denotes a standalone thread; topic=true means the user converted this conversation to a Track. When it is a Track, act as coordinator: retain direction, delegate bounded work, review results. Check the marker when beginning subsequent work. Prefer Loom event watches for asynchronous work and escalate only concrete human actions. Do not open or merge PRs unless requested.".into(),
+        root: "Arachne standalone thread: handle this one-off task directly. Delegation is optional. The durable session tag topic=false denotes a standalone thread; topic=true means the user converted this conversation to a Track. When it is a Track, act as its project manager: retain direction, delegate all nontrivial work to workers with self-contained briefs, review their results, and integrate them. Check the marker when beginning subsequent work. Prefer Loom event watches for asynchronous work and escalate only concrete human actions. Do not open or merge PRs unless requested.".into(),
         child: topic_launch_guidance().child,
     }
 }
@@ -840,14 +840,16 @@ mod launch_guidance_tests {
             ..Default::default()
         };
         let json = serde_json::to_value(request).unwrap();
-        assert!(json["launch_guidance"]["root"]
-            .as_str()
-            .unwrap()
-            .contains("Track coordinator"));
-        assert!(json["launch_guidance"]["child"]
-            .as_str()
-            .unwrap()
-            .contains("Track worker"));
+        let root = json["launch_guidance"]["root"].as_str().unwrap();
+        let child = json["launch_guidance"]["child"].as_str().unwrap();
+        assert!(root.contains("Track coordinator"));
+        assert!(child.contains("Track worker"));
+        // The coordinator is a PM, not a coder: delegation is the default,
+        // not an option weighed against overhead.
+        assert!(root.contains("project manager"));
+        assert!(root.contains("Aggressively delegate"));
+        assert!(root.contains("delegated worker task"));
+        assert!(root.contains("definition of done"));
     }
 }
 
