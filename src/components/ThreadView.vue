@@ -1201,7 +1201,7 @@ async function onLand(strategy: string) {
       <input
         ref="delegateInput"
         v-model="delegateTask"
-        placeholder="child task… e.g. “run the tests and report failures”"
+        placeholder="child task… goal, scope, and checks — e.g. “add retries to fetchBlobs in src/api.ts; cover with tests in fetch.test.ts; run npm test”"
         @keydown.enter.prevent="submitDelegate"
         @keydown.esc="showDelegate = false"
       />
