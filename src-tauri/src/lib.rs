@@ -24,6 +24,10 @@ pub mod secret;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        // OS notifications for Needs You attention (macOS Notification
+        // Center via notify-rust; falls back to the in-app banner when
+        // permission is denied or the frontend is a plain browser).
+        .plugin(tauri_plugin_notification::init())
         .manage(commands::LoomState::default())
         .invoke_handler(tauri::generate_handler![
             commands::connect,

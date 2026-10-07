@@ -27,6 +27,7 @@ thiserror = "2"
 # macOS Keychain storage for the loom bearer token (spec: credentials never
 # persist in frontend localStorage). Blocking ops run via spawn_blocking.
 keyring = { version = "3", features = ["apple-native"] }
+tauri-plugin-notification = "2"
 
 [profile.release]
 codegen-units = 1
