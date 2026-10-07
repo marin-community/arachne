@@ -119,14 +119,23 @@ test("an archived or missing remembered thread falls back to the coordinator", (
   );
 });
 
-test("clicking an already-selected topic keeps the current thread", () => {
+test("clicking an already-selected track keeps the coordinator open", () => {
   assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "grandchild", rememberedThreadId: "workerA" }),
-    { threadId: "grandchild", source: "current" },
+    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "coordinator", rememberedThreadId: "workerA" }),
+    { threadId: "coordinator", source: "current" },
   );
 });
 
-test("the current thread only wins when it belongs to the topic", () => {
+test("clicking a track while one of its threads is open goes to the coordinator", () => {
+  // The worker is already on screen; resolving to it would make the click
+  // a no-op with no way back to the track's own chat.
+  assert.deepEqual(
+    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "grandchild", rememberedThreadId: "workerA" }),
+    { threadId: "coordinator", source: "coordinator" },
+  );
+});
+
+test("a thread of another topic does not trigger the coordinator detour", () => {
   assert.deepEqual(
     resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "otherChild", rememberedThreadId: "grandchild" }),
     { threadId: "grandchild", source: "remembered" },
