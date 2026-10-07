@@ -17,8 +17,6 @@ import type { FileAttachment } from "./attachments";
 import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
 import { clearDraftOnLaunch, initializeDraftStorage } from "./newTopicDraft";
 import {
-  readTopicThreadMemory,
-  rememberTopicThread,
   resolveTopicThread,
   topicRootOf,
 } from "./topic-view";
@@ -371,24 +369,19 @@ function selectTopic(id: string) {
   openTopicChat(id);
 }
 
-// Which thread to show when a Topic opens: keep the coordinator when it
-// is already open (clicking an already-selected Topic), open the
-// coordinator when one of its threads is open (the click asked for the
-// Topic, not the thread already on screen — otherwise the click would be
-// a no-op with no way back to the Topic's own chat), otherwise the thread
-// last opened within it while it is still available, else the
-// coordinator. Pure decision logic lives in src/topic-view.ts.
+// Which thread to show when a Topic opens: its coordinator, always —
+// clicking a Topic means the Topic's chat. The only thing kept is an
+// already-open coordinator (clicking an already-selected Topic is a
+// no-op, not a refetch); an open worker of that Topic resolves to the
+// coordinator too, since the worker is already on screen and the click
+// asked for the Topic. Pure decision logic lives in src/topic-view.ts.
 async function openTopicChat(id: string) {
   const choice = resolveTopicThread({
     topicId: id,
-    fleet: fleet.value,
     currentThreadId: viewMode.value === "thread" ? selectedId.value : null,
-    rememberedThreadId: readTopicThreadMemory(localStorage)[id] ?? null,
   });
-  // Record what opened, except the coordinator: like the watch below, the
-  // coordinator is the Topic's default voice, not the person's place in
-  // it — visiting it must not evict the remembered worker thread.
-  if (choice.threadId !== id) rememberTopicThread(localStorage, id, choice.threadId);
+  // Already there: no refetch, no remount.
+  if (choice.source === "current") return;
   await selectSession(choice.threadId);
 }
 
@@ -405,25 +398,13 @@ function showTopicOverview(id: string) {
 
 // The explicit back-to-coordinator action (docs/design.md "Navigation"):
 // from a worker thread, open the topic's coordinator chat directly.
-// Unlike selectTopic/openTopicChat, this deliberately bypasses the
-// remembered-thread restoration — the user asked for the coordinator,
-// not for whichever thread they last opened inside this topic.
+// selectTopic lands on the same chat now; this stays as the header
+// action's direct path.
 async function openCoordinatorThread(topicId: string) {
   const coordinator = fleet.value.find((session) => session.id === topicId) ?? topicRootOf(fleet.value, topicId);
   if (!coordinator) return;
   await selectSession(coordinator.id);
 }
-
-// Keep the last-opened-thread memory current while the user moves between
-// threads: entering a thread inside a topic records it for that topic. A
-// stale entry (thread deleted, archived, or reparented) is simply never
-// restored — resolveTopicThread re-validates before using it.
-watch([selectedId, viewMode, fleet], () => {
-  const threadId = viewMode.value === "thread" ? selectedId.value : null;
-  if (!threadId || !fleet.value.length) return;
-  const topic = topicRootOf(fleet.value, threadId);
-  if (topic && topic.id !== threadId) rememberTopicThread(localStorage, topic.id, threadId);
-});
 
 function showTopicsHome() {
   closeLaunchers();

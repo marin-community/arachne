@@ -524,13 +524,13 @@ the same status groups filtered to its Tracks; it does not open a Project
 chat. Inbox may remain a separate attention/review tab, but Tracks home still
 includes all cross-Project Needs You items.
 
-Selecting a Track normally opens its **coordinator conversation** in the main
-pane, making the coordinator the Track's voice. First visit opens the
-coordinator. Subsequent visits restore the last-opened Thread for that Track
-if available, falling back to the coordinator. Clicking the already-selected
-Track keeps the current Thread. The Threads tab and chat header provide an
-explicit Coordinator action. The main pane should almost always be a chat;
-Tracks and Threads are levels of context, not peer destinations.
+Selecting a Track opens its **coordinator conversation** in the main pane,
+making the coordinator the Track's voice. A Track click always lands on
+the coordinator — no restore of the last-opened worker Thread. Clicking
+the already-selected Track keeps the coordinator (a no-op). The Threads
+tab and chat header provide an explicit Coordinator action. The main pane
+should almost always be a chat; Tracks and Threads are levels of context,
+not peer destinations.
 
 The right pane is the Track inspector: **Threads | Resources | Integrations |
 Todos**. Threads lists the coordinator and workers and switches the main chat;
@@ -555,8 +555,7 @@ project resources) sit in a card above the chat box and disappear at
 launch; the first send delivers the message and launches the track in the
 selected or default Project. Convert to
 track promotes a thread when it needs durable coordination and workers. Track
-selection opens its coordinator chat on first visit, then restores the
-last-opened Thread when available.
+selection always opens its coordinator chat.
 
 Example:
 

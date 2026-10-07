@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  TOPIC_THREAD_STORAGE_KEY,
-  readTopicThreadMemory,
-  rememberTopicThread,
   resolveTopicThread,
   threadAncestors,
   threadBelongsToTopic,
@@ -87,41 +84,18 @@ test("threadBelongsToTopic scopes membership to the topic subtree", () => {
   assert.equal(threadBelongsToTopic(fleet, "coordinator", null), false);
 });
 
-test("first visit opens the coordinator", () => {
+test("a track click opens the coordinator, first visit or not", () => {
+  // Entering from anywhere lands on the coordinator — never on whatever
+  // worker thread was open here before (no restore).
   assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: null, rememberedThreadId: null }),
-    { threadId: "coordinator", source: "coordinator" },
-  );
-});
-
-test("later visits restore the last-opened thread when it is still available", () => {
-  assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: null, rememberedThreadId: "grandchild" }),
-    { threadId: "grandchild", source: "remembered" },
-  );
-});
-
-test("a remembered thread must still belong to the topic", () => {
-  assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: null, rememberedThreadId: "otherChild" }),
-    { threadId: "coordinator", source: "coordinator" },
-  );
-});
-
-test("an archived or missing remembered thread falls back to the coordinator", () => {
-  assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: null, rememberedThreadId: "workerB" }),
-    { threadId: "coordinator", source: "coordinator" },
-  );
-  assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: null, rememberedThreadId: "gone" }),
+    resolveTopicThread({ topicId: "coordinator", currentThreadId: null }),
     { threadId: "coordinator", source: "coordinator" },
   );
 });
 
 test("clicking an already-selected track keeps the coordinator open", () => {
   assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "coordinator", rememberedThreadId: "workerA" }),
+    resolveTopicThread({ topicId: "coordinator", currentThreadId: "coordinator" }),
     { threadId: "coordinator", source: "current" },
   );
 });
@@ -130,49 +104,22 @@ test("clicking a track while one of its threads is open goes to the coordinator"
   // The worker is already on screen; resolving to it would make the click
   // a no-op with no way back to the track's own chat.
   assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "grandchild", rememberedThreadId: "workerA" }),
+    resolveTopicThread({ topicId: "coordinator", currentThreadId: "grandchild" }),
     { threadId: "coordinator", source: "coordinator" },
   );
 });
 
-test("a thread of another topic does not trigger the coordinator detour", () => {
+test("clicking a track while a thread of another topic is open goes to the coordinator", () => {
   assert.deepEqual(
-    resolveTopicThread({ topicId: "coordinator", fleet, currentThreadId: "otherChild", rememberedThreadId: "grandchild" }),
-    { threadId: "grandchild", source: "remembered" },
+    resolveTopicThread({ topicId: "coordinator", currentThreadId: "otherChild" }),
+    { threadId: "coordinator", source: "coordinator" },
   );
 });
 
 test("the coordinator itself always qualifies as the current thread", () => {
   // The fleet snapshot can lag a freshly launched coordinator.
   assert.deepEqual(
-    resolveTopicThread({ topicId: "fresh", fleet, currentThreadId: "fresh", rememberedThreadId: null }),
+    resolveTopicThread({ topicId: "fresh", currentThreadId: "fresh" }),
     { threadId: "fresh", source: "current" },
   );
-});
-
-test("memory persists per topic and survives unknown topics", () => {
-  const store = new Map([[TOPIC_THREAD_STORAGE_KEY, JSON.stringify({ topicOne: "thread1" })]]);
-  const storage = {
-    getItem: (key) => store.get(key) ?? null,
-    setItem: (key, value) => void store.set(key, value),
-  };
-  rememberTopicThread(storage, "topicTwo", "thread2");
-  assert.deepEqual(readTopicThreadMemory(storage), { topicOne: "thread1", topicTwo: "thread2" });
-  // Writing the same value is a no-op.
-  rememberTopicThread(storage, "topicTwo", "thread2");
-  assert.deepEqual(readTopicThreadMemory(storage), { topicOne: "thread1", topicTwo: "thread2" });
-  rememberTopicThread(storage, "topicOne", "thread9");
-  assert.equal(readTopicThreadMemory(storage).topicOne, "thread9");
-  // Missing/absent storage reads as empty, never throws.
-  assert.deepEqual(readTopicThreadMemory(null), {});
-});
-
-test("corrupt localStorage data reads as empty memory", () => {
-  for (const bad of ["not json", "42", "null", '["array"]', '"string"']) {
-    const storage = { getItem: () => bad, setItem: () => {} };
-    assert.deepEqual(readTopicThreadMemory(storage), {});
-  }
-  const nonStringValues = JSON.stringify({ a: 1, b: "", c: "ok" });
-  const storage = { getItem: () => nonStringValues, setItem: () => {} };
-  assert.deepEqual(readTopicThreadMemory(storage), { c: "ok" });
 });

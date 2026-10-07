@@ -52,13 +52,14 @@ conversation. Selecting a Project opens the same status groups filtered to that
 Project's Tracks. A
 Project home is an aggregate view, not a Project conversation.
 
-Selecting a Track opens a **chat**, normally its coordinator Thread. The
-coordinator is the Track's voice, not one item buried in a dashboard. On a
-first visit, open the coordinator; on later visits, restore the last Thread
-opened within that Track if it is still available, otherwise return to the
-coordinator. Clicking a Track while its coordinator is already open keeps
-it; clicking a Track while one of its worker Threads is open opens the
-coordinator — the worker is already on screen, so the click must go
+Selecting a Track opens a **chat**, always its coordinator Thread. The
+coordinator is the Track's voice, not one item buried in a dashboard. No
+restore: a Track click never re-opens whichever worker Thread was open
+before — worker Threads are opened deliberately through their own
+affordances (sidebar sub-thread rows, the Threads inspector, home rows).
+Clicking a Track while its coordinator is already open keeps it (a
+no-op); clicking a Track while one of its worker Threads is open opens
+the coordinator — the worker is already on screen, so the click must go
 somewhere else, and the Track's own chat is where it goes. The coordinator
 row in the Threads inspector and a header action provide an explicit way
 back to it. The legible hierarchy is global home → Project → Track →
