@@ -975,6 +975,12 @@ pub async fn launch_session(
             goal.push_str(&format!("- scratch/{}\n", file.name));
         }
     }
+    // The launch consumes `attachments` (scratch seeding); the names are
+    // needed after it, to record the files as the topic's resources.
+    let attachment_names: Vec<String> = attachments
+        .iter()
+        .map(|file| file.name.clone())
+        .collect();
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: managed_repo,
@@ -1002,6 +1008,54 @@ pub async fn launch_session(
             ..Default::default()
         })
         .await?;
+    // Launch attachments are a resource too: the files land at
+    // `scratch/<name>` in the fresh worktree (loom seeds them at launch),
+    // so they are recorded as File resources of the new branch — the
+    // track starts with what you attached, visible in the Resources panel
+    // from the first moment (design.md: the effective view). Names are
+    // captured before `scratch` consumes the list.
+    //
+    // Both post-launch manifest edits (these rows, and the initial hides
+    // below) go through ONE write so a failure in one cannot strand the
+    // other. The branch is brand new — loom keys artifacts by branch id,
+    // which `sessions.launch` just created — so the manifest cannot exist
+    // yet and revision 0 creates it (base_rev == latest == 0).
+    let mut initial_manifest = TopicResourcesView::default();
+    for name in &attachment_names {
+        let draft = ResourceDraft {
+            kind: ResourceKind::File,
+            title: name.clone(),
+            repository: view.branch.repo_root.clone(),
+            // The scratch file is uncommitted worktree content, not a
+            // commit: the "ref" that pins it is the branch the launch
+            // just created.
+            reference: Some(view.branch.branch.clone()),
+            path: Some(format!("scratch/{name}")),
+            url: None,
+        };
+        if let Ok(resource) = draft.validated(&view.branch.repo_root, &view.branch.branch) {
+            if !initial_manifest.resources.iter().any(|r| r.id == resource.id) {
+                initial_manifest.resources.push(resource);
+            }
+        }
+    }
+    // The creation form's unchecked project bindings are recorded as the
+    // topic's initial hides, matched by reference-free binding key — the
+    // binding stays attached to the project and keeps supplying other
+    // topics (design.md).
+    let hidden_keys = hidden_binding_keys.unwrap_or_default();
+    if !hidden_keys.is_empty() {
+        initial_manifest.hidden.extend(hidden_keys);
+        initial_manifest.hidden.sort();
+        initial_manifest.hidden.dedup();
+    }
+    if !initial_manifest.resources.is_empty() || !initial_manifest.hidden.is_empty() {
+        // Best-effort: a failed manifest write must not fail the launch —
+        // the attachments are still in Scratch and the goal text; the
+        // topic simply inherits everything until the user hides from the
+        // panel.
+        let _ = save_topic_resources(&client, &view.branch.id, &initial_manifest, 0).await;
+    }
     // `sessions.launch` has no description field (only GitHub issues seed
     // one server-side), so the topic card's description is stamped right
     // after launch via `sessions.update`. Best-effort: an empty description
@@ -1045,24 +1099,8 @@ pub async fn launch_session(
         let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
         // Project bindings keep supplying the topic live (design.md:
         // "Project resource bindings may continue to supply shared
-        // references to existing Topics") — nothing is copied at creation.
-        // The creation form's unchecked bindings are recorded as the
-        // topic's initial hides, matched by reference-free binding key.
-        // The branch is brand new, so the manifest cannot exist yet:
-        // revision 0 creates it (base_rev == latest == 0).
-        let keys = hidden_binding_keys.unwrap_or_default();
-        if !keys.is_empty() {
-            let mut manifest = load_topic_resources(&client, &view.branch.id)
-                .await
-                .unwrap_or_default();
-            manifest.hidden.extend(keys);
-            manifest.hidden.sort();
-            manifest.hidden.dedup();
-            // Best-effort: a failed hide write must not fail the launch —
-            // the topic simply inherits everything until the user hides
-            // one from the panel.
-            let _ = save_topic_resources(&client, &view.branch.id, &manifest, 0).await;
-        }
+        // references to existing Topics") — nothing is copied at creation;
+        // the initial hides were folded into the manifest write above.
     }
     // Loom does not publish a fleet event for description updates. Publish
     // the final launch state so the new topic card has its body immediately.

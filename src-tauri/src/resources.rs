@@ -531,6 +531,31 @@ mod tests {
     }
 
     #[test]
+    fn scratch_attachment_is_a_valid_file_resource_of_the_new_branch() {
+        // launch_session records each launch attachment as a File resource
+        // at scratch/<name>, pinned to the branch the launch just created:
+        // the file is uncommitted worktree content, and read_topic_resource
+        // reads the worktree, so the fresh branch is the right "ref".
+        let draft = ResourceDraft {
+            kind: ResourceKind::File,
+            title: "notes.md".into(),
+            repository: "/repo".into(),
+            reference: Some("topic".into()),
+            path: Some("scratch/notes.md".into()),
+            url: None,
+        };
+        let resource = draft.clone().validated("/repo", "topic").unwrap();
+        assert_eq!(
+            resource.id,
+            "file:/repo:topic:scratch/notes.md"
+        );
+        // Re-attaching the same object is idempotent — the manifest write
+        // dedupes on id.
+        let again = draft.clone().validated("/repo", "topic").unwrap();
+        assert_eq!(resource.id, again.id);
+    }
+
+    #[test]
     fn issue_and_pr_identity_is_their_github_url() {
         let issue = ResourceDraft {
             kind: ResourceKind::Issue,
