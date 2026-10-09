@@ -11,6 +11,26 @@ npx tauri dev
 
 The app initially targets `http://127.0.0.1:7878`. Open the connection indicator to set a different Loom URL. A remote Loom needs a bearer token; Arachne stores it in macOS Keychain. The web preview at Vite's port 5173 does not include Tauri commands and cannot connect to Loom by itself.
 
+To run both Loom and the native app locally, clone Loom into `../loom`, install
+Node 22+, Rust, and the platform's Tauri prerequisites, then run:
+
+```sh
+npm ci
+npm run dev:local
+```
+
+The launcher builds Loom and Tapestry, seeds the local operator from your `gh`
+login, and starts Loom at `http://127.0.0.1:7878`. Its database and server log
+live in `.local/loom-state/` (override with `WEAVER_HOME`). It reuses an existing
+server on that port and stops only the server it started when the app exits.
+Set `LOOM_SRC` for a different checkout, or `LOOM_OWNER_GITHUB` and
+`LOOM_OWNER_GITHUB_ID` to supply the bootstrap identity without `gh`.
+
+On Ubuntu, the native app needs `build-essential`, `pkg-config`,
+`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, and `libdbus-1-dev`. Saved tokens use the
+desktop Secret Service on Linux. The launcher also recognizes project-local
+Node and WebKit prerequisites under `.local/`.
+
 For the intended DGX Spark control plane, point Arachne at `http://100.121.8.110:7878` over Tailscale after Loom is deployed there. `scripts/deploy-loom-dgx.sh` describes the manual systemd installation. The Mac connects to that one control plane rather than maintaining a second Loom database.
 
 ## Launch and work on a task
