@@ -788,7 +788,32 @@ impl LoomClient {
         &self,
         input: &crate::loom::SessionsLaunchInput,
     ) -> Result<crate::loom::SessionView, LoomError> {
-        self.op("/api/sessions/launch", input).await
+        // Older Loom servers ignore launch_guidance. Seed the role in the
+        // durable first turn as well, then retain the concise user objective
+        // in branch metadata. Guidance-aware servers still receive the field
+        // for child inheritance and restarts.
+        let mut request = input.clone();
+        if let Some(guidance) = &input.launch_guidance {
+            request.goal = Some(format!(
+                "{}\n\n## Arachne role guidance\n\n{}",
+                input.goal.as_deref().unwrap_or_default(),
+                guidance.root
+            ));
+        }
+        let launched: crate::loom::SessionView = self.op("/api/sessions/launch", &request).await?;
+        if input.launch_guidance.is_some() {
+            // Metadata cleanup is not a launch failure: never invite a retry
+            // that would create a duplicate already-running worker.
+            return Ok(self
+                .update_session(&crate::loom::SessionsUpdateInput {
+                    session: Some(launched.id.clone()),
+                    goal: Some(input.goal.clone().unwrap_or_default()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap_or(launched));
+        }
+        Ok(launched)
     }
 
     /// `sessions.reparent` — re-parent a session under another (or detach),
@@ -1126,5 +1151,111 @@ mod resume_tests {
             "running"
         );
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::LoomClient;
+    use crate::loom::{SessionLaunchGuidance, SessionsLaunchInput};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn launch_with_legacy_server(metadata_fails: bool) -> crate::loom::SessionView {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let mut reply: serde_json::Value =
+                    serde_json::from_str(include_str!("../tests/fixtures/launch-response.json"))
+                        .unwrap();
+                let status;
+                if index == 0 {
+                    assert!(header.starts_with("POST /api/sessions/launch "));
+                    // Simulate a server that ignores the unknown guidance field.
+                    assert!(request["goal"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Own the task; publish a durable result."));
+                    assert!(request["goal"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("Fix the editor"));
+                    assert_eq!(request["parent_branch"], "parent-branch");
+                    assert_eq!(request["base"], "track-branch");
+                    reply["branch"]["goal"] = request["goal"].clone();
+                    status = "200 OK";
+                } else {
+                    assert!(header.starts_with("POST /api/sessions/update "));
+                    assert_eq!(request["goal"], "Fix the editor");
+                    assert_eq!(request["session"], "decode-probe-session");
+                    if metadata_fails {
+                        reply = serde_json::json!({"error":"metadata temporarily unavailable"});
+                        status = "500 Internal Server Error";
+                    } else {
+                        reply["branch"]["goal"] = request["goal"].clone();
+                        status = "200 OK";
+                    }
+                }
+                let body = reply.to_string();
+                let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
+        let launched = client
+            .launch(&SessionsLaunchInput {
+                goal: Some("Fix the editor".into()),
+                base: Some("track-branch".into()),
+                parent_branch: Some("parent-branch".into()),
+                launch_guidance: Some(SessionLaunchGuidance {
+                    root: "Own the task; publish a durable result.".into(),
+                    child: "Own a bounded subtask.".into(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        server.await.unwrap();
+        launched
+    }
+
+    #[tokio::test]
+    async fn legacy_launch_receives_role_and_preserves_concise_objective() {
+        let launched = launch_with_legacy_server(false).await;
+        assert_eq!(launched.branch.goal, "Fix the editor");
+    }
+
+    #[tokio::test]
+    async fn metadata_failure_does_not_fail_or_repeat_a_completed_launch() {
+        let launched = launch_with_legacy_server(true).await;
+        assert_eq!(launched.id, "decode-probe-session");
+        assert!(launched.branch.goal.contains("publish a durable result"));
     }
 }

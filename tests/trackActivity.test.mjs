@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { deliverySummary, watchTriggerKind, watchTriggerLabel } from "../src/trackActivity.ts";
+import { deliverySummary, messageSource, watchTriggerKind, watchTriggerLabel } from "../src/trackActivity.ts";
 
 test("watch labels distinguish event-driven work, timers, and mixed rules", () => {
   const event = { trigger: { on: ["pr.merged", "session.exited=error"] } };
@@ -18,4 +18,14 @@ test("mailbox records never imply delivery or completion without evidence", () =
   assert.equal(deliverySummary({ deliveries: [{ state: "delivered" }] }), "Delivered");
   assert.equal(deliverySummary({ deliveries: [{ state: "pending" }] }), "pending");
   assert.equal(deliverySummary({ deliveries: [{ state: "delivered" }, { state: "failed", last_error: "offline" }] }), "Delivery failed");
+});
+
+
+test("handoff drill-down follows source provenance before shared channel ownership", () => {
+  const channel = { session_id: "coordinator" };
+  assert.equal(messageSource({ author_kind: "session", author_id: "worker" }, channel), "worker");
+  assert.equal(messageSource({ author_kind: "user", payload: { arachne: { source_session_id: "source" } } }, channel), "source");
+  assert.equal(messageSource({ author_kind: "system", payload: { child_session_id: "child" } }, channel), "child");
+  assert.equal(messageSource({ author_kind: "user" }, channel), "coordinator");
+  assert.equal(messageSource({ author_kind: "user" }), null);
 });

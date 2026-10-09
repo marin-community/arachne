@@ -13,6 +13,7 @@ use crate::commands::{LoomState, UiError};
 pub struct TrackActivity {
     channels: Vec<Value>,
     messages: Vec<Value>,
+    handoffs: Vec<Value>,
     watches: Vec<Value>,
     warnings: Vec<String>,
     channels_truncated: bool,
@@ -45,6 +46,13 @@ fn message_query(channel: &Value) -> Value {
     let latest = channel["last_message"]["seq"].as_i64().unwrap_or(0);
     json!({ "channel": channel["id"], "after": (latest - 30).max(0),
         "limit": 30, "kinds": [], "peek": true })
+}
+
+fn handoff_query(channel: &Value) -> Value {
+    let latest = channel["last_message"]["seq"].as_i64().unwrap_or(0);
+    // Search a wider bounded window so routine messages cannot displace results.
+    json!({ "channel": channel["id"], "after": (latest - 500).max(0),
+        "limit": 500, "kinds": ["result"], "peek": true })
 }
 
 #[tauri::command]
@@ -119,11 +127,16 @@ pub async fn track_activity(
     let pages = stream::iter(channels.clone().into_iter().map(|channel| {
         let client = client.clone();
         async move {
+            let message_args = message_query(&channel);
+            let handoff_args = handoff_query(&channel);
+            let (messages, handoffs) = tokio::join!(
+                client.op::<Vec<Value>>("/api/channels/messages/list", &message_args),
+                client.op::<Vec<Value>>("/api/channels/messages/list", &handoff_args),
+            );
             (
                 channel["name"].as_str().unwrap_or("channel").to_owned(),
-                client
-                    .op::<Vec<Value>>("/api/channels/messages/list", &message_query(&channel))
-                    .await,
+                messages,
+                handoffs,
             )
         }
     }))
@@ -131,12 +144,19 @@ pub async fn track_activity(
     .collect::<Vec<_>>()
     .await;
     let mut messages = Vec::new();
-    for (name, result) in pages {
+    let mut handoffs = Vec::new();
+    for (name, result, results) in pages {
         match result {
             Ok(page) => messages.extend(page),
             Err(error) => warnings.push(format!("{name}: {error}")),
         }
+        match results {
+            Ok(page) => handoffs.extend(page),
+            Err(error) => warnings.push(format!("{name} handoffs: {error}")),
+        }
     }
+    handoffs.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
+    handoffs.truncate(60);
     messages.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str()));
     messages.truncate(60);
     // Fetch diagnostics only for failed watches, with a bounded fan-out.
@@ -159,6 +179,7 @@ pub async fn track_activity(
     Ok(TrackActivity {
         channels,
         messages,
+        handoffs,
         watches,
         warnings,
         channels_truncated,
@@ -202,5 +223,9 @@ mod tests {
         assert_eq!(query["after"], 90);
         assert_eq!(query["peek"], true);
         assert_eq!(message_query(&json!({"id":"new"}))["after"], 0);
+        let result_query = handoff_query(&json!({"id":"worker", "last_message":{"seq":900}}));
+        assert_eq!(result_query["after"], 400);
+        assert_eq!(result_query["kinds"], json!(["result"]));
+        assert_eq!(result_query["peek"], true);
     }
 }

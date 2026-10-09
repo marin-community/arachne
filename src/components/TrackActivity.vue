@@ -4,14 +4,14 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionSummary } from "../App.vue";
 import ChatMarkdown from "./ChatMarkdown.vue";
-import { deliverySummary, watchTriggerKind, watchTriggerLabel, type TrackActivitySnapshot } from "../trackActivity";
+import { deliverySummary, messageSource, watchTriggerKind, watchTriggerLabel, type TrackActivitySnapshot } from "../trackActivity";
 
-const props = defineProps<{ topic: SessionSummary }>();
+const props = defineProps<{ topic: SessionSummary; resultsOnly?: boolean }>();
 const emit = defineEmits<{ (e: "select", sessionId: string): void }>();
 const snapshot = ref<TrackActivitySnapshot | null>(null);
 const loading = ref(false);
 const error = ref("");
-const filter = ref<"all" | "results" | "errors">("all");
+const filter = ref<"all" | "results" | "errors">(props.resultsOnly ? "results" : "all");
 const updatedAt = ref("");
 let disposed = false;
 let generation = 0;
@@ -66,7 +66,7 @@ watch(() => props.topic.id, () => {
   updatedAt.value = "";
   if (loading.value) dirty = true; else void refresh();
 });
-const messages = computed(() => (snapshot.value?.messages ?? []).filter((m) =>
+const messages = computed(() => (filter.value === "results" ? snapshot.value?.handoffs ?? snapshot.value?.messages ?? [] : snapshot.value?.messages ?? []).filter((m) =>
   filter.value === "all" || (filter.value === "results" ? m.kind === "result" : deliverySummary(m) === "Delivery failed"),
 ));
 const channelById = computed(() => new Map((snapshot.value?.channels ?? []).map((c) => [c.id, c])));
@@ -83,7 +83,7 @@ function time(iso: string | null | undefined) {
 <template>
   <div class="track-activity">
     <div class="activity-toolbar">
-      <strong>Track activity</strong>
+      <strong>{{ resultsOnly ? "Worker handoffs" : "Track activity" }}</strong>
       <button type="button" :disabled="loading" @click="refresh">{{ loading ? "Loading…" : "Refresh" }}</button>
     </div>
     <p class="activity-hint">Mailbox records show delivery, not whether an agent completed the work.</p>
@@ -92,7 +92,7 @@ function time(iso: string | null | undefined) {
     <p v-for="warning in snapshot?.warnings ?? []" :key="warning" class="activity-error">{{ warning }}</p>
     <p v-if="loading && !snapshot" class="activity-hint">Reading Loom activity…</p>
     <template v-if="snapshot">
-      <section>
+      <section v-if="!resultsOnly">
         <h3>Watches <span>{{ watches.length }}</span></h3>
         <p class="activity-hint">Fleet watches whose repository filters include this Track. Their own rules decide when to act.</p>
         <p v-if="!watches.length" class="activity-empty">No matching watches reported.</p>
@@ -106,7 +106,7 @@ function time(iso: string | null | undefined) {
           <pre v-if="item.latest_run?.stderr" class="activity-error">{{ item.latest_run.stderr }}</pre>
         </details>
       </section>
-      <section>
+      <section v-if="!resultsOnly">
         <h3>Delivery subscriptions</h3>
         <p class="activity-hint">Track and worker channels, plus shared channels that deliver to them. Observation-only subscriptions are not exposed by Loom.</p>
         <p v-if="snapshot.channels_truncated" class="activity-hint">Showing the 20 channels with the most recent messages.</p>
@@ -123,13 +123,16 @@ function time(iso: string | null | undefined) {
         </details>
       </section>
       <section>
-        <h3>Recent mailbox</h3>
-        <label class="activity-filter">Show <select v-model="filter"><option value="all">All messages</option><option value="results">Results</option><option value="errors">Delivery errors</option></select></label>
-        <p class="activity-hint">Up to 60 recent entries across these channels. Read markers stay unchanged.</p>
+        <p v-if="resultsOnly && snapshot.channels_truncated" class="activity-hint">Showing the 20 channels with the most recent activity. Open a source thread for older results.</p>
+        <h3>{{ resultsOnly ? "Durable results" : "Recent mailbox" }}</h3>
+        <label v-if="!resultsOnly" class="activity-filter">Show <select v-model="filter"><option value="all">All messages</option><option value="results">Results</option><option value="errors">Delivery errors</option></select></label>
+        <p class="activity-hint">{{ filter === "results" ? "Up to 60 handoffs within each channel’s latest 500 messages. Open the source thread for full history." : "Up to 60 recent entries across these channels." }} Read markers stay unchanged.</p>
         <p v-if="!messages.length" class="activity-empty">No {{ filter === 'all' ? 'messages' : filter === 'results' ? 'results' : 'delivery errors' }} reported.</p>
         <details v-for="message in messages" :key="message.id" class="activity-card" :open="deliverySummary(message) === 'Delivery failed'">
           <summary><span>{{ channelById.get(message.channel_id)?.name || message.channel_id }} · {{ message.kind }}</span><span class="activity-chip" :class="{ failed: deliverySummary(message) === 'Delivery failed' }">{{ deliverySummary(message) }}</span></summary>
           <p class="activity-hint">{{ time(message.created_at) }} · {{ message.author_kind }} {{ message.author_id }}</p>
+          <button v-if="messageSource(message, channelById.get(message.channel_id))" type="button"
+            @click="emit('select', messageSource(message, channelById.get(message.channel_id))!)">Open source thread</button>
           <ChatMarkdown :text="message.body" />
           <div v-for="delivery in message.deliveries ?? []" :key="delivery.binding_id" class="activity-delivery">
             <span>{{ delivery.binding_kind }} · {{ delivery.state }} · {{ delivery.attempts }} {{ delivery.attempts === 1 ? 'attempt' : 'attempts' }}</span>

@@ -1845,9 +1845,9 @@ button.danger:hover { border-color: var(--blocked); }
   white-space: nowrap;
 }
 /* The inspector's tab row: same .tab-bar/.tab chrome as the sidebar, but
-   compact because four tabs share one narrow column. */
-.inspector-tab-bar { flex: none; }
-.inspector-tab-bar .tab { padding: 7px 0 6px; font-size: 11px; }
+   compact and scrollable because the inspector has several views. */
+.inspector-tab-bar { flex: none; overflow-x: auto; }
+.inspector-tab-bar .tab { flex: 1 0 auto; padding: 7px 8px 6px; font-size: 11px; }
 .inspector-body {
   flex: 1;
   min-height: 0;

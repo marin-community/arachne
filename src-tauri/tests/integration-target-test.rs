@@ -83,3 +83,19 @@ fn branch_id_parent_link_resolves_too() {
     let t = arachne_lib::commands::resolve_integration_target(&fleet, "worker").expect("resolve");
     assert_eq!(t.coordinator_id, "leader");
 }
+
+#[test]
+fn recursive_delegation_does_not_promote_workers_to_canonical_tracks() {
+    let fleet = vec![
+        row("track", "b-track", None, None, &[("topic", "true")]),
+        row("worker", "b-worker", Some("track"), None, &[]),
+        row("nested", "b-nested", Some("worker"), None, &[]),
+        row("legacy", "b-legacy", None, Some("b-worker"), &[]),
+    ];
+    assert!(arachne_lib::commands::should_mark_track(&fleet, "track"));
+    assert!(!arachne_lib::commands::should_mark_track(&fleet, "worker"));
+    assert!(!arachne_lib::commands::should_mark_track(&fleet, "legacy"));
+    assert!(!arachne_lib::commands::should_mark_track(&fleet, "missing"));
+    let target = arachne_lib::commands::resolve_integration_target(&fleet, "nested").unwrap();
+    assert_eq!(target.coordinator_id, "track");
+}

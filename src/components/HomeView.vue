@@ -5,7 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { SessionLayout, SessionSummary } from "../App.vue";
 import { homeRowTitle } from "../homeRows";
 import { layoutProjects, topicProjectId } from "../projects";
-import { attentionAction, attentionLevel, attentionReason, dismissibleAttention } from "../topicInspector";
+import { attentionAction, attentionLevel, attentionReason, dismissibleAttention, isReadyCandidate, threadStatus } from "../topicInspector";
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -100,13 +100,8 @@ function rowTitle(s: SessionSummary): string {
 
 const level = attentionLevel;
 
-const isIdle = (s: SessionSummary) => s.branch.tags.some((tag) => tag.key === "idle");
 // Do not infer readiness from a stopped worker. Loom must report it explicitly.
-const isReady = (s: SessionSummary) =>
-  s.branch.tags.some((tag) =>
-    (tag.key === "integration_ready" || tag.key === "integration_state") &&
-    (tag.value === "true" || tag.value === "ready"),
-  ) && !s.branch.tags.some((tag) => tag.key === "integration_result");
+const isReady = isReadyCandidate;
 
 function ago(iso: string): string {
   const minutes = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 60000));
@@ -117,7 +112,7 @@ function ago(iso: string): string {
 }
 
 function description(s: SessionSummary): string {
-  return attentionReason(s) || s.branch.description || s.branch.goal || "—";
+  return attentionReason(s) || threadStatus(s).detail || s.branch.description || s.branch.goal || "—";
 }
 
 const scoped = computed(() => props.fleet.filter((s) =>
@@ -129,11 +124,11 @@ const byRecency = (a: SessionSummary, b: SessionSummary) => b.last_activity_at.l
 const needs = computed(() => scoped.value.filter((s) => level(s) !== "ok")
   .sort((a, b) => (level(a) === "blocked" ? 0 : 1) - (level(b) === "blocked" ? 0 : 1) || byRecency(a, b)));
 const working = computed(() => scoped.value.filter((s) =>
-  level(s) === "ok" && s.status === "running" && !isIdle(s) && !isReady(s),
+  level(s) === "ok" && ["working", "reviewing"].includes(threadStatus(s).kind),
 ).sort(byRecency));
 const ready = computed(() => scoped.value.filter((s) => level(s) === "ok" && isReady(s)).sort(byRecency));
 const resting = computed(() => scoped.value.filter((s) =>
-  level(s) === "ok" && !isReady(s) && (s.status !== "running" || isIdle(s)),
+  level(s) === "ok" && !isReady(s) && !["working", "reviewing"].includes(threadStatus(s).kind),
 ).sort(byRecency));
 interface UserTodo { id: string; text: string; topic_id: string; revision: number }
 const userTodos = ref<UserTodo[]>([]);
@@ -293,7 +288,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
               @keydown.enter.stop.prevent="dismiss(s)"
               @keydown.space.stop.prevent="dismiss(s)"
             >{{ dismissingId === s.id ? "…" : "✕" }}</button>
-            <span class="row-when">{{ ago(s.last_activity_at) }}</span>
+            <span class="row-when" :title="threadStatus(s).detail">{{ threadStatus(s).label }} · {{ ago(s.last_activity_at) }}</span>
           </div>
           <section class="home-user-todos section" aria-label="Your Todos">
             <div class="home-todos-heading"><div class="section-title">Your Todos <span class="home-section-count">{{ visibleTodos.length }}</span></div>
@@ -327,7 +322,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
               @click="emit('select', s.id)" @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
               <span class="level-dot" :class="section.kind === 'ready' ? 'ready' : level(s)"></span>
               <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
-              <span class="row-when">{{ ago(s.last_activity_at) }}</span>
+              <span class="row-when" :title="threadStatus(s).detail">{{ threadStatus(s).label }} · {{ ago(s.last_activity_at) }}</span>
             </div>
           </template>
         </template>
@@ -342,7 +337,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
           @keydown.enter.prevent="emit('select', s.id)" @keydown.space.prevent="emit('select', s.id)">
           <span class="level-dot dim"></span>
           <div class="row-main"><div class="row-name">{{ rowTitle(s) }}</div><div class="row-why">{{ description(s) }}</div></div>
-          <span class="row-when">{{ ago(s.last_activity_at) }}</span>
+          <span class="row-when" :title="threadStatus(s).detail">{{ threadStatus(s).label }} · {{ ago(s.last_activity_at) }}</span>
         </div>
       </div>
     </div>

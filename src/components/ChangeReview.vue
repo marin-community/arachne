@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import CheckoutEditor from "./CheckoutEditor.vue";
 import type { SessionSummary } from "../App.vue";
+import { launchSelection } from "../launch";
 import { preparationRequest } from "../reviewRequest";
 
 interface ChangeLine {
@@ -62,7 +63,7 @@ function prepareRequest(mode: "review" | "prepare") {
   requestMode.value = mode;
   const revision = changes.value?.head_oid ? `The preview showed HEAD ${changes.value.head_oid}; re-read the current checkout, including uncommitted manual edits.` : "Inspect the current checkout, including uncommitted manual edits.";
   requestText.value = mode === "review"
-    ? `Review this thread's changes for correctness, regressions, and missing validation. ${revision} Use a review worker if useful. Report actionable findings with file locations and distinguish verified checks from unverified claims. Do not integrate, land, push, or open a PR as part of this review.`
+    ? `Review this thread's changes for correctness, regressions, and missing validation. ${revision} Act independently in a fresh review thread. Report actionable findings with file locations and distinguish verified checks from unverified claims. Do not integrate, land, push, or open a PR as part of this review.`
     : preparationRequest(props.isTopic, revision, props.integrationTarget ?? null, editedPaths.value);
 }
 async function sendRequest() {
@@ -72,9 +73,21 @@ async function sendRequest() {
   requesting.value = true;
   requestNote.value = "";
   try {
-    await invoke("send_input", { id, text: requestText.value });
+    let note: string;
+    if (requestMode.value === "review") {
+      const selection = launchSelection.value;
+      const result = await invoke<{ session: { id: string }; warnings: string[] }>("review_session", {
+        sourceId: id, brief: requestText.value,
+        profile: null, agent: selection.agent || null,
+        model: selection.model || null, effort: selection.effort || null,
+      });
+      note = `Independent reviewer ${result.session.id} launched. Its durable handoff will appear under Handoffs. ${result.warnings.join(" ")}`;
+    } else {
+      await invoke("send_input", { id, text: requestText.value });
+      note = "Preparation sent to this thread. Validation results will appear in its conversation.";
+    }
     if (id !== props.sessionId || request !== requestGeneration) return;
-    requestNote.value = "Request sent to this thread. Review and validation results will appear in its conversation.";
+    requestNote.value = note;
     requestMode.value = null;
     emit("requested");
   } catch (e: unknown) {
@@ -135,13 +148,13 @@ function lineNumber(value: number | null): string {
       <button :disabled="loading" @click="refresh">{{ loading ? "Loading…" : "Refresh" }}</button>
     </div>
     <div class="review-toolbar">
-      <button :disabled="loading || requesting" @click="prepareRequest('review')">Review with agent</button>
+      <button :disabled="loading || requesting" @click="prepareRequest('review')">Launch reviewer</button>
       <button :disabled="loading || requesting" @click="prepareRequest('prepare')">Prepare {{ isTopic ? "landing" : "integration" }}</button>
     </div>
     <div v-if="requestMode" class="review-request">
       <label :for="`review-request-${sessionId}`">{{ requestMode === 'review' ? "Review request" : "Preparation request" }}</label>
       <textarea :id="`review-request-${sessionId}`" v-model="requestText" :disabled="requesting" rows="5" />
-      <div><button :disabled="requesting" @click="requestMode = null">Cancel</button><button class="primary" :disabled="requesting || !requestText.trim()" @click="sendRequest">{{ requesting ? "Sending…" : "Send to agent" }}</button></div>
+      <div><button :disabled="requesting" @click="requestMode = null">Cancel</button><button class="primary" :disabled="requesting || !requestText.trim()" @click="sendRequest">{{ requesting ? "Sending…" : (requestMode === 'review' ? "Launch reviewer" : "Send to agent") }}</button></div>
     </div>
     <div v-if="requestNote" class="change-review-state" role="status">{{ requestNote }}</div>
     <div class="review-file-picker">

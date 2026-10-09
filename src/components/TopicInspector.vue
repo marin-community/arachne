@@ -8,14 +8,12 @@ import { reviewIntegrationTarget } from "../reviewRequest";
 import TrackActivity from "./TrackActivity.vue";
 import SplitButton from "./SplitButton.vue";
 import {
-  badgeLabel,
   integrationCandidates,
   type IntegrationCandidate,
-  isIdle,
-  loudTag,
   pendingPermissionSummary,
   statusClass,
   topicThreadRows,
+  threadStatus,
 } from "../topicInspector";
 
 // The Topic inspector (docs/design.md "Navigation"): the right pane while a
@@ -39,7 +37,8 @@ const emit = defineEmits<{
   (e: "checkout-saved", sessionId: string): void;
 }>();
 
-const tab = ref<"threads" | "review" | "resources" | "integrations" | "todos" | "activity">("threads");
+const candidateLabels = { ready: "Ready", stale: "Needs recheck", conflicted: "Conflict", integrated: "Integrated" };
+const tab = ref<"threads" | "review" | "resources" | "integrations" | "todos" | "activity" | "handoffs">("threads");
 const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId) ?? props.topic);
 const canEdit = computed(() => {
   try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(props.loomUrl ?? "").hostname); }
@@ -57,7 +56,7 @@ function reviewCandidate(id: string) { emit("select", id); tab.value = "review";
 function subtitle(s: SessionSummary): string {
   const permission = pendingPermissionSummary(s);
   if (permission) return permission;
-  return s.branch.description || s.branch.title || "—";
+  return threadStatus(s).detail || s.branch.description || s.branch.title || "—";
 }
 
 const collapsed = ref(new Set<string>());
@@ -233,6 +232,7 @@ watch(() => props.topic.id, () => {
     <div class="tab-bar inspector-tab-bar" role="tablist">
       <button class="tab" :class="{ active: tab === 'threads' }" role="tab" :aria-selected="tab === 'threads'" @click="tab = 'threads'">Threads</button>
       <button class="tab" :class="{ active: tab === 'review' }" role="tab" :aria-selected="tab === 'review'" @click="tab = 'review'">Review</button>
+      <button class="tab" :class="{ active: tab === 'handoffs' }" role="tab" :aria-selected="tab === 'handoffs'" @click="tab = 'handoffs'">Handoffs</button>
       <button class="tab" :class="{ active: tab === 'activity' }" role="tab" :aria-selected="tab === 'activity'" @click="tab = 'activity'">Activity</button>
       <button class="tab" :class="{ active: tab === 'resources' }" role="tab" :aria-selected="tab === 'resources'" @click="tab = 'resources'">Resources</button>
       <button class="tab" :class="{ active: tab === 'integrations' }" role="tab" :aria-selected="tab === 'integrations'" @click="tab = 'integrations'">Integrations</button>
@@ -267,15 +267,19 @@ watch(() => props.topic.id, () => {
               :aria-label="`${row.isCollapsed ? 'Expand' : 'Collapse'} threads under ${row.session.branch.name}`"
               @click.stop="toggle(row.session.id)">{{ row.isCollapsed ? "▸" : "▾" }}</span>
             <span class="name">{{ row.session.branch.name || row.session.id }}</span>
-            <span v-if="row.session.status === 'running' && !isIdle(row.session) && !loudTag(row.session)"
-              class="spinner mini" title="working" aria-hidden="true"></span>
-            <span v-else-if="badgeLabel(row.session)" class="badge" :class="statusClass(row.session)">{{ badgeLabel(row.session) }}</span>
+            <span v-if="['working', 'reviewing'].includes(threadStatus(row.session).kind)"
+              class="spinner mini" :title="threadStatus(row.session).label" aria-hidden="true"></span>
+            <span class="badge" :class="statusClass(row.session)" :title="threadStatus(row.session).detail">{{ threadStatus(row.session).label }}</span>
             <span v-if="row.childCount > 0" class="badge dim" :title="`${row.childCount} delegated children`">{{ row.childCount }}</span>
           </div>
           <div class="title">{{ subtitle(row.session) }}</div>
         </div>
         <div v-if="!topicRows.length" class="inspector-empty">No threads in this track yet.</div>
       </div>
+    </div>
+
+    <div v-else-if="tab === 'handoffs'" class="inspector-body inspector-body-flush">
+      <TrackActivity :topic="topic" results-only @select="emit('select', $event)" />
     </div>
 
     <!-- Resources: the topic's attached resources and refs (ResourcePanel's
@@ -302,14 +306,14 @@ watch(() => props.topic.id, () => {
         <div class="inspector-candidate-head">
           <span class="name">{{ candidate.session.branch.title || candidate.session.branch.name }}</span>
           <span class="badge" :class="candidate.state === 'ready' ? 'done' : 'dim'">
-            {{ candidate.state === "ready" ? "Ready" : "Integrated" }}
+            {{ candidateLabels[candidate.state] }}
           </span>
         </div>
         <div class="inspector-candidate-sub">
           {{ candidate.note || candidate.session.branch.branch }}
         </div>
         <div class="inspector-candidate-actions">
-          <button class="link" @click="reviewCandidate(candidate.session.id)">Review</button>
+          <button class="link" @click="reviewCandidate(candidate.session.id)">{{ candidate.state === 'stale' || candidate.state === 'conflicted' ? "Reconcile / review" : "Review" }}</button>
           <SplitButton
             v-if="candidate.state === 'ready'"
             kind="integrate"

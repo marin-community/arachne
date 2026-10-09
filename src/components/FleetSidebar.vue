@@ -11,7 +11,7 @@ import {
   visibleTopics,
 } from "../topicList";
 import { byTopicRecency, topicRecencyMap } from "../topicOrder";
-import { dismissibleAttention, pendingPermissionSummary } from "../topicInspector";
+import { dismissibleAttention, pendingPermissionSummary, statusClass, threadStatus } from "../topicInspector";
 import { topicRootOf, threadAncestors } from "../topic-view";
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -71,43 +71,11 @@ const dropTarget = ref<string | null>(null);
 // list block below for the model.
 const showArchived = ref(false);
 
-// Loom tag semantics (weaver-core/src/tags.rs): the loud keys `attention`
-// (agent self-report) and `triage` (outside assessment) carry values
-// `attention` | `blocked`; absence is the calm/default state. `idle` is a
-// quiet resting mark. Prose status lives on branch.description.
-function loudTag(s: SessionSummary): { level: "attention" | "blocked" } | null {
-  for (const key of ["attention", "triage"]) {
-    const tag = s.branch.tags.find((t) => t.key === key);
-    if (tag && (tag.value === "attention" || tag.value === "blocked")) {
-      return { level: tag.value };
-    }
-  }
-  if (s.pending_permissions?.length && s.status !== "archived") return { level: "attention" };
-  return null;
-}
-
 function subtitle(s: SessionSummary): string {
-  const permission = pendingPermissionSummary(s);
-  if (permission) return permission;
-  return s.branch.description || s.branch.title || "—";
+  return pendingPermissionSummary(s) || threadStatus(s).detail || s.branch.description || s.branch.title || "—";
 }
-
-function statusClass(s: SessionSummary): string {
-  const loud = loudTag(s);
-  if (loud?.level === "blocked") return "error";
-  if (loud?.level === "attention") return "attention";
-  return "done";
-}
-
-// The text badge for a row, or null when it should stay quiet: a working
-// thread spins instead, a resting one (running + idle mark) shows nothing.
 function badgeLabel(s: SessionSummary): string | null {
-  if (s.status === "archived") return "done";
-  if (s.status === "orphaned") return null;
-  const loud = loudTag(s);
-  if (loud) return loud.level;
-  if (s.status === "running") return null;
-  return s.status;
+  return threadStatus(s).label;
 }
 
 // --- Track tree --------------------------------------------------------------
@@ -115,14 +83,6 @@ function badgeLabel(s: SessionSummary): string | null {
 interface TreeNode {
   session: SessionSummary;
   children: TreeNode[];
-}
-
-// The quiet `idle` mark loom stamps when an agent finishes its turn: the
-// process stays `running` between turns, so "running" alone means "alive",
-// not "working". (Mirrors loom's own idleTag: a resting agent is idle, a
-// working one has no idle mark.)
-function isIdle(s: SessionSummary): boolean {
-  return s.branch.tags.some((t) => t.key === "idle");
 }
 
 interface Lane {
@@ -773,16 +733,14 @@ async function archiveRow(id: string) {
                    badge so attention/blocked never reads as ordinary progress. -->
               <span
                 v-if="
-                  row.session.status === 'running' &&
-                  !isIdle(row.session) &&
-                  !loudTag(row.session)
+                  ['working', 'reviewing'].includes(threadStatus(row.session).kind)
                 "
                 class="spinner mini"
                 title="working"
                 aria-hidden="true"
               ></span>
               <span
-                v-else-if="badgeLabel(row.session)"
+                v-if="badgeLabel(row.session)"
                 class="badge"
                 :class="statusClass(row.session)"
                 >{{ badgeLabel(row.session) }}</span
@@ -1000,16 +958,14 @@ async function archiveRow(id: string) {
                    spins, resting/terminal stay quiet, loud tags stay text. -->
               <span
                 v-if="
-                  t.session.status === 'running' &&
-                  !isIdle(t.session) &&
-                  !loudTag(t.session)
+                  ['working', 'reviewing'].includes(threadStatus(t.session).kind)
                 "
                 class="spinner mini"
                 title="working"
                 aria-hidden="true"
               ></span>
               <span
-                v-else-if="badgeLabel(t.session)"
+                v-if="badgeLabel(t.session)"
                 class="badge"
                 :class="statusClass(t.session)"
                 >{{ badgeLabel(t.session) }}</span

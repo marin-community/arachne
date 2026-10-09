@@ -11,6 +11,8 @@ import {
   pendingPermissionSummary,
   statusClass,
   topicThreadRows,
+  threadStatus,
+  attentionLevel,
 } from "../src/topicInspector.ts";
 
 const session = (id, overrides = {}) => ({
@@ -198,4 +200,46 @@ test("attention reasons ignore notes on cleared tags and prefer live approvals",
   assert.equal(attentionReason(pending), "Approve tool use: Run deploy?");
   assert.equal(attentionAction(pending), "Review approval");
   assert.equal(attentionReason(withTag(session("a"), "attention", "ok", "Old success")), null);
+});
+
+
+test("thread facts separate active work, review, waiting, parent help, and human attention", () => {
+  assert.equal(threadStatus(session("active")).kind, "working");
+  assert.equal(threadStatus(withTag(session("review"), "role", "reviewer")).kind, "reviewing");
+  const idle = withTag(session("idle"), "idle", "true");
+  assert.equal(threadStatus(idle).kind, "resting");
+  const waiting = withTag(idle, "waiting", "experiment", "Experiment 32x4");
+  assert.deepEqual(threadStatus(waiting), { kind: "waiting", label: "waiting", detail: "Experiment 32x4" });
+  const help = withTag(idle, "parent_help", "requested", "Need target context");
+  assert.equal(threadStatus(help).kind, "parent-help");
+  assert.equal(attentionLevel(help), "ok");
+  const error = session("error", { status: "error" });
+  assert.equal(threadStatus(error).kind, "error");
+  assert.equal(attentionLevel(error), "ok");
+  const escalated = withTag(help, "attention", "blocked", "Human must grant access");
+  assert.equal(threadStatus(escalated).kind, "needs-you");
+  assert.equal(attentionLevel(escalated), "blocked");
+});
+
+test("new stale/conflict facts supersede old readiness and reviewers never become candidates", () => {
+  const ready = withTag(session("worker", { parent_session_id: "track" }), "integration_ready", "true", "Track@abc");
+  const conflict = withTag(ready, "integration_state", "conflicted", "Track@def conflicts");
+  const stale = withTag(ready, "integration_state", "stale", "Track advanced");
+  assert.equal(isReadyCandidate(conflict), false);
+  assert.equal(isReadyCandidate(stale), false);
+  assert.equal(threadStatus(conflict).kind, "conflicted");
+  assert.equal(threadStatus(stale).kind, "stale");
+  const reviewer = withTag(withTag(session("reviewer", { parent_session_id: "track" }), "role", "reviewer"), "integration_ready", "true");
+  const rows = topicThreadRows([session("track"), conflict, reviewer], "track", new Set());
+  assert.deepEqual(integrationCandidates(rows, "track").map(c => [c.session.id, c.state]), [["worker", "conflicted"]]);
+  const integrated = withTag(ready, "integration_result", "commit123");
+  assert.equal(isReadyCandidate(integrated), false);
+});
+
+test("waiting PRs and resolved wait tags do not imply human attention", () => {
+  const idle = withTag(session("pr"), "idle", "true");
+  idle.branch.github = { pr_state: "OPEN", pr_number: 12, checks: "PENDING" };
+  assert.equal(threadStatus(idle).label, "waiting on CI");
+  assert.equal(attentionLevel(idle), "ok");
+  assert.equal(threadStatus(withTag(withTag(session("done"), "idle", "true"), "waiting", "resolved")).kind, "resting");
 });
