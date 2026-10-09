@@ -901,7 +901,6 @@ async function archiveRow(id: string) {
             class="project-header"
             :class="{
               selected: selectedProjectId === section.id,
-              empty: !section.topics.length,
             }"
             :title="
               dragging
