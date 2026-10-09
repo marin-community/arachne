@@ -156,7 +156,8 @@ async function answerPermission(block: ChatDisplayBlock, optionId: string) {
 }
 
 const draft = ref("");
-const completion = useFileCompletion(draft, computed(() => props.session.id));
+const composerEl = ref<HTMLTextAreaElement | null>(null);
+const completion = useFileCompletion(draft, computed(() => ({ id: props.session.id })), composerEl);
 const attachments = ref<FileAttachment[]>([]);
 const attachmentError = ref("");
 const attachmentLoading = ref(false);
@@ -199,7 +200,6 @@ interface MentionResource {
   /** Inherited rows the track hid — never offerable as a mention. */
   hidden?: boolean;
 }
-const composerEl = ref<HTMLTextAreaElement | null>(null);
 const slash = useSlashCommands(draft, computed(() => metadata.value?.commands ?? []), composerEl);
 const canCompact = computed(() => metadata.value?.commands.some((command) => command.name === "compact") ?? false);
 const mentionResources = ref<MentionResource[]>([]);
@@ -233,11 +233,12 @@ async function loadMentionResources() {
 }
 
 function updateMention() {
+  completion.updateCaret();
   const caret = composerEl.value?.selectionStart ?? draft.value.length;
   const before = draft.value.slice(0, caret);
-  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(before);
+  const match = /(?:^|\s)@\{?([^@{}\n]{0,64})$/.exec(before);
   const wasOpen = !!mentionRange.value;
-  mentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
+  mentionRange.value = match ? { start: before.lastIndexOf("@"), end: caret, query: match[1] } : null;
   mentionIndex.value = 0;
   if (mentionRange.value && !wasOpen) void loadMentionResources();
 }
@@ -260,13 +261,12 @@ function chooseMention(resource: MentionResource) {
 
 function onComposerKeydown(event: KeyboardEvent) {
   if (slash.onKeydown(event)) return;
-  if (completion.onKeydown(event)) return;
+  if (completion.onKeydown(event)) { mentionRange.value = null; return; }
   if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
-    if (mentionRange.value && matchingResources.value.length) chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
     // Empty composer + idle agent + flagged thread: the send button is the
     // dismiss button, so ⌘/Ctrl+Enter affirms the same way.
-    else if (sendAsDismiss.value) void dismissAttention();
+    if (sendAsDismiss.value) void dismissAttention();
     else void send();
     return;
   }
@@ -276,6 +276,8 @@ function onComposerKeydown(event: KeyboardEvent) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value + 1) % matchingResources.value.length;
   } else if (event.key === "ArrowUp" && matchingResources.value.length) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value - 1 + matchingResources.value.length) % matchingResources.value.length;
+  } else if ((event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) && matchingResources.value.length) {
+    event.preventDefault(); chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
 }
 
@@ -716,9 +718,6 @@ onUnmounted(() => {
 });
 
 async function send() {
-  if (mentionRange.value && matchingResources.value.length) {
-    chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
-  }
   const text = draft.value.trim();
   if (!canSend.value || (!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
   const wasOrphaned = currentStatus.value === "orphaned";
@@ -1433,7 +1432,7 @@ async function onLand(strategy: string) {
           <button class="primary" :disabled="!handoffAllowed || handingOff" @click="handoff">{{ handingOff ? "Switching…" : "Switch" }}</button>
         </div>
       </div>
-      <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Track resources">
+      <div v-if="mentionRange && !completion.visible.value" class="mention-menu" role="listbox" aria-label="Track resources">
         <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
         <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
         <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
@@ -1471,8 +1470,8 @@ async function onLand(strategy: string) {
               ? 'Agent is working — your message will queue behind the current turn…'
               : `Ask ${session.agent_kind || 'the agent'} to implement, inspect, explain, or fix…${metadata?.commands.length ? ' Type / for commands.' : ''}`
           "
-          @input="completion.updateCaret"
-          @click="completion.updateCaret"
+          @input="updateMention"
+          @click="updateMention"
           @keyup="completion.updateCaret"
           @keydown="onComposerKeydown"
           @paste="onComposerPaste"
@@ -1489,7 +1488,7 @@ async function onLand(strategy: string) {
               role="option"
               :aria-selected="index === completion.selected.value"
               @mousedown.prevent
-              @click="completion.choose(path)"
+              @click="completion.choose(path); mentionRange = null"
             >
               @{{ path }}
             </button>

@@ -1,13 +1,20 @@
-import { computed, nextTick, onUnmounted, ref, watch, type Ref } from "vue";
+import { computed, nextTick, onScopeDispose, ref, watch, type Ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+
+export interface FileCompletionSource {
+  id?: string;
+  repo?: string;
+}
 
 // Both composers send plain text. Complete the mention at the caret, then
 // leave the @path in the prompt so the agent can see the selected file.
 export function useFileCompletion(
   draft: Ref<string>,
-  sessionId: Ref<string | null>,
+  source: Ref<FileCompletionSource | null>,
+  input: Ref<HTMLTextAreaElement | HTMLInputElement | null>,
+  lookup = (source: FileCompletionSource, query: string) =>
+    invoke<string[]>("complete_files", { ...source, query }),
 ) {
-  const input = ref<HTMLInputElement | HTMLTextAreaElement | null>(null);
   const caret = ref(0);
   const matches = ref<string[]>([]);
   const selected = ref(0);
@@ -17,7 +24,7 @@ export function useFileCompletion(
 
   const mention = computed(() => {
     const before = draft.value.slice(0, caret.value);
-    const found = /(?:^|\s)@([^\s@]*)$/.exec(before);
+    const found = /(?:^|\s)@([^\s@{}]*)$/.exec(before);
     if (!found) return null;
     return { start: before.length - found[1].length - 1, query: found[1] };
   });
@@ -25,20 +32,17 @@ export function useFileCompletion(
     !dismissed.value && mention.value !== null && matches.value.length > 0,
   );
 
-  watch([mention, sessionId], ([current, id]) => {
+  watch([mention, source], ([current, target]) => {
     selected.value = 0;
     dismissed.value = false;
     const request = ++sequence;
     if (timer) clearTimeout(timer);
     matches.value = [];
-    if (!current || !id) return;
+    if (!current || !target) return;
     timer = setTimeout(async () => {
       timer = null;
       try {
-        const files = await invoke<string[]>("complete_files", {
-          id,
-          query: current.query,
-        });
+        const files = await lookup(target, current.query);
         if (request === sequence) matches.value = files;
       } catch {
         // Completion is optional; a failed lookup must never block typing.
@@ -69,19 +73,22 @@ export function useFileCompletion(
   }
 
   function onKeydown(event: KeyboardEvent): boolean {
-    if (!visible.value) return false;
-    if (event.key === "Escape") {
+    if (event.key === "Escape" && mention.value && !dismissed.value) {
       event.preventDefault();
+      event.stopPropagation();
+      sequence++;
+      if (timer) clearTimeout(timer);
       dismissed.value = true;
       return true;
     }
+    if (!visible.value) return false;
     if (event.key === "ArrowDown" || event.key === "ArrowUp") {
       event.preventDefault();
       const delta = event.key === "ArrowDown" ? 1 : -1;
       selected.value = (selected.value + delta + matches.value.length) % matches.value.length;
       return true;
     }
-    if (event.key === "Tab" || event.key === "Enter") {
+    if (event.key === "Tab" || (event.key === "Enter" && !event.shiftKey && !event.metaKey && !event.ctrlKey)) {
       event.preventDefault();
       choose(matches.value[selected.value]);
       return true;
@@ -89,7 +96,7 @@ export function useFileCompletion(
     return false;
   }
 
-  onUnmounted(() => {
+  onScopeDispose(() => {
     sequence++;
     if (timer) clearTimeout(timer);
   });

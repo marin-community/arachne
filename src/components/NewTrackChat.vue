@@ -7,6 +7,7 @@ import { pasteAsPlainText } from "../composerPaste";
 import { readDraft, saveDraft, mergeLaunchConfig, type NewTopicDraft } from "../newTopicDraft";
 import { recentRepositories, rememberRepository, readProjectDefaults } from "../launchDefaults";
 import { layoutProjects } from "../projects";
+import { useFileCompletion } from "../useFileCompletion";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-track chat (docs/design.md "Navigation"): New track opens a chat
@@ -169,6 +170,7 @@ const mentions = computed({
 Object.assign(draft, mergeLaunchConfig(draft, props.launchOptions));
 
 const bodyEl = ref<HTMLTextAreaElement | null>(null);
+const completion = useFileCompletion(body, computed(() => repo.value.trim() ? { repo: repo.value.trim() } : null), bodyEl);
 
 const profile = computed({
   get: () => draft.profile,
@@ -308,10 +310,11 @@ async function loadMentionResources() {
 }
 
 function updateMention() {
+  completion.updateCaret();
   const caret = bodyEl.value?.selectionStart ?? body.value.length;
-  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(body.value.slice(0, caret));
+  const match = /(?:^|\s)@\{?([^@{}\n]{0,64})$/.exec(body.value.slice(0, caret));
   const wasOpen = !!mentionRange.value;
-  mentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
+  mentionRange.value = match ? { start: body.value.slice(0, caret).lastIndexOf("@"), end: caret, query: match[1] } : null;
   mentionIndex.value = 0;
   if (mentionRange.value && !wasOpen) void loadMentionResources();
 }
@@ -534,13 +537,10 @@ function send() {
 // a newline so the opening message can be multi-line. The mention menu
 // owns the arrow keys and Escape while it's open.
 function onComposerKeydown(event: KeyboardEvent) {
+  if (completion.onKeydown(event)) { mentionRange.value = null; return; }
   if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
-    if (mentionRange.value && matchingResources.value.length) {
-      chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
-    } else {
-      send();
-    }
+    send();
     return;
   }
   if (!mentionRange.value) return;
@@ -549,6 +549,8 @@ function onComposerKeydown(event: KeyboardEvent) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value + 1) % matchingResources.value.length;
   } else if (event.key === "ArrowUp" && matchingResources.value.length) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value - 1 + matchingResources.value.length) % matchingResources.value.length;
+  } else if ((event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) && matchingResources.value.length) {
+    event.preventDefault(); chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
 }
 </script>
@@ -684,7 +686,14 @@ function onComposerKeydown(event: KeyboardEvent) {
          pills, and send — the same affordances a live thread's composer
          carries. -->
     <div class="composer-wrap" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
-      <div v-if="mentionRange" class="mention-menu" role="listbox" aria-label="Existing track resources">
+      <div v-if="completion.visible.value" class="mention-menu" role="listbox" aria-label="Repository files">
+        <button v-for="(path, index) in completion.matches.value" :key="path" type="button" role="option"
+          :aria-selected="index === completion.selected.value" :class="{ selected: index === completion.selected.value }"
+          @mousedown.prevent="completion.choose(path); mentionRange = null">
+          <strong>@{{ path }}</strong>
+        </button>
+      </div>
+      <div v-else-if="mentionRange" class="mention-menu" role="listbox" aria-label="Existing track resources">
         <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
         <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
         <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
@@ -713,9 +722,10 @@ function onComposerKeydown(event: KeyboardEvent) {
           <textarea
             ref="bodyEl"
             v-model="body"
-            placeholder="Describe the goal, context, and what a good result looks like… Use @ to mention an existing resource."
+            placeholder="Describe the goal, context, and what a good result looks like… Use @ to mention a repository file or resource."
             @input="updateMention"
             @click="updateMention"
+            @keyup="completion.updateCaret"
             @keydown="onComposerKeydown"
             @paste="onPaste"
           ></textarea>
