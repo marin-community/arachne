@@ -637,8 +637,9 @@ squash into the primary checkout's CURRENT branch; never substitute recorded bas
 never push or open a PR. Preserve all staged, unstaged and untracked target changes; use an \
 isolated checkout for reconciliation and advance/update the target safely, without absorbing \
 foreign staged changes or using destructive resets/stashes. A changed target requires fresh \
-validation; unrelated in-progress Git operations are blockers. Other non-PR strategies use \
-the resolved target policy above and re-verify it against the live checkout. Report the actual \
+validation; unrelated in-progress Git operations are blockers. Other non-PR strategies honor \
+an explicit destination; otherwise use the primary checkout's current branch, falling back to `main` \
+only when it cannot be resolved. Re-verify the target against the live checkout. Report the actual \
 completed commit/PR or no-op, exact source/target revisions, validation and remaining git \
 status. Stamp integration_result only after actual successful landing and validation; queued \
 preparation is not landed or verified readiness.\n\
