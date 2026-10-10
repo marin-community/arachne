@@ -20,6 +20,7 @@ pub mod editor;
 pub mod file_completion;
 pub mod landing;
 pub mod loom;
+pub mod publishing;
 pub mod resources;
 pub mod secret;
 
@@ -69,6 +70,7 @@ pub fn run() {
             commands::delete_group,
             commands::integrate_session,
             commands::land_topic,
+            publishing::publish_track,
             commands::work_summary,
             commands::work_changes,
             activity::track_activity,
