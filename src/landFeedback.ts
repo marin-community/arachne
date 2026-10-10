@@ -6,6 +6,7 @@ export interface LandResult {
     commit?: string;
     commits_squashed: number;
     primary_checkout: string;
+    warnings?: string[];
   };
 }
 
@@ -13,9 +14,10 @@ export interface LandResult {
 export function landResultFeedback(result: LandResult): string {
   if (result.local && result.landing) {
     const done = result.landing;
-    return done.landed
+    const feedback = done.landed
       ? `Published locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch}${done.commit ? ` · ${done.commit}` : " (commit revision unavailable)"}`
       : `${done.target_branch} already contained this track's changes — nothing to do.`;
+    return `${feedback}${done.warnings?.length ? ` ${done.warnings.join(" ")}` : ""}`;
   }
   return "Publish requested. Follow the actual result in this thread.";
 }

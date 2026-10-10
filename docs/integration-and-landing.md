@@ -51,7 +51,14 @@ operation remains an actionable blocker.
 
 **Review → Prepare** remains optional preparation only. It inspects,
 repairs, validates and commits intended source changes without accepting or
-publishing. Review compares against the canonical Track topic branch.
+publishing. Worker review compares against the canonical Track topic branch.
+Track review uses the canonical accepted ref as its candidate and the
+publishing base as its comparison, even when coordinator scratch differs.
+Local previews calculate that actual comparison. Loom has no arbitrary-ref
+remote diff read endpoint: remote previews report their scope as unavailable
+and preserve the Review action for an independent agent to inspect the real
+canonical comparison in the remote repository. Never label a recorded-base
+diff as the canonical comparison.
 Reviewer Threads report findings and are not acceptance candidates.
 
 ## Canonical Track topic branches
@@ -185,3 +192,9 @@ The exact metadata and backend command contract lives in
 [thread-landing-contract.md](thread-landing-contract.md). Agent procedure is
 in [integration guidance](../skills/integration.md); role/wake guidance is
 in [coordinator](../skills/coordinator.md) and [worker](../skills/worker.md).
+
+Dispatch receipts confirm request delivery only. A malformed or lost receipt
+can mean the full authorization already arrived: report uncertain delivery
+and reconcile the durable thread/channel before retrying. Terminal requests
+use stable identities and verified own-channel delivery subscriptions; they
+never type into active shells or claim an ACP queue.

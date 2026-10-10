@@ -47,3 +47,13 @@ test("completed publish remains completion if a follow-up commit revision is una
   assert.match(feedback, /commit revision unavailable/);
   assert.doesNotMatch(feedback, /undefined|requested|failed/);
 });
+
+
+test("post-completion warnings do not turn a successful Git write into a queued or failed operation", () => {
+  const feedback = landResultFeedback({ local: true, landing: { ...landing,
+    warnings: ["Git completed; revision metadata could not be refreshed."],
+  } });
+  assert.match(feedback, /Published locally.*abc123/);
+  assert.match(feedback, /revision metadata could not be refreshed/);
+  assert.doesNotMatch(feedback, /Publish requested/);
+});
