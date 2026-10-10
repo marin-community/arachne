@@ -73,6 +73,7 @@ const draftStorage = {
   removeItem: (key: string) => localStorage.removeItem(key),
 };
 const draft: NewTopicDraft = reactive(readDraft(draftStorage));
+defineExpose({ draftSnapshot: () => JSON.stringify(draft) });
 const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
 
 // The project picker: the layout's non-system groups, "No project" first.

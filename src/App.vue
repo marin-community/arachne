@@ -15,7 +15,7 @@ import ProjectSheet from "./components/ProjectSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
 import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
-import { clearDraftOnLaunch, initializeDraftStorage } from "./newTopicDraft";
+import { clearDraftOnLaunch, initializeDraftStorage, readDraft } from "./newTopicDraft";
 import {
   resolveTopicThread,
   topicRootOf,
@@ -189,7 +189,9 @@ watch(showResources, value => localStorage.setItem("arachne.inspector", String(v
 const showSearch = ref(false);
 const settingsSaving = ref(false);
 const threadView = ref<InstanceType<typeof ThreadView> | null>(null);
+const newTrackChat = ref<InstanceType<typeof NewTrackChat> | null>(null);
 let connectionGeneration = 0;
+let launcherGeneration = 0;
 function closeLaunchers() { showNewTopic.value = false; showNewThread.value = false; showNewProject.value = false; projectResourcesProject.value = null; }
 async function openWorker() {
   if (!selectedView.value && selectedTopic.value) await selectSession(selectedTopic.value.id);
@@ -339,8 +341,8 @@ async function saveSettings(url: string, token: string) {
 
 // --- Actions ----------------------------------------------------------------
 
-async function selectSession(id: string) {
-  closeLaunchers();
+async function selectSession(id: string, launchedView?: SessionView, launcher = launcherGeneration) {
+  if (!launchedView) closeLaunchers();
   const generation = connectionGeneration;
   viewMode.value = "thread";
   selectedId.value = id;
@@ -351,10 +353,20 @@ async function selectSession(id: string) {
   selectedView.value = null;
   try {
     const view = await invoke<SessionView>("open_session", { id });
-    if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id) selectedView.value = view;
+    if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id) {
+      selectedView.value = view;
+      if (launchedView && launcher === launcherGeneration) closeLaunchers();
+    }
   } catch (e: any) {
-    if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id)
+    if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id) {
       connError.value = e?.message ?? String(e);
+      if (launchedView) {
+        // Creation succeeded even if activating its stream failed. Show the
+        // existing track with the error instead of a launch retry.
+        selectedView.value = launchedView;
+        if (launcher === launcherGeneration) closeLaunchers();
+      }
+    }
   }
 }
 
@@ -428,6 +440,7 @@ async function openTopicInZed(id: string) {
 const newTopicProject = ref<{ id: string | null; name: string } | null>(null);
 
 function openNewThread() {
+  launcherGeneration++;
   // A stale connection error from an earlier flow shouldn't read as a
   // launch failure inside the fresh sheet.
   connError.value = null;
@@ -437,6 +450,7 @@ function openNewThread() {
 }
 
 function openNewTopic() {
+  launcherGeneration++;
   connError.value = null;
   closeLaunchers();
   newTopicProject.value = null;
@@ -447,6 +461,7 @@ function openNewTopic() {
 // sheet. Navigation itself (the project-filtered home) is a separate
 // minimal handler.
 function openNewTopicInProject(project: { id: string | null; name: string } | null) {
+  launcherGeneration++;
   connError.value = null;
   closeLaunchers();
   newTopicProject.value = project;
@@ -464,6 +479,7 @@ function closeNewThreadSheet() {
 // (what new topics inherit) without creating a topic first.
 const projectResourcesProject = ref<{ id: string; name: string } | null>(null);
 function openNewProject() {
+  launcherGeneration++;
   connError.value = null;
   closeLaunchers();
   newTopicProject.value = null;
@@ -478,6 +494,7 @@ function openProjectResources(project: { id: string | null; name: string }) {
   // Only real projects have bindings — Ungrouped (null id) never opens
   // this sheet; the sidebar only emits for named headings anyway.
   if (!project.id) return;
+  launcherGeneration++;
   connError.value = null;
   closeLaunchers();
   newTopicProject.value = null;
@@ -509,7 +526,11 @@ async function launchTask(
   meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[]; asTrack?: boolean },
   completed?: (success: boolean) => void,
 ) {
+  // Vue batches prop updates, so the composer's disabled state alone cannot
+  // prevent two submissions in the same tick (keyboard + click, for example).
+  if (launching.value) return;
   launching.value = true;
+  const launcher = launcherGeneration;
   try {
     const view = await invoke<SessionView>("launch_session", {
       repo,
@@ -532,8 +553,8 @@ async function launchTask(
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
     // not just the launch stub — otherwise the thread never streams live.
-    showNewThread.value = false;
-    await selectSession(view.id);
+    // Keep the launch composer painted until the live view is available.
+    await selectSession(view.id, view, launcher);
     completed?.(true);
   } catch (e: any) {
     // Keep the sheet open with the draft intact: a failed launch
@@ -559,13 +580,19 @@ function launchTopic(
   repo: string,
   meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
 ) {
+  const launcher = launcherGeneration;
+  const launchedDraft = newTrackChat.value?.draftSnapshot();
   launchTask(task, repo, { ...meta, asTrack: true }, (success) => {
     if (success) {
-      closeNewTopic();
+      if (launcher === launcherGeneration) closeNewTopic();
       // Unmounting the sheet snapshots its draft (onUnmounted runs on
       // this same flush); drop it a microtask later, after that snapshot
       // has landed, so reopening the sheet starts fresh.
-      nextTick(() => clearDraftOnLaunch(localStorage));
+      nextTick(() => {
+        // Navigation may have saved a newer draft while creation was pending.
+        // Only remove the saved snapshot belonging to the launched composer.
+        if (JSON.stringify(readDraft(localStorage)) === launchedDraft) clearDraftOnLaunch(localStorage);
+      });
     }
   });
 }
@@ -579,8 +606,9 @@ function launchThread(
   repo: string,
   meta?: { mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
+  const launcher = launcherGeneration;
   launchTask(task, repo, meta, (success) => {
-    if (success) closeNewThreadSheet();
+    if (success && launcher === launcherGeneration) closeNewThreadSheet();
   });
 }
 
@@ -783,6 +811,7 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       @unarchive="onUnarchived"
     />
     <NewTrackChat
+      ref="newTrackChat"
       v-if="showNewTopic"
       :fleet="fleet"
       :launching="launching"
