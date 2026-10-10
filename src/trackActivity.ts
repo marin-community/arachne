@@ -11,6 +11,7 @@ export interface ActivityMessage {
   id: string; channel_id: string; seq: number; kind: string; urgency: string;
   author_kind: string; author_id: string; body: string; created_at: string;
   deliveries?: ActivityDelivery[];
+  payload?: { arachne?: { source_session_id?: string }; child_session_id?: string };
 }
 export interface ActivityWatch {
   id: string; name: string; enabled: boolean;
@@ -21,7 +22,7 @@ export interface ActivityWatch {
   latest_run?: { summary?: string; stderr?: string; exit_code?: number | null } | null;
 }
 export interface TrackActivitySnapshot {
-  channels: ActivityChannel[]; messages: ActivityMessage[]; watches: ActivityWatch[];
+  channels: ActivityChannel[]; messages: ActivityMessage[]; handoffs?: ActivityMessage[]; watches: ActivityWatch[];
   warnings: string[]; channels_truncated: boolean;
 }
 
@@ -50,4 +51,10 @@ export function deliverySummary(message: ActivityMessage): string {
   if (!deliveries.length) return message.kind === "result" ? "Result recorded" : "Recorded";
   if (deliveries.every((d) => d.state === "delivered")) return "Delivered";
   return [...new Set(deliveries.map((d) => d.state))].join(" · ");
+}
+
+/** Prefer the actual author of shared-channel results over the channel owner. */
+export function messageSource(message: ActivityMessage, channel?: ActivityChannel): string | null {
+  if (message.author_kind === "session") return message.author_id;
+  return message.payload?.arachne?.source_session_id || message.payload?.child_session_id || channel?.session_id || null;
 }

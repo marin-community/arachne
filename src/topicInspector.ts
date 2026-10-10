@@ -45,7 +45,7 @@ export function attentionReason(s: SessionSummary): string | null {
 
 export function attentionLevel(s: SessionSummary): "blocked" | "attention" | "ok" {
   if (s.status === "archived") return "ok";
-  return loudTag(s)?.level ?? (s.status === "error" ? "attention" : "ok");
+  return loudTag(s)?.level ?? "ok";
 }
 
 /** Label the concrete next step without assuming every open PR needs a human. */
@@ -188,10 +188,43 @@ export function topicThreadRows(
  * never implies readiness.
  */
 export function isReadyCandidate(s: SessionSummary): boolean {
+  if (integrationResult(s) || s.branch.tags.some(t => t.key === "role" && t.value === "reviewer")) return false;
+  const state = s.branch.tags.find(t => t.key === "integration_state")?.value;
+  // A current failure/staleness assessment supersedes an old ready mark.
+  if (state && !["true", "ready"].includes(state)) return false;
   return ["integration_ready", "integration_state"].some((key) => {
     const value = s.branch.tags.find((t) => t.key === key)?.value;
     return value === "true" || value === "ready";
   });
+}
+
+export type ThreadFactKind = "archived" | "needs-you" | "parent-help" | "error" | "conflicted" | "stale"
+  | "ready" | "reviewing" | "working" | "integrated" | "waiting" | "resting";
+
+/** Advisory facts, independent of the process lifecycle and Git ancestry. */
+export function threadStatus(s: SessionSummary): { kind: ThreadFactKind; label: string; detail: string } {
+  const tag = (key: string) => s.branch.tags.find(t => t.key === key);
+  const fact = (kind: ThreadFactKind, label: string, detail = "") => ({ kind, label, detail });
+  if (s.status === "archived") return fact("archived", "archived");
+  if (loudTag(s)) return fact("needs-you", "needs you", attentionReason(s) ?? "");
+  if (tag("parent_help")?.value === "requested") return fact("parent-help", "needs parent", tag("parent_help")?.note);
+  if (s.status === "error") return fact("error", "error", "Inspect the error; escalate explicitly if human action is needed.");
+  const integration = tag("integration_state");
+  if (integration?.value === "conflicted") return fact("conflicted", "integration conflict", integration.note);
+  if (integration?.value === "stale") return fact("stale", "needs recheck", integration.note);
+  if (isReadyCandidate(s)) return fact("ready", "ready to integrate", tag("integration_ready")?.note || integration?.note);
+  if (s.status === "running" && !isIdle(s)) return tag("role")?.value === "reviewer"
+    ? fact("reviewing", "reviewing") : fact("working", "working");
+  const result = integrationResult(s);
+  if (result) return fact("integrated", "integrated", result.note || result.value);
+  const waiting = tag("waiting");
+  if (waiting && !["false", "done", "resolved"].includes(waiting.value)) return fact("waiting", "waiting", waiting.note || waiting.value);
+  const pr = s.branch.github;
+  if (pr?.pr_state?.toLowerCase() === "open") {
+    const checks = pr.checks?.toLowerCase();
+    return fact("waiting", checks && ["pending", "queued", "in_progress"].includes(checks) ? "waiting on CI" : "waiting on PR", `PR #${pr.pr_number}`);
+  }
+  return fact("resting", "resting");
 }
 
 /** The recorded integration outcome tag, when Loom verified one. */
@@ -201,7 +234,7 @@ export function integrationResult(s: SessionSummary) {
 
 export interface IntegrationCandidate {
   session: SessionSummary;
-  state: "ready" | "integrated";
+  state: "ready" | "stale" | "conflicted" | "integrated";
   /** Readiness revision / outcome reference from the tag. */
   note: string;
 }
@@ -217,10 +250,15 @@ export function integrationCandidates(
 ): IntegrationCandidate[] {
   const out: IntegrationCandidate[] = [];
   for (const { session: s } of rows) {
-    if (s.id === topicId) continue;
+    if (s.id === topicId || s.branch.tags.some(t => t.key === "role" && t.value === "reviewer")) continue;
     const result = integrationResult(s);
     if (result) {
       out.push({ session: s, state: "integrated", note: result.note || result.value });
+      continue;
+    }
+    const state = s.branch.tags.find(t => t.key === "integration_state");
+    if (state?.value === "stale" || state?.value === "conflicted") {
+      out.push({ session: s, state: state.value, note: state.note || "Reconcile and revalidate against the current Track." });
       continue;
     }
     if (isReadyCandidate(s)) {
@@ -235,7 +273,8 @@ export function integrationCandidates(
     }
   }
   return out.sort((a, b) => {
-    if (a.state !== b.state) return a.state === "ready" ? -1 : 1;
+    const rank = { conflicted: 0, stale: 1, ready: 2, integrated: 3 };
+    if (a.state !== b.state) return rank[a.state] - rank[b.state];
     return b.session.last_activity_at.localeCompare(a.session.last_activity_at);
   });
 }

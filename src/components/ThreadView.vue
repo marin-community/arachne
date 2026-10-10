@@ -991,6 +991,7 @@ function messageAuthor(block: ChatDisplayBlock): string {
 }
 
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
+const isReviewer = computed(() => currentSummary.value?.branch.tags.some(tag => tag.key === "role" && tag.value === "reviewer"));
 const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id));
 const lastIntegration = computed(() => currentSummary.value?.branch.tags.find((tag) => tag.key === "integration_result"));
 const integrationTarget = computed(() => reviewIntegrationTarget(props.fleet, props.session.id));
@@ -1163,7 +1164,7 @@ async function onLand(strategy: string) {
         @open-resource="openResource"
       />
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
-      <SplitButton v-if="isWorker" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
+      <SplitButton v-if="isWorker && !isReviewer" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
       <button v-if="!isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
       <button @click="interrupt">Interrupt</button>
@@ -1174,7 +1175,7 @@ async function onLand(strategy: string) {
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
     </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
-    <div v-if="isWorker && lastIntegration" class="integrate-note" :title="lastIntegration.note">
+    <div v-if="isWorker && !isReviewer && lastIntegration" class="integrate-note" :title="lastIntegration.note">
       Last integrated result: {{ lastIntegration.value }}<span v-if="lastIntegration.note"> · {{ lastIntegration.note }}</span>
     </div>
     <div v-if="showSendToThread" class="send-thread-box">

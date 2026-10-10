@@ -15,6 +15,7 @@ pub mod activity;
 pub mod blocks;
 pub mod client;
 pub mod commands;
+pub mod coordination;
 pub mod editor;
 pub mod file_completion;
 pub mod landing;
@@ -52,6 +53,7 @@ pub fn run() {
             commands::list_repos,
             commands::handoff_session,
             commands::delegate_task,
+            coordination::review_session,
             commands::archive_session,
             commands::update_session,
             commands::clear_attention,

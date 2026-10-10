@@ -47,3 +47,12 @@ test("a fresh permission request with the same title resurfaces", () => {
   const b = session("topic", [], { pending_permissions: [{ request_id: "b", title: "Write config?" }] });
   assert.notEqual(attentionNotices([a])[0].key, attentionNotices([b])[0].key);
 });
+
+
+test("worker errors and parent help do not notify humans without explicit escalation", () => {
+  const error = session("error", [], { status: "error" });
+  const help = session("help", [{ key: "parent_help", value: "requested", note: "Need context" }]);
+  assert.deepEqual(attentionNotices([error, help]), []);
+  error.branch.tags.push(tag("blocked", "Human access required"));
+  assert.equal(attentionNotices([error])[0].sessionId, "error");
+});

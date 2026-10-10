@@ -1030,7 +1030,9 @@ pub async fn launch_session(
             // Empty strings mean "inherit the server default" — filter to
             // None so loom sees omitted-vs-blank as intended.
             profile: profile.filter(|s| !s.is_empty()),
-            launch_guidance: Some(if as_track.unwrap_or(true) {
+            launch_guidance: Some(if parent_branch.is_some() {
+                crate::loom::worker_launch_guidance()
+            } else if as_track.unwrap_or(true) {
                 crate::loom::topic_launch_guidance()
             } else {
                 crate::loom::thread_launch_guidance()
@@ -1251,7 +1253,7 @@ pub async fn delegate_task(
             title: Some(task.chars().take(80).collect()),
             goal: Some(task),
             parent_branch: Some(parent.branch.id),
-            launch_guidance: Some(crate::loom::topic_launch_guidance()),
+            launch_guidance: Some(crate::loom::worker_launch_guidance()),
             // Launch overrides from the picker: empty strings mean "inherit
             // the server default", so filter them to None (loom's
             // omitted-vs-blank distinction).
@@ -1263,9 +1265,11 @@ pub async fn delegate_task(
         .await?;
     // Self-heal the parent's topic marker: leaders launched from the CLI (or
     // before this marker existed) should still hold their shape.
-    let _ = client
-        .set_tag(&parent_id, "topic", "true", "joined by child session")
-        .await;
+    if should_mark_track(&fleet, &parent_id) {
+        let _ = client
+            .set_tag(&parent_id, "topic", "true", "joined by child session")
+            .await;
+    }
     Ok(view)
 }
 
@@ -1930,6 +1934,13 @@ pub async fn move_to_group(
     Ok(layout)
 }
 
+/// A child acquiring children is a local coordinator, not a new canonical Track.
+pub fn should_mark_track(fleet: &[SessionSummaryView], parent_id: &str) -> bool {
+    fleet.iter().find(|s| s.id == parent_id).is_some_and(|s| {
+        s.parent_session_id.is_none() && s.parent_id.is_none()
+    })
+}
+
 /// Re-parent a session under another (its topic's top-level chat), or
 /// detach it to top level. The session follows the parent's placement group.
 #[tauri::command]
@@ -1942,11 +1953,15 @@ pub async fn reparent_session(
     client
         .reparent_session(&session_id, parent_id.as_deref().filter(|p| !p.is_empty()))
         .await?;
-    // Joining a parent makes that parent a topic — stamp the durable marker.
+    // Only a root is promoted; recursive delegation does not change Track ownership.
     if let Some(parent) = parent_id.as_deref().filter(|p| !p.is_empty()) {
-        let _ = client
-            .set_tag(parent, "topic", "true", "joined by child session")
-            .await;
+        if let Ok(fleet) = client.list_sessions().await {
+            if should_mark_track(&fleet, parent) {
+                let _ = client
+                    .set_tag(parent, "topic", "true", "joined by child session")
+                    .await;
+            }
+        }
     }
     Ok(())
 }
@@ -2058,6 +2073,9 @@ pub async fn integrate_session(
         unreachable: false,
     })?;
     let view = client.get_session(&session_id).await?;
+    if view.branch.tags.iter().any(|t| t.key == "role" && t.value == "reviewer") {
+        return Err(resource_error("Review threads report findings; integrate the implementation thread instead."));
+    }
     let coordinator = client.get_session(&target.coordinator_id).await?;
     if view.branch.repo_root != coordinator.branch.repo_root {
         return Err(UiError {
@@ -3202,7 +3220,9 @@ pub async fn attach_topic_resource(
         // override/hide matching works across scopes.
         draft.repository = repo_root_of(&client, &draft.repository)
             .await?
-            .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
+            .ok_or_else(|| {
+                resource_error("no loom branch exists for that repository yet")
+            })?;
     }
     let resource = draft
         .validated(&topic.branch.repo_root, &topic.branch.branch)
