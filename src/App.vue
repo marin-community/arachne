@@ -13,6 +13,7 @@ import NewThreadSheet from "./components/NewThreadSheet.vue";
 import NewTrackChat from "./components/NewTrackChat.vue";
 import ProjectSheet from "./components/ProjectSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
+import type { ArtifactTarget } from "./artifactLinks";
 import type { FileAttachment } from "./attachments";
 import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
 import { launchTopicBranch } from "./trackPolicy.ts";
@@ -185,6 +186,11 @@ const showNewThread = ref(false);
 const showNewTopic = ref(false);
 const showNewProject = ref(false);
 const showSettings = ref(false);
+const artifactRequest = ref<ArtifactTarget | null>(null);
+function openArtifact(target: ArtifactTarget) {
+  artifactRequest.value = { ...target };
+  showResources.value = true;
+}
 const showResources = ref(localStorage.getItem("arachne.inspector") !== "false");
 watch(showResources, value => localStorage.setItem("arachne.inspector", String(value)));
 const showSearch = ref(false);
@@ -769,11 +775,17 @@ const selectedTopic = computed(() => {
   }
   return node && !isStandalone(node) ? node : null;
 });
+// A standalone chat can also open an artifact in the Resources inspector.
+const inspectorTopic = computed(() => selectedTopic.value ?? (artifactRequest.value
+  ? fleet.value.find(session => session.id === selectedId.value) ?? null : null));
+watch([loomUrl, selectedId, selectedTopicId], () => { artifactRequest.value = null; });
 const showProjectSheet = computed(() => showNewProject.value || !!projectResourcesProject.value);
+const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.value && !showProjectSheet.value
+  && viewMode.value !== "home" && !!inspectorTopic.value && showResources.value);
 </script>
 
 <template>
-  <div class="app" :class="{ 'with-resources': !showNewThread && !showNewTopic && !showProjectSheet && viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': inspectorVisible }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
       <button class="title home-link" title="Show Tracks home" @click="onHome">🕸 Arachne</button>
       <button class="header-search" title="Search and commands (⌘K)" @click="showSearch = true">Search <kbd>⌘K</kbd></button>
@@ -857,6 +869,7 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       :fleet="fleet"
       :launch-options="launchOptions"
       :loom-url="loomUrl"
+      @open-artifact="openArtifact"
       @error="connError = $event"
       @archive="onArchived"
       :unarchiving="unarchivingIds.has(selectedId)"
@@ -885,7 +898,8 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       @manage-project-resources="openProjectResources"
       @error="connError = $event"
     />
-    <TopicInspector v-if="!showNewThread && !showNewTopic && !showProjectSheet && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
+    <TopicInspector v-if="inspectorVisible && inspectorTopic" :topic="inspectorTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
+      :artifact-request="artifactRequest" @open-artifact="openArtifact"
       @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" @policy-updated="onPolicyUpdated" />
     <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && !showProjectSheet && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
     <CommandPalette v-if="showSearch" :fleet="fleet" @close="showSearch = false" @select="selectSession" @action="command" />

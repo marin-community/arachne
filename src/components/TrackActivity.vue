@@ -4,10 +4,11 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionSummary } from "../App.vue";
 import ChatMarkdown from "./ChatMarkdown.vue";
+import type { ArtifactTarget } from "../artifactLinks";
 import { deliverySummary, messageSource, watchTriggerKind, watchTriggerLabel, type TrackActivitySnapshot } from "../trackActivity";
 
-const props = defineProps<{ topic: SessionSummary; resultsOnly?: boolean }>();
-const emit = defineEmits<{ (e: "select", sessionId: string): void }>();
+const props = defineProps<{ topic: SessionSummary; resultsOnly?: boolean; loomUrl?: string }>();
+const emit = defineEmits<{ (e: "open-artifact", target: ArtifactTarget): void; (e: "select", sessionId: string): void }>();
 const snapshot = ref<TrackActivitySnapshot | null>(null);
 const loading = ref(false);
 const error = ref("");
@@ -133,7 +134,7 @@ function time(iso: string | null | undefined) {
           <p class="activity-hint">{{ time(message.created_at) }} · {{ message.author_kind }} {{ message.author_id }}</p>
           <button v-if="messageSource(message, channelById.get(message.channel_id))" type="button"
             @click="emit('select', messageSource(message, channelById.get(message.channel_id))!)">Open source thread</button>
-          <ChatMarkdown :text="message.body" />
+          <ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="message.body" />
           <div v-for="delivery in message.deliveries ?? []" :key="delivery.binding_id" class="activity-delivery">
             <span>{{ delivery.binding_kind }} · {{ delivery.state }} · {{ delivery.attempts }} {{ delivery.attempts === 1 ? 'attempt' : 'attempts' }}</span>
             <button v-if="delivery.target_session_id" type="button" @click="emit('select', delivery.target_session_id)">Open recipient</button>

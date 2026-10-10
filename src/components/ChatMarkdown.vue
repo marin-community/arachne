@@ -3,7 +3,16 @@ import { computed } from "vue";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
 
-const props = defineProps<{ text: string }>();
+import { loomArtifactTarget, routeArtifactClick, type ArtifactTarget } from "../artifactLinks";
+
+const props = defineProps<{ text: string; loomUrl?: string }>();
+const emit = defineEmits<{ (e: "open-artifact", target: ArtifactTarget): void }>();
+
+function onClick(event: MouseEvent) {
+  const link = (event.target as Element | null)?.closest?.("a[href]");
+  if (!link || !(event.currentTarget as Element).contains(link)) return;
+  routeArtifactClick(event, link.getAttribute("href") ?? "", props.loomUrl ?? "", target => emit("open-artifact", target));
+}
 
 const imageDataUrl = /^data:image\/(?:png|jpeg|gif|webp|avif);base64,[a-z\d+/=]+$/i;
 
@@ -33,7 +42,9 @@ const html = computed(() => {
   const template = document.createElement("template");
   template.innerHTML = clean;
   template.content.querySelectorAll("a").forEach((link) => {
-    if (!safeUrl(link.getAttribute("href") ?? "", false)) link.removeAttribute("href");
+    if (loomArtifactTarget(link.getAttribute("href") ?? "", props.loomUrl ?? "")) {
+      link.removeAttribute("target");
+    } else if (!safeUrl(link.getAttribute("href") ?? "", false)) link.removeAttribute("href");
     else {
       link.target = "_blank";
       link.rel = "noopener noreferrer";
@@ -60,5 +71,5 @@ const html = computed(() => {
   <!-- data-markdown keeps the raw source on the rendered node so the
        conversation's copy handler can rebuild a markdown clipboard flavor
        (the DOM itself only holds rendered HTML). -->
-  <div class="chat-markdown" :data-markdown="text" v-html="html"></div>
+  <div class="chat-markdown" :data-markdown="text" @click="onClick" v-html="html"></div>
 </template>

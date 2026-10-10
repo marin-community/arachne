@@ -86,6 +86,7 @@ pub fn run() {
             commands::hide_topic_resource,
             commands::unhide_topic_resource,
             commands::read_topic_resource,
+            commands::read_linked_artifact,
             commands::open_topic_resource_in_zed,
             commands::project_bindings,
             commands::managed_repos,

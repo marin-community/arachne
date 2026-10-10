@@ -410,6 +410,22 @@ impl LoomClient {
         .await
     }
 
+    /// Artifact page keys are canonical branch ids or legacy session keys.
+    /// sessions.get resolves either when a session exists. A terminal or
+    /// sessionless branch still owns artifacts, so only its 404 falls back
+    /// to the branch API; authentication and connection failures propagate.
+    pub async fn linked_artifact(
+        &self,
+        key: &str,
+        name: &str,
+    ) -> Result<serde_json::Value, LoomError> {
+        match self.get_session(key).await {
+            Ok(session) => self.branch_artifact(&session.branch.id, name).await,
+            Err(LoomError::Api { status: 404, .. }) => self.branch_artifact(key, name).await,
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn write_branch_artifact(
         &self,
         branch: &str,
@@ -1402,6 +1418,184 @@ mod resume_tests {
             "branch": { "id": "branch", "branch": "topic", "name": "topic", "title": "Topic",
                 "repo_root": "/tmp", "tags": [] }
         })
+    }
+
+    async fn artifact_server(
+        key: &'static str,
+        session_reply: (&'static str, serde_json::Value),
+        artifact_reply: Option<(&'static str, &'static str, serde_json::Value)>,
+    ) -> (LoomClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut replies = vec![(
+            "/api/sessions/get",
+            serde_json::json!({"session": key}),
+            session_reply.0,
+            session_reply.1,
+        )];
+        if let Some((branch, status, body)) = artifact_reply {
+            replies.push((
+                "/api/artifacts/get",
+                serde_json::json!({"branch": branch, "name": "track-brief", "repo": false}),
+                status,
+                body,
+            ));
+        }
+        let server = tokio::spawn(async move {
+            for (path, expected, status, body) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                assert!(String::from_utf8_lossy(&bytes[..header_end])
+                    .starts_with(&format!("POST {path} ")));
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                assert_eq!(request, expected);
+                let body = body.to_string();
+                socket.write_all(format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len(),
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        (
+            LoomClient::new(&format!("http://{addr}/api/"), None).unwrap(),
+            server,
+        )
+    }
+
+    #[tokio::test]
+    async fn linked_artifact_reads_legacy_archived_session_branch() {
+        let artifact =
+            serde_json::json!({"meta": {"title": "Track brief"}, "content": "Correct branch"});
+        let (client, server) = artifact_server(
+            "linked-worker",
+            ("200 OK", session("archived")),
+            Some(("branch", "200 OK", artifact.clone())),
+        )
+        .await;
+        assert_eq!(
+            client
+                .linked_artifact("linked-worker", "track-brief")
+                .await
+                .unwrap(),
+            artifact
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn linked_artifact_reads_canonical_track_branch_key() {
+        // artifacts.url returns the branch id even though the live session differs.
+        let mut track = session("running");
+        track["id"] = "fwn0ypj5".into();
+        track["branch"]["id"] = "99ne4k2x".into();
+        let artifact = serde_json::json!({"content": "Canonical Track brief"});
+        let (client, server) = artifact_server(
+            "99ne4k2x",
+            ("200 OK", track),
+            Some(("99ne4k2x", "200 OK", artifact.clone())),
+        )
+        .await;
+        assert_eq!(
+            client
+                .linked_artifact("99ne4k2x", "track-brief")
+                .await
+                .unwrap(),
+            artifact
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn linked_artifact_reads_canonical_branch_without_active_session() {
+        // require_session cannot resolve a branch whose session is done/error/archived,
+        // but require_branch used by artifacts.get can still resolve it.
+        let artifact = serde_json::json!({"content": "Durable Track brief"});
+        let (client, server) = artifact_server(
+            "99ne4k2x",
+            (
+                "404 Not Found",
+                serde_json::json!({"error": "session not found"}),
+            ),
+            Some(("99ne4k2x", "200 OK", artifact.clone())),
+        )
+        .await;
+        assert_eq!(
+            client
+                .linked_artifact("99ne4k2x", "track-brief")
+                .await
+                .unwrap(),
+            artifact
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn linked_artifact_preserves_missing_artifact_error() {
+        let (client, server) = artifact_server(
+            "linked-worker",
+            ("200 OK", session("archived")),
+            Some((
+                "branch",
+                "404 Not Found",
+                serde_json::json!({"error": "artifact not found"}),
+            )),
+        )
+        .await;
+        let error = client
+            .linked_artifact("linked-worker", "track-brief")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, super::LoomError::Api { status: 404, ref message, .. } if message == "artifact not found")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn linked_artifact_does_not_fall_back_on_permission_errors() {
+        let (client, server) = artifact_server(
+            "99ne4k2x",
+            (
+                "403 Forbidden",
+                serde_json::json!({"error": "access denied"}),
+            ),
+            None,
+        )
+        .await;
+        let error = client
+            .linked_artifact("99ne4k2x", "track-brief")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, super::LoomError::Api { status: 403, ref message, .. } if message == "access denied")
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]

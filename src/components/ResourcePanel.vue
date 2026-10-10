@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import CheckoutEditor from "./CheckoutEditor.vue";
+import type { ArtifactTarget } from "../artifactLinks";
+import { createArtifactPreview, type ArtifactContent } from "../artifactPreview";
 import type { SessionSummary } from "../App.vue";
 import { liveRows, mentionableRows, originLabel, prLight, prNumberFromUrl, type AttachedPrStatus, type EffectiveRow, type PanelIssue, type PanelPr } from "../resourcePanel";
 
@@ -38,12 +40,21 @@ interface TopicResourceContent {
   content: string;
 }
 
-const props = defineProps<{ topic: SessionSummary; embedded?: boolean; canEdit?: boolean }>();
+const props = defineProps<{ topic: SessionSummary; embedded?: boolean; canEdit?: boolean; artifactRequest?: ArtifactTarget | null }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "error", message: string): void; (e: "checkout-saved", sessionId: string): void }>();
 const snapshot = ref<TopicResourcesPanel>({
   resources: [], hidden_resources: [], revision: 0, issues: [], prs: [],
 });
 const selectedId = ref<string | null>(null);
+const artifact = createArtifactPreview(target => invoke<ArtifactContent>("read_linked_artifact", {
+  key: target.key, name: target.name,
+}));
+const { target: artifactTarget, view: artifactView, loading: artifactLoading, error: artifactError } = artifact;
+watch(() => props.artifactRequest, target => {
+  if (target) void artifact.open(target);
+  else artifact.close();
+}, { immediate: true });
+onUnmounted(artifact.close);
 const editPath = ref<string | null>(null);
 
 // --- Live topic resources --------------------------------------------
@@ -138,6 +149,7 @@ watch(() => props.topic.id, () => {
 const content = ref("");
 const markdown = new MarkdownIt({ html: false, linkify: true, breaks: false });
 const renderedContent = computed(() => DOMPurify.sanitize(markdown.render(content.value)));
+const renderedArtifact = computed(() => DOMPurify.sanitize(markdown.render(artifactView.value?.content ?? "")));
 const loading = ref(false);
 const reading = ref(false);
 const saving = ref(false);
@@ -337,6 +349,11 @@ async function refresh() {
 function onCheckoutSaved() {
   emit("checkout-saved", props.topic.id);
   if (selectedId.value) void selectResource(selectedId.value);
+}
+
+function selectAttachedResource(id: string) {
+  artifact.close();
+  selectedId.value = id;
 }
 
 async function selectResource(id: string) {
@@ -627,7 +644,7 @@ async function onPreviewClick(event: MouseEvent) {
       <button v-for="resource in sortedResources" :key="resource.id" class="resource-panel-item"
         :class="{ selected: resource.id === selectedId }"
         :title="resource.kind === 'pull_request' && attachedPr(resource) ? prTooltip(attachedPr(resource)!) : (resource.url ?? resource.path ?? '')"
-        @click="resource.url ? openExternal(resource.url) : (selectedId = resource.id)">
+        @click="resource.url ? openExternal(resource.url) : selectAttachedResource(resource.id)">
         <span class="resource-panel-icon"
           :class="resource.kind === 'pull_request' && attachedPr(resource) ? (prLight(attachedPr(resource)!) ? `pr-light-${prLight(attachedPr(resource)!)}` : 'pr-light-none') : ''">{{ iconFor(resource.kind) }}</span>
         <span class="resource-panel-item-text">
@@ -706,7 +723,17 @@ async function onPreviewClick(event: MouseEvent) {
       </template>
     </div>
     <div v-if="message" class="resource-panel-message">{{ message }}</div>
-    <div v-if="selected" class="resource-panel-preview">
+    <div v-if="artifactTarget" class="resource-panel-preview">
+      <div class="resource-panel-preview-head">
+        <strong>{{ artifactView?.title || artifactTarget.name }}</strong>
+        <button aria-label="Close artifact preview" @click="artifact.close">×</button>
+      </div>
+      <div class="resource-panel-location">{{ artifactTarget.key }} · {{ artifactTarget.name }}</div>
+      <div v-if="artifactLoading" class="resource-panel-empty">Loading artifact…</div>
+      <div v-else-if="artifactError" class="resource-panel-empty" role="alert">{{ artifactError }}</div>
+      <div v-else class="resource-panel-content" @click="onPreviewClick" v-html="renderedArtifact"></div>
+    </div>
+    <div v-else-if="selected" class="resource-panel-preview">
       <div class="resource-panel-preview-head">
         <strong>{{ selected.title }}</strong>
         <button v-if="canEdit && selected.path && ['file', 'design_document'].includes(selected.kind) && selected.repository === topic.branch.repo_root && selected.reference === topic.branch.branch" @click="editPath = selected.path">Edit</button>

@@ -4093,6 +4093,35 @@ async fn resolve_topic_resource(
     Ok((context.topic, resource))
 }
 
+#[derive(Serialize)]
+pub struct LinkedArtifactContent {
+    title: String,
+    content: String,
+}
+
+/// Read a linked artifact without attaching it or changing the open session.
+#[tauri::command]
+pub async fn read_linked_artifact(
+    state: State<'_, LoomState>,
+    key: String,
+    name: String,
+) -> Result<LinkedArtifactContent, UiError> {
+    let client = state_client(&state).await?;
+    let artifact = client.linked_artifact(&key, &name).await?;
+    let content = artifact
+        .get("content")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| resource_error("artifact has no text content"))?
+        .to_owned();
+    let title = artifact
+        .get("meta")
+        .and_then(|meta| meta.get("title"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(&name)
+        .to_owned();
+    Ok(LinkedArtifactContent { title, content })
+}
+
 #[tauri::command]
 pub async fn read_topic_resource(
     state: State<'_, LoomState>,
