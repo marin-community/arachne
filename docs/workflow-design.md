@@ -456,6 +456,26 @@ The parent may:
 
 Only when the hierarchy cannot reasonably resolve the issue should it become **Needs You**.
 
+`attention` and `blocked` explicitly request human action. They must not mean
+"my parent needs to review this" or "another agent must act". A delegated
+reviewer's approval, requested changes, failed checks, request for context or
+"ready for review" handoff belongs to its immediate parent. The child keeps
+status `ok` and publishes a typed result on its own Loom channel, which wakes
+the parent. A concrete help request may also use `parent_help=requested`.
+Intermediate parents resolve or forward the request through the hierarchy.
+
+For example, **Review child interruption parent wake** sends findings or its
+verdict to the interruption worker. That worker owns repairs and escalates to
+the Track coordinator if needed; the user does not need to supervise that
+review. Repository instructions to request final review use this parent
+handoff for delegated work. Human review is requested only for a concrete
+prepared result that requires the user's judgment or a specific decision or
+access requirement the hierarchy cannot resolve.
+
+If a child mistakenly raises human attention for agent-owned work, its parent
+takes ownership of the handoff and has the child clear that status. The
+mistaken escalation does not transfer coordination responsibility to the user.
+
 Any human escalation should ideally include:
 
 - what happened;

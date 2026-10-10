@@ -202,3 +202,14 @@ can mean the full authorization already arrived: report uncertain delivery
 and reconcile the durable thread/channel before retrying. Terminal requests
 use stable identities and verified own-channel delivery subscriptions; they
 never type into active shells or claim an ACP queue.
+
+Delegated review handoffs belong to the immediate parent: ready for review,
+approval, requested changes, failed checks, conflicts and requests for context
+remain `ok`. Publish a typed own-channel result to wake that parent; a concrete
+coordinator help request may also use `parent_help=requested`. Never use
+`attention` or `blocked` merely to wake an agent. Intermediate parents resolve
+or forward the request through the hierarchy. If a child accidentally raises
+human attention for agent-owned work, its parent takes ownership, routes the
+repair/review and has the child clear that status. Only a specific decision or
+access requirement the hierarchy cannot resolve, or human judgment of a
+concrete prepared result, warrants human attention.
