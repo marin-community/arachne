@@ -962,17 +962,19 @@ pub async fn launch_session(
     // project and keeps supplying other topics.
     hidden_binding_keys: Option<Vec<String>>,
     as_track: Option<bool>,
+    topic_branch: Option<String>,
 ) -> Result<SessionView, UiError> {
     let client = state_client(&state).await?;
     let (managed_repo, cwd) = launch_repository(&repo);
-    let parent_branch = match parent_id {
-        Some(id) if !id.is_empty() => {
-            // Resolve the parent session to its branch id for the link.
-            let parent = client.get_session(&id).await?;
-            Some(parent.branch.id)
-        }
-        _ => None,
+    let parent = match parent_id.as_deref().filter(|s| !s.is_empty()) {
+        Some(id) => Some(client.get_session(id).await?),
+        None => None,
     };
+    let parent_branch = parent.as_ref().map(|p| p.branch.id.clone());
+    if let Some(parent) = &parent {
+        let fleet = client.list_sessions().await?;
+        prepare_child_autoland(&client, parent, &fleet).await?;
+    }
     // A bare prompt (the New thread sheet with no explicit title) sends
     // only `task`, so the title falls back to it like the CLI; the expanded
     // topic card sends an explicit short title and longer body.
@@ -982,6 +984,16 @@ pub async fn launch_session(
         .filter(|t| !t.is_empty())
         .map(String::from)
         .unwrap_or_else(|| task.chars().take(80).collect());
+    let canonical = if parent_branch.is_none() && as_track.unwrap_or(true) {
+        let branch_label = title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(task.trim());
+        Some(allocate_track_branch(&client, &repo, branch_label, topic_branch.as_deref()).await?)
+    } else {
+        None
+    };
     let description = description
         .as_deref()
         .map(str::trim)
@@ -1011,11 +1023,8 @@ pub async fn launch_session(
     }
     // The launch consumes `attachments` (scratch seeding); the names are
     // needed after it, to record the files as the topic's resources.
-    let attachment_names: Vec<String> = attachments
-        .iter()
-        .map(|file| file.name.clone())
-        .collect();
-    let view = client
+    let attachment_names: Vec<String> = attachments.iter().map(|file| file.name.clone()).collect();
+    let mut view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: managed_repo,
             cwd,
@@ -1026,6 +1035,9 @@ pub async fn launch_session(
                 .map(String::from),
             title: Some(label),
             goal: Some(goal),
+            initialization_prompt: canonical
+                .as_deref()
+                .map(crate::track_policy::initialization_prompt),
             parent_branch: parent_branch.clone(),
             // Empty strings mean "inherit the server default" — filter to
             // None so loom sees omitted-vs-blank as intended.
@@ -1070,7 +1082,11 @@ pub async fn launch_session(
             url: None,
         };
         if let Ok(resource) = draft.validated(&view.branch.repo_root, &view.branch.branch) {
-            if !initial_manifest.resources.iter().any(|r| r.id == resource.id) {
+            if !initial_manifest
+                .resources
+                .iter()
+                .any(|r| r.id == resource.id)
+            {
                 initial_manifest.resources.push(resource);
             }
         }
@@ -1105,24 +1121,11 @@ pub async fn launch_session(
             })
             .await;
     }
-    // New root sessions are topics by default: stamp the durable marker
-    // so the topic card and inspector recognize them.
-    if parent_branch.is_none() {
+    if let Some(canonical) = &canonical {
+        stamp_new_track_metadata(&client, &mut view, canonical).await;
+    } else if parent_branch.is_none() {
         let _ = client
-            .set_tag(
-                &view.id,
-                "topic",
-                if as_track.unwrap_or(true) {
-                    "true"
-                } else {
-                    "false"
-                },
-                if as_track.unwrap_or(true) {
-                    "Track coordinator"
-                } else {
-                    "Standalone thread"
-                },
-            )
+            .set_tag(&view.id, "topic", "false", "Standalone thread")
             .await;
     }
     // File the new topic into its project when one was preselected (a
@@ -1218,6 +1221,98 @@ end run
         .collect())
 }
 
+/// Post-launch failures are recoverable setup blockers, never a failed launch
+/// that invites retrying sessions.launch. The opening turn repairs metadata.
+async fn stamp_new_track_metadata(client: &LoomClient, view: &mut SessionView, canonical: &str) {
+    let mut failures = Vec::new();
+    for (key, value, note) in [
+        (
+            "track_topic_branch",
+            canonical,
+            "Canonical accepted ref; verify real launch-seed initialization before use",
+        ),
+        ("topic", "true", "Track coordinator"),
+    ] {
+        match client.set_tag(&view.id, key, value, note).await {
+            Ok(()) => view.branch.tags.push(crate::loom::TagView {
+                key: key.into(),
+                value: value.into(),
+                note: note.into(),
+                set_at: String::new(),
+                set_by: "arachne".into(),
+            }),
+            Err(error) => failures.push(format!("{key}: {error}")),
+        }
+    }
+    if !failures.is_empty() {
+        let note = format!("Track launched; canonical initialization metadata needs repair for {canonical}. Do not retry launch. {}", failures.join("; "));
+        // Retained launch intent makes missing canonical tags fail closed even
+        // when every follow-up metadata request fails.
+        if !view
+            .branch
+            .goal
+            .contains(crate::track_policy::CANONICAL_INITIALIZATION_MARKER)
+        {
+            view.branch.goal.push_str(&format!(
+                "\n\n{} {canonical}",
+                crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+            ));
+        }
+        view.branch.description = note.clone();
+        let _ = client
+            .set_tag(&view.id, "attention", "blocked", &note)
+            .await;
+    }
+}
+
+/// Inspect server-side refs AND durable Track claims before allocating. A
+/// launch race is fenced by exclusive Git ref creation in the opening turn.
+pub(crate) async fn allocate_track_branch(
+    client: &LoomClient,
+    repo: &str,
+    title: &str,
+    requested: Option<&str>,
+) -> Result<String, UiError> {
+    if requested
+        .filter(|s| !s.is_empty())
+        .is_some_and(|s| !crate::track_policy::valid_topic_branch(s))
+    {
+        return Err(resource_error("Invalid or reserved Track topic branch."));
+    }
+    let (managed, _) = launch_repository(repo);
+    let repo_root = if let Some(slug) = managed {
+        client
+            .list_repos()
+            .await?
+            .into_iter()
+            .find(|r| r.slug == slug)
+            .ok_or_else(|| {
+                resource_error(
+                    "Managed repository is not available for canonical branch validation.",
+                )
+            })?
+            .path
+    } else {
+        repo.trim().to_owned()
+    };
+    let mut occupied: Vec<String> = client
+        .repo_branches(&repo_root)
+        .await?
+        .into_iter()
+        .map(|b| b.name)
+        .collect();
+    for session in client.list_sessions().await? {
+        if session.branch.repo_root == repo_root {
+            if let Some(claimed) = crate::track_policy::tag(&session.branch, "track_topic_branch")
+                .or_else(|| crate::track_policy::pending_topic_branch(&session.branch))
+            {
+                occupied.push(claimed.into());
+            }
+        }
+    }
+    crate::track_policy::choose_topic_branch(requested, title, &occupied).map_err(resource_error)
+}
+
 /// Create a child session delegated to the given parent.
 ///
 /// The child targets the parent's repository using only server-side truth:
@@ -1242,9 +1337,20 @@ pub async fn delegate_task(
     let fleet = client.list_sessions().await?;
     // Conversation ancestry is independent of git ancestry. A child of a
     // worker starts from the topic's accepted branch when one exists.
-    let base = resolve_integration_target(&fleet, &parent_id)
-        .map(|target| target.target_branch)
-        .unwrap_or_else(|| parent.branch.branch.clone());
+    let base = if fleet
+        .iter()
+        .find(|s| s.id == parent.id)
+        .is_some_and(crate::track_policy::owns_track)
+    {
+        crate::track_policy::canonical_topic_branch(&parent.branch)
+            .ok_or_else(|| resource_error("Invalid canonical Track ref."))?
+            .to_owned()
+    } else {
+        resolve_integration_target(&fleet, &parent_id)
+            .map(|target| target.target_branch)
+            .unwrap_or_else(|| parent.branch.branch.clone())
+    };
+    prepare_child_autoland(&client, &parent, &fleet).await?;
     let view = client
         .launch(&crate::loom::SessionsLaunchInput {
             repo: parent.github_repo.clone(),
@@ -1759,7 +1865,7 @@ pub async fn pr_status(url: String) -> Result<PrStatusView, UiError> {
 
 #[cfg(test)]
 mod zed_tests {
-    use super::{thread_note_body, zed_target};
+    use super::zed_target;
 
     #[test]
     fn local_checkout_is_a_path() {
@@ -1936,9 +2042,10 @@ pub async fn move_to_group(
 
 /// A child acquiring children is a local coordinator, not a new canonical Track.
 pub fn should_mark_track(fleet: &[SessionSummaryView], parent_id: &str) -> bool {
-    fleet.iter().find(|s| s.id == parent_id).is_some_and(|s| {
-        s.parent_session_id.is_none() && s.parent_id.is_none()
-    })
+    fleet
+        .iter()
+        .find(|s| s.id == parent_id)
+        .is_some_and(|s| s.parent_session_id.is_none() && s.parent_id.is_none())
 }
 
 /// Re-parent a session under another (its topic's top-level chat), or
@@ -1984,119 +2091,92 @@ pub struct IntegrationTarget {
     pub coordinator_name: String,
 }
 
-/// Resolve where a worker's integration request goes.
-///
-/// Spec ("Integration target"): do not assume thread ancestry equals git
-/// ancestry — default to the nearest ancestor scope with a writable canonical
-/// Resource for the relevant repository; if none, the Topic's canonical
-/// Resource for that repository.
-///
-/// Walk conversation ancestors, selecting the topic leader for the same
-/// repository when available, otherwise the nearest live parent in that
-/// repository. A thread cannot integrate into itself.
+/// Resolve acceptance to a marked same-repository Track and its canonical ref.
 pub fn resolve_integration_target(
     fleet: &[SessionSummaryView],
     session_id: &str,
 ) -> Option<IntegrationTarget> {
-    let by_id: std::collections::HashMap<&str, &SessionSummaryView> =
-        fleet.iter().map(|s| (s.id.as_str(), s)).collect();
-    let by_branch: std::collections::HashMap<&str, &SessionSummaryView> =
-        fleet.iter().map(|s| (s.branch.id.as_str(), s)).collect();
-
-    let source = by_id.get(session_id).copied()?;
-    let repo = &source.branch.repo_root;
-    let mut cur = source;
-    let mut seen = std::collections::HashSet::new();
-    let mut nearest = None;
-    for _ in 0..32 {
-        if !seen.insert(cur.id.as_str()) {
-            break;
-        }
-        let parent = cur
-            .parent_session_id
-            .as_deref()
-            .and_then(|id| by_id.get(id).copied())
-            .or_else(|| {
-                cur.parent_id
-                    .as_deref()
-                    .and_then(|bid| by_branch.get(bid).copied())
-            });
-        let Some(p) = parent else {
-            break;
-        };
-        if p.branch.repo_root == *repo && p.status != "archived" && !p.branch.branch.is_empty() {
-            let target = IntegrationTarget {
-                coordinator_id: p.id.clone(),
-                target_branch: p.branch.branch.clone(),
-                coordinator_name: p.branch.name.clone(),
-            };
-            if nearest.is_none() {
-                nearest = Some(target.clone());
-            }
-            if p.branch
-                .tags
-                .iter()
-                .any(|t| t.key == "topic" && t.value != "false")
-            {
-                return Some(target);
-            }
-        }
-        cur = p;
-    }
-    nearest
+    let track = crate::track_policy::track_ancestor(fleet, session_id)?;
+    Some(IntegrationTarget {
+        coordinator_id: track.id.clone(),
+        target_branch: crate::track_policy::canonical_topic_branch(&track.branch)?.into(),
+        coordinator_name: track.branch.name.clone(),
+    })
 }
 
-/// Send a structured integration request for a completed worker to its
-/// coordinator, with the chosen strategy. The button and the sentence are
-/// the same operation (spec: "Integration is an LLM/skill operation").
-#[tauri::command]
-pub async fn integrate_session(
-    app: AppHandle,
-    state: State<'_, LoomState>,
-    session_id: String,
-    strategy: String,
-) -> Result<IntegrationTarget, UiError> {
-    let client = state_client(&state).await?;
-    let strategy = crate::loom::IntegrationStrategy::parse(&strategy).ok_or_else(|| UiError {
-        message: format!("unknown integration strategy {strategy:?}"),
-        unreachable: false,
+/// Direct results already link to the parent. Nested results link to their
+/// immediate parent's channel, so THAT channel must deliver to the Track.
+async fn ensure_acceptance_route(
+    client: &LoomClient,
+    fleet: &[SessionSummaryView],
+    source: &SessionSummaryView,
+    coordinator_id: &str,
+) -> Result<(), UiError> {
+    client
+        .ensure_delivery_subscription(coordinator_id, coordinator_id)
+        .await?;
+    let parent = crate::track_policy::immediate_parent(fleet, source).ok_or_else(|| {
+        resource_error("Cannot route source results without its immediate parent channel.")
     })?;
-    if strategy == crate::loom::IntegrationStrategy::Push {
-        return Err(UiError {
-            message: "push is a landing strategy".into(),
-            unreachable: false,
-        });
+    if parent.id != coordinator_id {
+        client
+            .ensure_delivery_subscription(&parent.id, coordinator_id)
+            .await?;
     }
+    Ok(())
+}
+
+pub(crate) async fn land_thread_with_client(
+    client: &LoomClient,
+    session_id: &str,
+    strategy: Option<&str>,
+) -> Result<IntegrationTarget, UiError> {
+    let choice = strategy
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("squash");
+    let strategy = crate::loom::IntegrationStrategy::parse(choice)
+        .filter(|s| matches!(s, crate::loom::IntegrationStrategy::Squash | crate::loom::IntegrationStrategy::Merge | crate::loom::IntegrationStrategy::Rebase | crate::loom::IntegrationStrategy::CherryPick | crate::loom::IntegrationStrategy::Ask))
+        .ok_or_else(|| resource_error("Thread Land accepts squash, merge, rebase or cherry-pick; publishing is a separate Track action."))?;
     let fleet = client.list_sessions().await?;
-    let target = resolve_integration_target(&fleet, &session_id).ok_or_else(|| UiError {
-        message: "no coordinator found for this session — it has no topic to integrate into".into(),
-        unreachable: false,
+    let mut target = resolve_integration_target(&fleet, session_id).ok_or_else(|| {
+        resource_error("No canonical owning Track target is available for this repository. Attach the source to a Track or finish its canonical branch initialization, then retry Thread Land.")
     })?;
-    let view = client.get_session(&session_id).await?;
-    if view.branch.tags.iter().any(|t| t.key == "role" && t.value == "reviewer") {
-        return Err(resource_error("Review threads report findings; integrate the implementation thread instead."));
+    let source = fleet.iter().find(|s| s.id == session_id).unwrap();
+    let view = client.get_session(session_id).await?;
+    if crate::track_policy::tag(&view.branch, "role") == Some("reviewer") {
+        return Err(resource_error(
+            "Review threads report findings; accept the implementation thread instead.",
+        ));
     }
     let coordinator = client.get_session(&target.coordinator_id).await?;
-    if view.branch.repo_root != coordinator.branch.repo_root {
-        return Err(UiError {
-            message: "source and target are in different repositories; choose a coordinator for this repository".into(),
-            unreachable: false,
-        });
+    if view.branch.repo_root != coordinator.branch.repo_root
+        || view.branch.repo_root != source.branch.repo_root
+    {
+        return Err(resource_error(
+            "Source and Track must remain in the same repository.",
+        ));
     }
+    let owner = fleet.iter().find(|s| s.id == coordinator.id).unwrap();
+    if coordinator.status == "archived"
+        || crate::track_policy::tag(&coordinator.branch, "topic") == Some("false")
+        || !crate::track_policy::owns_track(owner)
+    {
+        return Err(resource_error(
+            "The Track coordinator must be live and own this repository; standalone topic=false roots cannot accept.",
+        ));
+    }
+    target.target_branch = crate::track_policy::canonical_topic_branch(&coordinator.branch)
+        .ok_or_else(|| resource_error("The canonical Track ref is invalid."))?
+        .into();
     if view.branch.branch == target.target_branch {
-        return Err(UiError {
-            message: "source and target already use the same branch".into(),
-            unreachable: false,
-        });
+        return Err(resource_error(
+            "Source and canonical target already use the same branch.",
+        ));
     }
-    if coordinator.status == "archived" {
-        return Err(UiError {
-            message: "the coordinator thread is archived; reopen it before integrating".into(),
-            unreachable: false,
-        });
-    }
+    ensure_acceptance_route(client, &fleet, source, &target.coordinator_id).await?;
     let request = crate::loom::IntegrationRequest {
-        action: "integrate",
+        action: "land-thread",
         source_session: view.id.clone(),
         source_branch: view.branch.branch.clone(),
         source_work_dir: view.work_dir.clone(),
@@ -2106,22 +2186,191 @@ pub async fn integrate_session(
         strategy,
         requested_by: "user",
     };
-    let topic_name = coordinator.branch.name.clone();
-    let prompt = request.to_prompt(&topic_name);
-    client.resume_if_orphaned(&target.coordinator_id).await?;
-    // Queue the structured request behind any active ACP turn. Terminal
-    // sessions get the text directly because Loom has no terminal prompt queue.
-    if coordinator.protocol == "terminal" {
-        client
-            .send_text(&target.coordinator_id, &prompt, true)
-            .await?;
-    } else {
-        client.queue_prompt(&target.coordinator_id, &prompt).await?;
-    }
-    // A sent request is not a successful integration. The coordinator's
-    // durable conversation records the result after git and validation.
+    // Advisory only. Failed metadata does not prevent the authorized delivery.
+    let _ = client
+        .set_tag(
+            &view.id,
+            "landing_request",
+            "pending",
+            "Thread Land wrap-up/acceptance requested; not readiness",
+        )
+        .await;
+    client
+        .deliver_request(
+            &view,
+            &request.source_wrap_up_prompt(),
+            serde_json::json!({ "action": "land-thread-wrap-up", "request": request }),
+        )
+        .await?;
+    client
+        .deliver_request(
+            &coordinator,
+            &request.to_prompt(&coordinator.branch.name),
+            serde_json::json!({ "action": "land-thread", "request": request }),
+        )
+        .await?;
+    Ok(target)
+}
+
+#[tauri::command]
+pub async fn land_thread(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    session_id: String,
+    strategy: Option<String>,
+) -> Result<IntegrationTarget, UiError> {
+    let client = state_client(&state).await?;
+    let target = land_thread_with_client(&client, &session_id, strategy.as_deref()).await?;
     let _ = app.emit("loom://integration-sent", &target);
     Ok(target)
+}
+
+/// Compatibility alias with identical Thread Land acceptance semantics.
+#[tauri::command]
+pub async fn integrate_session(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    session_id: String,
+    strategy: Option<String>,
+) -> Result<IntegrationTarget, UiError> {
+    land_thread(app, state, session_id, strategy).await
+}
+
+pub(crate) async fn set_autoland_with_client(
+    client: &LoomClient,
+    session_id: &str,
+    policy: &str,
+) -> Result<SessionView, UiError> {
+    let view = client.get_session(session_id).await?;
+    let fleet = client.list_sessions().await?;
+    let track_policy = fleet
+        .iter()
+        .find(|s| s.id == view.id)
+        .is_some_and(crate::track_policy::owns_track);
+    let allowed = if track_policy {
+        matches!(policy, "on" | "off")
+    } else {
+        matches!(policy, "inherit" | "on" | "off")
+    };
+    if !allowed {
+        return Err(resource_error(
+            "Track policy accepts on/off; source policy accepts inherit/on/off.",
+        ));
+    }
+    let coordinator_id = if track_policy {
+        view.id.clone()
+    } else {
+        resolve_integration_target(&fleet, session_id)
+            .ok_or_else(|| {
+                resource_error("Autoland needs a marked same-repository Track ancestor.")
+            })?
+            .coordinator_id
+    };
+    let coordinator = if track_policy {
+        view.clone()
+    } else {
+        client.get_session(&coordinator_id).await?
+    };
+    if coordinator.status == "archived"
+        || crate::track_policy::tag(&coordinator.branch, "topic") == Some("false")
+        || coordinator.branch.repo_root != view.branch.repo_root
+    {
+        return Err(resource_error(
+            "Autoland needs a live same-repository Track.",
+        ));
+    }
+    // Persist OFF immediately even if route setup later fails; stale automatic
+    // requests are required to read this live tag before every write.
+    client
+        .set_tag(
+            session_id,
+            if track_policy {
+                "track_autoland"
+            } else {
+                "thread_autoland"
+            },
+            policy,
+            "Durable autoland policy; reread live before automatic writes",
+        )
+        .await?;
+    let canonical = crate::track_policy::canonical_topic_branch(&coordinator.branch)
+        .ok_or_else(|| resource_error("Autoland policy was saved, but canonical Track initialization is incomplete or invalid. Repair initialization before acceptance routing can be completed."))?;
+    client
+        .ensure_delivery_subscription(&coordinator_id, &coordinator_id)
+        .await?;
+    let mut routed = std::collections::HashSet::new();
+    for source in &fleet {
+        if crate::track_policy::track_ancestor(&fleet, &source.id)
+            .is_some_and(|t| t.id == coordinator_id)
+        {
+            if let Some(parent) = crate::track_policy::immediate_parent(&fleet, source) {
+                if parent.id != coordinator_id && routed.insert(parent.id.clone()) {
+                    client
+                        .ensure_delivery_subscription(&parent.id, &coordinator_id)
+                        .await?;
+                }
+            }
+        }
+    }
+    client.deliver_request(&coordinator, &crate::loom::autoland_policy_prompt(&coordinator, canonical), serde_json::json!({"action":"autoland-policy", "session_id":session_id, "policy":policy, "track_id":coordinator_id, "target_branch":canonical})).await?;
+    client.get_session(session_id).await.map_err(Into::into)
+}
+
+#[tauri::command]
+pub async fn set_autoland(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    session_id: String,
+    policy: String,
+) -> Result<SessionView, UiError> {
+    let client = state_client(&state).await?;
+    let view = set_autoland_with_client(&client, &session_id, &policy).await?;
+    if let Ok(fleet) = client.list_sessions().await {
+        emit_fleet(&app, &client, fleet).await;
+    }
+    Ok(view)
+}
+
+/// Establish routes and notify the Track BEFORE a future child can report a
+/// result. Policy is checked again by the coordinator at every actual write.
+async fn prepare_child_autoland(
+    client: &LoomClient,
+    parent: &SessionView,
+    fleet: &[SessionSummaryView],
+) -> Result<(), UiError> {
+    let track_id = if fleet
+        .iter()
+        .find(|s| s.id == parent.id)
+        .is_some_and(crate::track_policy::owns_track)
+    {
+        Some(parent.id.as_str())
+    } else {
+        crate::track_policy::track_ancestor(fleet, &parent.id).map(|t| t.id.as_str())
+    };
+    let Some(track_id) = track_id else {
+        return Ok(());
+    };
+    let track = if track_id == parent.id {
+        parent.clone()
+    } else {
+        client.get_session(track_id).await?
+    };
+    // A future child defaults to inherit, independent of its parent's override.
+    if crate::track_policy::tag(&track.branch, "track_autoland") != Some("on") {
+        return Ok(());
+    }
+    let canonical = crate::track_policy::canonical_topic_branch(&track.branch)
+        .ok_or_else(|| resource_error("Invalid canonical Track ref."))?;
+    client
+        .ensure_delivery_subscription(track_id, track_id)
+        .await?;
+    if parent.id != track_id {
+        client
+            .ensure_delivery_subscription(&parent.id, track_id)
+            .await?;
+    }
+    client.deliver_request(&track, &crate::loom::autoland_policy_prompt(&track, canonical), serde_json::json!({"action":"autoland-child-launch", "parent_session":parent.id, "track_id":track_id, "target_branch":canonical})).await?;
+    Ok(())
 }
 
 /// How a landing target was resolved — the provenance the prompt and the
@@ -3029,15 +3278,16 @@ pub async fn project_bindings(
 /// (project bindings, topic attachments). Slug + path so the frontend can
 /// offer the human-readable name while commands key by either.
 #[tauri::command]
-pub async fn managed_repos(
-    state: State<'_, LoomState>,
-) -> Result<Vec<ManagedRepoView>, UiError> {
+pub async fn managed_repos(state: State<'_, LoomState>) -> Result<Vec<ManagedRepoView>, UiError> {
     let client = state_client(&state).await?;
     let mut repos = client.list_repos().await?;
     repos.sort_by(|a, b| a.slug.cmp(&b.slug));
     Ok(repos
         .into_iter()
-        .map(|r| ManagedRepoView { slug: r.slug, path: r.path })
+        .map(|r| ManagedRepoView {
+            slug: r.slug,
+            path: r.path,
+        })
         .collect())
 }
 
@@ -3100,9 +3350,7 @@ pub async fn add_project_binding(
         // host repo is, so identity matches what a topic attach produces.
         draft.repository = repo_root_of(&client, &draft.repository)
             .await?
-            .ok_or_else(|| {
-                resource_error("no loom branch exists for that repository yet")
-            })?;
+            .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
     } else {
         draft.repository = repo_root.clone();
     }
@@ -3193,9 +3441,7 @@ pub async fn attach_topic_resource(
         // override/hide matching works across scopes.
         draft.repository = repo_root_of(&client, &draft.repository)
             .await?
-            .ok_or_else(|| {
-                resource_error("no loom branch exists for that repository yet")
-            })?;
+            .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
     }
     let resource = draft
         .validated(&topic.branch.repo_root, &topic.branch.branch)
@@ -4034,18 +4280,13 @@ mod integration_tests {
     }
 
     #[test]
-    fn cross_repo_topic_uses_nearest_same_repo_parent() {
+    fn cross_repo_track_never_accepts_into_unmarked_parent() {
         let fleet = vec![
             session("topic", "other-topic", "/other", None, true),
             session("parent", "parent-branch", "/repo", Some("topic"), false),
             session("child", "child-branch", "/repo", Some("parent"), false),
         ];
-        assert_eq!(
-            resolve_integration_target(&fleet, "child")
-                .unwrap()
-                .target_branch,
-            "parent-branch"
-        );
+        assert!(resolve_integration_target(&fleet, "child").is_none());
         assert!(resolve_integration_target(&fleet, "parent").is_none());
     }
 }
@@ -4609,5 +4850,488 @@ mod landing_dispatch_tests {
             .contains("different repository"));
         assert_eq!(git(&repo.0, &["status", "--porcelain"]), "");
         assert!(!repo.0.join("topic.txt").exists());
+    }
+}
+
+#[cfg(test)]
+mod thread_landing_contract_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn view(id: &str, protocol: &str) -> SessionView {
+        let mut v: SessionView =
+            serde_json::from_str(include_str!("../tests/fixtures/launch-response.json")).unwrap();
+        v.id = id.into();
+        v.protocol = protocol.into();
+        v.status = "running".into();
+        v.branch.id = format!("{id}-branch-id");
+        v.branch.branch = format!("weaver/{id}");
+        v.branch.repo_root = "/repo".into();
+        v.work_dir = format!("/repo/.worktrees/{id}");
+        v.branch.tags.clear();
+        v
+    }
+    fn tagged(v: &mut SessionView, key: &str, value: &str) {
+        v.branch.tags.push(crate::loom::TagView {
+            key: key.into(),
+            value: value.into(),
+            note: String::new(),
+            set_at: String::new(),
+            set_by: "arachne".into(),
+        });
+    }
+    fn summary(view: &SessionView, parent: Option<&str>) -> Value {
+        let mut value = serde_json::to_value(view).unwrap();
+        value["parent_session_id"] = json!(parent);
+        value["parent_id"] = Value::Null;
+        value
+    }
+    fn fixture(protocol: &str) -> (SessionView, SessionView, Value) {
+        let mut track = view("track", protocol);
+        tagged(&mut track, "topic", "true");
+        tagged(&mut track, "track_topic_branch", "arachne/tracks/accepted");
+        let parent = view("parent", protocol);
+        let worker = view("worker", protocol);
+        let fleet = json!([
+            summary(&track, None),
+            summary(&parent, Some("track")),
+            summary(&worker, Some("parent"))
+        ]);
+        (track, worker, fleet)
+    }
+    fn sub(channel: &str, session: &str) -> Value {
+        json!({"channel_id":channel,"subject_kind":"session","subject_id":session,"mode":"deliver"})
+    }
+    async fn mock(
+        script: Vec<(&'static str, Value)>,
+    ) -> (LoomClient, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (path, reply) in script {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                assert!(headers.starts_with(&format!("POST {path} ")), "{headers}");
+                let body = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                requests.push((path.into(), body));
+                let (status, response) = if reply.get("_http_error").is_some() {
+                    (
+                        "500 Internal Server Error",
+                        json!({"error":reply["_http_error"]}).to_string(),
+                    )
+                } else {
+                    ("200 OK", reply.to_string())
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (
+            LoomClient::new(&format!("http://{addr}"), None).unwrap(),
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn nested_acp_land_queues_wrapup_and_one_complete_canonical_acceptance() {
+        let (track, worker, fleet) = fixture("acp");
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/get", json!(track)),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "track")),
+            ("/api/sessions/tags/set", json!({})),
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/prompt/create", json!({})),
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/prompt/create", json!({})),
+        ])
+        .await;
+        let target = land_thread_with_client(&client, "worker", None)
+            .await
+            .unwrap();
+        assert_eq!(target.target_branch, "arachne/tracks/accepted");
+        let calls = server.await.unwrap();
+        assert_eq!(
+            calls[4].1,
+            json!({"channel":"parent","session":"track","mode":"deliver"})
+        );
+        assert_eq!(calls[5].1["key"], "landing_request");
+        for i in [7, 9] {
+            assert_eq!(calls[i].1["send_now"], false);
+        }
+        let wrap = calls[7].1["text"].as_str().unwrap();
+        assert!(wrap.contains(&worker.work_dir));
+        assert!(wrap.contains(&worker.branch.branch));
+        let accept = calls[9].1["text"].as_str().unwrap();
+        assert!(accept.contains("\"strategy\":\"squash\""));
+        assert!(accept.contains("successful intended wrap-up"));
+        assert!(accept.contains("review, repair, commit, validate and acceptance"));
+        assert!(accept.contains("preserve foreign edits"));
+        assert!(accept.contains("arachne/tracks/accepted"));
+        assert!(accept.contains("Never push, publish, open PRs"));
+    }
+
+    #[tokio::test]
+    async fn terminal_land_is_durable_and_never_types_or_interrupts() {
+        let (track, worker, fleet) = fixture("terminal");
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/get", json!(track)),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "track")),
+            ("/api/sessions/tags/set", json!({})),
+            ("/api/channels/subscription/set", sub("worker", "worker")),
+            ("/api/channels/messages/create", json!({})),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/messages/create", json!({})),
+        ])
+        .await;
+        land_thread_with_client(&client, "worker", Some("merge"))
+            .await
+            .unwrap();
+        let calls = server.await.unwrap();
+        assert_eq!(calls[7].1["channel"], "worker");
+        assert_eq!(calls[9].1["channel"], "track");
+        assert_eq!(calls[7].1["payload"]["request"]["source_session"], "worker");
+        assert_eq!(
+            calls[9].1["payload"]["request"]["target_branch"],
+            "arachne/tracks/accepted"
+        );
+        assert!(calls.iter().all(|(p, _)| !p.ends_with("/send")
+            && !p.ends_with("/interrupt")
+            && !p.ends_with("/prompt/create")));
+    }
+
+    #[tokio::test]
+    async fn subscriptions_reject_wrong_channel_subject_or_observe_mode() {
+        for (field, wrong) in [
+            ("channel_id", "wrong"),
+            ("subject_kind", "user"),
+            ("subject_id", "caller"),
+            ("mode", "observe"),
+        ] {
+            let mut reply = sub("parent", "track");
+            reply[field] = json!(wrong);
+            let (client, server) = mock(vec![("/api/channels/subscription/set", reply)]).await;
+            assert!(client
+                .ensure_delivery_subscription("parent", "track")
+                .await
+                .is_err());
+            let calls = server.await.unwrap();
+            assert_eq!(calls[0].1["session"], "track");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_nested_route_stops_before_wrapup_or_acceptance() {
+        let (track, worker, fleet) = fixture("acp");
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/get", json!(track)),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "human")),
+        ])
+        .await;
+        assert!(land_thread_with_client(&client, "worker", None)
+            .await
+            .is_err());
+        assert_eq!(server.await.unwrap().len(), 5);
+    }
+
+    #[tokio::test]
+    async fn policy_off_persists_routes_nested_children_and_delivers_live_guard() {
+        let (track, _, fleet) = fixture("acp");
+        let mut refreshed = track.clone();
+        tagged(&mut refreshed, "track_autoland", "off");
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/tags/set", json!({})),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "track")),
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/prompt/create", json!({})),
+            ("/api/sessions/get", json!(refreshed)),
+        ])
+        .await;
+        let result = set_autoland_with_client(&client, "track", "off")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::track_policy::tag(&result.branch, "track_autoland"),
+            Some("off")
+        );
+        let calls = server.await.unwrap();
+        assert_eq!(calls[2].1["key"], "track_autoland");
+        assert_eq!(calls[2].1["value"], "off");
+        let prompt = calls[6].1["text"].as_str().unwrap();
+        assert!(prompt.contains("reread LIVE Track and source session tags"));
+        assert!(prompt.contains("including source commits, repairs"));
+        assert!(prompt.contains("stop this stale automatic request before writing"));
+        assert!(prompt.contains("source on overrides"));
+        assert!(prompt.contains("no scheduler or polling"));
+        assert_eq!(calls[6].1["send_now"], false);
+    }
+
+    #[tokio::test]
+    async fn disabling_persists_live_off_even_if_canonical_initialization_is_incomplete() {
+        let (mut track, _, _) = fixture("acp");
+        track.branch.tags.retain(|t| t.key != "track_topic_branch");
+        track.branch.goal = format!(
+            "{} arachne/tracks/pending",
+            crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+        );
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/summary/list", json!([summary(&track, None)])),
+            ("/api/sessions/tags/set", json!({})),
+        ])
+        .await;
+        let error = set_autoland_with_client(&client, "track", "off")
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("policy was saved"));
+        let calls = server.await.unwrap();
+        assert_eq!(calls[2].1["key"], "track_autoland");
+        assert_eq!(calls[2].1["value"], "off");
+    }
+
+    #[tokio::test]
+    async fn source_override_routes_to_track_and_returns_refreshed_source() {
+        let (track, worker, fleet) = fixture("terminal");
+        let mut refreshed = worker.clone();
+        tagged(&mut refreshed, "thread_autoland", "on");
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/tags/set", json!({})),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "track")),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/messages/create", json!({})),
+            ("/api/sessions/get", json!(refreshed)),
+        ])
+        .await;
+        let result = set_autoland_with_client(&client, "worker", "on")
+            .await
+            .unwrap();
+        assert_eq!(result.id, "worker");
+        assert_eq!(
+            crate::track_policy::tag(&result.branch, "thread_autoland"),
+            Some("on")
+        );
+        let calls = server.await.unwrap();
+        assert_eq!(calls[3].1["key"], "thread_autoland");
+        assert_eq!(calls[7].1["payload"]["session_id"], "worker");
+    }
+
+    #[tokio::test]
+    async fn future_nested_launch_installs_parent_route_before_work() {
+        let (mut track, _, fleet) = fixture("acp");
+        tagged(&mut track, "track_autoland", "on");
+        let parent = view("parent", "acp");
+        let fleet: Vec<SessionSummaryView> = serde_json::from_value(fleet).unwrap();
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(track)),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "track")),
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/prompt/create", json!({})),
+        ])
+        .await;
+        prepare_child_autoland(&client, &parent, &fleet)
+            .await
+            .unwrap();
+        let calls = server.await.unwrap();
+        assert_eq!(calls[2].1["channel"], "parent");
+        assert!(calls[4].1["text"]
+            .as_str()
+            .unwrap()
+            .contains("existing or future linked"));
+    }
+
+    #[tokio::test]
+    async fn launch_branch_allocation_respects_git_refs_and_durable_claims() {
+        let (track, _, _) = fixture("acp");
+        let (client, server) = mock(vec![
+            (
+                "/api/repos/branches",
+                json!([{"name":"arachne/tracks/api","worktree":null,"current":false}]),
+            ),
+            ("/api/sessions/summary/list", json!([summary(&track, None)])),
+        ])
+        .await;
+        assert_eq!(
+            allocate_track_branch(&client, "/repo", "API", None)
+                .await
+                .unwrap(),
+            "arachne/tracks/api-2"
+        );
+        server.await.unwrap();
+        let (client, server) = mock(vec![
+            ("/api/repos/branches", json!([])),
+            ("/api/sessions/summary/list", json!([summary(&track, None)])),
+        ])
+        .await;
+        assert!(allocate_track_branch(
+            &client,
+            "/repo",
+            "ignored",
+            Some("arachne/tracks/accepted")
+        )
+        .await
+        .is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn launch_durable_first_turn_initializes_real_ref_before_task_and_keeps_metadata_concise()
+    {
+        let launched = view("new-track", "terminal");
+        let (client, server) = mock(vec![
+            ("/api/sessions/launch", json!(launched)),
+            ("/api/branches/update", json!(launched.branch)),
+        ])
+        .await;
+        let input = crate::loom::SessionsLaunchInput {
+            cwd: "/repo".into(),
+            goal: Some("Implement API".into()),
+            initialization_prompt: Some(crate::track_policy::initialization_prompt(
+                "arachne/tracks/api",
+            )),
+            launch_guidance: Some(crate::loom::topic_launch_guidance()),
+            ..Default::default()
+        };
+        client.launch(&input).await.unwrap();
+        let calls = server.await.unwrap();
+        let opening = calls[0].1["goal"].as_str().unwrap();
+        assert!(opening.starts_with(crate::track_policy::CANONICAL_INITIALIZATION_MARKER));
+        assert!(opening.find("git update-ref").unwrap() < opening.find("Implement API").unwrap());
+        assert!(opening.contains("Capture the fresh launch seed"));
+        assert!(opening.contains("STOP and report"));
+        let metadata_goal = calls[1].1["goal"].as_str().unwrap();
+        assert!(metadata_goal.starts_with("Implement API"));
+        assert!(metadata_goal.contains(crate::track_policy::CANONICAL_INITIALIZATION_MARKER));
+        assert!(!metadata_goal.contains("Arachne role guidance"));
+        assert!(calls[0].1.get("initialization_prompt").is_none());
+    }
+
+    #[tokio::test]
+    async fn canonical_tag_failure_is_recoverable_and_cannot_become_legacy_scratch_acceptance() {
+        let mut launched = view("new-track", "terminal");
+        launched.branch.goal = format!(
+            "Implement API\n\n{} arachne/tracks/api",
+            crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+        );
+        let (client, server) = mock(vec![
+            (
+                "/api/sessions/tags/set",
+                json!({"_http_error":"metadata temporarily unavailable"}),
+            ),
+            ("/api/sessions/tags/set", json!({})),
+            ("/api/sessions/tags/set", json!({})),
+        ])
+        .await;
+        stamp_new_track_metadata(&client, &mut launched, "arachne/tracks/api").await;
+        assert_eq!(launched.id, "new-track");
+        assert!(crate::track_policy::is_track(&launched.branch));
+        assert!(crate::track_policy::canonical_topic_branch(&launched.branch).is_none());
+        assert!(launched.branch.description.contains("Do not retry launch"));
+        let calls = server.await.unwrap();
+        assert_eq!(calls[2].1["key"], "attention");
+        assert!(calls.iter().all(|(path, _)| !path.ends_with("/launch")));
+    }
+
+    #[test]
+    fn canonical_resolution_covers_legacy_standalone_cross_repo_cycles_and_pending_initialization()
+    {
+        let (mut track, worker, fleet) = fixture("acp");
+        let fleet: Vec<SessionSummaryView> = serde_json::from_value(fleet).unwrap();
+        assert_eq!(
+            resolve_integration_target(&fleet, &worker.id)
+                .unwrap()
+                .target_branch,
+            "arachne/tracks/accepted"
+        );
+        track.branch.tags.clear();
+        let parent = view("parent", "acp");
+        let summaries = |track: &SessionView| {
+            serde_json::from_value::<Vec<SessionSummaryView>>(json!([
+                summary(track, None),
+                summary(&parent, Some("track")),
+                summary(&worker, Some("parent"))
+            ]))
+            .unwrap()
+        };
+        assert_eq!(
+            resolve_integration_target(&summaries(&track), "worker")
+                .unwrap()
+                .target_branch,
+            "weaver/track"
+        );
+        tagged(&mut track, "topic", "false");
+        assert!(resolve_integration_target(&summaries(&track), "worker").is_none());
+        track.branch.tags.clear();
+        track.branch.repo_root = "/other".into();
+        assert!(resolve_integration_target(&summaries(&track), "worker").is_none());
+        track.branch.repo_root = "/repo".into();
+        track.branch.goal = format!(
+            "{} arachne/tracks/new",
+            crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+        );
+        assert!(resolve_integration_target(&summaries(&track), "worker").is_none());
+        let mut cycle = summaries(&track);
+        cycle[0].parent_session_id = Some("worker".into());
+        assert!(resolve_integration_target(&cycle, "worker").is_none());
+    }
+
+    #[tokio::test]
+    async fn publishing_choices_are_rejected_without_any_http_write() {
+        let client = LoomClient::new("http://127.0.0.1:1", None).unwrap();
+        for choice in ["open-pr", "pr-stack", "push", "land-locally"] {
+            let error = land_thread_with_client(&client, "worker", Some(choice))
+                .await
+                .unwrap_err();
+            assert!(!error.unreachable);
+            assert!(error.message.contains("publishing is a separate"));
+        }
     }
 }

@@ -501,54 +501,36 @@ pub struct IntegrationRequest {
 }
 
 impl IntegrationRequest {
-    /// Render the request as the prompt the coordinator reads. Structured
-    /// payload first (machine-parseable), then a human-readable statement
-    /// — the skill instructs the agent to treat both as the same intent.
-    pub fn to_prompt(&self, topic_name: &str) -> String {
-        let strategy = match self.strategy {
-            IntegrationStrategy::Squash => "squash".to_string(),
-            IntegrationStrategy::Merge => "merge".to_string(),
-            IntegrationStrategy::Rebase => "rebase".to_string(),
-            IntegrationStrategy::CherryPick => "cherry-pick".to_string(),
-            IntegrationStrategy::OpenPr => "open-pr".to_string(),
-            IntegrationStrategy::Push => "push".to_string(),
-            IntegrationStrategy::Ask => "decide".to_string(),
-            // Local landing repair preserves this strategy when delegated.
-            IntegrationStrategy::LandLocally => "land-locally".to_string(),
-        };
-        let request = format!(
-            "**Integration request**\n\
-\n\
-Integrate the work from session `{source}` (branch `{source_branch}`, worktree `{source_work}`) \
-into this topic's accepted state for repository `{repo}`, using strategy **{strategy}**. \
-Apply the integration skill: inspect source and target state, verify the result is complete, \
-resolve straightforward conflicts, run validation, update the topic branch, and report the \
-outcome concisely. If the conflict needs product judgment, escalate rather than inventing a \
-decision.\n\
-\n\
-```json\n{json}\n```",
-            source = self.source_session,
-            source_branch = self.source_branch,
-            source_work = self.source_work_dir,
-            repo = self.repo_root,
-            json = serde_json::json!({
-                "action": "integrate",
-                "source_thread": self.source_session,
-                "source_resource": self.source_branch,
-                "source_work": self.source_work_dir,
-                "repository": self.repo_root,
-                "target_thread": self.target_session,
-                "target_scope": topic_name,
-                "target_resource": self.target_branch,
-                "strategy": strategy,
-                "requested_by": "user",
-            }),
-        );
-        format!(
-            "{request}\n\n## Integration procedure\n\n{}",
-            include_str!("../../skills/integration.md")
-        )
+    pub fn source_wrap_up_prompt(&self) -> String {
+        format!("Thread Land wrap-up requested for session {} in repository {}, original branch {}, original worktree {}. Finish the active intended task first; this request is queued behind active work. Preserve your original session/repository/branch/worktree identity. Inspect and commit only intended source changes, preserving foreign edits, staged/unstaged changes and untracked files; validate the intended result. Send a typed durable result on your OWN channel with successful intended completion, exact source revision, validation and exclusions. Checkpoint/help/partial results do not qualify. The Track coordinator {} will inspect, review/repair and accept into canonical ref {} using {}. Do not publish, push, open a PR, or accept the work yourself. landing_request=pending is only advisory, never readiness or successful acceptance.", self.source_session, self.repo_root, self.source_branch, self.source_work_dir, self.target_session, self.target_branch, self.strategy.as_str())
     }
+
+    /// Complete acceptance authorization; no second Prepare click is needed.
+    pub fn to_prompt(&self, topic_name: &str) -> String {
+        let automatic = self.requested_by == "autoland";
+        let guard = if automatic {
+            autoland_guard()
+        } else {
+            "This is an explicit manual acceptance request; automatic policy does not revoke this user action."
+        };
+        format!("Thread Land acceptance request for Track {topic_name}.\n\n```json\n{}\n```\n\nWait for the source's successful intended wrap-up result on its durable own channel or linked result notice; checkpoint/help/partial results and landing_request=pending do not qualify. Source session status, sleeping, completion, integration_state and integration_ready are never evidence of intended success. If the result has not arrived, retain this request durably and wait on the installed result delivery route; do not poll or use a scheduler.\n\nInspect the exact source session/repository/original branch/worktree and canonical target ref named above. Verify the LIVE Track is still the same-repository owning Track ancestor (marked Track, or legacy unmarked root unless topic=false) and its LIVE track_topic_branch still agrees with this target (a legacy missing tag retains its existing coordinator branch). Verify the canonical ref exists and initialization succeeded before accepting. Preserve worker identity and the coordinator Loom scratch branch. Review and repair the intended changes, commit only intended source changes, preserve foreign edits and staged/unstaged/untracked files in every checkout, and validate. One active writer per worktree: wait for source wrap-up before writing, or use an isolated checkout. Delegate only when useful through visible Loom children with typed own-channel results.\n\n{guard}\n\nImmediately before EVERY acceptance write after preparation or delegation, reverify the exact source and canonical target repository/branch/revision and refresh review/validation if either changed. Apply the chosen acceptance strategy into the canonical accepted ref only (squash is the default). Complete review, repair, commit, validate and acceptance without another Prepare click. Never push, publish, open PRs, modify primary HEAD or substitute local main. Record integration_result on the ORIGINAL source only after actual successful canonical acceptance and validation, then send a typed durable outcome with source/target SHAs, strategy, checks and exclusions on your own channel. A queued request is not a completed acceptance.",
+            serde_json::json!({
+                "action": self.action, "source_thread": self.source_session,
+                "source_resource": self.source_branch, "source_work": self.source_work_dir,
+                "repository": self.repo_root, "target_thread": self.target_session,
+                "target_scope": topic_name, "target_resource": self.target_branch,
+                "strategy": self.strategy.as_str(), "requested_by": self.requested_by,
+                "prepare_then_accept": true,
+            }))
+    }
+}
+
+pub fn autoland_guard() -> &'static str {
+    "AUTOLAND LIVE WRITE GUARD: Immediately before EVERY automatic Git/ref/index/worktree write, including source commits, repairs and final canonical acceptance, reread LIVE Track and source session tags from Loom; never use the policy snapshot in this queued prompt. Track track_autoland is ON only for exact on, absent/invalid means OFF. Source thread_autoland=on overrides Track OFF; off overrides Track ON; absent/invalid/inherit inherits Track. If effectively OFF, stop this stale automatic request before writing and report deferred/cancelled acceptance. Recheck after delegation and on every resumed turn. Before writes also reverify the LIVE canonical target and source identity; skip exact source revisions already successfully accepted (integration_result is actual outcome only). Only typed successful complete intended results qualify; exclude reviewer, checkpoint, help and partial results. Autoland never publishes."
+}
+
+pub fn autoland_policy_prompt(track: &SessionView, target_branch: &str) -> String {
+    format!("Durable autoland policy setup for Track {} in repository {}, canonical accepted ref {}. Subscribe/retain result delivery on your own channel and installed immediate-parent channels for nested sources. On existing or future linked successful intended child results, resolve the ORIGINAL source identity and SAME-repository owning Track ancestor (marked Track, or legacy unmarked root unless topic=false), reread LIVE policy, and if effectively ON execute one complete Thread Land acceptance with squash default: wait for intended wrap-up, inspect/review/repair, commit only intended source changes, preserve foreign edits, validate, reverify exact source and canonical revisions, accept only into this initialized canonical ref and report actual integration_result on the original source plus typed own-channel outcome. Failed/help/checkpoint/partial/reviewer results do not qualify. Off policy does not disable source on overrides. Never treat sleeping/working/completion or advisory tags as readiness. Do not ask for another Prepare click. {} Use existing durable result wakeups; no scheduler or polling loops. Never publish or change primary HEAD or Loom scratch branches.", track.id, track.branch.repo_root, target_branch, autoland_guard())
 }
 
 /// A landing request (Topic → upstream), the sibling of IntegrationRequest.
@@ -841,6 +823,9 @@ pub struct SessionsLaunchInput {
     pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_guidance: Option<SessionLaunchGuidance>,
+    /// Local prompt prefix, retained in the first durable turn on old servers.
+    #[serde(skip)]
+    pub initialization_prompt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -861,7 +846,7 @@ pub struct SessionLaunchGuidance {
 
 pub fn topic_launch_guidance() -> SessionLaunchGuidance {
     SessionLaunchGuidance {
-        root: include_str!("../../skills/coordinator.md").into(),
+        root: format!("{}\n\nRevised Thread Land policy (supersedes earlier acceptance defaults): accepted state is LIVE track_topic_branch, or the existing Loom branch only for a legacy Track with no tag. New Tracks require verified real ref initialization before acceptance or publishing. Manual Land includes complete wrap-up, review/repair and canonical acceptance. Autoland defaults OFF, source overrides inherit/on/off, and is driven by durable successful result wakeups only. {}", include_str!("../../skills/coordinator.md"), autoland_guard()),
         child: include_str!("../../skills/worker.md").into(),
     }
 }

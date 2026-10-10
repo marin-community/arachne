@@ -730,6 +730,63 @@ impl LoomClient {
         .await
     }
 
+    /// Install an actual session delivery route and verify the server did not
+    /// silently subscribe the human caller or fall back to observe mode.
+    pub async fn ensure_delivery_subscription(
+        &self,
+        channel: &str,
+        session: &str,
+    ) -> Result<(), LoomError> {
+        const PATH: &str = "/api/channels/subscription/set";
+        let reply: serde_json::Value = self
+            .op(
+                PATH,
+                &serde_json::json!({
+                    "channel": channel, "session": session, "mode": "deliver"
+                }),
+            )
+            .await?;
+        if reply["channel_id"] != channel
+            || reply["subject_kind"] != "session"
+            || reply["subject_id"] != session
+            || reply["mode"] != "deliver"
+        {
+            return Err(LoomError::Decode { path: PATH.into(), detail: "delivery subscription did not match requested channel, session subject and deliver mode".into() });
+        }
+        Ok(())
+    }
+
+    /// Terminal requests are durable inbox messages, never input into an
+    /// active shell. ACP requests always queue behind the current turn.
+    pub async fn deliver_request(
+        &self,
+        view: &crate::loom::SessionView,
+        text: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), LoomError> {
+        if view.protocol == "terminal" {
+            self.ensure_delivery_subscription(&view.id, &view.id)
+                .await?;
+            // Each user action is independent; avoid deduplicating later
+            // requests for the same worker after its contents have changed.
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            self.send_to_thread(
+                &view.id,
+                text,
+                payload,
+                &format!("arachne-request-{}-{nonce}", view.id),
+            )
+            .await?;
+        } else {
+            self.resume_if_orphaned(&view.id).await?;
+            self.queue_prompt(&view.id, text).await?;
+        }
+        Ok(())
+    }
+
     /// `sessions.send` — text input to a terminal session; `submit` presses enter.
     pub async fn send_text(&self, id: &str, text: &str, submit: bool) -> Result<(), LoomError> {
         let _: serde_json::Value = self
@@ -800,9 +857,15 @@ impl LoomClient {
                 guidance.root
             ));
         }
+        if let Some(initialization) = &input.initialization_prompt {
+            request.goal = Some(format!(
+                "{initialization}\n\n{}",
+                request.goal.as_deref().unwrap_or_default()
+            ));
+        }
         let mut launched: crate::loom::SessionView =
             self.op("/api/sessions/launch", &request).await?;
-        if input.launch_guidance.is_some() {
+        if input.launch_guidance.is_some() || input.initialization_prompt.is_some() {
             // sessions.update rewrites goal.txt, which terminal agents may
             // not have read yet. branches.update changes metadata without
             // replacing the durable launch prompt (including profile notes).
@@ -813,7 +876,12 @@ impl LoomClient {
                     "/api/branches/update",
                     &serde_json::json!({
                         "branch": launched.branch.id,
-                        "goal": input.goal.as_deref().unwrap_or_default(),
+                        // A missing canonical tag on a NEW Track must never
+                        // masquerade as a legacy scratch destination.
+                        "goal": match &input.initialization_prompt {
+                            Some(initialization) => format!("{}\n\n{}", input.goal.as_deref().unwrap_or_default(), initialization.lines().next().unwrap_or_default()),
+                            None => input.goal.clone().unwrap_or_default(),
+                        },
                     }),
                 )
                 .await

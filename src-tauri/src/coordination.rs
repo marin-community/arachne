@@ -11,7 +11,7 @@ pub fn review_launch_input(
     target: Option<&str>,
     brief: &str,
 ) -> SessionsLaunchInput {
-    let destination = target.map(|branch| format!("Integration target: {branch}. Re-read its current revision."))
+    let destination = target.map(|branch| format!("Canonical accepted Track target: {branch}. Re-read its current revision; compare against this ref, preserving the candidate branch."))
         .unwrap_or_else(|| "No integration target has been selected. Inspect the recorded base and repository policy; report the comparison used.".into());
     SessionsLaunchInput {
         repo: source.github_repo.clone(),
@@ -123,6 +123,35 @@ mod tests {
         assert!(goal.contains("HEAD abc"));
         assert!(goal.contains("uncommitted source edits read-only"));
         assert!(input.scratch.is_empty());
+    }
+
+    #[test]
+    fn worker_review_compares_canonical_accepted_ref_while_forking_candidate() {
+        let mut source: SessionView =
+            serde_json::from_str(include_str!("../tests/fixtures/launch-response.json")).unwrap();
+        source.id = "source".into();
+        let mut track = source.clone();
+        track.id = "track".into();
+        track.branch.branch = "weaver/coordinator-scratch".into();
+        track.branch.tags = serde_json::from_value(serde_json::json!([
+            {"key":"topic","value":"true","note":"","set_at":"","set_by":""},
+            {"key":"track_topic_branch","value":"arachne/tracks/accepted","note":"","set_at":"","set_by":""}
+        ])).unwrap();
+        let root = serde_json::to_value(&track).unwrap();
+        let mut worker = serde_json::to_value(&source).unwrap();
+        worker["parent_session_id"] = serde_json::json!("track");
+        let fleet: Vec<crate::loom::SessionSummaryView> =
+            serde_json::from_value(serde_json::json!([root, worker])).unwrap();
+        let target = resolve_integration_target(&fleet, "source").unwrap();
+        let input = review_launch_input(
+            &source,
+            Some(&target.target_branch),
+            "Review intended changes.",
+        );
+        assert_eq!(input.base.as_deref(), Some(source.branch.branch.as_str()));
+        let prompt = input.goal.unwrap();
+        assert!(prompt.contains("Canonical accepted Track target: arachne/tracks/accepted"));
+        assert!(!prompt.contains("weaver/coordinator-scratch"));
     }
 
     #[test]

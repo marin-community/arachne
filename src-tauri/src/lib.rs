@@ -23,6 +23,7 @@ pub mod loom;
 pub mod publishing;
 pub mod resources;
 pub mod secret;
+pub mod track_policy;
 
 pub fn run() {
     tauri::Builder::default()
@@ -69,6 +70,8 @@ pub fn run() {
             commands::move_to_group,
             commands::delete_group,
             commands::integrate_session,
+            commands::land_thread,
+            commands::set_autoland,
             commands::land_topic,
             publishing::publish_track,
             commands::work_summary,
