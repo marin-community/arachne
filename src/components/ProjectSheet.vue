@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from "vue";
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import type { SessionLayout } from "../App.vue";
+import { saveNewProject, type ProjectBinding, type ProjectBindingsView, type ProjectCreationDraft } from "../projectCreation";
 import { readProjectDefaults, saveProjectDefaults, recentRepositories } from "../launchDefaults";
 import RepoBaseFields from "./RepoBaseFields.vue";
 import { readDraft, DEFAULT_REPO } from "../newTopicDraft";
@@ -13,22 +15,23 @@ import { readDraft, DEFAULT_REPO } from "../newTopicDraft";
 // → the repo-shared `arachne-projects` store), never copied onto topics.
 
 const props = defineProps<{
-  project: { id: string; name: string };
+  project?: { id: string; name: string } | null;
+  layout?: SessionLayout | null;
 }>();
 
 const emit = defineEmits<{
   (e: "close"): void;
+  (e: "created", project: { id: string; name: string }): void;
+  (e: "layout", layout: SessionLayout): void;
 }>();
 
-interface ProjectBinding {
-  id: string;
-  kind: string;
-  title: string;
-  repository: string;
-  reference: string | null;
-  path: string | null;
-  url: string | null;
-}
+const creation = reactive<ProjectCreationDraft>({ project: null, bindings: [] });
+const creating = computed(() => !props.project);
+const project = computed(() => props.project ?? creation.project);
+const name = ref("");
+const nameInput = ref<HTMLInputElement | null>(null);
+const projectName = computed(() => project.value?.name || name.value.trim() || "this project");
+const visibleBindings = computed(() => [...bindings.value, ...creation.bindings]);
 
 // The store is per-repo (`arachne-projects` lives in the repo's shared
 // artifact space), so bindings are addressed by project id + repo. The
@@ -43,8 +46,11 @@ const loading = ref(false);
 const error = ref("");
 const saving = ref(false);
 const defaultsSaved = ref(false);
+let active = true;
+onUnmounted(() => { active = false; });
 function saveDefaults() {
-  saveProjectDefaults(localStorage, props.project.id, { repo: repo.value.trim(), base: base.value.trim() });
+  if (!active || !project.value) return;
+  saveProjectDefaults(localStorage, project.value.id, { repo: repo.value.trim(), base: base.value.trim() });
   defaultsSaved.value = true;
 }
 watch([repo, base], () => { defaultsSaved.value = false; });
@@ -54,7 +60,7 @@ watch([repo, base], () => { defaultsSaved.value = false; });
 let loadRequest = 0;
 async function load() {
   const request = ++loadRequest;
-  const projectId = props.project.id;
+  const projectId = project.value?.id;
   const repoInput = repo.value.trim();
   if (!projectId || !repoInput) return;
   loading.value = true;
@@ -65,7 +71,7 @@ async function load() {
       repo: repoInput,
     });
     // Guard a project switch racing the reply.
-    if (request !== loadRequest || projectId !== props.project.id || repoInput !== repo.value.trim()) return;
+    if (request !== loadRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
     bindings.value = view.bindings ?? [];
     revision.value = view.revision ?? 0;
   } catch (e: any) {
@@ -79,7 +85,7 @@ async function load() {
 
 // Managed repos fill the default; loading failures leave the field free.
 async function seedRepoDefault() {
-  const saved = readProjectDefaults(localStorage, props.project.id);
+  const saved = project.value ? readProjectDefaults(localStorage, project.value.id) : null;
   if (saved) { repo.value = saved.repo; base.value = saved.base; return; }
   try {
     const parsed = readDraft(localStorage);
@@ -91,9 +97,8 @@ async function seedRepoDefault() {
 
 onMounted(() => {
   void seedRepoDefault();
-  document.addEventListener("keydown", onKeydown);
+  if (creating.value) nameInput.value?.focus();
 });
-onUnmounted(() => document.removeEventListener("keydown", onKeydown));
 
 // A repo change swaps to that repo's store.
 let loadTimer: ReturnType<typeof setTimeout> | undefined;
@@ -102,6 +107,7 @@ watch(repo, () => {
   bindings.value = [];
   revision.value = 0;
   error.value = "";
+  if (creating.value) return;
   loading.value = !!repo.value.trim();
   clearTimeout(loadTimer);
   loadTimer = setTimeout(() => void load(), 300);
@@ -161,33 +167,36 @@ function chooseKind() {
 }
 
 async function attach() {
-  const projectId = props.project.id;
+  const projectId = project.value?.id;
   const repoInput = repo.value.trim();
   const title = formTitle.value.trim();
   const path = formPath.value.trim();
   const url = formUrl.value.trim();
   const targetRepo = formRepo.value.trim();
   if (!repoInput || saving.value || loading.value || !attachValid.value) return;
+  const resource = isUrlKind.value
+    ? { kind: formKind.value, title, repository: "", reference: null, path: null, url }
+    : formKind.value === "repository"
+      ? { kind: formKind.value, title, repository: targetRepo, reference: null, path: null, url: null }
+      : { kind: formKind.value, title, repository: "", reference: null, path, url: null };
+  if (creating.value) {
+    creation.bindings.push({ id: crypto.randomUUID(), ...resource });
+    resetAttach();
+    return;
+  }
+  if (!projectId) return;
   saving.value = true;
   error.value = "";
   try {
     const view = await invoke<{ bindings: ProjectBinding[]; revision: number }>("add_project_binding", {
       projectId,
       repo: repoInput,
-      resource: isUrlKind.value
-        ? { kind: formKind.value, title, repository: "", reference: null, path: null, url }
-        : formKind.value === "repository"
-          ? { kind: formKind.value, title, repository: targetRepo, reference: null, path: null, url: null }
-          : { kind: formKind.value, title, repository: "", reference: null, path, url: null },
+      resource,
       expectedRevision: revision.value,
     });
     bindings.value = view.bindings ?? [];
     revision.value = view.revision ?? 0;
-    showAttach.value = false;
-    formTitle.value = "Design document";
-    formPath.value = "docs/design.md";
-    formUrl.value = "";
-    formKind.value = "design_document";
+    resetAttach();
   } catch (e: any) {
     // Conflict or failure: reload so the next edit starts from truth.
     await load();
@@ -198,9 +207,15 @@ async function attach() {
 }
 
 async function remove(binding: ProjectBinding) {
-  const projectId = props.project.id;
+  if (saving.value || loading.value) return;
+  const pendingIndex = creation.bindings.findIndex((b) => b.id === binding.id);
+  if (pendingIndex !== -1) {
+    creation.bindings.splice(pendingIndex, 1);
+    return;
+  }
+  const projectId = project.value?.id;
   const repoInput = repo.value.trim();
-  if (!repoInput || saving.value || loading.value) return;
+  if (!projectId || !repoInput) return;
   saving.value = true;
   error.value = "";
   try {
@@ -220,36 +235,77 @@ async function remove(binding: ProjectBinding) {
   }
 }
 
+function resetAttach() {
+  showAttach.value = false;
+  formTitle.value = "Design document";
+  formPath.value = "docs/design.md";
+  formUrl.value = "";
+  formKind.value = "design_document";
+}
+
+async function create() {
+  if (saving.value || !name.value.trim() || showAttach.value) return;
+  saving.value = true;
+  error.value = "";
+  try {
+    const savedProject = await saveNewProject(
+      creation,
+      { name: name.value, repo: repo.value, layout: props.layout ?? null, isActive: () => active },
+      invoke,
+      (layout) => emit("layout", layout),
+      (view: ProjectBindingsView) => {
+        bindings.value = view.bindings ?? [];
+        revision.value = view.revision ?? 0;
+      },
+    );
+    saveDefaults();
+    emit("created", savedProject);
+  } catch (e: any) {
+    error.value = e?.message ?? String(e);
+    if (creation.project) saveDefaults();
+  } finally {
+    saving.value = false;
+  }
+}
+
 // --- Sheet chrome ---------------------------------------------------------
 
 function onKeydown(event: KeyboardEvent) {
+  if (event.defaultPrevented) return;
   if (event.key === "Escape") {
     event.preventDefault();
-    emit("close");
+    event.stopPropagation();
+    if (!saving.value) emit("close");
   }
 }
 </script>
 
 <template>
-  <section class="new-thread-sheet" aria-label="Project settings">
+  <section id="project-sheet" class="new-thread-sheet" :aria-label="creating ? 'New project' : 'Project settings'" @keydown="onKeydown">
     <div class="nts-inner">
       <header class="nts-head">
-        <h1>Project settings</h1>
-        <span class="nts-project" :title="`Bindings every new track in ${props.project.name} inherits`">{{ props.project.name }}</span>
-        <button class="nts-close" title="Close (esc)" aria-label="Close project resources" @click="emit('close')">✕</button>
+        <h1>{{ creating ? 'New project' : 'Project settings' }}</h1>
+        <span v-if="!creating" class="nts-project" :title="`Bindings every new track in ${projectName} inherits`">{{ projectName }}</span>
+        <button class="nts-close" :disabled="saving" title="Close (esc)" aria-label="Close project settings" @click="emit('close')">✕</button>
       </header>
 
-      <RepoBaseFields v-model:repo="repo" v-model:base="base" :disabled="saving" @submit="saveDefaults" />
-      <div class="nts-binding-actions">
+      <label v-if="creating" class="nts-field">
+        <span class="nts-field-name">Project name</span>
+        <input ref="nameInput" v-model="name" :disabled="saving || !!creation.project" placeholder="Project name" @keydown.enter.prevent="create" />
+      </label>
+
+      <RepoBaseFields v-model:repo="repo" v-model:base="base" :disabled="saving || (creating && !!creation.savedRepo)" @submit="creating ? create() : saveDefaults()" />
+      <div v-if="!creating" class="nts-binding-actions">
         <button type="button" :disabled="!repo.trim() || saving" @click="saveDefaults">{{ defaultsSaved ? 'Defaults saved' : 'Save launch defaults' }}</button>
         <span class="nts-hint">Repository and base for new tracks on this device. Existing work keeps its settings.</span>
       </div>
+      <span v-else class="nts-hint">Set the repository and base for new tracks, and bind the resources they should inherit.</span>
 
       <div class="nts-field nts-project-bindings">
         <span class="nts-field-name">Bound resources <em class="nts-opt">inherited by new tracks</em></span>
         <div v-if="loading" class="nts-project-hint">Loading project bindings…</div>
-        <template v-else-if="bindings.length">
-          <div v-for="binding in bindings" :key="binding.id" class="nts-binding-row">
+        <template v-else-if="visibleBindings.length">
+          <div v-for="binding in visibleBindings" :key="binding.id" class="nts-binding-row">
             <span class="nts-binding-kind" :title="binding.kind">{{ binding.kind }}</span>
             <span class="nts-binding-text">
               <strong>{{ binding.title }}</strong>
@@ -258,7 +314,7 @@ function onKeydown(event: KeyboardEvent) {
             <button
               type="button"
               class="nts-binding-remove"
-              :aria-label="`Remove ${binding.title} from project ${props.project.name}`"
+              :aria-label="`Remove ${binding.title} from project ${projectName}`"
               :disabled="saving || loading"
               title="Remove from the project (existing tracks keep their own bindings)"
               @click="remove(binding)"
@@ -266,15 +322,14 @@ function onKeydown(event: KeyboardEvent) {
           </div>
         </template>
         <div v-else-if="!error" class="nts-project-hint">
-          Nothing bound yet — new tracks in {{ props.project.name }} inherit what you bind here.
+          Nothing bound yet — new tracks in {{ projectName }} inherit what you bind here.
         </div>
-        <div v-if="error" class="nts-project-hint">{{ error }}</div>
         <div class="nts-binding-actions">
           <button type="button" class="link" :disabled="saving" @click="showAttach = !showAttach">
             {{ showAttach ? "Cancel" : "+ Bind a resource" }}
           </button>
         </div>
-        <div v-if="showAttach" class="nts-binding-form">
+        <fieldset v-if="showAttach" class="nts-binding-form" :disabled="saving">
           <label>Kind
             <select v-model="formKind" @change="chooseKind">
               <option value="design_document">Design document</option>
@@ -294,14 +349,23 @@ function onKeydown(event: KeyboardEvent) {
           </label>
           <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
           <label v-else-if="formKind !== 'repository'">Path in repo <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
-          <button type="button" class="primary" :disabled="saving || loading || !attachValid || !repo.trim()" @click="attach">Bind to project</button>
-        </div>
+          <button type="button" class="primary" :disabled="saving || loading || !attachValid || !repo.trim()" @click="attach">{{ creating ? 'Add resource' : 'Bind to project' }}</button>
+        </fieldset>
       </div>
 
+      <div v-if="error" class="nts-error" role="alert">{{ error }}</div>
+      <span v-if="creating && creation.project && !saving" class="nts-hint">The project was created. Retry to save the remaining resources, or close to keep its saved settings.</span>
+      <span v-if="creating && creation.savedRepo && !saving" class="nts-hint">Finish saving resources in this repository. You can edit launch defaults in Project settings afterward.</span>
       <span class="nts-hint">
-        Bound resources are inherited by every new track in {{ props.project.name }}; a track can hide one from
+        Bound resources are inherited by every new track in {{ projectName }}; a track can hide one from
         its Resources panel without removing it here. Existing tracks keep supplying these bindings live.
       </span>
+      <div v-if="creating" class="nts-actions">
+        <button type="button" :disabled="saving" @click="emit('close')">{{ creation.project ? 'Close' : 'Cancel' }}</button>
+        <button type="button" class="primary" :disabled="saving || !name.trim() || showAttach || (!!creation.bindings.length && !repo.trim())" @click="create">
+          {{ saving ? 'Saving…' : creation.project ? 'Save remaining resources' : 'Create project' }}
+        </button>
+      </div>
     </div>
   </section>
 </template>

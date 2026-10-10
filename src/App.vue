@@ -181,6 +181,7 @@ const showNewThread = ref(false);
 // choices (title, repo/base, project bindings) in the conversation area
 // and the first send launching the track (launchTopic).
 const showNewTopic = ref(false);
+const showNewProject = ref(false);
 const showSettings = ref(false);
 const showResources = ref(localStorage.getItem("arachne.inspector") !== "false");
 watch(showResources, value => localStorage.setItem("arachne.inspector", String(value)));
@@ -188,7 +189,7 @@ const showSearch = ref(false);
 const settingsSaving = ref(false);
 const threadView = ref<InstanceType<typeof ThreadView> | null>(null);
 let connectionGeneration = 0;
-function closeLaunchers() { showNewTopic.value = false; showNewThread.value = false; projectResourcesProject.value = null; }
+function closeLaunchers() { showNewTopic.value = false; showNewThread.value = false; showNewProject.value = false; projectResourcesProject.value = null; }
 async function openWorker() {
   if (!selectedView.value && selectedTopic.value) await selectSession(selectedTopic.value.id);
   await nextTick();
@@ -207,7 +208,7 @@ function onShortcut(event: KeyboardEvent) {
   if (event.key === "Escape") {
     if (showSearch.value) showSearch.value = false;
     else if (showSettings.value && !settingsSaving.value) showSettings.value = false;
-    else if (showNewTopic.value || showNewThread.value || projectResourcesProject.value) closeLaunchers();
+    else if (showNewTopic.value || showNewThread.value || showNewProject.value || projectResourcesProject.value) closeLaunchers();
     else return;
     event.preventDefault(); return;
   }
@@ -361,7 +362,7 @@ function selectTopic(id: string) {
   // the topic's chat takes the main pane, and the sheet (which also lives
   // in grid-area main) would otherwise block it. The composer draft is
   // snapshotted (localStorage) and restored when the sheet reopens.
-  showNewTopic.value = false;
+  closeLaunchers();
   selectedTopicId.value = id;
   // The chat-first route (docs/design.md "Navigation"): the main pane is a
   // conversation whenever a Topic is open. The scoped dashboard remains an
@@ -390,6 +391,7 @@ async function openTopicChat(id: string) {
 // the Overview action in the Topic/coordinator chat header — the main pane
 // stays a conversation whenever a Topic is open.
 function showTopicOverview(id: string) {
+  closeLaunchers();
   selectedTopicId.value = id;
   selectedId.value = null;
   selectedView.value = null;
@@ -428,16 +430,14 @@ function openNewThread() {
   // A stale connection error from an earlier flow shouldn't read as a
   // launch failure inside the fresh sheet.
   connError.value = null;
-  showNewTopic.value = false;
+  closeLaunchers();
   newTopicProject.value = null;
-  projectResourcesProject.value = null;
   showNewThread.value = true;
 }
 
 function openNewTopic() {
   connError.value = null;
-  showNewThread.value = false;
-  projectResourcesProject.value = null;
+  closeLaunchers();
   newTopicProject.value = null;
   showNewTopic.value = true;
 }
@@ -447,9 +447,8 @@ function openNewTopic() {
 // minimal handler.
 function openNewTopicInProject(project: { id: string | null; name: string } | null) {
   connError.value = null;
-  projectResourcesProject.value = null;
+  closeLaunchers();
   newTopicProject.value = project;
-  showNewThread.value = false;
   showNewTopic.value = true;
 }
 function closeNewTopic() {
@@ -463,17 +462,28 @@ function closeNewThreadSheet() {
 // The project heading's ⚙ button: manage that project's resource bindings
 // (what new topics inherit) without creating a topic first.
 const projectResourcesProject = ref<{ id: string; name: string } | null>(null);
+function openNewProject() {
+  connError.value = null;
+  closeLaunchers();
+  newTopicProject.value = null;
+  showNewProject.value = true;
+}
+function onProjectCreated(project: { id: string; name: string }) {
+  showTopicsHome();
+  selectedProject.value = project;
+  projectResourcesProject.value = project;
+}
 function openProjectResources(project: { id: string | null; name: string }) {
   // Only real projects have bindings — Ungrouped (null id) never opens
   // this sheet; the sidebar only emits for named headings anyway.
   if (!project.id) return;
   connError.value = null;
-  showNewTopic.value = false;
+  closeLaunchers();
   newTopicProject.value = null;
-  showNewThread.value = false;
   projectResourcesProject.value = { id: project.id, name: project.name };
 }
 function closeProjectResources() {
+  showNewProject.value = false;
   projectResourcesProject.value = null;
 }
 
@@ -704,10 +714,11 @@ const selectedTopic = computed(() => {
   }
   return node && !isStandalone(node) ? node : null;
 });
+const showProjectSheet = computed(() => showNewProject.value || !!projectResourcesProject.value);
 </script>
 
 <template>
-  <div class="app" :class="{ 'with-resources': !showNewThread && !showNewTopic && viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': !showNewThread && !showNewTopic && !showProjectSheet && viewMode !== 'home' && !!selectedTopic && showResources }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
       <button class="title home-link" title="Show Tracks home" @click="onHome">🕸 Arachne</button>
       <button class="header-search" title="Search and commands (⌘K)" @click="showSearch = true">Search <kbd>⌘K</kbd></button>
@@ -726,7 +737,7 @@ const selectedTopic = computed(() => {
             : (connError ?? "connecting…")
         }}
       </button>
-      <button v-if="viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
+      <button v-if="!showProjectSheet && viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
         title="Track inspector (⌘⇧E)" @click="showResources = !showResources">Inspector</button>
     </header>
     <FleetSidebar
@@ -736,11 +747,13 @@ const selectedTopic = computed(() => {
       :selected-id="selectedId ?? selectedTopicId"
       :show-new-thread="showNewThread"
       :show-new-topic="showNewTopic"
+      :show-new-project="showNewProject"
       @select="selectSession"
       @select-topic="selectTopic"
       @update-topic="updateTopic"
       @new-thread="openNewThread"
       @new-topic="openNewTopic"
+      @new-project="openNewProject"
       @new-topic-in-project="openNewTopicInProject"
       @manage-project-resources="openProjectResources"
       @select-project="selectProject"
@@ -760,10 +773,13 @@ const selectedTopic = computed(() => {
       @launch="launchTopic"
     />
     <ProjectSheet
-      v-else-if="projectResourcesProject"
-      :key="projectResourcesProject.id"
+      v-else-if="showProjectSheet"
+      :key="projectResourcesProject?.id ?? 'new-project'"
       :project="projectResourcesProject"
+      :layout="layout"
       @close="closeProjectResources"
+      @created="onProjectCreated"
+      @layout="layout = $event"
     />
     <NewThreadSheet
       v-else-if="showNewThread"
@@ -808,9 +824,9 @@ const selectedTopic = computed(() => {
       @manage-project-resources="openProjectResources"
       @error="connError = $event"
     />
-    <TopicInspector v-if="!showNewThread && !showNewTopic && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
+    <TopicInspector v-if="!showNewThread && !showNewTopic && !showProjectSheet && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
       @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" />
-    <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
+    <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && !showProjectSheet && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
     <CommandPalette v-if="showSearch" :fleet="fleet" @close="showSearch = false" @select="selectSession" @action="command" />
     <div v-if="connError && !showSettings && !showNewThread && !showNewTopic" class="app-error" role="alert"><span>{{ connError }}</span><button @click="showSettings = true" v-if="!connected">Connection settings</button><button aria-label="Dismiss error" @click="connError = null">×</button></div>
     <SettingsSheet
