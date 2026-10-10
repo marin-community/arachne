@@ -13,8 +13,11 @@ export function preparationRequest(isTrack: boolean, revision: string, target: S
     : target
       ? `Landing destination: coordinator ${target.branch.name} (session ${target.id}), branch ${canonicalTopicBranch(target)}, repository ${target.branch.repo_root}. Re-verify this exact target and its current revision; do not substitute main or the primary checkout's branch.`
       : "No landing target is resolved. Identify the same-repository track coordinator before claiming readiness; do not assume main.";
-  const edits = editedPaths.length ? ` Files manually saved through this review: ${editedPaths.join(", ")}. Treat these as intentional user edits; inspect their relevance and explicitly report anything excluded.` : "";
-  return `Prepare this ${isTrack ? "track" : "worker"} for ${isTrack ? "publishing" : "landing"}. ${revision} ${destination}${edits} Review the result, fix straightforward issues, and run the repository's required validation. Delegate review or repair where useful through visible Loom child sessions, including reviewers. Stabilize and commit the intended source changes once validation passes, preserving unrelated manual edits. Re-verify the exact source branch and revision and the exact target before reporting preparation. Report the exact source revision, target revision, validation evidence, and git status after preparation. If any uncommitted edits remain, list the files and report preparation as incomplete; do not mark the source ready. This is optional agent preparation, not control-plane verified readiness: do not set integration_ready or claim a verified ready-at-SHA result. Do not land, publish, push, or open a PR until I choose that action.`;
+  const edits = !isTrack && editedPaths.length ? ` Files manually saved through this review: ${editedPaths.join(", ")}. Treat these as intentional user edits; inspect their relevance and explicitly report anything excluded.` : "";
+  const sourceScope = isTrack
+    ? "Inspect and validate committed canonical accepted state in an isolated checkout. Coordinator scratch commits and staged, unstaged or untracked edits are outside the publishing source; keep preparation focused on accepted state, preserving unrelated manual edits. Do not incorporate scratch work into preparation. Report any accepted-state repair separately."
+    : "Stabilize and commit the intended worker source changes once validation passes, preserving unrelated manual edits.";
+  return `Prepare this ${isTrack ? "track" : "worker"} for ${isTrack ? "publishing" : "landing"}. ${revision} ${destination}${edits} Review the result, fix straightforward issues, and run the repository's required validation. Delegate review or repair where useful through visible Loom child sessions, including reviewers. ${sourceScope} Re-verify the exact source branch and revision and the exact target before reporting preparation. Report the exact source revision, target revision, validation evidence, and git status after preparation. If any intended source edits remain uncommitted, list the files and report preparation as incomplete; do not mark the source ready. This is optional agent preparation, not control-plane verified readiness: do not set integration_ready or claim a verified ready-at-SHA result. Do not land, publish, push, or open a PR until I choose that action.`;
 }
 
 /** Independent reviews compare worker changes with the canonical accepted ref. */
@@ -22,5 +25,26 @@ export function independentReviewRequest(revision: string, target: SessionSummar
   const destination = target
     ? `${isTrack ? "Canonical accepted source" : "Compare against canonical accepted branch"}: ${canonicalTopicBranch(target)} in ${target.branch.repo_root} (Track ${target.id}). Re-read and verify this exact ref and revision; do not substitute its scratch branch or main.`
     : "No same-repository Track is resolved. Resolve the canonical accepted ref before comparing changes; do not assume main.";
-  return `Review this thread's changes for correctness, regressions, and missing validation. ${revision} ${destination} Act independently in a fresh review thread. Report actionable findings with file locations and distinguish verified checks from unverified claims. Do not land, publish, push, or open a PR as part of this review.`;
+  const sourceScope = isTrack
+    ? " Fork the committed canonical accepted ref and compare with its recorded publishing base. Coordinator scratch commits and checkout edits are outside this review; report the exact accepted source and publishing base revisions."
+    : " Fork the original worker branch and compare its current state, including inherited unaccepted changes, with the current canonical target. Inspect uncommitted worker edits read-only and report that coverage separately.";
+  return `Review this thread's changes for correctness, regressions, and missing validation. ${revision} ${destination}${sourceScope} Act independently in a fresh review thread. Report actionable findings with file locations and distinguish verified checks from unverified claims. Do not land, publish, push, or open a PR as part of this review.`;
+}
+
+/** Preview evidence names its actual Git source and comparison, including scope. */
+export function reviewPreviewEvidence(changes: {
+  source_ref: string;
+  accepted_source: boolean;
+  head_oid: string | null;
+  base: { state: string; reference: string; oid?: string };
+} | null): string {
+  if (!changes) return "No preview snapshot is available; resolve and verify the actual review source and comparison.";
+  if (changes.base.state !== "available") {
+    return `Preview source: ${changes.source_ref}; comparison ${changes.base.reference} was unavailable. No Git diff or source/target revisions were verified by this preview. Perform the actual comparison on the repository host and report its exact refs, revisions and coverage.`;
+  }
+  const source = `The preview showed ${changes.source_ref}${changes.head_oid ? ` at ${changes.head_oid}` : ""}`;
+  const target = ` compared with ${changes.base.reference} at ${changes.base.oid}`;
+  return `${source}${target}. ${changes.accepted_source
+    ? "It covered committed canonical accepted state only; coordinator checkout edits are excluded."
+    : "It included worker checkout edits; re-read the original worker checkout and report current coverage."} Re-read both refs and revisions before reviewing or preparing.`;
 }

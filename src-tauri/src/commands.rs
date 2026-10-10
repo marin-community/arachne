@@ -2703,17 +2703,432 @@ pub async fn work_summary(
     })
 }
 
-/// The complete bounded Loom change set for the review pane.
+/// Actual canonical comparison for loopback repositories, with explicit remote limits.
 #[tauri::command]
 pub async fn work_changes(
     state: State<'_, LoomState>,
     session_id: String,
-) -> Result<crate::loom::ChangeSetView, UiError> {
+) -> Result<ReviewChanges, UiError> {
     let client = state_client(&state).await?;
-    client
-        .session_changes(&session_id)
+    load_review_changes(&client, &session_id).await
+}
+
+/// A canonical preview identifies its actual source and comparison, rather than
+/// re-labelling Loom's recorded-base changes as accepted-state evidence.
+#[derive(Debug, Serialize)]
+pub struct ReviewChanges {
+    #[serde(flatten)]
+    pub changes: crate::loom::ChangeSetView,
+    pub source_ref: String,
+    pub accepted_source: bool,
+    pub comparison: &'static str,
+}
+
+async fn load_review_changes(
+    client: &LoomClient,
+    session_id: &str,
+) -> Result<ReviewChanges, UiError> {
+    let source = client.get_session(session_id).await?;
+    if source.id != session_id {
+        return Err(resource_error(
+            "The review source identity changed; refresh before comparing.",
+        ));
+    }
+    let comparison = crate::coordination::resolve_review_comparison(client, &source).await?;
+    review_changes_for_source(client, &source, &comparison).await
+}
+
+async fn review_changes_for_source(
+    client: &LoomClient,
+    source: &SessionView,
+    comparison: &crate::coordination::ReviewComparison,
+) -> Result<ReviewChanges, UiError> {
+    // This check precedes every filesystem or Git read: server paths are not
+    // desktop paths. There is no arbitrary-ref diff endpoint in Loom today.
+    if !host_is_loopback(client.server_host().unwrap_or("")) {
+        return Ok(ReviewChanges {
+            source_ref: comparison.source_ref.clone(),
+            accepted_source: comparison.accepted_source,
+            comparison: "target-tree",
+            changes: crate::loom::ChangeSetView {
+                base: serde_json::json!({"state":"unavailable", "reference":comparison.target_ref,
+                    "reason":"remote_canonical_preview_unavailable"}),
+                ..Default::default()
+            },
+        });
+    }
+    local_review_changes(source, comparison).await
+}
+
+/// Bounded read-only Git capture. Disable optional index writes, external diff
+/// drivers and text conversion; a preview never fetches or runs repo helpers.
+async fn review_git(
+    root: &std::path::Path,
+    args: &[&str],
+    cap: usize,
+) -> Result<(Vec<u8>, bool), UiError> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncRead, AsyncReadExt};
+    async fn capture(mut reader: impl AsyncRead + Unpin, cap: usize) -> std::io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 8192];
+        loop {
+            let n = reader.read(&mut chunk).await?;
+            if n == 0 {
+                return Ok(bytes);
+            }
+            let keep = n.min((cap + 1).saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&chunk[..keep]);
+        }
+    }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "diff.autoRefreshIndex=false",
+            "-c",
+            "color.ui=false",
+            "-c",
+            "submodule.recurse=false",
+        ])
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| resource_error(e.to_string()))?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let (out, err) = tokio::join!(capture(stdout, cap), capture(stderr, 8192));
+        let mut out = out.map_err(|e| resource_error(e.to_string()))?;
+        let err = err.map_err(|e| resource_error(e.to_string()))?;
+        let truncated = out.len() > cap;
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| resource_error(e.to_string()))?;
+        if !status.success() {
+            return Err(resource_error(format!(
+                "Canonical Git comparison failed: {}",
+                String::from_utf8_lossy(&err).trim()
+            )));
+        }
+        out.truncate(cap);
+        Ok((out, truncated))
+    })
+    .await
+    .map_err(|_| resource_error("Canonical Git comparison timed out."))?;
+    output
+}
+
+async fn review_oid(root: &std::path::Path, reference: &str) -> Result<String, UiError> {
+    let (bytes, truncated) = review_git(
+        root,
+        &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+        128,
+    )
+    .await?;
+    let oid = String::from_utf8_lossy(&bytes).trim().to_owned();
+    if truncated || !matches!(oid.len(), 40 | 64) || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(resource_error(
+            "The comparison ref does not resolve to a Git commit.",
+        ));
+    }
+    Ok(oid)
+}
+
+fn review_path(raw: &[u8]) -> serde_json::Value {
+    serde_json::json!({"display":String::from_utf8_lossy(raw),
+        "bytes":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)})
+}
+
+fn review_hunks(patch: &[u8], line_budget: &mut usize) -> (Vec<serde_json::Value>, u32, u32, bool) {
+    let mut hunks = Vec::new();
+    let mut header = String::new();
+    let mut lines = Vec::new();
+    let (mut old, mut new) = (0u32, 0u32);
+    let (mut additions, mut deletions) = (0, 0);
+    let mut truncated = false;
+    for line in String::from_utf8_lossy(patch).lines() {
+        if line.starts_with("@@ ") {
+            if !header.is_empty() {
+                hunks.push(serde_json::json!({"header":header,"lines":lines,"truncated":false}));
+                lines = Vec::new();
+            }
+            if hunks.len() >= 50 {
+                truncated = true;
+                break;
+            }
+            header = line.to_string();
+            let mut parts = line.split_whitespace();
+            parts.next();
+            old = parts
+                .next()
+                .and_then(|s| s.trim_start_matches('-').split(',').next()?.parse().ok())
+                .unwrap_or(0);
+            new = parts
+                .next()
+                .and_then(|s| s.trim_start_matches('+').split(',').next()?.parse().ok())
+                .unwrap_or(0);
+        } else if !header.is_empty() {
+            let kind = match line.as_bytes().first() {
+                Some(b'+') => "addition",
+                Some(b'-') => "deletion",
+                Some(b' ') => "context",
+                _ => continue,
+            };
+            if *line_budget == 0 || lines.len() >= 1000 {
+                truncated = true;
+                break;
+            }
+            *line_budget -= 1;
+            let (old_line, new_line) = (
+                if kind == "addition" { None } else { Some(old) },
+                if kind == "deletion" { None } else { Some(new) },
+            );
+            if old_line.is_some() {
+                old += 1;
+            }
+            if new_line.is_some() {
+                new += 1;
+            }
+            if kind == "addition" {
+                additions += 1;
+            }
+            if kind == "deletion" {
+                deletions += 1;
+            }
+            let text = line[1..].chars().take(2048).collect::<String>();
+            if text.len() < line[1..].len() {
+                truncated = true;
+            }
+            lines.push(serde_json::json!({"kind":kind,"old_line":old_line,"new_line":new_line,"text":text}));
+        }
+    }
+    if !header.is_empty() {
+        hunks.push(serde_json::json!({"header":header,"lines":lines,"truncated":truncated}));
+    }
+    (hunks, additions, deletions, truncated)
+}
+
+async fn local_review_changes(
+    source: &SessionView,
+    comparison: &crate::coordination::ReviewComparison,
+) -> Result<ReviewChanges, UiError> {
+    use tokio::io::AsyncReadExt;
+    let root = std::path::Path::new(if comparison.accepted_source {
+        &source.branch.repo_root
+    } else {
+        &source.work_dir
+    });
+    if !comparison.accepted_source {
+        crate::landing::ensure_same_repository(
+            root,
+            std::path::Path::new(&source.branch.repo_root),
+        )
         .await
-        .map_err(Into::into)
+        .map_err(resource_error)?;
+    }
+    let source_git_ref = format!("refs/heads/{}", comparison.source_ref);
+    let source_oid = review_oid(root, &source_git_ref).await?;
+    // Explicit canonical refs always name local accepted branches. A publishing
+    // base can also be a recorded remote-tracking ref (e.g. origin/main).
+    let target_git_ref = format!("refs/heads/{}", comparison.target_ref);
+    let (target_git_ref, target_oid) = match review_oid(root, &target_git_ref).await {
+        Ok(oid) => (target_git_ref, oid),
+        Err(error) if !comparison.accepted_source => return Err(error),
+        Err(_) => {
+            let reference = format!("refs/remotes/{}", comparison.target_ref);
+            let oid = review_oid(root, &reference).await?;
+            (reference, oid)
+        }
+    };
+    if !comparison.accepted_source {
+        let (branch, _) = review_git(root, &["symbolic-ref", "--quiet", "HEAD"], 4096).await?;
+        if String::from_utf8_lossy(&branch).trim() != source_git_ref
+            || review_oid(root, "HEAD").await? != source_oid
+        {
+            return Err(resource_error(
+                "The worker checkout changed branch or revision; refresh before comparing.",
+            ));
+        }
+    }
+    let mut diff_args = vec![
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--submodule=short",
+        "--line-prefix=",
+        "--no-renames",
+        "--ignore-submodules=dirty",
+        "--name-status",
+        "-z",
+        target_oid.as_str(),
+    ];
+    if comparison.accepted_source {
+        diff_args.push(&source_oid);
+    }
+    diff_args.push("--");
+    let (inventory, inventory_truncated) = review_git(root, &diff_args, 8 * 1024 * 1024).await?;
+    if inventory_truncated {
+        return Err(resource_error(
+            "The canonical change inventory exceeds preview limits.",
+        ));
+    }
+    let mut paths: Vec<(String, Vec<u8>, bool)> = Vec::new();
+    let mut parts = inventory.split(|b| *b == 0).filter(|s| !s.is_empty());
+    while let Some(status) = parts.next() {
+        let path = parts
+            .next()
+            .ok_or_else(|| resource_error("Incomplete Git change inventory."))?;
+        let status = match status.first() {
+            Some(b'A') => "added",
+            Some(b'D') => "deleted",
+            Some(b'T') => "type_changed",
+            _ => "modified",
+        };
+        paths.push((status.into(), path.to_vec(), false));
+    }
+    if !comparison.accepted_source {
+        let (untracked, truncated) = review_git(
+            root,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+            8 * 1024 * 1024,
+        )
+        .await?;
+        if truncated {
+            return Err(resource_error(
+                "Untracked file inventory exceeds preview limits.",
+            ));
+        }
+        paths.extend(
+            untracked
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(|p| ("added".into(), p.to_vec(), true)),
+        );
+    }
+    let mut totals = crate::loom::ChangeTotalsView {
+        files: paths.len().min(u32::MAX as usize) as u32,
+        truncated: paths.len() > 100,
+        ..Default::default()
+    };
+    let mut files = Vec::new();
+    let mut line_budget = 8000;
+    for (status, raw_path, untracked) in paths.into_iter().take(100) {
+        let (mut content, mut patch, mut truncated) = ("text", Vec::new(), false);
+        if let Ok(path) = std::str::from_utf8(&raw_path) {
+            if untracked {
+                let full_path = root.join(path);
+                let metadata = tokio::fs::symlink_metadata(&full_path)
+                    .await
+                    .map_err(|e| resource_error(e.to_string()))?;
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    content = "unsupported";
+                } else {
+                    let file = tokio::fs::File::open(full_path)
+                        .await
+                        .map_err(|e| resource_error(e.to_string()))?;
+                    let mut bytes = Vec::new();
+                    file.take(128 * 1024 + 1)
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|e| resource_error(e.to_string()))?;
+                    if bytes.len() > 128 * 1024 {
+                        content = "oversize";
+                        truncated = true;
+                    } else if bytes.contains(&0) {
+                        content = "binary";
+                    } else {
+                        patch.extend_from_slice(b"@@ -0,0 +1 @@\n");
+                        for line in String::from_utf8_lossy(&bytes).lines() {
+                            patch.push(b'+');
+                            patch.extend_from_slice(line.as_bytes());
+                            patch.push(b'\n');
+                        }
+                    }
+                }
+            } else {
+                let mut args = vec![
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-color",
+                    "--submodule=short",
+                    "--line-prefix=",
+                    "--no-renames",
+                    "--ignore-submodules=dirty",
+                    "--unified=3",
+                    target_oid.as_str(),
+                ];
+                if comparison.accepted_source {
+                    args.push(&source_oid);
+                }
+                args.extend(["--", path]);
+                (patch, truncated) = review_git(root, &args, 128 * 1024).await?;
+                if patch.windows(13).any(|s| s == b"Binary files ") {
+                    content = "binary";
+                }
+            }
+        } else {
+            content = "unsupported";
+        }
+        let (hunks, additions, deletions, limited) = review_hunks(&patch, &mut line_budget);
+        truncated |= limited;
+        totals.additions += additions;
+        totals.deletions += deletions;
+        totals.truncated |= truncated;
+        files.push(serde_json::json!({"status":status,"path":review_path(&raw_path),"old_path":null,
+            "sources":[if untracked { "untracked" } else if comparison.accepted_source { "committed" } else { "checkout" }],
+            "additions":if content == "text" { Some(additions) } else { None },
+            "deletions":if content == "text" { Some(deletions) } else { None },
+            "content":content,"hunks":hunks,"truncated":truncated}));
+    }
+    // Both SHAs must still name the refs used for this snapshot; advanced
+    // canonical targets require another comparison, never recorded-base reuse.
+    if review_oid(root, &source_git_ref).await? != source_oid
+        || review_oid(root, &target_git_ref).await? != target_oid
+    {
+        return Err(resource_error(
+            "Source or canonical comparison advanced during preview; refresh.",
+        ));
+    }
+    if !comparison.accepted_source {
+        let (branch, _) = review_git(root, &["symbolic-ref", "--quiet", "HEAD"], 4096).await?;
+        if String::from_utf8_lossy(&branch).trim() != source_git_ref
+            || review_oid(root, "HEAD").await? != source_oid
+        {
+            return Err(resource_error(
+                "The worker checkout changed during preview; refresh.",
+            ));
+        }
+    }
+    Ok(ReviewChanges {
+        source_ref: comparison.source_ref.clone(),
+        accepted_source: comparison.accepted_source,
+        comparison: "target-tree",
+        changes: crate::loom::ChangeSetView {
+            version: None,
+            base: serde_json::json!({"state":"available","reference":comparison.target_ref,"oid":target_oid}),
+            head_oid: Some(source_oid),
+            truncated: totals.truncated,
+            totals,
+            files,
+        },
+    })
 }
 
 fn resource_error(message: impl Into<String>) -> UiError {
@@ -5313,5 +5728,499 @@ mod thread_landing_contract_tests {
             assert!(!error.unreachable);
             assert!(error.message.contains("publishing is a separate"));
         }
+    }
+}
+#[cfg(test)]
+mod canonical_comparison_tests {
+    use super::*;
+    use crate::coordination::{resolve_review_comparison, review_launch_input, ReviewComparison};
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct Repository(PathBuf);
+    impl Drop for Repository {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().into()
+    }
+    fn commit(root: &Path, path: &str, contents: &str) {
+        std::fs::write(root.join(path), contents).unwrap();
+        git(root, &["add", "--", path]);
+        git(root, &["commit", "-m", path]);
+    }
+    fn repo() -> Repository {
+        let path = std::env::temp_dir().join(format!(
+            "arachne-canonical-review-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        git(&path, &["init", "-b", "release"]);
+        git(&path, &["config", "user.name", "Test"]);
+        git(&path, &["config", "user.email", "test@example.invalid"]);
+        commit(&path, "seed.txt", "seed\n");
+        git(&path, &["branch", "accepted/topic"]);
+        Repository(path)
+    }
+    fn view(id: &str, repo: &str) -> SessionView {
+        let mut source: SessionView =
+            serde_json::from_str(include_str!("../tests/fixtures/launch-response.json")).unwrap();
+        source.id = id.into();
+        source.branch.id = format!("branch-{id}");
+        source.branch.branch = format!("work/{id}");
+        source.branch.repo_root = repo.into();
+        source.work_dir = repo.into();
+        source
+    }
+    fn track(repo: &str) -> SessionView {
+        let mut track = view("track", repo);
+        track.branch.branch = "scratch/coordinator".into();
+        track.branch.tags = serde_json::from_value(json!([
+            {"key":"topic","value":"true","note":"","set_by":"","set_at":""},
+            {"key":"track_topic_branch","value":"accepted/topic","note":"","set_by":"","set_at":""}
+        ]))
+        .unwrap();
+        track
+    }
+    fn summary(view: &SessionView, parent: Option<&str>) -> Value {
+        let mut value = serde_json::to_value(view).unwrap();
+        value["parent_session_id"] = json!(parent);
+        value["parent_id"] = Value::Null;
+        value
+    }
+    async fn mock(
+        script: Vec<(&'static str, Value)>,
+    ) -> (LoomClient, tokio::task::JoinHandle<Vec<Value>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for (path, reply) in script {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        assert!(headers.starts_with(&format!("POST {path} ")), "{headers}");
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(str::to_owned)
+                            })
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0; 8192];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&chunk[..n]);
+                }
+                requests
+                    .push(serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap());
+                let response = reply.to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        (
+            LoomClient::new(&format!("http://{addr}"), None).unwrap(),
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_preview_includes_inherited_changes_checkout_edits_and_advanced_target() {
+        let repo = repo();
+        let root = &repo.0;
+        git(root, &["checkout", "-b", "work/parent", "accepted/topic"]);
+        commit(root, "inherited.txt", "unaccepted parent\n");
+        git(root, &["checkout", "-b", "work/worker"]);
+        commit(root, "worker.txt", "worker\n");
+        commit(root, "shared.txt", "worker original\n");
+        std::fs::write(root.join("staged.txt"), "staged edit\n").unwrap();
+        git(root, &["add", "staged.txt"]);
+        std::fs::write(root.join("worker.txt"), "worker manual\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "new edit\n").unwrap();
+        let source = view("worker", root.to_str().unwrap());
+        let comparison = ReviewComparison {
+            source_ref: "work/worker".into(),
+            target_ref: "accepted/topic".into(),
+            accepted_source: false,
+        };
+        let before = git(root, &["status", "--porcelain=v1"]);
+        let first = local_review_changes(&source, &comparison).await.unwrap();
+        let paths: Vec<_> = first
+            .changes
+            .files
+            .iter()
+            .map(|f| f["path"]["display"].as_str().unwrap())
+            .collect();
+        for path in ["inherited.txt", "worker.txt", "staged.txt", "untracked.txt"] {
+            assert!(paths.contains(&path), "{paths:?}");
+        }
+        assert_eq!(git(root, &["status", "--porcelain=v1"]), before);
+        let accepted_checkout = root.join("accepted-checkout");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                accepted_checkout.to_str().unwrap(),
+                "accepted/topic",
+            ],
+        );
+        commit(&accepted_checkout, "shared.txt", "canonical advanced\n");
+        let second = local_review_changes(&source, &comparison).await.unwrap();
+        assert_ne!(first.changes.base["oid"], second.changes.base["oid"]);
+        assert_eq!(
+            second.changes.base["oid"],
+            git(root, &["rev-parse", "accepted/topic"])
+        );
+        let shared = second
+            .changes
+            .files
+            .iter()
+            .find(|f| f["path"]["display"] == "shared.txt")
+            .unwrap();
+        assert!(shared.to_string().contains("canonical advanced"));
+        assert!(shared.to_string().contains("worker original"));
+        assert_eq!(
+            git(
+                root,
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "--",
+                    "worker.txt",
+                    "staged.txt",
+                    "untracked.txt"
+                ]
+            ),
+            "A  staged.txt\n M worker.txt\n?? untracked.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_preview_and_reviewer_checkout_use_real_accepted_ref_not_scratch() {
+        let repo = repo();
+        let root = &repo.0;
+        git(root, &["checkout", "accepted/topic"]);
+        commit(root, "accepted-only.txt", "accepted\n");
+        git(root, &["checkout", "-b", "scratch/coordinator", "release"]);
+        commit(root, "scratch-only.txt", "scratch\n");
+        std::fs::write(root.join("scratch-dirty.txt"), "dirty\n").unwrap();
+        let source = track(root.to_str().unwrap());
+        let comparison = ReviewComparison {
+            source_ref: "accepted/topic".into(),
+            target_ref: "release".into(),
+            accepted_source: true,
+        };
+        let before = git(root, &["status", "--porcelain=v1"]);
+        let changes = local_review_changes(&source, &comparison).await.unwrap();
+        assert_eq!(changes.source_ref, "accepted/topic");
+        assert!(changes.accepted_source);
+        assert_eq!(
+            changes.changes.head_oid.unwrap(),
+            git(root, &["rev-parse", "accepted/topic"])
+        );
+        assert_eq!(changes.changes.files.len(), 1);
+        assert_eq!(
+            changes.changes.files[0]["path"]["display"],
+            "accepted-only.txt"
+        );
+        assert_eq!(git(root, &["status", "--porcelain=v1"]), before);
+        let input = review_launch_input(&source, &comparison, "Review accepted state.");
+        assert_eq!(input.base.as_deref(), Some("accepted/topic"));
+        assert_eq!(input.parent_branch.as_deref(), Some("branch-track"));
+        let reviewer = root.join("reviewer-checkout");
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                reviewer.to_str().unwrap(),
+                input.base.as_deref().unwrap(),
+            ],
+        );
+        assert!(reviewer.join("accepted-only.txt").exists());
+        assert!(!reviewer.join("scratch-only.txt").exists());
+        assert!(!reviewer.join("scratch-dirty.txt").exists());
+        let prompt = input.goal.unwrap();
+        assert!(prompt.contains("Publishing comparison base: release"));
+        assert!(prompt.contains("git diff <base-SHA> <accepted-SHA>"));
+    }
+
+    #[tokio::test]
+    async fn canonical_preview_mock_contract_never_calls_recorded_base_changes() {
+        let repo = repo();
+        git(
+            &repo.0,
+            &["checkout", "-b", "work/worker", "accepted/topic"],
+        );
+        commit(&repo.0, "inherited.txt", "intended\n");
+        let source = view("worker", repo.0.to_str().unwrap());
+        let owner = track(repo.0.to_str().unwrap());
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(source)),
+            (
+                "/api/sessions/summary/list",
+                json!([summary(&owner, None), summary(&source, Some("track"))]),
+            ),
+            ("/api/sessions/get", json!(owner)),
+        ])
+        .await;
+        let result = load_review_changes(&client, "worker").await.unwrap();
+        assert_eq!(result.changes.base["reference"], "accepted/topic");
+        assert_eq!(result.changes.files[0]["path"]["display"], "inherited.txt");
+        let requests = server.await.unwrap();
+        assert_eq!(requests[0], json!({"session":"worker"}));
+        assert_eq!(requests[2], json!({"session":"track"}));
+    }
+
+    #[tokio::test]
+    async fn review_scope_mock_uses_fresh_canonical_metadata_and_repository_specific_publish_base()
+    {
+        let source = view("worker", "/provider/repository");
+        let owner = track("/provider/repository");
+        let mut stale_owner = owner.clone();
+        stale_owner.branch.tags[1].value = "old/topic".into();
+        let (client, server) = mock(vec![
+            (
+                "/api/sessions/summary/list",
+                json!([summary(&stale_owner, None), summary(&source, Some("track"))]),
+            ),
+            ("/api/sessions/get", json!(owner)),
+        ])
+        .await;
+        let comparison = resolve_review_comparison(&client, &source).await.unwrap();
+        assert_eq!(comparison.target_ref, "accepted/topic");
+        assert_eq!(comparison.source_ref, "work/worker");
+        assert!(!comparison.accepted_source);
+        server.await.unwrap();
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", json!([summary(&owner, None)])),
+            ("/api/branches/list", json!([
+                {"branch":"accepted/topic","repo_root":"/other-repo","base_branch":"wrong"},
+                {"branch":"accepted/topic","repo_root":"/provider/repository","base_branch":"release"},
+                {"branch":"scratch/coordinator","repo_root":"/provider/repository","base_branch":"old"}
+            ])),
+        ]).await;
+        let comparison = resolve_review_comparison(&client, &owner).await.unwrap();
+        assert!(comparison.accepted_source);
+        assert_eq!(comparison.source_ref, "accepted/topic");
+        assert_eq!(comparison.target_ref, "release");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_review_uses_newer_fleet_canonical_tag_and_legacy_seed_base() {
+        let owner = track("/provider/repository");
+        let mut earlier = owner.clone();
+        earlier.branch.tags[1].value = "old/topic".into();
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", json!([summary(&owner, None)])),
+            ("/api/branches/list", json!([
+                {"branch":"scratch/coordinator","repo_root":"/provider/repository","base_branch":"release"}
+            ])),
+        ]).await;
+        let scope = resolve_review_comparison(&client, &earlier).await.unwrap();
+        assert_eq!(scope.source_ref, "accepted/topic");
+        assert_eq!(scope.target_ref, "release");
+        assert!(scope.accepted_source);
+        assert_eq!(
+            review_launch_input(&earlier, &scope, "Review accepted state")
+                .base
+                .as_deref(),
+            Some("accepted/topic")
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unresolved_publish_base_or_incomplete_initialization_never_falls_back_to_scratch() {
+        let owner = track("/provider/repository");
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", json!([summary(&owner, None)])),
+            ("/api/branches/list", json!([])),
+        ])
+        .await;
+        assert!(resolve_review_comparison(&client, &owner)
+            .await
+            .err()
+            .unwrap()
+            .message
+            .contains("No publishing base"));
+        server.await.unwrap();
+        let mut pending = owner;
+        pending.branch.tags.clear();
+        pending.branch.goal =
+            "Arachne canonical Track initialization required: accepted/topic".into();
+        let (client, server) = mock(vec![(
+            "/api/sessions/summary/list",
+            json!([summary(&pending, None)]),
+        )])
+        .await;
+        assert!(resolve_review_comparison(&client, &pending)
+            .await
+            .err()
+            .unwrap()
+            .message
+            .contains("initialization"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_preview_never_reads_provider_paths_locally_and_keeps_review_scope() {
+        let client = LoomClient::new("https://loom.example.invalid", None).unwrap();
+        for accepted_source in [false, true] {
+            let source = view("worker", "/this-provider-path-must-never-be-read-locally");
+            let comparison = ReviewComparison {
+                source_ref: if accepted_source {
+                    "accepted/topic"
+                } else {
+                    "work/worker"
+                }
+                .into(),
+                target_ref: "release".into(),
+                accepted_source,
+            };
+            let preview = review_changes_for_source(&client, &source, &comparison)
+                .await
+                .unwrap();
+            assert_eq!(preview.changes.base["state"], "unavailable");
+            assert_eq!(
+                preview.changes.base["reason"],
+                "remote_canonical_preview_unavailable"
+            );
+            assert_eq!(preview.changes.base["reference"], "release");
+            assert_eq!(preview.source_ref, comparison.source_ref);
+            assert!(preview.changes.files.is_empty());
+            assert!(preview.changes.head_oid.is_none());
+            let input = review_launch_input(&source, &comparison, "Review on repository host.");
+            assert_eq!(input.base.as_deref(), Some(comparison.source_ref.as_str()));
+            assert!(input.goal.unwrap().contains("On the repository host"));
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_canonical_ref_and_changed_worker_checkout_fail_closed() {
+        let repo = repo();
+        let source = view("worker", repo.0.to_str().unwrap());
+        let comparison = ReviewComparison {
+            source_ref: "release".into(),
+            target_ref: "missing/accepted".into(),
+            accepted_source: false,
+        };
+        assert!(local_review_changes(&source, &comparison).await.is_err());
+        git(&repo.0, &["branch", "work/worker"]);
+        let comparison = ReviewComparison {
+            source_ref: "work/worker".into(),
+            target_ref: "accepted/topic".into(),
+            accepted_source: false,
+        };
+        assert!(local_review_changes(&source, &comparison)
+            .await
+            .err()
+            .unwrap()
+            .message
+            .contains("checkout changed branch"));
+    }
+
+    #[tokio::test]
+    async fn worker_checkout_in_an_unrelated_repository_cannot_impersonate_canonical_refs() {
+        let advertised = repo();
+        let unrelated = repo();
+        git(&unrelated.0, &["checkout", "-b", "work/worker"]);
+        commit(
+            &unrelated.0,
+            "foreign.txt",
+            "foreign repository
+",
+        );
+        let mut source = view("worker", advertised.0.to_str().unwrap());
+        source.work_dir = unrelated.0.to_str().unwrap().into();
+        let scope = ReviewComparison {
+            source_ref: "work/worker".into(),
+            target_ref: "accepted/topic".into(),
+            accepted_source: false,
+        };
+        let before = git(&unrelated.0, &["status", "--porcelain=v1"]);
+        let error = local_review_changes(&source, &scope).await.err().unwrap();
+        assert!(
+            error.message.contains("different repository"),
+            "{}",
+            error.message
+        );
+        assert_eq!(git(&unrelated.0, &["status", "--porcelain=v1"]), before);
+    }
+
+    #[test]
+    fn ambient_git_overrides_cannot_redirect_canonical_preview() {
+        let unrelated = repo();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "commands::canonical_comparison_tests::worker_preview_includes_inherited_changes_checkout_edits_and_advanced_target", "--nocapture"])
+            .env("GIT_DIR", unrelated.0.join(".git"))
+            .env("GIT_WORK_TREE", &unrelated.0)
+            .env("GIT_INDEX_FILE", unrelated.0.join(".git/index"))
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    fn hunk_parser_has_correct_coordinates_and_honest_bounds() {
+        let mut budget = 3;
+        let (hunks, additions, deletions, truncated) = review_hunks(
+            b"@@ -4,2 +4,2 @@\n context\n-old\n+new\n context\n",
+            &mut budget,
+        );
+        assert!(truncated);
+        assert_eq!((additions, deletions), (1, 1));
+        assert_eq!(hunks[0]["lines"][0]["old_line"], 4);
+        assert_eq!(hunks[0]["lines"][1]["old_line"], 5);
+        assert_eq!(hunks[0]["lines"][2]["new_line"], 5);
+        assert_eq!(hunks[0]["lines"][1]["new_line"], Value::Null);
     }
 }

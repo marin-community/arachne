@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { preparationRequest, reviewIntegrationTarget, independentReviewRequest } from "../src/reviewRequest.ts";
+import { preparationRequest, reviewIntegrationTarget, independentReviewRequest, reviewPreviewEvidence } from "../src/reviewRequest.ts";
 
 const session = (id, parent = null, repo = "/repo", tags = []) => ({
   id, status: "running", parent_session_id: parent, parent_id: null,
@@ -14,7 +14,7 @@ test("preparation routes nested workers to same-repository track rather than mai
   const prompt = preparationRequest(false, "HEAD abc", track, ["src/app.ts"]);
   assert.match(prompt, /branch work\/track, repository \/repo/);
   assert.match(prompt, /src\/app\.ts/);
-  assert.match(prompt, /If any uncommitted edits remain/);
+  assert.match(prompt, /If any intended source edits remain uncommitted/);
   assert.match(prompt, /do not set integration_ready/);
 });
 test("unresolved or cross-repository parents never fabricate an integration destination", () => {
@@ -52,4 +52,36 @@ test("both preparation and independent review name the canonical accepted ref", 
   }
   assert.match(independentReviewRequest("HEAD source", null), /No same-repository Track is resolved/);
   assert.match(preparationRequest(true, "HEAD source", track), /Canonical publish source: arachne\/tracks\/accepted/);
+});
+
+
+test("root review and optional preparation exclude coordinator scratch edits", () => {
+  const track = session("track", null, "/repo", [
+    { key: "topic", value: "true" }, { key: "track_topic_branch", value: "accepted/topic" },
+  ]);
+  const review = independentReviewRequest("Snapshot evidence", track, true);
+  assert.match(review, /Fork the committed canonical accepted ref/);
+  assert.match(review, /recorded publishing base/);
+  assert.match(review, /Coordinator scratch commits and checkout edits are outside this review/);
+  const prepare = preparationRequest(true, "Snapshot evidence", track, ["scratch-edit.ts"]);
+  assert.match(prepare, /validate committed canonical accepted state in an isolated checkout/);
+  assert.doesNotMatch(prepare, /scratch-edit.ts|Stabilize and commit the intended worker/);
+  assert.match(prepare, /Do not land, publish, push, or open a PR until I choose that action/);
+});
+
+test("preview evidence records actual accepted or worker source and target snapshots", () => {
+  const snapshot = { source_ref: "accepted/topic", accepted_source: true, head_oid: "abc",
+    base: { state: "available", reference: "release", oid: "def" } };
+  assert.match(reviewPreviewEvidence(snapshot), /accepted\/topic at abc compared with release at def/);
+  assert.match(reviewPreviewEvidence(snapshot), /checkout edits are excluded/);
+  assert.match(reviewPreviewEvidence({ ...snapshot, source_ref: "work/worker", accepted_source: false }), /included worker checkout edits/);
+  assert.match(reviewPreviewEvidence({ ...snapshot, head_oid: null, base: { state: "unavailable", reference: "release" } }), /comparison release was unavailable/);
+  assert.doesNotMatch(reviewPreviewEvidence({ ...snapshot, head_oid: null, base: { state: "unavailable", reference: "release" } }), /at null|at undefined|It covered|It included/);
+});
+
+test("worker review includes inherited unaccepted changes and verifies target again", () => {
+  const prompt = independentReviewRequest("", session("track"));
+  assert.match(prompt, /Fork the original worker branch/);
+  assert.match(prompt, /inherited unaccepted changes/);
+  assert.match(prompt, /Inspect uncommitted worker edits read-only/);
 });

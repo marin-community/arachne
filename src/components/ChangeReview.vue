@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import CheckoutEditor from "./CheckoutEditor.vue";
 import type { SessionSummary } from "../App.vue";
 import { launchSelection } from "../launch";
-import { preparationRequest, independentReviewRequest } from "../reviewRequest";
+import { preparationRequest, independentReviewRequest, reviewPreviewEvidence } from "../reviewRequest";
 
 interface ChangeLine {
   kind: "context" | "addition" | "deletion";
@@ -29,6 +29,8 @@ interface ChangeFile {
   truncated: boolean;
 }
 interface ChangeSet {
+  source_ref: string;
+  accepted_source: boolean;
   version: string | null;
   base: { state: "available"; reference: string; oid: string } | { state: "unavailable"; reference: string; reason: string };
   head_oid: string | null;
@@ -38,6 +40,8 @@ interface ChangeSet {
 }
 
 const props = withDefaults(defineProps<{ sessionId: string; canEdit?: boolean; isTopic?: boolean; integrationTarget?: SessionSummary | null; embedded?: boolean }>(), { canEdit: false, isTopic: false, embedded: false });
+const reviewingTrack = computed(() => changes.value?.accepted_source ?? props.isTopic);
+const checkoutEditable = computed(() => props.canEdit && !reviewingTrack.value);
 const emit = defineEmits<{ (e: "requested"): void; (e: "saved"): void }>();
 const editPath = ref<string | null>(null);
 const editedPaths = ref<string[]>([]);
@@ -53,7 +57,7 @@ let requestGeneration = 0;
 watch(fileQuery, async query => {
   const current = ++completionGeneration;
   fileOptions.value = [];
-  if (!props.canEdit || !query.trim()) return;
+  if (!checkoutEditable.value || !query.trim()) return;
   try {
     const files = await invoke<string[]>("complete_files", { id: props.sessionId, query });
     if (current === completionGeneration) fileOptions.value = files.slice(0, 20);
@@ -61,10 +65,10 @@ watch(fileQuery, async query => {
 });
 function prepareRequest(mode: "review" | "prepare") {
   requestMode.value = mode;
-  const revision = changes.value?.head_oid ? `The preview showed HEAD ${changes.value.head_oid}; re-read the current checkout, including uncommitted manual edits.` : "Inspect the current checkout, including uncommitted manual edits.";
+  const revision = reviewPreviewEvidence(changes.value);
   requestText.value = mode === "review"
-    ? independentReviewRequest(revision, props.integrationTarget ?? null, props.isTopic)
-    : preparationRequest(props.isTopic, revision, props.integrationTarget ?? null, editedPaths.value);
+    ? independentReviewRequest(revision, props.integrationTarget ?? null, reviewingTrack.value)
+    : preparationRequest(reviewingTrack.value, revision, props.integrationTarget ?? null, editedPaths.value);
 }
 async function sendRequest() {
   if (requesting.value || !requestText.value.trim()) return;
@@ -133,6 +137,13 @@ watch(() => props.sessionId, () => {
   void refresh();
 }, { immediate: true });
 
+watch(() => [props.isTopic, props.integrationTarget?.id, props.integrationTarget?.branch.branch,
+  props.integrationTarget?.branch.tags.find(tag => tag.key === "track_topic_branch")?.value], () => {
+  changes.value = null;
+  requestMode.value = null;
+  void refresh();
+});
+
 function lineNumber(value: number | null): string {
   return value == null ? "" : String(value);
 }
@@ -143,13 +154,13 @@ function lineNumber(value: number | null): string {
     <div class="change-review-heading">
       <div>
         <strong>Review changes</strong>
-        <span v-if="changes" class="change-review-count">{{ changes.totals.files }} files · +{{ changes.totals.additions }} −{{ changes.totals.deletions }}</span>
+        <span v-if="changes?.base.state === 'available'" class="change-review-count">{{ changes.totals.files }} files · +{{ changes.totals.additions }} −{{ changes.totals.deletions }}</span>
       </div>
       <button :disabled="loading" @click="refresh">{{ loading ? "Loading…" : "Refresh" }}</button>
     </div>
     <div class="review-toolbar">
       <button :disabled="loading || requesting" @click="prepareRequest('review')">Launch reviewer</button>
-      <button :disabled="loading || requesting" @click="prepareRequest('prepare')">Prepare {{ isTopic ? "publishing" : "landing" }}</button>
+      <button :disabled="loading || requesting" @click="prepareRequest('prepare')">Prepare {{ reviewingTrack ? "publishing" : "landing" }}</button>
     </div>
     <div v-if="requestMode" class="review-request">
       <label :for="`review-request-${sessionId}`">{{ requestMode === 'review' ? "Review request" : "Preparation request" }}</label>
@@ -158,25 +169,26 @@ function lineNumber(value: number | null): string {
     </div>
     <div v-if="requestNote" class="change-review-state" role="status">{{ requestNote }}</div>
     <div class="review-file-picker">
-      <input v-model="fileQuery" :list="`review-files-${sessionId}`" placeholder="Filter changes or open a file…" aria-label="Find a checkout file" @keydown.enter.prevent="canEdit && fileQuery.trim() && (editPath = fileQuery.trim())" />
+      <input v-model="fileQuery" :list="`review-files-${sessionId}`" placeholder="Filter changes or open a file…" aria-label="Find a checkout file" @keydown.enter.prevent="checkoutEditable && fileQuery.trim() && (editPath = fileQuery.trim())" />
       <datalist :id="`review-files-${sessionId}`"><option v-for="path in fileOptions" :key="path" :value="path" /></datalist>
-      <button v-if="canEdit" :disabled="!fileQuery.trim()" @click="editPath = fileQuery.trim()">Edit file</button>
+      <button v-if="checkoutEditable" :disabled="!fileQuery.trim()" @click="editPath = fileQuery.trim()">Edit file</button>
     </div>
-    <div v-if="loading && !changes" class="change-review-state" role="status">Loading the current checkout diff…</div>
+    <div v-if="loading && !changes" class="change-review-state" role="status">Loading the current comparison…</div>
     <div v-else-if="error" class="change-review-state change-review-error" role="alert">Could not load changes: {{ error }}</div>
     <template v-else-if="changes">
       <div v-if="changes.base.state === 'unavailable'" class="change-review-state" role="status">
-        Base {{ changes.base.reference }} is unavailable ({{ changes.base.reason.replaceAll('_', ' ') }}). There is no reliable comparison yet.
+        <template v-if="changes.base.reason === 'remote_canonical_preview_unavailable'">Canonical preview is unavailable for this remote repository. Launch a reviewer to compare {{ changes.source_ref }} with {{ changes.base.reference }} on the repository host and report exact revisions and coverage.</template>
+        <template v-else>Base {{ changes.base.reference }} is unavailable ({{ changes.base.reason.replaceAll('_', ' ') }}). There is no reliable comparison yet.</template>
       </div>
       <template v-else>
         <div class="change-review-base" :title="`Base ${changes.base.oid}${changes.head_oid ? ` · HEAD ${changes.head_oid}` : ''}`">
           Compared with {{ changes.base.reference }} · {{ changes.base.oid.slice(0, 10) }}
         </div>
         <div v-if="changes.truncated || changes.totals.truncated" class="change-review-state" role="status">
-          Large diff: Loom limited this preview. Open the checkout for the complete changes.
+          Large diff: this preview is limited. Open the checkout for the complete changes.
         </div>
-        <div v-if="changes.head_oid" class="change-review-base">Source HEAD · {{ changes.head_oid.slice(0, 10) }} · includes current checkout edits</div>
-        <div v-if="changes.files.length === 0" class="change-review-state">No changes against this branch’s base.</div>
+        <div v-if="changes.head_oid" class="change-review-base">Source {{ changes.source_ref }} · {{ changes.head_oid.slice(0, 10) }} · {{ changes.accepted_source ? "committed accepted state" : "includes worker checkout edits" }}</div>
+        <div v-if="changes.files.length === 0" class="change-review-state">No changes against this comparison ref.</div>
         <div v-else-if="!visibleFiles.length" class="change-review-state">No changed files match this filter.</div>
         <div v-else class="change-review-files">
           <details v-for="(file, index) in visibleFiles" :key="file.path.bytes" class="change-review-file" :open="index === 0">
@@ -185,7 +197,7 @@ function lineNumber(value: number | null): string {
               <span class="change-review-path" :title="file.path.display">{{ file.old_path ? `${file.old_path.display} → ` : "" }}{{ file.path.display }}</span>
               <span class="change-review-file-stats">{{ file.additions == null ? "" : `+${file.additions}` }} {{ file.deletions == null ? "" : `−${file.deletions}` }}</span>
             </summary>
-            <div v-if="canEdit && file.content === 'text' && file.status !== 'deleted'" class="review-file-actions"><button @click="editPath = file.path.display">Edit file</button><span>Changes save to this thread’s checkout</span></div>
+            <div v-if="checkoutEditable && file.content === 'text' && file.status !== 'deleted'" class="review-file-actions"><button @click="editPath = file.path.display">Edit file</button><span>Changes save to this thread’s checkout</span></div>
             <div v-if="file.content !== 'text'" class="change-review-state">{{ file.content }} content cannot be previewed here.</div>
             <div v-else-if="file.hunks.length === 0" class="change-review-state">No text hunks available for this file.</div>
             <div v-else class="change-review-hunks">
