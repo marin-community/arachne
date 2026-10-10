@@ -39,6 +39,8 @@ Use **New thread** for a one-off, or **New track** for a durable effort led by a
 
 Type **@** in a chat to complete repository file paths, including untracked files outside the ignore rules. Before launching a track, completion uses the selected repository; for a remote Loom server it needs an existing session checkout in that repository. Use **@{** to browse attached resources instead. Pick a file with **Tab** or **Enter**; **⌘/Ctrl+Enter** sends the message and **Shift+Enter** adds a newline.
 
+While the agent is working, an empty composer shows **Stop** in place of Send. Typing a message or attaching files brings Send back so you can queue a follow-up. To restore an archived track, enable **Archived** in the Tracks sidebar and click **Unarchive** on its card or in its thread header. Loom restores the checkout and resumes the agent with the existing conversation.
+
 The thread's resource strip shows the checkout and any associated pull request. **Open in Zed** opens a local checkout directly or a remote checkout over SSH, using the active session's path from Loom.
 
 A session that needs a person — a blocking question, a decision, or work ready for review — carries an `attention` or `blocked` flag and lands in the home's **Needs You** bucket. A tag-raised flag can be dismissed without opening the thread: the **✕** on any Needs You row, sidebar track card, or thread-header **Dismiss** button clears it. Tool-approval attention (an unanswered permission request) has no dismiss — it is answered in the thread's approval prompt.

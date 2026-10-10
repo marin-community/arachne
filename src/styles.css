@@ -911,6 +911,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   color: var(--bg);
 }
 .composer-send.send-dismiss svg { width: 18px; height: 18px; }
+.composer-send.send-stop svg { width: 20px; height: 20px; }
 .composer-handoff { margin: 0 0 8px; border: 1px solid var(--border); border-radius: 10px; }
 .composer-hint {
   padding: 4px 2px 0;

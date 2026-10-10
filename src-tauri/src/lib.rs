@@ -55,6 +55,7 @@ pub fn run() {
             commands::delegate_task,
             coordination::review_session,
             commands::archive_session,
+            commands::unarchive_session,
             commands::update_session,
             commands::clear_attention,
             commands::open_in_zed,

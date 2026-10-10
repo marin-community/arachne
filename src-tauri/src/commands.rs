@@ -1288,6 +1288,21 @@ pub async fn archive_session(
     Ok(())
 }
 
+/// Unarchive a session, restoring its checkout and agent through Loom.
+#[tauri::command]
+pub async fn unarchive_session(
+    app: AppHandle,
+    state: State<'_, LoomState>,
+    id: String,
+) -> Result<SessionView, UiError> {
+    let client = state_client(&state).await?;
+    let view = client.unarchive(&id).await?;
+    if let Ok(list) = client.list_sessions().await {
+        emit_fleet(&app, &client, list).await;
+    }
+    Ok(view)
+}
+
 /// Edit a topic's metadata: title (compare-and-swap fenced), goal, and
 /// description. Loom's `sessions.update` publishes no SSE event for these
 /// fields, so the fresh view is re-emitted on the fleet snapshot path to
