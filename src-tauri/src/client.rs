@@ -800,18 +800,26 @@ impl LoomClient {
                 guidance.root
             ));
         }
-        let launched: crate::loom::SessionView = self.op("/api/sessions/launch", &request).await?;
+        let mut launched: crate::loom::SessionView =
+            self.op("/api/sessions/launch", &request).await?;
         if input.launch_guidance.is_some() {
+            // sessions.update rewrites goal.txt, which terminal agents may
+            // not have read yet. branches.update changes metadata without
+            // replacing the durable launch prompt (including profile notes).
             // Metadata cleanup is not a launch failure: never invite a retry
             // that would create a duplicate already-running worker.
-            return Ok(self
-                .update_session(&crate::loom::SessionsUpdateInput {
-                    session: Some(launched.id.clone()),
-                    goal: Some(input.goal.clone().unwrap_or_default()),
-                    ..Default::default()
-                })
+            if let Ok(branch) = self
+                .op::<crate::loom::BranchSummaryView>(
+                    "/api/branches/update",
+                    &serde_json::json!({
+                        "branch": launched.branch.id,
+                        "goal": input.goal.as_deref().unwrap_or_default(),
+                    }),
+                )
                 .await
-                .unwrap_or(launched));
+            {
+                launched.branch = branch;
+            }
         }
         Ok(launched)
     }
@@ -1160,9 +1168,18 @@ mod launch_tests {
     use crate::loom::{SessionLaunchGuidance, SessionsLaunchInput};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn launch_with_legacy_server(metadata_fails: bool) -> crate::loom::SessionView {
+    async fn launch_with_legacy_server(
+        guidance: SessionLaunchGuidance,
+        metadata_fails: bool,
+    ) -> (crate::loom::SessionView, String) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let goal_file = std::env::temp_dir().join(format!(
+            "arachne-launch-prompt-{}-{}.txt",
+            std::process::id(),
+            addr.port()
+        ));
+        let server_goal_file = goal_file.clone();
         let server = tokio::spawn(async move {
             for index in 0..2 {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -1202,24 +1219,37 @@ mod launch_tests {
                     assert!(request["goal"]
                         .as_str()
                         .unwrap()
-                        .contains("Own the task; publish a durable result."));
-                    assert!(request["goal"]
-                        .as_str()
-                        .unwrap()
                         .starts_with("Fix the editor"));
-                    assert_eq!(request["parent_branch"], "parent-branch");
-                    assert_eq!(request["base"], "track-branch");
+                    assert_eq!(request["base"], "main");
+                    // Loom writes the goal with launch-profile instructions.
+                    // A terminal agent may read it only after launch returns.
+                    std::fs::write(
+                        &server_goal_file,
+                        format!(
+                            "Profile instructions\n\n{}",
+                            request["goal"].as_str().unwrap()
+                        ),
+                    )
+                    .unwrap();
                     reply["branch"]["goal"] = request["goal"].clone();
                     status = "200 OK";
                 } else {
-                    assert!(header.starts_with("POST /api/sessions/update "));
                     assert_eq!(request["goal"], "Fix the editor");
-                    assert_eq!(request["session"], "decode-probe-session");
                     if metadata_fails {
                         reply = serde_json::json!({"error":"metadata temporarily unavailable"});
                         status = "500 Internal Server Error";
                     } else {
                         reply["branch"]["goal"] = request["goal"].clone();
+                        if header.starts_with("POST /api/sessions/update ") {
+                            // Match Loom's session-update side effect so a
+                            // regression loses guidance just as the agent does.
+                            std::fs::write(&server_goal_file, request["goal"].as_str().unwrap())
+                                .unwrap();
+                        } else {
+                            assert!(header.starts_with("POST /api/branches/update "));
+                            assert_eq!(request["branch"], "decode-probe-branch");
+                            reply = reply["branch"].clone();
+                        }
                         status = "200 OK";
                     }
                 }
@@ -1232,30 +1262,48 @@ mod launch_tests {
         let launched = client
             .launch(&SessionsLaunchInput {
                 goal: Some("Fix the editor".into()),
-                base: Some("track-branch".into()),
-                parent_branch: Some("parent-branch".into()),
-                launch_guidance: Some(SessionLaunchGuidance {
-                    root: "Own the task; publish a durable result.".into(),
-                    child: "Own a bounded subtask.".into(),
-                }),
+                base: Some("main".into()),
+                launch_guidance: Some(guidance),
                 ..Default::default()
             })
             .await
             .unwrap();
         server.await.unwrap();
-        launched
+        let opening_turn = std::fs::read_to_string(&goal_file).unwrap();
+        std::fs::remove_file(goal_file).unwrap();
+        (launched, opening_turn)
     }
 
     #[tokio::test]
-    async fn legacy_launch_receives_role_and_preserves_concise_objective() {
-        let launched = launch_with_legacy_server(false).await;
+    async fn new_track_preserves_delegation_prompt_after_metadata_cleanup() {
+        let guidance = crate::loom::topic_launch_guidance();
+        let (launched, opening_turn) = launch_with_legacy_server(guidance.clone(), false).await;
         assert_eq!(launched.branch.goal, "Fix the editor");
+        assert!(opening_turn.starts_with("Profile instructions\n\nFix the editor"));
+        assert!(opening_turn.contains(&guidance.root));
+        assert!(opening_turn.contains("Aggressively delegate substantial implementation"));
+        assert!(opening_turn.contains("loom sessions launch"));
+    }
+
+    #[tokio::test]
+    async fn worker_and_reviewer_prompts_survive_metadata_cleanup() {
+        for guidance in [
+            crate::loom::worker_launch_guidance(),
+            crate::loom::reviewer_launch_guidance(),
+        ] {
+            let (launched, opening_turn) = launch_with_legacy_server(guidance.clone(), false).await;
+            assert_eq!(launched.branch.goal, "Fix the editor");
+            assert!(opening_turn.contains(&guidance.root));
+            assert!(opening_turn.contains("Profile instructions"));
+        }
     }
 
     #[tokio::test]
     async fn metadata_failure_does_not_fail_or_repeat_a_completed_launch() {
-        let launched = launch_with_legacy_server(true).await;
+        let guidance = crate::loom::topic_launch_guidance();
+        let (launched, opening_turn) = launch_with_legacy_server(guidance.clone(), true).await;
         assert_eq!(launched.id, "decode-probe-session");
-        assert!(launched.branch.goal.contains("publish a durable result"));
+        assert!(launched.branch.goal.contains(&guidance.root));
+        assert!(opening_turn.contains(&guidance.root));
     }
 }

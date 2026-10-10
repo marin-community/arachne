@@ -2,7 +2,7 @@
 
 This implements the initial priorities in [workflow-design.md](workflow-design.md), using Arachne's existing Loom session, channel, tag, resource, and integration primitives. The policy remains permissive and advisory; no workflow state machine or mandatory review gate is introduced.
 
-- Coordinator, worker, and reviewer guidance lives in `skills/coordinator.md`, `skills/worker.md`, and `skills/reviewer.md`. It covers context protection, bounded/recursive delegation, risk-based review, durable handoffs, Track brief curation, parent-first escalation, and event-driven waiting. Guidance travels in both the launch-guidance fields and the durable opening turn because older Loom servers ignore the former. A metadata update restores the concise objective after launch; failure does not retry an already completed launch.
+- Coordinator, worker, and reviewer guidance lives in `skills/coordinator.md`, `skills/worker.md`, and `skills/reviewer.md`. It covers context protection, bounded/recursive delegation, risk-based review, durable handoffs, Track brief curation, parent-first escalation, and event-driven waiting. Guidance travels in both the launch-guidance fields and the durable opening turn because older Loom servers ignore the former. A `branches.update` metadata update restores the concise objective after launch while preserving `goal.txt`, including the role and launch-profile instructions. `sessions.update` must not be used for this cleanup: it replaces the startup prompt before a terminal agent may read it. Metadata failure does not retry an already completed launch.
 - Dashboard delegations receive worker guidance. Recursive delegation and reparenting promote only root conversations to Tracks, preserving the accepted Track target independently of conversation ancestry.
 - The existing Delegate and Send to thread actions remain the launch and provenance-preserving messaging paths. Agent guidance explains their CLI equivalents and typed result publication.
 - Launch reviewer creates a fresh child Thread from the candidate branch with its objective, source checkout, integration target, and editable review brief. It receives no implementation transcript. Review findings return to the original worker; preparation still runs in the source Thread. Reviewer Threads are excluded from integration candidates and cannot be integrated as implementations. Tag-write failures are surfaced as warnings without falsely failing a successful reviewer launch.
@@ -15,10 +15,10 @@ The specification explicitly places automation triage Threads, lightweight model
 
 Validation:
 
-- `npm test`: 136 passed.
+- `npm test`: 141 passed.
 - `npm run typecheck`: passed.
 - `npm run build`: passed.
-- `cargo test --manifest-path src-tauri/Cargo.toml --locked`: 98 passed (89 unit, 4 decode, 5 integration-target).
+- `cargo test --manifest-path src-tauri/Cargo.toml --locked`: 100 passed (91 unit, 4 decode, 5 integration-target).
 - `git diff --check`: passed.
 
-Regression coverage includes independent reviewer context/source routing, legacy-server role delivery, avoiding duplicate launches after metadata failure, recursive Track ownership, stale readiness precedence, explicit human escalation, and handoff provenance. No live agent launch or deployment was performed as validation.
+Regression coverage includes independent reviewer context/source routing, legacy-server role delivery after metadata cleanup and a delayed startup-prompt read, avoiding duplicate launches after metadata failure, recursive Track ownership, stale readiness precedence, explicit human escalation, and handoff provenance. No live agent launch was performed as validation. Running Arachne instances must be reopened after rebuilding the backend to receive new launch behavior; existing sessions do not receive retroactive role guidance.
