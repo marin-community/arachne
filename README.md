@@ -35,6 +35,11 @@ For the intended DGX Spark control plane, point Arachne at `http://100.121.8.110
 
 ## Launch and work on a task
 
+**+ Project** opens a full pane in the chat area with a project name,
+repository/base defaults, and resource bindings. Add the resources that new
+tracks should inherit, then choose **Create project**. The pane stays open as
+Project settings for further edits; each project's **⚙** button opens it later.
+
 Use **New thread** for a one-off, or **New track** for a durable effort led by a coordinator. New track opens a chat immediately: the setup choices (title, repository, base branch, inherited project resources) sit in a setup card above the chat box and disappear once the model starts — the first send delivers the message and launches the track. The chat box keeps message text, attachments, @-mentions, and the launch-config pills (profile, agent, model, effort). **Convert to track** preserves a thread's conversation and checkout. Choose a managed repository or local checkout path, base branch, agent, inference profile, model, and reasoning effort before launch. The available profiles and model names come from the connected Loom server. Loom creates the session and checkout; Arachne streams the conversation and attention state. An idle ACP thread can switch its model through Loom's handoff operation. **Send to thread** delivers a note with source provenance into another thread's durable Loom channel.
 
 Type **@** in a chat to complete repository file paths, including untracked files outside the ignore rules. Before launching a track, completion uses the selected repository; for a remote Loom server it needs an existing session checkout in that repository. Use **@{** to browse attached resources instead. Pick a file with **Tab** or **Enter**; **⌘/Ctrl+Enter** sends the message and **Shift+Enter** adds a newline.

@@ -131,6 +131,12 @@ attention- and activity-based ordering — they are about workers, not tracks.
 
 ## Project defaults and resource inheritance
 
+**New project** opens a full pane in the chat area using the same layout as
+Project settings. Name the project, set repository/base defaults, and queue
+resource bindings before creating it. Creation saves those settings and keeps
+the project's settings pane open for further edits. Cancel leaves an unsaved
+project uncreated.
+
 A Project can bind multiple repositories, design documents, and other
 Resources. It can also set defaults for runner, agent, inference route, primary
 repository, Track branch creation policy, and integration policy. A new Track
