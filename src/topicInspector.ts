@@ -257,6 +257,9 @@ export function landingCandidates(rows: ThreadRow[], topicId: string): LandingCa
       const fact = threadStatus(s);
       if (fact.kind === "working" || fact.kind === "waiting") out.push({ session: s, state: fact.kind, note: fact.detail });
       else if (s.status === "running" && !isIdle(s)) out.push({ session: s, state: "working", note: fact.detail || fact.label });
+      else if (s.status !== "archived" && s.branch.branch) out.push({
+        session: s, state: "waiting", note: fact.detail || `${fact.label}; Land can request wrap-up without implying readiness.`,
+      });
     }
   }
   const rank = { conflicted: 0, stale: 1, ready: 2, waiting: 3, working: 4, landed: 5 };

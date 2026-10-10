@@ -175,15 +175,19 @@ test("candidate queue: reported ready first, landed outcomes after, topic exclud
   });
   const rows = topicThreadRows(taggedFleet, "topic", new Set());
   const candidates = landingCandidates(rows, "topic");
-  assert.deepEqual(candidates.map((c) => c.session.id), ["ready", "integrated"]);
-  assert.deepEqual(candidates.map((c) => c.state), ["ready", "landed"]);
+  assert.deepEqual(candidates.map((c) => c.session.id), ["ready", "stopped", "sleeping", "integrated"]);
+  assert.deepEqual(candidates.map((c) => c.state), ["ready", "waiting", "waiting", "landed"]);
   assert.equal(candidates[0].note, "clean against topic@789abc");
-  assert.equal(candidates[1].note, "squash into topic");
+  assert.equal(candidates[3].note, "squash into topic");
   // A landed outcome does not offer Land again.
   assert.equal(candidates.find((c) => c.session.id === "integrated").state, "landed");
-  // Stopped and sleeping workers never appear.
-  assert.ok(!candidates.some((c) => c.session.id === "stopped"));
-  assert.ok(!candidates.some((c) => c.session.id === "sleeping"));
+  // Resting sources remain requestable; stopping never implies readiness.
+  for (const id of ["stopped", "sleeping"]) {
+    const candidate = candidates.find(c => c.session.id === id);
+    assert.equal(candidate.state, "waiting");
+    assert.match(candidate.note, /resting/);
+    assert.equal(isReadyCandidate(candidate.session), false);
+  }
 });
 
 test("blocked assessment wins over attention; archived tags stay quiet", () => {
