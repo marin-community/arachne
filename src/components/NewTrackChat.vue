@@ -76,6 +76,7 @@ const draftStorage = {
 const draft: NewTopicDraft = reactive(readDraft(draftStorage));
 const branchError = computed(() => topicBranchError(draft.topicBranch));
 const inferredBranch = computed(() => inferTopicBranch(draft.title, draft.body || (draft.attachments[0] ? `Review ${draft.attachments[0].name}` : "")));
+defineExpose({ draftSnapshot: () => JSON.stringify(draft) });
 const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
 
 // The project picker: the layout's non-system groups, "No project" first.

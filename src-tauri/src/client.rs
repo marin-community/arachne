@@ -1109,8 +1109,6 @@ impl LoomClient {
     }
 
     /// `sessions.archive` — tear down terminal + worktree, keep the branch.
-    /// Not yet surfaced in the UI; kept for the next iteration.
-    #[allow(dead_code)]
     pub async fn archive(&self, id: &str) -> Result<(), LoomError> {
         let _: serde_json::Value = self
             .op(
@@ -1119,6 +1117,27 @@ impl LoomClient {
             )
             .await?;
         Ok(())
+    }
+
+    /// `sessions.recover` — rebuild an archived checkout and resume its agent.
+    pub async fn recover(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
+        self.op(
+            "/api/sessions/recover",
+            &serde_json::json!({ "session": id }),
+        )
+        .await
+    }
+
+    /// Recover when the fetched session is archived; leave already-live runtimes alone.
+    /// The status check and recovery are separate requests, so another client can
+    /// restore the session between them.
+    pub async fn unarchive(&self, id: &str) -> Result<crate::loom::SessionView, LoomError> {
+        let current = self.get_session(id).await?;
+        if current.status == "archived" {
+            self.recover(id).await
+        } else {
+            Ok(current)
+        }
     }
 
     /// `repos.worktrees.ensure` — materialize a branch's worktree when it is
@@ -1418,6 +1437,153 @@ mod resume_tests {
             "running"
         );
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod unarchive_tests {
+    use super::{LoomClient, LoomError};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn session(status: &str) -> serde_json::Value {
+        let mut view: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/launch-response.json")).unwrap();
+        view["status"] = status.into();
+        view
+    }
+
+    async fn mock_server(
+        replies: Vec<(&'static str, &'static str, serde_json::Value)>,
+    ) -> (LoomClient, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for (path, status, body) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .expect("timed out waiting for the expected unarchive request")
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let (header_end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                        let length: usize = header
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length: "))
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < header_end + length {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                let header = String::from_utf8_lossy(&bytes[..header_end]);
+                assert!(header.starts_with(&format!("POST {path} ")), "{header}");
+                let request: serde_json::Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                assert_eq!(
+                    request,
+                    serde_json::json!({"session": "decode-probe-session"})
+                );
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn archived_session_returns_the_recovered_checkout_and_runtime() {
+        let mut archived = session("archived");
+        archived["worktree_present"] = false.into();
+        archived["term_session"] = "".into();
+        let mut recovered = session("running");
+        recovered["work_dir"] = "/tmp/restored-checkout".into();
+        recovered["worktree_present"] = true.into();
+        recovered["term_session"] = "restored-runtime".into();
+        let (client, server) = mock_server(vec![
+            ("/api/sessions/get", "200 OK", archived),
+            ("/api/sessions/recover", "200 OK", recovered.clone()),
+        ])
+        .await;
+
+        let view = client.unarchive("decode-probe-session").await.unwrap();
+        server.await.unwrap();
+        assert_eq!(view.id, "decode-probe-session");
+        assert_eq!(view.status, "running");
+        assert_eq!(view.work_dir, "/tmp/restored-checkout");
+        assert!(view.worktree_present);
+        assert_eq!(view.term_session, "restored-runtime");
+        assert_eq!(view.branch.id, recovered["branch"]["id"].as_str().unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_live_sessions_are_returned_without_recovery_or_restart() {
+        let statuses = ["running", "idle", "orphaned"];
+        let (client, server) = mock_server(
+            statuses
+                .iter()
+                .map(|status| ("/api/sessions/get", "200 OK", session(status)))
+                .collect(),
+        )
+        .await;
+
+        for status in statuses {
+            let expected = session(status);
+            let view = client.unarchive("decode-probe-session").await.unwrap();
+            assert_eq!(view.status, status);
+            assert_eq!(
+                view.term_session,
+                expected["term_session"].as_str().unwrap()
+            );
+            assert_eq!(view.work_dir, expected["work_dir"].as_str().unwrap());
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_api_failure_is_propagated() {
+        let (client, server) = mock_server(vec![
+            ("/api/sessions/get", "200 OK", session("archived")),
+            (
+                "/api/sessions/recover",
+                "500 Internal Server Error",
+                serde_json::json!({"error": "checkout recovery failed"}),
+            ),
+        ])
+        .await;
+
+        let error = client.unarchive("decode-probe-session").await.unwrap_err();
+        server.await.unwrap();
+        match error {
+            LoomError::Api {
+                status,
+                method,
+                path,
+                message,
+            } => {
+                assert_eq!(status, 500);
+                assert_eq!(method, "POST");
+                assert_eq!(path, "/api/sessions/recover");
+                assert_eq!(message, "checkout recovery failed");
+            }
+            error => panic!("expected recovery API error, got {error:?}"),
+        }
     }
 }
 

@@ -103,6 +103,15 @@ export function composerSendAsDismiss(input: {
   return input.dismissible && !input.working && !input.hasContent;
 }
 
+/** Empty composers offer Stop while a turn can be interrupted. */
+export function composerSendAsStop(input: {
+  interruptible: boolean;
+  hasContent: boolean;
+  preparing: boolean;
+}): boolean {
+  return input.interruptible && !input.hasContent && !input.preparing;
+}
+
 /** The quiet `idle` mark: running alone means alive, not working. */
 export function isIdle(s: SessionSummary): boolean {
   return s.branch.tags.some((t) => t.key === "idle");

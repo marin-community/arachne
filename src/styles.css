@@ -1,6 +1,7 @@
 /* Arachne cockpit — dark, calm, terminal-adjacent. */
 
 :root {
+  color-scheme: dark;
   --bg: #0d1117;
   --bg-raised: #161b22;
   --bg-hover: #1c2129;
@@ -21,6 +22,7 @@
 html, body, #app {
   height: 100%;
   margin: 0;
+  background: var(--bg);
 }
 
 body {
@@ -39,6 +41,7 @@ body {
     "header header"
     "sidebar main";
   height: 100vh;
+  background: var(--bg);
   padding-top: 28px; /* title bar overlay */
 }
 .app.with-resources {
@@ -572,7 +575,7 @@ body {
 
 /* --- Main / thread -------------------------------------------------- */
 
-.main { grid-area: main; display: flex; flex-direction: column; overflow: hidden; }
+.main { grid-area: main; display: flex; flex-direction: column; overflow: hidden; background: var(--bg); }
 
 .thread-header {
   display: flex;
@@ -877,6 +880,7 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   color: var(--bg);
 }
 .composer-send.send-dismiss svg { width: 18px; height: 18px; }
+.composer-send.send-stop svg { width: 20px; height: 20px; }
 .composer-handoff { margin: 0 0 8px; border: 1px solid var(--border); border-radius: 10px; }
 .composer-hint {
   padding: 4px 2px 0;
