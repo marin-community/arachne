@@ -37,3 +37,13 @@ test("local no-op preserves actual already-contained feedback", () => {
 test("missing local completion detail cannot claim a completed landing", () => {
   assert.equal(landResultFeedback({ local: true }), landResultFeedback({ local: false }));
 });
+
+
+test("completed publish remains completion if a follow-up commit revision is unavailable", () => {
+  const feedback = landResultFeedback({ local: true, landing: {
+    landed: true, target_branch: "primary", commits_squashed: 2, primary_checkout: "/repo",
+  } });
+  assert.match(feedback, /Published locally.*primary/);
+  assert.match(feedback, /commit revision unavailable/);
+  assert.doesNotMatch(feedback, /undefined|requested|failed/);
+});

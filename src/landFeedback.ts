@@ -14,7 +14,7 @@ export function landResultFeedback(result: LandResult): string {
   if (result.local && result.landing) {
     const done = result.landing;
     return done.landed
-      ? `Published locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch} · ${done.commit}`
+      ? `Published locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch}${done.commit ? ` · ${done.commit}` : " (commit revision unavailable)"}`
       : `${done.target_branch} already contained this track's changes — nothing to do.`;
   }
   return "Publish requested. Follow the actual result in this thread.";

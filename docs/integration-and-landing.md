@@ -90,7 +90,8 @@ Manual Land remains a separate explicit authorization.
 
 Policy changes persist `track_autoland=on|off` and
 `thread_autoland=inherit|on|off` in Loom tags and deliver explicit coordinator
-instructions. The coordinator uses existing typed results and delivery
+instructions. Show the saved policy even when later route setup or delivery
+fails, and report the setup warning separately. The coordinator uses existing typed results and delivery
 wakeups to inspect successful complete work, delegate independent review and
 repair, and accept it as a squash into the canonical topic branch. Partial,
 checkpoint, incomplete or parent-help results are not completion/readiness.
@@ -144,12 +145,18 @@ operation under that authorization. Keep unaccepted source/scratch edits
 separate; do not silently incorporate them in a publish.
 
 The clean local squash remains deterministic and synchronous. Preserve
-unrelated unstaged target edits and untracked files. A staged target must
+unrelated unstaged target edits and untracked files, including ignored-file
+collisions. Pin the accepted source SHA and reverify live canonical metadata
+and the primary branch/revision/status immediately before writing. Changed
+state queues fresh review under the same chosen Publish authorization; it
+never silently publishes a different snapshot. A staged target must
 not ride along in the squash commit. Queue coordinator reconciliation for
 target staging or a safely unwound recoverable failure, with exact accepted
 source and primary target snapshots. Failed Git attempts must be cleaned up
 safely before dispatch; cleanup failures remain actionable errors. Do not
 discard staged/unstaged content or alter another in-progress Git operation.
+A completed Git operation stays completed if a later revision read or tag
+delivery fails; report the known result and evidence limitation separately.
 
 `LandResult.local=true` is compatibility wire naming for an actually
 completed synchronous local **publish**, with commit/target/count or a
