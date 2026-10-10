@@ -1,0 +1,44 @@
+{
+  "slug": [
+    { "title": "Thread landing & Publish", "expected": "arachne/tracks/thread-landing-publish" },
+    { "title": "  UI / API__Repair  ", "expected": "arachne/tracks/ui-api-repair" },
+    { "title": "", "expected": "arachne/tracks/track" },
+    { "title": "日本語", "expected": "arachne/tracks/track" }
+  ],
+  "refs": [
+    { "value": "arachne/tracks/working-thread", "valid": true },
+    { "value": "custom/topic", "valid": true },
+    { "value": "topic", "valid": true },
+    { "value": "", "valid": false },
+    { "value": "HEAD", "valid": false },
+    { "value": "refs/heads/topic", "valid": false },
+    { "value": "-topic", "valid": false },
+    { "value": ".topic", "valid": false },
+    { "value": "topic.lock", "valid": false },
+    { "value": "a/.hidden", "valid": false },
+    { "value": "a/topic.lock", "valid": false },
+    { "value": "topic.", "valid": false },
+    { "value": "a//b", "valid": false },
+    { "value": "a/../b", "valid": false },
+    { "value": "a@{b", "valid": false },
+    { "value": "a b", "valid": false },
+    { "value": "topic~1", "valid": false },
+    { "value": "a:b", "valid": false },
+    { "value": "a?b", "valid": false },
+    { "value": "a*b", "valid": false },
+    { "value": "a[b", "valid": false },
+    { "value": "a\\b", "valid": false },
+    { "value": "@", "valid": false },
+    { "value": "a/", "valid": false }
+  ],
+  "policy": [
+    { "track": null, "thread": null, "effective": false },
+    { "track": "off", "thread": "inherit", "effective": false },
+    { "track": "on", "thread": null, "effective": true },
+    { "track": "on", "thread": "inherit", "effective": true },
+    { "track": "on", "thread": "off", "effective": false },
+    { "track": "off", "thread": "on", "effective": true },
+    { "track": "invalid", "thread": "inherit", "effective": false },
+    { "track": "on", "thread": "invalid", "effective": true }
+  ]
+}
