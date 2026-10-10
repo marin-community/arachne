@@ -869,7 +869,13 @@ auto-integrate:
     integration strategy is configured
 ```
 
-Anything outside policy should become coordinator or human attention.
+Anything outside policy goes to the parent coordinator first. Review findings,
+failed checks, conflicts, waiting for another agent and "ready for review"
+handoffs remain `ok`; publish a typed own-channel result to wake the parent.
+Use `parent_help=requested` for a concrete coordinator help request. Only a
+decision or access requirement the hierarchy cannot resolve becomes human
+`attention` or `blocked`. A reviewer reports to its parent, which owns repairs
+and any further escalation; it does not ask the user to supervise agent review.
 
 Do not implement broad autonomous integration before the manual flow is trustworthy.
 
