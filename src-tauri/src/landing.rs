@@ -8,7 +8,7 @@
 //!
 //! Unrelated unstaged and untracked target changes survive the deterministic
 //! path. Staged target changes are never absorbed into a squash commit. A
-//! failed attempt is recoverable only after `git reset --merge` succeeds.
+//! failed attempt is recoverable only after isolated-index rollback succeeds.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -23,12 +23,15 @@ pub struct LocalLanding {
     pub landed: bool,
     /// The primary checkout's branch the topic landed into.
     pub target_branch: String,
-    /// The resulting squash commit (short sha), when one was created.
+    /// Full verified resulting revision, including for a pinned no-op.
+    /// None means the write completed but neither Git stdout nor HEAD supplied its revision.
     pub commit: Option<String>,
     /// How many topic commits the squash carries.
     pub commits_squashed: u32,
     /// The primary checkout the landing ran in.
     pub primary_checkout: String,
+    /// Limitations after a completed write; these never turn completion into failure.
+    pub warnings: Vec<String>,
 }
 
 /// Why a local landing could not happen. Every message is user-facing.
@@ -142,7 +145,28 @@ pub async fn ensure_same_repository(source: &Path, repo: &Path) -> Result<(), St
 /// cleared so the checkout Arachne writes to is exactly the one `-C`
 /// names, never one an inherited environment silently re-points at.
 async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-    let mut command = tokio::process::Command::new("git");
+    git_with_index(dir, args, timeout, None).await
+}
+
+async fn git_with_index(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    index: Option<&Path>,
+) -> Result<String, String> {
+    // Per-fixture fault injection avoids process-global PATH mutations in
+    // concurrent temporary-Git tests. Production always invokes ordinary Git.
+    #[cfg(test)]
+    let test_git = dir.join(".git/arachne-test-git");
+    #[cfg(test)]
+    let executable = if test_git.exists() {
+        test_git.as_os_str()
+    } else {
+        std::ffi::OsStr::new("git")
+    };
+    #[cfg(not(test))]
+    let executable = "git";
+    let mut command = tokio::process::Command::new(executable);
     command
         .arg("-C")
         .arg(dir)
@@ -150,10 +174,14 @@ async fn git(dir: &Path, args: &[&str], timeout: Duration) -> Result<String, Str
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| format!("git {} timed out", args.join(" ")))?
@@ -212,24 +240,94 @@ fn parse_primary_worktree(listing: &str) -> Option<PrimaryWorktree> {
     })
 }
 
-/// True when the index differs from HEAD (`git status --porcelain` rows with
-/// a staged status). Unstaged modifications and untracked files don't count
-/// — the merge machinery refuses to touch those itself when they overlap.
-async fn has_staged_changes(dir: &Path) -> Result<bool, String> {
-    let status = git(dir, &["status", "--porcelain"], Duration::from_secs(30)).await?;
-    Ok(status.lines().any(|line| {
+fn status_has_staged_changes(status: &str) -> bool {
+    status.lines().any(|line| {
         let index = line.chars().next().unwrap_or(' ');
         index != ' ' && index != '?'
-    }))
+    })
+}
+
+/// Cooperate with ordinary Git writers via the REAL primary index.lock, while
+/// merge, hooks and rollback use a private copy. The live index is never a
+/// source of squash content after acquisition. Git hooks inherit the private
+/// index, as they do for Git's own temporary-index commits.
+struct OperationIndex {
+    path: PathBuf,
+    real: PathBuf,
+    lock: PathBuf,
+    owns_lock: bool,
+    owns_index: bool,
+}
+
+impl OperationIndex {
+    fn acquire(real: PathBuf) -> Result<Self, String> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let lock = real.with_extension("lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+            .map_err(|e| {
+                format!("cannot reserve the primary Git index (another writer may own it): {e}")
+            })?;
+        let path = real.with_file_name(format!(
+            "arachne-landing-index-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut operation = Self {
+            path,
+            real,
+            lock,
+            owns_lock: true,
+            owns_index: false,
+        };
+        let mut destination = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&operation.path)
+            .map_err(|e| format!("creating the isolated index: {e}"))?;
+        operation.owns_index = true;
+        let mut source = std::fs::File::open(&operation.real)
+            .map_err(|e| format!("reading the primary index: {e}"))?;
+        std::io::copy(&mut source, &mut destination)
+            .map_err(|e| format!("copying the primary index: {e}"))?;
+        Ok(operation)
+    }
+
+    async fn git(&self, dir: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
+        git_with_index(dir, args, timeout, Some(&self.path)).await
+    }
+
+    fn install(&mut self) -> Result<(), String> {
+        std::fs::copy(&self.path, &self.lock)
+            .map_err(|e| format!("preparing the completed index: {e}"))?;
+        std::fs::rename(&self.lock, &self.real)
+            .map_err(|e| format!("installing the completed index: {e}"))?;
+        self.owns_lock = false;
+        Ok(())
+    }
+}
+
+impl Drop for OperationIndex {
+    fn drop(&mut self) {
+        if self.owns_index {
+            let _ = std::fs::remove_file(&self.path);
+            let _ = std::fs::remove_file(self.path.with_extension("lock"));
+        }
+        if self.owns_lock {
+            let _ = std::fs::remove_file(&self.lock);
+        }
+    }
 }
 
 /// The git state files/dirs that mean another operation owns the checkout.
 /// A squash commit made mid-cherry-pick would conclude *that* operation, so
 /// this is a hard preflight — the unwinding reset must never disturb state
-/// that was not ours. (For the primary worktree `.git` is always a real
-/// directory, so plain filesystem checks are exact.)
-fn in_progress_operation(primary: &Path) -> Option<&'static str> {
-    let git_dir = primary.join(".git");
+/// that was not ours. Resolve the actual Git directory, including separate
+/// Git directories, before checking these paths.
+fn in_progress_operation(git_dir: &Path) -> Option<&'static str> {
     for (name, what) in [
         ("MERGE_HEAD", "merge"),
         ("CHERRY_PICK_HEAD", "cherry-pick"),
@@ -245,17 +343,31 @@ fn in_progress_operation(primary: &Path) -> Option<&'static str> {
     None
 }
 
-/// Unwind after a failed squash: removes the squash's staged result and
-/// merge state while keeping unstaged changes (git's `reset --merge`
-/// contract; a no-op when the attempt never got started).
-async fn unwind(primary: &Path) -> Result<(), String> {
-    git(primary, &["reset", "--merge"], Duration::from_secs(60))
+/// Roll back only the operation index and its worktree changes. reset --merge
+/// refuses overlapping unstaged edits, and the real index stays byte-for-byte
+/// untouched. Never reset a foreign index or discard post-merge editor saves.
+async fn unwind(primary: &Path, index: &OperationIndex, revision: &str) -> Result<(), String> {
+    let head = git(
+        primary,
+        &["rev-parse", "--verify", "HEAD"],
+        Duration::from_secs(20),
+    )
+    .await?;
+    if head.trim() != revision {
+        return Err("The primary HEAD changed; refusing to reset another writer's revision".into());
+    }
+    index
+        .git(
+            primary,
+            &["reset", "--merge", revision],
+            Duration::from_secs(60),
+        )
         .await
         .map(|_| ())
 }
 
 /// Verified local destination, captured before either a squash or dispatch.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LocalLandingTarget {
     pub branch: String,
     pub checkout: String,
@@ -289,9 +401,20 @@ pub async fn inspect_local_target(
             path: repo_root.display().to_string(),
         });
     }
-    let Some(target_branch) = primary.branch else {
-        return Err(LandingError::Detached);
-    };
+    let target_branch = git(
+        &primary.path,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        Duration::from_secs(20),
+    )
+    .await
+    .map_err(|_| LandingError::Detached)?
+    .trim()
+    .to_owned();
+    if primary.branch.as_deref() != Some(target_branch.as_str()) {
+        return Err(LandingError::RepairNeeded {
+            detail: "The primary branch changed during inspection; refresh before landing.".into(),
+        });
+    }
     if target_branch == topic_branch {
         return Err(LandingError::SelfMerge {
             branch: topic_branch.to_owned(),
@@ -309,7 +432,14 @@ pub async fn inspect_local_target(
     })?;
     // The checkout must be ours to drive: another in-progress operation
     // would make the squash commit conclude *that* operation instead.
-    if let Some(what) = in_progress_operation(&primary.path) {
+    let git_dir = git(
+        &primary.path,
+        &["rev-parse", "--absolute-git-dir"],
+        Duration::from_secs(20),
+    )
+    .await
+    .map_err(|detail| LandingError::Failed { detail })?;
+    if let Some(what) = in_progress_operation(Path::new(git_dir.trim())) {
         return Err(LandingError::OperationInProgress {
             what: what.to_owned(),
         });
@@ -336,116 +466,118 @@ pub async fn inspect_local_target(
     })
 }
 
-/// Squash-merge `topic_branch` onto the primary checkout's currently
-/// checked out branch, creating one commit there.
-///
-/// `repo_root` may be any directory of the repository (loom reports the
-/// canonical repo root, but the primary is resolved here regardless); the
-/// landing always runs in the primary checkout itself — the surface a
-/// human actually opens — never a worker worktree. The target is whatever
-/// branch that checkout has checked out *now*: a deterministic landing
-/// must not act on a remembered target that can go stale.
+/// Compatibility entry point: capture fresh pins and use the guarded API.
 pub async fn squash_into_primary_checkout(
     repo_root: &Path,
     topic_branch: &str,
     title: &str,
 ) -> Result<LocalLanding, LandingError> {
     let topic_branch = topic_branch.trim();
-    if topic_branch.is_empty() {
-        return Err(LandingError::Failed {
-            detail: "the topic has no branch to land".into(),
-        });
-    }
     let target = inspect_local_target(repo_root, topic_branch).await?;
-    let target_branch = target.branch;
-    let primary = PrimaryWorktree {
-        path: PathBuf::from(target.checkout),
-        branch: None,
-        bare: false,
-    };
-    let topic_ref = format!("refs/heads/{topic_branch}");
-    // Staged changes would ride along inside the squash commit — refuse.
-    if has_staged_changes(&primary.path)
-        .await
-        .map_err(|detail| LandingError::Failed { detail })?
-    {
-        return Err(LandingError::StagedChanges);
-    }
-    // Squash-merge the topic onto the checkout's branch. On failure, unwind
-    // to the pre-merge state; the reset preserves unstaged changes and
-    // removes the squash's staged result, so the checkout is left exactly
-    // as it was found.
-    if let Err(detail) = git(
-        &primary.path,
-        &["merge", "--squash", &topic_ref],
-        Duration::from_secs(300),
+    let revision = git(
+        Path::new(&target.checkout),
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{topic_branch}^{{commit}}"),
+        ],
+        Duration::from_secs(20),
     )
     .await
-    {
-        let mut message =
-            format!("squash merge of {topic_branch} into {target_branch} failed: {detail}");
-        if let Err(cleanup) = unwind(&primary.path).await {
-            message.push_str(&format!(
-                " (cleanup also failed: {cleanup}; run `git reset --merge` in {} yourself)",
-                primary.path.display()
-            ));
-            return Err(LandingError::Failed { detail: message });
-        }
-        return Err(LandingError::RepairNeeded { detail: message });
+    .map_err(|detail| LandingError::Failed { detail })?;
+    let mut landing = squash_into_primary_checkout_pinned(
+        repo_root,
+        topic_branch,
+        revision.trim(),
+        &target,
+        title,
+    )
+    .await?;
+    // Keep the historical no-op display contract for existing callers. The
+    // pinned API exposes the known target revision for publication evidence.
+    if !landing.landed {
+        landing.commit = None;
     }
-    // An up-to-date squash stages nothing: the target already contains the
-    // topic's changes. Unwind the leftover squash state and report the no-op.
-    if !has_staged_changes(&primary.path)
+    Ok(landing)
+}
+
+/// Land exactly the reviewed source SHA into exactly the inspected primary
+/// destination. Changed pins queue repair before any worktree/index writes.
+/// Normal primary Git writers are excluded for the entire operation, including
+/// hooks and rollback; merge consumes an immutable SHA, never a branch ref.
+pub async fn squash_into_primary_checkout_pinned(
+    repo_root: &Path,
+    source_branch: &str,
+    expected_full_sha: &str,
+    expected_target: &LocalLandingTarget,
+    title: &str,
+) -> Result<LocalLanding, LandingError> {
+    let repair = |detail| LandingError::RepairNeeded { detail };
+    if source_branch.is_empty()
+        || source_branch != source_branch.trim()
+        || ![40, 64].contains(&expected_full_sha.len())
+        || !expected_full_sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(repair(
+            "The source branch or immutable revision is invalid; refresh before landing.".into(),
+        ));
+    }
+    let primary = Path::new(&expected_target.checkout);
+    // Resolve the real index via Git (also works with a separate Git directory).
+    let index_path = git(
+        primary,
+        &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        Duration::from_secs(20),
+    )
+    .await
+    .map_err(repair)?;
+    let mut index = OperationIndex::acquire(PathBuf::from(index_path.trim())).map_err(repair)?;
+    let target = inspect_local_target(repo_root, source_branch)
         .await
-        .map_err(|detail| LandingError::Failed { detail })?
-    {
-        unwind(&primary.path)
-            .await
-            .map_err(|detail| LandingError::Failed {
-                detail: format!("cleaning up the no-op squash failed: {detail}"),
-            })?;
-        return Ok(LocalLanding {
-            landed: false,
-            target_branch,
-            commit: None,
-            commits_squashed: 0,
-            primary_checkout: primary.path.display().to_string(),
-        });
+        .map_err(|e| repair(format!("The landing target changed or is unavailable: {e}")))?;
+    if &target != expected_target {
+        return Err(repair(
+            "The primary checkout branch, HEAD or status changed; refresh before landing.".into(),
+        ));
     }
-    // Compose the commit message from the commits being squashed.
-    let target_ref = format!("refs/heads/{target_branch}");
+    if status_has_staged_changes(&target.status) {
+        return Err(LandingError::StagedChanges);
+    }
+    let topic_ref = format!("refs/heads/{source_branch}^{{commit}}");
+    let source_revision = git(
+        primary,
+        &["rev-parse", "--verify", &topic_ref],
+        Duration::from_secs(20),
+    )
+    .await
+    .map_err(repair)?;
+    if source_revision.trim() != expected_full_sha {
+        return Err(repair(
+            "The canonical source revision changed; refresh before landing.".into(),
+        ));
+    }
+    // All fallible preparation precedes merge, so it cannot leave squash dirt.
     let log = git(
-        &primary.path,
+        primary,
         &[
             "log",
             "--reverse",
             "--format=%s",
-            &format!("{target_ref}..{topic_ref}"),
+            &format!("{}..{expected_full_sha}", target.revision),
         ],
         Duration::from_secs(30),
     )
     .await
-    .map_err(|detail| LandingError::Failed {
-        detail: format!("listing the topic's commits: {detail}"),
-    })?;
-    let subjects: Vec<String> = log
-        .lines()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .collect();
+    .map_err(repair)?;
+    let subjects: Vec<&str> = log.lines().filter(|s| !s.is_empty()).collect();
     let title = if title.trim().is_empty() {
-        topic_branch
+        source_branch
     } else {
         title
     };
-    let subject = format!("{} (squash into {})", shorten(title, 48), target_branch);
-    let mut body = format!(
-        "Squash-merged {} commit{} from {} into {} in the primary checkout by Arachne's Land action.",
-        subjects.len(),
-        if subjects.len() == 1 { "" } else { "s" },
-        topic_branch,
-        target_branch,
-    );
+    let subject = format!("{} (squash into {})", shorten(title, 48), target.branch);
+    let mut body = format!("Squash-merged {} commit{} from {} into {} in the primary checkout by Arachne's Land action.",
+        subjects.len(), if subjects.len() == 1 { "" } else { "s" }, source_branch, target.branch);
     if !subjects.is_empty() {
         body.push_str("\n\n");
         for s in subjects.iter().take(30) {
@@ -455,40 +587,149 @@ pub async fn squash_into_primary_checkout(
             body.push_str(&format!("* …and {} more\n", subjects.len() - 30));
         }
     }
-    // Commit the squash (hooks run: validation is the checkout's own
-    // policy). On failure, unwind so no half-state is left behind.
-    if let Err(detail) = git(
-        &primary.path,
-        &["commit", "-m", &subject, "-m", &body],
-        Duration::from_secs(600),
-    )
-    .await
-    {
-        let mut message = format!("creating the squash commit failed: {detail}");
-        if let Err(cleanup) = unwind(&primary.path).await {
-            message.push_str(&format!(
-                " (cleanup also failed: {cleanup}; run `git reset --merge` in {} yourself)",
-                primary.path.display()
-            ));
-            return Err(LandingError::Failed { detail: message });
-        }
-        return Err(LandingError::RepairNeeded { detail: message });
-    }
-    let commit = git(
-        &primary.path,
-        &["rev-parse", "--short", "HEAD"],
+    // Inspect again at the write boundary. Reads never refresh the locked live
+    // index. Git itself guards tracked/untracked/ignored worktree collisions.
+    let boundary = inspect_local_target(repo_root, source_branch)
+        .await
+        .map_err(|e| repair(format!("The landing target changed: {e}")))?;
+    let source_revision = git(
+        primary,
+        &["rev-parse", "--verify", &topic_ref],
         Duration::from_secs(20),
     )
     .await
-    .map_err(|detail| LandingError::Failed {
-        detail: format!("reading the new commit: {detail}"),
-    })?;
+    .map_err(repair)?;
+    if boundary != target || source_revision.trim() != expected_full_sha {
+        return Err(repair(
+            "The source or primary checkout changed before landing; refresh before landing.".into(),
+        ));
+    }
+    let attempt = async {
+        index
+            .git(
+                primary,
+                &[
+                    "merge",
+                    "--squash",
+                    "--no-overwrite-ignore",
+                    expected_full_sha,
+                ],
+                Duration::from_secs(300),
+            )
+            .await?;
+        let staged = index
+            .git(
+                primary,
+                &["diff", "--cached", "--name-only"],
+                Duration::from_secs(30),
+            )
+            .await?;
+        if staged.is_empty() {
+            return Ok(None);
+        }
+        let current_branch = git(
+            primary,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            Duration::from_secs(20),
+        )
+        .await?;
+        let current_head = git(
+            primary,
+            &["rev-parse", "--verify", "HEAD"],
+            Duration::from_secs(20),
+        )
+        .await?;
+        if current_branch.trim() != target.branch || current_head.trim() != target.revision {
+            return Err("The primary branch or HEAD changed before committing".into());
+        }
+        let stdout = index
+            .git(
+                primary,
+                &[
+                    "-c",
+                    &format!("core.abbrev={}", expected_full_sha.len()),
+                    "commit",
+                    "-m",
+                    &subject,
+                    "-m",
+                    &body,
+                ],
+                Duration::from_secs(600),
+            )
+            .await?;
+        Ok::<Option<String>, String>(Some(stdout))
+    }
+    .await;
+    let commit_stdout = match attempt {
+        Ok(stdout) => stdout,
+        Err(detail) => {
+            let message = format!("squash landing failed: {detail}");
+            return match unwind(primary, &index, &target.revision).await {
+                Ok(()) => Err(repair(message)),
+                Err(cleanup) => Err(LandingError::Failed { detail: format!("{message}; isolated rollback failed: {cleanup}. Preserve checkout edits and repair manually.") }),
+            };
+        }
+    };
+    if commit_stdout.is_none() {
+        unwind(primary, &index, &target.revision)
+            .await
+            .map_err(|detail| LandingError::Failed { detail })?;
+        return Ok(LocalLanding {
+            landed: false,
+            target_branch: target.branch,
+            commit: Some(target.revision),
+            commits_squashed: 0,
+            primary_checkout: target.checkout,
+            warnings: vec![],
+        });
+    }
+    // Commit succeeded. From here on, every failure is a completion warning,
+    // never an ordinary error that could authorize a duplicate attempt.
+    let mut warnings = vec![];
+    // Git's own final commit summary contains the full object ID because we
+    // requested full abbreviation. Keep this known outcome if a post-commit
+    // hook or read failure makes HEAD unavailable or moves it elsewhere.
+    let known_commit = commit_stdout.as_deref().and_then(|stdout| {
+        stdout.lines().rev().find_map(|line| {
+            let summary = line.strip_prefix('[')?.split_once(']')?.0;
+            let sha = summary.split_whitespace().last()?;
+            (sha.len() == expected_full_sha.len() && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| sha.to_owned())
+        })
+    });
+    let commit = match git(
+        primary,
+        &["rev-parse", "--verify", "HEAD"],
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        Ok(revision)
+            if known_commit
+                .as_deref()
+                .is_some_and(|known| known != revision.trim()) =>
+        {
+            warnings.push("The squash commit completed, but HEAD subsequently changed; reporting the completed commit.".into());
+            known_commit
+        }
+        Ok(revision) => Some(revision.trim().to_owned()),
+        Err(detail) => {
+            warnings.push(format!(
+                "The squash commit completed, but its revision could not be read: {detail}"
+            ));
+            known_commit
+        }
+    };
+    if let Err(detail) = index.install() {
+        warnings.push(detail);
+    }
     Ok(LocalLanding {
         landed: true,
-        target_branch,
-        commit: Some(commit.trim().to_owned()),
+        target_branch: target.branch,
+        commit,
         commits_squashed: subjects.len() as u32,
-        primary_checkout: primary.path.display().to_string(),
+        primary_checkout: target.checkout,
+        warnings,
     })
 }
 
@@ -610,6 +851,408 @@ worktree /repo/.worktrees/topic\nHEAD def\nbranch refs/heads/weaver/topic\n";
         .to_string()
     }
 
+    async fn pins(dir: &Path) -> (String, super::LocalLandingTarget) {
+        let target = super::inspect_local_target(dir, "weaver/topic")
+            .await
+            .unwrap();
+        let source = super::git(dir, &["rev-parse", "weaver/topic"], Duration::from_secs(20))
+            .await
+            .unwrap();
+        (source.trim().into(), target)
+    }
+
+    #[cfg(unix)]
+    fn hook(dir: &Path, name: &str, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(".git/hooks").join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ignored_collision_queues_repair_preserving_exact_bytes() {
+        let dir = repo_with_topic("ignored-collision");
+        sh(&dir, &["checkout", "-q", "weaver/topic"]);
+        std::fs::write(dir.join("private.env"), "accepted content\n").unwrap();
+        sh(&dir, &["add", "private.env"]);
+        sh(&dir, &["commit", "-q", "-m", "accepted environment"]);
+        sh(&dir, &["checkout", "-q", "main"]);
+        std::fs::write(dir.join(".git/info/exclude"), "private.env\n").unwrap();
+        let foreign = b"foreign secret\0\xff\n";
+        std::fs::write(dir.join("private.env"), foreign).unwrap();
+        let (source, target) = pins(&dir).await;
+        let before_index = std::fs::read(dir.join(".git/index")).unwrap();
+        let error = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, LandingError::RepairNeeded { .. }),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(dir.join("private.env")).unwrap(), foreign);
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), before_index);
+        assert_eq!(pins(&dir).await.1, target);
+        assert!(!dir.join(".git/index.lock").exists());
+        assert!(!dir.join("topic.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_advanced_source_pin_without_writing() {
+        let dir = repo_with_topic("source-pin");
+        let (source, target) = pins(&dir).await;
+        sh(&dir, &["checkout", "-q", "weaver/topic"]);
+        std::fs::write(dir.join("later.txt"), "later\n").unwrap();
+        sh(&dir, &["add", "later.txt"]);
+        sh(&dir, &["commit", "-q", "-m", "source advances"]);
+        sh(&dir, &["checkout", "-q", "main"]);
+        let error = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, LandingError::RepairNeeded { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("changed"));
+        assert_eq!(pins(&dir).await.1, target);
+        assert!(!dir.join("topic.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_changed_target_head_branch_and_status_without_writing() {
+        for change in ["head", "branch", "unstaged", "staged", "untracked"] {
+            let dir = repo_with_topic(change);
+            let (source, target) = pins(&dir).await;
+            match change {
+                "head" => sh(
+                    &dir,
+                    &["commit", "-q", "--allow-empty", "-m", "target advances"],
+                ),
+                "branch" => sh(&dir, &["checkout", "-q", "-b", "other"]),
+                "unstaged" => std::fs::write(dir.join("base.txt"), b"foreign\0\xff").unwrap(),
+                "staged" => {
+                    std::fs::write(dir.join("base.txt"), b"foreign staged\0\xff").unwrap();
+                    sh(&dir, &["add", "base.txt"]);
+                }
+                _ => std::fs::write(dir.join("foreign.txt"), b"foreign\0\xff").unwrap(),
+            }
+            let before = pins(&dir).await.1;
+            let before_index = std::fs::read(dir.join(".git/index")).unwrap();
+            let error = super::squash_into_primary_checkout_pinned(
+                &dir,
+                "weaver/topic",
+                &source,
+                &target,
+                "land",
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(error, LandingError::RepairNeeded { .. }),
+                "{change}: {error}"
+            );
+            assert_eq!(pins(&dir).await.1, before);
+            assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), before_index);
+            assert!(!dir.join("topic.txt").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreign_staging_is_blocked_while_hooks_use_isolated_index() {
+        let dir = repo_with_topic("foreign-staging");
+        let foreign = b"foreign\0\xff\n";
+        std::fs::write(dir.join("foreign.txt"), foreign).unwrap();
+        hook(
+            &dir,
+            "pre-commit",
+            r#"
+            test -f .git/index.lock || exit 20
+            test "$GIT_INDEX_FILE" != "$PWD/.git/index" || exit 21
+            env -u GIT_INDEX_FILE git add foreign.txt 2>.git/foreign-staging-error
+            result=$?
+            echo "$result" >.git/foreign-staging-result
+            test "$result" -ne 0 || exit 22
+            git diff --cached --name-only >.git/hook-staged-paths
+        "#,
+        );
+        let out = squash_into_primary_checkout(&dir, "weaver/topic", "land")
+            .await
+            .unwrap();
+        assert!(out.landed);
+        assert_eq!(out.commit.as_ref().unwrap().len(), 40);
+        assert!(
+            std::fs::read_to_string(dir.join(".git/foreign-staging-error"))
+                .unwrap()
+                .contains("index.lock")
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/hook-staged-paths")).unwrap(),
+            "topic.txt\n"
+        );
+        assert_eq!(std::fs::read(dir.join("foreign.txt")).unwrap(), foreign);
+        assert_eq!(status(&dir), "?? foreign.txt\n");
+        let tree = super::git(
+            &dir,
+            &["ls-tree", "--name-only", "HEAD"],
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert!(!tree.contains("foreign.txt"));
+        assert!(!dir.join(".git/index.lock").exists());
+        // After release, the foreign edit can still be staged normally.
+        sh(&dir, &["add", "foreign.txt"]);
+        assert_eq!(status(&dir), "A  foreign.txt\n");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hook_rejection_rolls_back_only_operation_preserving_foreign_dirt() {
+        let dir = repo_with_topic("hook-rejection");
+        std::fs::write(dir.join("base.txt"), b"foreign tracked\0\xff").unwrap();
+        std::fs::write(dir.join("foreign.txt"), b"foreign untracked\0\xff").unwrap();
+        std::fs::write(dir.join(".git/info/exclude"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), b"foreign ignored\0\xff").unwrap();
+        let (source, target) = pins(&dir).await;
+        let before_index = std::fs::read(dir.join(".git/index")).unwrap();
+        hook(
+            &dir,
+            "pre-commit",
+            "test -n \"$GIT_INDEX_FILE\" || exit 20\nexit 1",
+        );
+        let error = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, LandingError::RepairNeeded { .. }),
+            "{error}"
+        );
+        assert_eq!(pins(&dir).await.1, target);
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), before_index);
+        assert_eq!(
+            std::fs::read(dir.join("base.txt")).unwrap(),
+            b"foreign tracked\0\xff"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("foreign.txt")).unwrap(),
+            b"foreign untracked\0\xff"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("ignored.txt")).unwrap(),
+            b"foreign ignored\0\xff"
+        );
+        assert!(!dir.join("topic.txt").exists());
+        assert!(!dir.join(".git/index.lock").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn existing_real_index_lock_is_preserved_and_blocks_landing() {
+        let dir = repo_with_topic("existing-lock");
+        let (source, target) = pins(&dir).await;
+        let lock_bytes = b"foreign writer lock\0\xff";
+        std::fs::write(dir.join(".git/index.lock"), lock_bytes).unwrap();
+        let before_index = std::fs::read(dir.join(".git/index")).unwrap();
+        let error = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, LandingError::RepairNeeded { .. }),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(".git/index.lock")).unwrap(),
+            lock_bytes
+        );
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), before_index);
+        assert!(!dir.join("topic.txt").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merge_uses_immutable_source_when_branch_advances_at_merge_invocation() {
+        let dir = repo_with_topic("immutable-merge");
+        let (source, target) = pins(&dir).await;
+        sh(&dir, &["checkout", "-q", "weaver/topic"]);
+        std::fs::write(dir.join("later.txt"), "unreviewed later change\n").unwrap();
+        sh(&dir, &["add", "later.txt"]);
+        sh(&dir, &["commit", "-q", "-m", "unreviewed later change"]);
+        let advanced = super::git(&dir, &["rev-parse", "HEAD"], Duration::from_secs(20))
+            .await
+            .unwrap();
+        sh(&dir, &["checkout", "-q", "main"]);
+        sh(&dir, &["update-ref", "refs/heads/weaver/topic", &source]);
+        use std::os::unix::fs::PermissionsExt;
+        let wrapper = dir.join(".git/arachne-test-git");
+        std::fs::write(
+            &wrapper,
+            format!(
+                r#"#!/bin/sh
+            if [ "$3" = merge ]; then
+                git -C "$2" update-ref refs/heads/weaver/topic {}
+                printf '%s\n' "$6" >"$2/.git/merge-revision"
+            fi
+            exec git "$@"
+        "#,
+                advanced.trim()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap();
+        assert!(out.landed);
+        assert_eq!(pins(&dir).await.0, advanced.trim());
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".git/merge-revision"))
+                .unwrap()
+                .trim(),
+            source
+        );
+        assert!(!dir.join("later.txt").exists());
+        let tree = super::git(
+            &dir,
+            &["ls-tree", "--name-only", "HEAD"],
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(tree, "base.txt\ntopic.txt\n");
+        assert_eq!(out.commits_squashed, 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_refuses_to_discard_post_merge_editor_save() {
+        let dir = repo_with_topic("postmerge-editor");
+        let (source, target) = pins(&dir).await;
+        hook(
+            &dir,
+            "pre-commit",
+            "printf 'foreign editor save' >topic.txt\nexit 1",
+        );
+        let error = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, LandingError::Failed { .. }), "{error}");
+        assert_eq!(
+            std::fs::read(dir.join("topic.txt")).unwrap(),
+            b"foreign editor save"
+        );
+        assert_eq!(pins(&dir).await.1.revision, target.revision);
+        assert!(!dir.join(".git/index.lock").exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_commit_head_read_failure_still_reports_completion() {
+        use std::os::unix::fs::PermissionsExt;
+        for suppress_summary in [false, true] {
+            let dir = repo_with_topic("postcommit-read");
+            let (source, target) = pins(&dir).await;
+            // The real commit command and hooks succeed. Only the helper's
+            // subsequent HEAD read fails; no shared PATH/global env is changed.
+            let wrapper = dir.join(".git/arachne-test-git");
+            std::fs::write(&wrapper, r#"#!/bin/sh
+                if [ -f "$2/.git/read-head-fault" ] && [ "$3" = rev-parse ] && [ "$4" = --verify ] && [ "$5" = HEAD ]; then
+                    echo 'injected post-commit HEAD read failure' >&2
+                    exit 1
+                fi
+                if [ -f "$2/.git/suppress-commit-summary" ] && [ "$3" = -c ] && [ "$5" = commit ]; then
+                    git "$@" >/dev/null
+                    exit $?
+                fi
+                exec git "$@"
+            "#).unwrap();
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if suppress_summary {
+                std::fs::write(dir.join(".git/suppress-commit-summary"), "").unwrap();
+            }
+            hook(&dir, "post-commit", "touch .git/read-head-fault");
+            let out = super::squash_into_primary_checkout_pinned(
+                &dir,
+                "weaver/topic",
+                &source,
+                &target,
+                "land",
+            )
+            .await
+            .unwrap();
+            assert!(out.landed);
+            assert!(!out.warnings.is_empty());
+            std::fs::remove_file(dir.join(".git/read-head-fault")).unwrap();
+            let new_target = pins(&dir).await.1;
+            assert_ne!(new_target.revision, target.revision);
+            if suppress_summary {
+                assert_eq!(out.commit, None);
+            } else {
+                assert_eq!(out.commit, Some(new_target.revision));
+            }
+            assert_eq!(new_target.status, "");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("topic.txt")).unwrap(),
+                "topic\n"
+            );
+            assert_eq!(
+                super::git(
+                    &dir,
+                    &["rev-list", "--count", "main"],
+                    Duration::from_secs(20)
+                )
+                .await
+                .unwrap()
+                .trim(),
+                "2"
+            );
+            assert!(!dir.join(".git/index.lock").exists());
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn source_preflight_reports_uncommitted_editor_changes() {
         let dir = repo_with_topic("source-edits");
@@ -692,6 +1335,33 @@ worktree /repo/.worktrees/topic\nHEAD def\nbranch refs/heads/weaver/topic\n";
         );
         // No leftover squash state from the no-op attempt.
         assert_eq!(status(&dir), "");
+    }
+
+    #[tokio::test]
+    async fn pinned_no_op_returns_the_known_target_revision() {
+        let dir = repo_with_topic("pinned-noop");
+        squash_into_primary_checkout(&dir, "weaver/topic", "land")
+            .await
+            .unwrap();
+        let (source, target) = pins(&dir).await;
+        let before_index = std::fs::read(dir.join(".git/index")).unwrap();
+        let out = super::squash_into_primary_checkout_pinned(
+            &dir,
+            "weaver/topic",
+            &source,
+            &target,
+            "land",
+        )
+        .await
+        .unwrap();
+        assert!(!out.landed);
+        assert_eq!(out.commit, Some(target.revision.clone()));
+        assert_eq!(out.commits_squashed, 0);
+        assert!(out.warnings.is_empty());
+        assert_eq!(pins(&dir).await.1, target);
+        assert_eq!(std::fs::read(dir.join(".git/index")).unwrap(), before_index);
+        assert!(!dir.join(".git/SQUASH_MSG").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
