@@ -2175,6 +2175,15 @@ pub(crate) async fn land_thread_with_client(
         ));
     }
     ensure_acceptance_route(client, &fleet, source, &target.coordinator_id).await?;
+    // Request identity only: active/uncommitted work still wraps up under this
+    // authorization, and the coordinator must review/reverify its final SHA.
+    // Bind both delivery stages to one snapshot rather than activity counters
+    // that our own delivery can change. Later committed work gets a new key.
+    let source_changes = client.session_changes(session_id).await?;
+    let source_request_version = source_changes.version;
+    let source_request_revision = source_changes.head_oid
+        .filter(|revision| !revision.trim().is_empty())
+        .ok_or_else(|| resource_error("Cannot bind Thread Land request identity without a source HEAD. Reconcile the source repository before authorizing delivery."))?;
     let request = crate::loom::IntegrationRequest {
         action: "land-thread",
         source_session: view.id.clone(),
@@ -2199,14 +2208,14 @@ pub(crate) async fn land_thread_with_client(
         .deliver_request(
             &view,
             &request.source_wrap_up_prompt(),
-            serde_json::json!({ "action": "land-thread-wrap-up", "request": request }),
+            serde_json::json!({ "action": "land-thread-wrap-up", "request": request, "source_request_revision": source_request_revision, "source_request_version": source_request_version }),
         )
         .await?;
     client
         .deliver_request(
             &coordinator,
             &request.to_prompt(&coordinator.branch.name),
-            serde_json::json!({ "action": "land-thread", "request": request }),
+            serde_json::json!({ "action": "land-thread", "request": request, "source_request_revision": source_request_revision, "source_request_version": source_request_version }),
         )
         .await?;
     Ok(target)
@@ -2236,11 +2245,17 @@ pub async fn integrate_session(
     land_thread(app, state, session_id, strategy).await
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct AutolandPolicyResult {
+    pub session: SessionView,
+    pub warnings: Vec<String>,
+}
+
 pub(crate) async fn set_autoland_with_client(
     client: &LoomClient,
     session_id: &str,
     policy: &str,
-) -> Result<SessionView, UiError> {
+) -> Result<AutolandPolicyResult, UiError> {
     let view = client.get_session(session_id).await?;
     let fleet = client.list_sessions().await?;
     let track_policy = fleet
@@ -2260,11 +2275,12 @@ pub(crate) async fn set_autoland_with_client(
     let coordinator_id = if track_policy {
         view.id.clone()
     } else {
-        resolve_integration_target(&fleet, session_id)
+        crate::track_policy::track_ancestor(&fleet, session_id)
             .ok_or_else(|| {
                 resource_error("Autoland needs a marked same-repository Track ancestor.")
             })?
-            .coordinator_id
+            .id
+            .clone()
     };
     let coordinator = if track_policy {
         view.clone()
@@ -2281,30 +2297,79 @@ pub(crate) async fn set_autoland_with_client(
     }
     // Persist OFF immediately even if route setup later fails; stale automatic
     // requests are required to read this live tag before every write.
+    let key = if track_policy {
+        "track_autoland"
+    } else {
+        "thread_autoland"
+    };
     client
         .set_tag(
             session_id,
-            if track_policy {
-                "track_autoland"
-            } else {
-                "thread_autoland"
-            },
+            key,
             policy,
             "Durable autoland policy; reread live before automatic writes",
         )
         .await?;
+    // The acknowledged tag write is durable even when setup/refresh fails.
+    // Keep that confirmed state separate from best-effort delivery setup.
+    let mut saved = view.clone();
+    saved.branch.tags.retain(|tag| tag.key != key);
+    saved.branch.tags.push(crate::loom::TagView {
+        key: key.into(),
+        value: policy.into(),
+        note: "Durable autoland policy; reread live before automatic writes".into(),
+        set_at: String::new(),
+        set_by: "arachne".into(),
+    });
+    let mut warnings = Vec::new();
+    if let Err(error) = setup_autoland_policy(
+        client,
+        &fleet,
+        &coordinator,
+        session_id,
+        policy,
+        view.branch.tags.iter().find(|tag| tag.key == key),
+    )
+    .await
+    {
+        warnings.push(format!(
+            "Autoland policy {policy} was saved, but setup is incomplete: {}",
+            error.message
+        ));
+    }
+    match client.get_session(session_id).await {
+        Ok(fresh) => saved = fresh,
+        Err(error) => warnings.push(format!(
+            "Autoland policy {policy} was saved; session refresh failed: {error}"
+        )),
+    }
+    Ok(AutolandPolicyResult {
+        session: saved,
+        warnings,
+    })
+}
+
+async fn setup_autoland_policy(
+    client: &LoomClient,
+    fleet: &[SessionSummaryView],
+    coordinator: &SessionView,
+    session_id: &str,
+    policy: &str,
+    previous_policy_tag: Option<&crate::loom::TagView>,
+) -> Result<(), UiError> {
+    let coordinator_id = &coordinator.id;
     let canonical = crate::track_policy::canonical_topic_branch(&coordinator.branch)
         .ok_or_else(|| resource_error("Autoland policy was saved, but canonical Track initialization is incomplete or invalid. Repair initialization before acceptance routing can be completed."))?;
     client
         .ensure_delivery_subscription(&coordinator_id, &coordinator_id)
         .await?;
     let mut routed = std::collections::HashSet::new();
-    for source in &fleet {
-        if crate::track_policy::track_ancestor(&fleet, &source.id)
-            .is_some_and(|t| t.id == coordinator_id)
+    for source in fleet {
+        if crate::track_policy::track_ancestor(fleet, &source.id)
+            .is_some_and(|t| &t.id == coordinator_id)
         {
             if let Some(parent) = crate::track_policy::immediate_parent(&fleet, source) {
-                if parent.id != coordinator_id && routed.insert(parent.id.clone()) {
+                if &parent.id != coordinator_id && routed.insert(parent.id.clone()) {
                     client
                         .ensure_delivery_subscription(&parent.id, &coordinator_id)
                         .await?;
@@ -2312,8 +2377,11 @@ pub(crate) async fn set_autoland_with_client(
             }
         }
     }
-    client.deliver_request(&coordinator, &crate::loom::autoland_policy_prompt(&coordinator, canonical), serde_json::json!({"action":"autoland-policy", "session_id":session_id, "policy":policy, "track_id":coordinator_id, "target_branch":canonical})).await?;
-    client.get_session(session_id).await.map_err(Into::into)
+    // A later On -> Off -> On transition must wake the coordinator again.
+    // The previously observed durable tag revision distinguishes that new
+    // policy authorization while keeping retries of this envelope stable.
+    client.deliver_request(&coordinator, &crate::loom::autoland_policy_prompt(&coordinator, canonical), serde_json::json!({"action":"autoland-policy", "session_id":session_id, "policy":policy, "previous_policy_tag":previous_policy_tag, "track_id":coordinator_id, "target_branch":canonical})).await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2322,7 +2390,7 @@ pub async fn set_autoland(
     state: State<'_, LoomState>,
     session_id: String,
     policy: String,
-) -> Result<SessionView, UiError> {
+) -> Result<AutolandPolicyResult, UiError> {
     let client = state_client(&state).await?;
     let view = set_autoland_with_client(&client, &session_id, &policy).await?;
     if let Ok(fleet) = client.list_sessions().await {
@@ -5015,7 +5083,7 @@ mod landing_dispatch_tests {
                 let body = if path == "/api/sessions/get" {
                     session.clone()
                 } else {
-                    serde_json::json!({"queued":true})
+                    serde_json::json!({"queued":true,"turn":null})
                 }
                 .to_string();
                 socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
@@ -5340,13 +5408,24 @@ mod thread_landing_contract_tests {
                 }
                 let headers = String::from_utf8_lossy(&bytes[..header_end]);
                 assert!(headers.starts_with(&format!("POST {path} ")), "{headers}");
-                let body = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let body: Value =
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let reply = if reply.get("_message_receipt").is_some() {
+                    json!({"id":"durable-message", "channel_id":body["channel"], "kind":"message", "body":body["body"].as_str().unwrap().trim(), "payload":body["payload"]})
+                } else {
+                    reply
+                };
                 requests.push((path.into(), body));
+                if reply.get("_drop_ack").is_some() {
+                    continue;
+                }
                 let (status, response) = if reply.get("_http_error").is_some() {
                     (
                         "500 Internal Server Error",
                         json!({"error":reply["_http_error"]}).to_string(),
                     )
+                } else if let Some(raw) = reply["_raw_ack"].as_str() {
+                    ("200 OK", raw.into())
                 } else {
                     ("200 OK", reply.to_string())
                 };
@@ -5369,11 +5448,21 @@ mod thread_landing_contract_tests {
             ("/api/sessions/get", json!(track)),
             ("/api/channels/subscription/set", sub("track", "track")),
             ("/api/channels/subscription/set", sub("parent", "track")),
+            (
+                "/api/sessions/changes",
+                json!({"head_oid":"authorized-source-head","base":null}),
+            ),
             ("/api/sessions/tags/set", json!({})),
             ("/api/sessions/get", json!(worker)),
-            ("/api/sessions/prompt/create", json!({})),
+            (
+                "/api/sessions/prompt/create",
+                json!({"queued":true,"turn":null}),
+            ),
             ("/api/sessions/get", json!(track)),
-            ("/api/sessions/prompt/create", json!({})),
+            (
+                "/api/sessions/prompt/create",
+                json!({"queued":true,"turn":null}),
+            ),
         ])
         .await;
         let target = land_thread_with_client(&client, "worker", None)
@@ -5385,14 +5474,14 @@ mod thread_landing_contract_tests {
             calls[4].1,
             json!({"channel":"parent","session":"track","mode":"deliver"})
         );
-        assert_eq!(calls[5].1["key"], "landing_request");
-        for i in [7, 9] {
+        assert_eq!(calls[6].1["key"], "landing_request");
+        for i in [8, 10] {
             assert_eq!(calls[i].1["send_now"], false);
         }
-        let wrap = calls[7].1["text"].as_str().unwrap();
+        let wrap = calls[8].1["text"].as_str().unwrap();
         assert!(wrap.contains(&worker.work_dir));
         assert!(wrap.contains(&worker.branch.branch));
-        let accept = calls[9].1["text"].as_str().unwrap();
+        let accept = calls[10].1["text"].as_str().unwrap();
         assert!(accept.contains("\"strategy\":\"squash\""));
         assert!(accept.contains("successful intended wrap-up"));
         assert!(accept.contains("review, repair, commit, validate and acceptance"));
@@ -5410,27 +5499,148 @@ mod thread_landing_contract_tests {
             ("/api/sessions/get", json!(track)),
             ("/api/channels/subscription/set", sub("track", "track")),
             ("/api/channels/subscription/set", sub("parent", "track")),
+            (
+                "/api/sessions/changes",
+                json!({"head_oid":"authorized-source-head","base":null}),
+            ),
             ("/api/sessions/tags/set", json!({})),
             ("/api/channels/subscription/set", sub("worker", "worker")),
-            ("/api/channels/messages/create", json!({})),
+            (
+                "/api/channels/messages/create",
+                json!({"_message_receipt":true}),
+            ),
             ("/api/channels/subscription/set", sub("track", "track")),
-            ("/api/channels/messages/create", json!({})),
+            (
+                "/api/channels/messages/create",
+                json!({"_message_receipt":true}),
+            ),
         ])
         .await;
         land_thread_with_client(&client, "worker", Some("merge"))
             .await
             .unwrap();
         let calls = server.await.unwrap();
-        assert_eq!(calls[7].1["channel"], "worker");
-        assert_eq!(calls[9].1["channel"], "track");
-        assert_eq!(calls[7].1["payload"]["request"]["source_session"], "worker");
+        assert_eq!(calls[8].1["channel"], "worker");
         assert_eq!(
-            calls[9].1["payload"]["request"]["target_branch"],
+            calls[8].1["payload"]["source_request_revision"],
+            "authorized-source-head"
+        );
+        assert_eq!(
+            calls[10].1["payload"]["source_request_revision"],
+            "authorized-source-head"
+        );
+        assert_eq!(calls[10].1["channel"], "track");
+        assert_eq!(calls[8].1["payload"]["request"]["source_session"], "worker");
+        assert_eq!(
+            calls[10].1["payload"]["request"]["target_branch"],
             "arachne/tracks/accepted"
         );
         assert!(calls.iter().all(|(p, _)| !p.ends_with("/send")
             && !p.ends_with("/interrupt")
             && !p.ends_with("/prompt/create")));
+    }
+
+    #[tokio::test]
+    async fn terminal_land_retry_keeps_snapshot_keys_and_later_head_gets_new_keys() {
+        let (track, worker, fleet) = fixture("terminal");
+        let mut replies = Vec::new();
+        for (index, (head, version)) in [
+            ("first-head", "same-work"),
+            ("first-head", "same-work"),
+            ("later-head", "later-work"),
+            ("later-head", "new-uncommitted-work"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            replies.extend([
+                ("/api/sessions/summary/list", fleet.clone()),
+                ("/api/sessions/get", json!(worker)),
+                ("/api/sessions/get", json!(track)),
+                ("/api/channels/subscription/set", sub("track", "track")),
+                ("/api/channels/subscription/set", sub("parent", "track")),
+                (
+                    "/api/sessions/changes",
+                    json!({"head_oid":head,"version":version,"base":null}),
+                ),
+                ("/api/sessions/tags/set", json!({})),
+                ("/api/channels/subscription/set", sub("worker", "worker")),
+                (
+                    "/api/channels/messages/create",
+                    json!({"_message_receipt":true}),
+                ),
+                ("/api/channels/subscription/set", sub("track", "track")),
+                (
+                    "/api/channels/messages/create",
+                    if index == 0 {
+                        json!({"_drop_ack":true})
+                    } else {
+                        json!({"_message_receipt":true})
+                    },
+                ),
+            ]);
+        }
+        let (client, server) = mock(replies).await;
+        let error = land_thread_with_client(&client, "worker", None)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("may already have been delivered"));
+        land_thread_with_client(&client, "worker", None)
+            .await
+            .unwrap();
+        land_thread_with_client(&client, "worker", None)
+            .await
+            .unwrap();
+        land_thread_with_client(&client, "worker", None)
+            .await
+            .unwrap();
+        let calls = server.await.unwrap();
+        for stage in [8, 10] {
+            assert_eq!(
+                calls[stage].1["idempotency_key"],
+                calls[stage + 11].1["idempotency_key"]
+            );
+            assert_ne!(
+                calls[stage + 11].1["idempotency_key"],
+                calls[stage + 22].1["idempotency_key"]
+            );
+            assert_ne!(
+                calls[stage + 22].1["idempotency_key"],
+                calls[stage + 33].1["idempotency_key"]
+            );
+        }
+        assert_eq!(
+            calls[8].1["payload"]["source_request_revision"],
+            calls[10].1["payload"]["source_request_revision"]
+        );
+        assert_eq!(
+            calls[32].1["payload"]["source_request_revision"],
+            "later-head"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_source_head_cannot_claim_snapshot_bound_land_delivery() {
+        let (track, worker, fleet) = fixture("terminal");
+        let (client, server) = mock(vec![
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/get", json!(track)),
+            ("/api/channels/subscription/set", sub("track", "track")),
+            ("/api/channels/subscription/set", sub("parent", "track")),
+            (
+                "/api/sessions/changes",
+                json!({"head_oid":null,"base":null}),
+            ),
+        ])
+        .await;
+        let error = land_thread_with_client(&client, "worker", None)
+            .await
+            .unwrap_err();
+        assert!(error
+            .message
+            .contains("request identity without a source HEAD"));
+        assert_eq!(server.await.unwrap().len(), 6);
     }
 
     #[tokio::test]
@@ -5471,6 +5681,266 @@ mod thread_landing_contract_tests {
     }
 
     #[tokio::test]
+    async fn saved_policy_survives_route_delivery_and_refresh_failures_in_both_directions() {
+        for (previous, policy) in [("off", "on"), ("on", "off")] {
+            for failure in ["route", "delivery", "refresh"] {
+                let (mut track, _, fleet) = fixture("acp");
+                tagged(&mut track, "track_autoland", previous);
+                let mut replies = vec![
+                    ("/api/sessions/get", json!(track)),
+                    ("/api/sessions/summary/list", fleet),
+                    ("/api/sessions/tags/set", json!({})),
+                ];
+                if failure == "route" {
+                    replies.push((
+                        "/api/channels/subscription/set",
+                        sub("track", "wrong-subject"),
+                    ));
+                } else {
+                    replies.extend([
+                        ("/api/channels/subscription/set", sub("track", "track")),
+                        ("/api/channels/subscription/set", sub("parent", "track")),
+                        ("/api/sessions/get", json!(track)),
+                        (
+                            "/api/sessions/prompt/create",
+                            if failure == "delivery" {
+                                json!({"_drop_ack":true})
+                            } else {
+                                json!({"queued":true,"turn":null})
+                            },
+                        ),
+                    ]);
+                }
+                replies.push((
+                    "/api/sessions/get",
+                    json!({"_http_error":"refresh unavailable"}),
+                ));
+                let (client, server) = mock(replies).await;
+                let result = set_autoland_with_client(&client, "track", policy)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    crate::track_policy::tag(&result.session.branch, "track_autoland"),
+                    Some(policy)
+                );
+                assert!(result.warnings.iter().all(|w| w.contains("was saved")));
+                assert_eq!(
+                    result.warnings.len(),
+                    if failure == "refresh" { 1 } else { 2 }
+                );
+                if failure == "delivery" {
+                    assert!(result.warnings[0].contains("delivery to track is uncertain"));
+                }
+                let calls = server.await.unwrap();
+                assert_eq!(calls[2].1["value"], policy);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn later_policy_reenable_has_a_new_request_identity() {
+        let mut keys = Vec::new();
+        for revision in ["off-before-first-enable", "off-after-disable"] {
+            let (mut track, _, fleet) = fixture("terminal");
+            tagged(&mut track, "track_autoland", "off");
+            track.branch.tags.last_mut().unwrap().set_at = revision.into();
+            let mut refreshed = track.clone();
+            refreshed.branch.tags.last_mut().unwrap().value = "on".into();
+            let (client, server) = mock(vec![
+                ("/api/sessions/get", json!(track)),
+                ("/api/sessions/summary/list", fleet),
+                ("/api/sessions/tags/set", json!({})),
+                ("/api/channels/subscription/set", sub("track", "track")),
+                ("/api/channels/subscription/set", sub("parent", "track")),
+                ("/api/channels/subscription/set", sub("track", "track")),
+                (
+                    "/api/channels/messages/create",
+                    json!({"_message_receipt":true}),
+                ),
+                ("/api/sessions/get", json!(refreshed)),
+            ])
+            .await;
+            let result = set_autoland_with_client(&client, "track", "on")
+                .await
+                .unwrap();
+            assert!(result.warnings.is_empty());
+            let calls = server.await.unwrap();
+            assert_eq!(
+                calls[6].1["payload"]["previous_policy_tag"]["set_at"],
+                revision
+            );
+            keys.push(calls[6].1["idempotency_key"].clone());
+        }
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    #[tokio::test]
+    async fn policy_refresh_can_report_a_newer_live_policy() {
+        let (track, _, fleet) = fixture("acp");
+        let mut live = track.clone();
+        tagged(&mut live, "track_autoland", "off");
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/tags/set", json!({})),
+            ("/api/channels/subscription/set", sub("track", "wrong")),
+            ("/api/sessions/get", json!(live)),
+        ])
+        .await;
+        let result = set_autoland_with_client(&client, "track", "on")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::track_policy::tag(&result.session.branch, "track_autoland"),
+            Some("off")
+        );
+        assert_eq!(result.warnings.len(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn terminal_uncertain_receipts_keep_retry_identity_across_client_restarts() {
+        for bad in [
+            json!({}),
+            json!({"_raw_ack":"broken json"}),
+            json!({"_drop_ack":true}),
+            json!({"_http_error":"failed after append"}),
+        ] {
+            let terminal = view("terminal", "terminal");
+            let (client, server) = mock(vec![
+                (
+                    "/api/channels/subscription/set",
+                    sub("terminal", "terminal"),
+                ),
+                ("/api/channels/messages/create", bad),
+                (
+                    "/api/channels/subscription/set",
+                    sub("terminal", "terminal"),
+                ),
+                (
+                    "/api/channels/messages/create",
+                    json!({"_message_receipt":true}),
+                ),
+                (
+                    "/api/channels/subscription/set",
+                    sub("terminal", "terminal"),
+                ),
+                (
+                    "/api/channels/messages/create",
+                    json!({"_message_receipt":true}),
+                ),
+            ])
+            .await;
+            let payload =
+                json!({"action":"publish","source_revision":"sha1","target_revision":"target1"});
+            let error = client
+                .deliver_request(&terminal, "complete authorization", payload.clone())
+                .await
+                .unwrap_err();
+            let LoomError::DeliveryUncertain {
+                request_key: Some(key),
+                ..
+            } = &error
+            else {
+                panic!("{error}")
+            };
+            assert!(error
+                .to_string()
+                .contains("may already have been delivered"));
+            let restarted = LoomClient::new(&client.server_url(), None).unwrap();
+            restarted
+                .deliver_request(&terminal, "complete authorization", payload)
+                .await
+                .unwrap();
+            restarted.deliver_request(&terminal, "complete authorization", json!({"action":"publish","source_revision":"sha2","target_revision":"target1"})).await.unwrap();
+            let calls = server.await.unwrap();
+            assert_eq!(calls[1].1["idempotency_key"], key.as_str());
+            assert_eq!(calls[1].1["idempotency_key"], calls[3].1["idempotency_key"]);
+            assert_ne!(calls[3].1["idempotency_key"], calls[5].1["idempotency_key"]);
+            assert!(calls.iter().all(|(p, _)| !p.ends_with("/send")
+                && !p.ends_with("/interrupt")
+                && !p.ends_with("/prompt/create")));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_terminal_receipts_are_uncertain_not_successful() {
+        for field in ["id", "channel_id", "kind", "body", "payload"] {
+            let mut receipt = json!({"id":"message","channel_id":"terminal","kind":"message","body":"authorization","payload":{}});
+            receipt[field] = json!("wrong");
+            if field == "id" {
+                receipt[field] = json!("");
+            }
+            let (client, server) = mock(vec![("/api/channels/messages/create", receipt)]).await;
+            assert!(matches!(
+                client
+                    .send_to_thread("terminal", "authorization", json!({}), "stable-key")
+                    .await,
+                Err(LoomError::DeliveryUncertain {
+                    request_key: Some(_),
+                    ..
+                })
+            ));
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn acp_receipts_require_real_ack_and_never_suggest_safe_retry() {
+        for reply in [
+            json!({}),
+            json!({"queued":"true","turn":null}),
+            json!({"queued":true}),
+            json!({"queued":true,"turn":-1}),
+            json!({"_raw_ack":"broken"}),
+            json!({"_drop_ack":true}),
+        ] {
+            let (client, server) = mock(vec![("/api/sessions/prompt/create", reply)]).await;
+            let error = client
+                .queue_prompt("worker", "authorization")
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                LoomError::DeliveryUncertain {
+                    request_key: None,
+                    ..
+                }
+            ));
+            assert!(error.to_string().contains("Reconcile"));
+            let calls = server.await.unwrap();
+            assert_eq!(calls[0].1["send_now"], false);
+            assert!(calls[0].1.get("idempotency_key").is_none());
+        }
+        for reply in [
+            json!({"queued":true,"turn":null}),
+            json!({"queued":false,"turn":12}),
+        ] {
+            let (client, server) = mock(vec![("/api/sessions/prompt/create", reply)]).await;
+            client
+                .queue_prompt("worker", "authorization")
+                .await
+                .unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_route_failure_prevents_terminal_authorization() {
+        let (client, server) = mock(vec![(
+            "/api/channels/subscription/set",
+            sub("terminal", "wrong"),
+        )])
+        .await;
+        let error = client
+            .deliver_request(&view("terminal", "terminal"), "authorization", json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, LoomError::Decode { .. }));
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
     async fn policy_off_persists_routes_nested_children_and_delivers_live_guard() {
         let (track, _, fleet) = fixture("acp");
         let mut refreshed = track.clone();
@@ -5482,7 +5952,10 @@ mod thread_landing_contract_tests {
             ("/api/channels/subscription/set", sub("track", "track")),
             ("/api/channels/subscription/set", sub("parent", "track")),
             ("/api/sessions/get", json!(track)),
-            ("/api/sessions/prompt/create", json!({})),
+            (
+                "/api/sessions/prompt/create",
+                json!({"queued":true,"turn":null}),
+            ),
             ("/api/sessions/get", json!(refreshed)),
         ])
         .await;
@@ -5490,7 +5963,7 @@ mod thread_landing_contract_tests {
             .await
             .unwrap();
         assert_eq!(
-            crate::track_policy::tag(&result.branch, "track_autoland"),
+            crate::track_policy::tag(&result.session.branch, "track_autoland"),
             Some("off")
         );
         let calls = server.await.unwrap();
@@ -5517,15 +5990,59 @@ mod thread_landing_contract_tests {
             ("/api/sessions/get", json!(track)),
             ("/api/sessions/summary/list", json!([summary(&track, None)])),
             ("/api/sessions/tags/set", json!({})),
+            (
+                "/api/sessions/get",
+                json!({"_http_error":"refresh unavailable"}),
+            ),
         ])
         .await;
-        let error = set_autoland_with_client(&client, "track", "off")
+        let result = set_autoland_with_client(&client, "track", "off")
             .await
-            .unwrap_err();
-        assert!(error.message.contains("policy was saved"));
+            .unwrap();
+        assert!(result.warnings[0].contains("policy off was saved"));
+        assert_eq!(
+            crate::track_policy::tag(&result.session.branch, "track_autoland"),
+            Some("off")
+        );
         let calls = server.await.unwrap();
         assert_eq!(calls[2].1["key"], "track_autoland");
         assert_eq!(calls[2].1["value"], "off");
+    }
+
+    #[tokio::test]
+    async fn source_off_persists_before_incomplete_canonical_setup() {
+        let (mut track, worker, _) = fixture("acp");
+        track
+            .branch
+            .tags
+            .retain(|tag| tag.key != "track_topic_branch");
+        track.branch.goal = format!(
+            "{} arachne/tracks/pending",
+            crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+        );
+        let fleet = json!([summary(&track, None), summary(&worker, Some("track"))]);
+        let (client, server) = mock(vec![
+            ("/api/sessions/get", json!(worker)),
+            ("/api/sessions/summary/list", fleet),
+            ("/api/sessions/get", json!(track)),
+            ("/api/sessions/tags/set", json!({})),
+            (
+                "/api/sessions/get",
+                json!({"_http_error":"refresh unavailable"}),
+            ),
+        ])
+        .await;
+        let result = set_autoland_with_client(&client, "worker", "off")
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::track_policy::tag(&result.session.branch, "thread_autoland"),
+            Some("off")
+        );
+        assert!(result.warnings[0].contains("initialization is incomplete"));
+        let calls = server.await.unwrap();
+        assert_eq!(calls[3].1["key"], "thread_autoland");
+        assert_eq!(calls[3].1["value"], "off");
     }
 
     #[tokio::test]
@@ -5541,16 +6058,19 @@ mod thread_landing_contract_tests {
             ("/api/channels/subscription/set", sub("track", "track")),
             ("/api/channels/subscription/set", sub("parent", "track")),
             ("/api/channels/subscription/set", sub("track", "track")),
-            ("/api/channels/messages/create", json!({})),
+            (
+                "/api/channels/messages/create",
+                json!({"_message_receipt":true}),
+            ),
             ("/api/sessions/get", json!(refreshed)),
         ])
         .await;
         let result = set_autoland_with_client(&client, "worker", "on")
             .await
             .unwrap();
-        assert_eq!(result.id, "worker");
+        assert_eq!(result.session.id, "worker");
         assert_eq!(
-            crate::track_policy::tag(&result.branch, "thread_autoland"),
+            crate::track_policy::tag(&result.session.branch, "thread_autoland"),
             Some("on")
         );
         let calls = server.await.unwrap();
@@ -5569,7 +6089,10 @@ mod thread_landing_contract_tests {
             ("/api/channels/subscription/set", sub("track", "track")),
             ("/api/channels/subscription/set", sub("parent", "track")),
             ("/api/sessions/get", json!(track)),
-            ("/api/sessions/prompt/create", json!({})),
+            (
+                "/api/sessions/prompt/create",
+                json!({"queued":true,"turn":null}),
+            ),
         ])
         .await;
         prepare_child_autoland(&client, &parent, &fleet)

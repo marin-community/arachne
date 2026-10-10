@@ -16,6 +16,76 @@ use tokio::sync::mpsc;
 
 use crate::loom::EventFrame;
 
+// Versioned SHA-256 fingerprint of the complete authorization envelope. Do
+// not use RandomState/DefaultHasher: its algorithm is not a stable wire format.
+fn request_key(destination: &str, text: &str, payload: &serde_json::Value) -> String {
+    let envelope = serde_json::to_vec(&serde_json::json!([destination, text.trim(), payload]))
+        .expect("request envelope serialization");
+    format!("arachne-request-v1-{}", sha256(&envelope))
+}
+
+fn sha256(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut bytes = input.to_vec();
+    bytes.push(0x80);
+    while bytes.len() % 64 != 56 {
+        bytes.push(0);
+    }
+    bytes.extend_from_slice(&(input.len() as u64 * 8).to_be_bytes());
+    for chunk in bytes.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes(word.try_into().unwrap());
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add((e & f) ^ (!e & g))
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let t2 = s0.wrapping_add((a & b) ^ (a & c) ^ (b & c));
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (value, add) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *value = value.wrapping_add(add);
+        }
+    }
+    state.iter().map(|v| format!("{v:08x}")).collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoomError {
     #[error("connection failed: {0}")]
@@ -31,6 +101,13 @@ pub enum LoomError {
     Decode { path: String, detail: String },
     #[error("invalid image attachment: {0}")]
     InvalidImage(String),
+    #[error("request delivery to {session_id} is uncertain: {detail}. The request may already have been delivered. Reconcile the destination inbox/queue before retrying; do not issue a new authorization")]
+    DeliveryUncertain {
+        session_id: String,
+        path: String,
+        request_key: Option<String>,
+        detail: String,
+    },
 }
 
 impl LoomError {
@@ -38,6 +115,28 @@ impl LoomError {
     /// answered with an error". Drives the connection indicator.
     pub fn is_unreachable(&self) -> bool {
         matches!(self, LoomError::Connection(_))
+    }
+
+    fn after_dispatch(self, session_id: &str, path: &str, key: Option<&str>) -> Self {
+        // A timeout, invalid receipt or server failure can follow a successful
+        // durable write, including a delivery-layer 4xx after append. Only
+        // authentication/access denial occurs before the operation runs.
+        // The ACP prompt API has no idempotency operand.
+        if matches!(
+            self,
+            Self::Api {
+                status: 401 | 403,
+                ..
+            }
+        ) {
+            return self;
+        }
+        Self::DeliveryUncertain {
+            session_id: session_id.into(),
+            path: path.into(),
+            request_key: key.map(str::to_owned),
+            detail: self.to_string(),
+        }
     }
 }
 
@@ -686,12 +785,28 @@ impl LoomClient {
     /// Queue an ACP request behind the current turn. Integration and landing
     /// must not interrupt work already in progress in a coordinator thread.
     pub async fn queue_prompt(&self, id: &str, text: &str) -> Result<(), LoomError> {
-        let _: serde_json::Value = self
+        const PATH: &str = "/api/sessions/prompt/create";
+        let reply: serde_json::Value = self
             .op(
-                "/api/sessions/prompt/create",
+                PATH,
                 &serde_json::json!({ "session": id, "text": text, "send_now": false }),
             )
-            .await?;
+            .await
+            .map_err(|e| e.after_dispatch(id, PATH, None))?;
+        // queued=false is valid: an idle ACP runtime can start immediately.
+        // Neither acknowledgment says the requested operation has completed.
+        if !reply["queued"].is_boolean()
+            || !reply.as_object().is_some_and(|v| v.contains_key("turn"))
+            || !(reply["turn"].is_null() || reply["turn"].as_i64().is_some_and(|v| v >= 0))
+        {
+            return Err(LoomError::Decode {
+                path: PATH.into(),
+                detail:
+                    "prompt receipt must contain queued boolean and turn null/nonnegative integer"
+                        .into(),
+            }
+            .after_dispatch(id, PATH, None));
+        }
         Ok(())
     }
 
@@ -716,18 +831,33 @@ impl LoomClient {
         payload: serde_json::Value,
         idempotency_key: &str,
     ) -> Result<serde_json::Value, LoomError> {
-        self.op(
-            "/api/channels/messages/create",
-            &serde_json::json!({
-                "channel": destination_id,
-                "body": body,
-                "kind": "message",
-                "urgency": "normal",
-                "payload": payload,
-                "idempotency_key": idempotency_key,
-            }),
-        )
-        .await
+        const PATH: &str = "/api/channels/messages/create";
+        let reply: serde_json::Value = self
+            .op(
+                PATH,
+                &serde_json::json!({
+                    "channel": destination_id,
+                    "body": body,
+                    "kind": "message",
+                    "urgency": "normal",
+                    "payload": payload,
+                    "idempotency_key": idempotency_key,
+                }),
+            )
+            .await
+            .map_err(|e| e.after_dispatch(destination_id, PATH, Some(idempotency_key)))?;
+        if !reply["id"].as_str().is_some_and(|id| !id.trim().is_empty())
+            || reply["channel_id"] != destination_id
+            || reply["kind"] != "message"
+            || reply["body"] != body.trim()
+            || reply["payload"] != payload
+        {
+            return Err(LoomError::Decode {
+                path: PATH.into(),
+                detail: "message receipt did not match destination, kind, body and payload or had no durable id".into(),
+            }.after_dispatch(destination_id, PATH, Some(idempotency_key)));
+        }
+        Ok(reply)
     }
 
     /// Install an actual session delivery route and verify the server did not
@@ -756,30 +886,48 @@ impl LoomClient {
         Ok(())
     }
 
+    /// Verify the own-channel route before terminal request dispatch. ACP
+    /// requests use the prompt API and need no channel subscription.
+    pub async fn ensure_request_route(
+        &self,
+        view: &crate::loom::SessionView,
+    ) -> Result<(), LoomError> {
+        if view.protocol == "terminal" {
+            self.ensure_delivery_subscription(&view.id, &view.id)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Terminal requests are durable inbox messages, never input into an
-    /// active shell. ACP requests always queue behind the current turn.
+    /// active shell. Identical authorization content keeps the same retry key
+    /// across client restarts. Callers must include verified source/target
+    /// revisions in the payload to distinguish later changed authorizations.
+    /// ACP requests queue behind the current turn; uncertain ACP receipt must
+    /// be reconciled, because that API has no retry-safe identity.
     pub async fn deliver_request(
         &self,
         view: &crate::loom::SessionView,
         text: &str,
         payload: serde_json::Value,
     ) -> Result<(), LoomError> {
+        let key = request_key(&view.id, text, &payload);
+        self.deliver_request_with_key(view, text, payload, &key)
+            .await
+    }
+
+    /// Use a caller-owned durable action identity when available. Reusing a
+    /// key with different authorization content is rejected by receipt checks.
+    pub async fn deliver_request_with_key(
+        &self,
+        view: &crate::loom::SessionView,
+        text: &str,
+        payload: serde_json::Value,
+        key: &str,
+    ) -> Result<(), LoomError> {
+        self.ensure_request_route(view).await?;
         if view.protocol == "terminal" {
-            self.ensure_delivery_subscription(&view.id, &view.id)
-                .await?;
-            // Each user action is independent; avoid deduplicating later
-            // requests for the same worker after its contents have changed.
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            self.send_to_thread(
-                &view.id,
-                text,
-                payload,
-                &format!("arachne-request-{}-{nonce}", view.id),
-            )
-            .await?;
+            self.send_to_thread(&view.id, text, payload, key).await?;
         } else {
             self.resume_if_orphaned(&view.id).await?;
             self.queue_prompt(&view.id, text).await?;
@@ -1146,6 +1294,49 @@ fn encode_base64(bytes: &[u8]) -> String {
         });
     }
     result
+}
+
+#[cfg(test)]
+mod request_key_tests {
+    use super::*;
+
+    #[test]
+    fn fingerprint_matches_sha256_vectors_and_changed_authorizations() {
+        for (input, expected) in [
+            (
+                "",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            (
+                "abc",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            ),
+            (
+                "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+                "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+            ),
+        ] {
+            assert_eq!(sha256(input.as_bytes()), expected);
+        }
+        assert_eq!(
+            sha256(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+        let payload = serde_json::json!({"source_revision":"sha1"});
+        let key = request_key("session", "authorization", &payload);
+        assert_eq!(key, request_key("session", " authorization ", &payload));
+        assert_ne!(key, request_key("other", "authorization", &payload));
+        assert_ne!(key, request_key("session", "different strategy", &payload));
+        assert_ne!(
+            key,
+            request_key(
+                "session",
+                "authorization",
+                &serde_json::json!({"source_revision":"sha2"})
+            )
+        );
+        assert!(key.len() <= 255);
+    }
 }
 
 #[cfg(test)]
