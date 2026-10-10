@@ -199,16 +199,9 @@ async fn publish(
         .find(|branch| branch.name == source)
         .and_then(|branch| branch.worktree.clone());
     if local_client(client) {
-        request.target_revision = git(
-            Path::new(&view.branch.repo_root),
-            &[
-                "rev-parse",
-                "--verify",
-                &format!("refs/heads/{}^{{commit}}", request.target_upstream),
-            ],
-        )
-        .await
-        .ok();
+        request.target_revision =
+            resolve_upstream_revision(Path::new(&view.branch.repo_root), &request.target_upstream)
+                .await;
         request.source_revision =
             Some(verify_ref(Path::new(&view.branch.repo_root), &source).await?);
         if !explicit {
@@ -233,12 +226,17 @@ async fn publish(
                 .as_ref()
                 .is_none_or(|s| s.status.trim().is_empty())
         {
-            request.stack = stack_plan(
-                Path::new(&view.branch.repo_root),
-                request.source_revision.as_deref().unwrap(),
-                &request.target_upstream,
-            )
-            .await?;
+            if let Some(base) = request.target_revision.as_deref() {
+                request.stack = stack_plan(
+                    Path::new(&view.branch.repo_root),
+                    request.source_revision.as_deref().unwrap(),
+                    &request.target_upstream,
+                    base,
+                )
+                .await?;
+            } else {
+                request.repair_reason = Some("Chosen PR-stack upstream is not available or unambiguous locally. Resolve/fetch the exact chosen upstream on its actual host, validate its revision and derive the ordered dependent stack before the same chosen publishing operation; do not guess a remote or require a Prepare click.".into());
+            }
         }
     }
     dispatch(client, &view, request).await
@@ -274,6 +272,53 @@ async fn verify_ref(repo: &Path, branch: &str) -> Result<String, UiError> {
         .map_err(|_| error(format!("Canonical accepted branch {branch} is missing or uninitialized. Initialize it from the Track seed before publishing; coordinator scratch is never a substitute.")))
 }
 
+// Accepted sources remain local heads; upstream comparison may be a remote
+// tracking ref. Missing/ambiguous snapshots defer to authorized coordinator
+// preparation instead of rejecting a valid chosen publishing destination.
+async fn resolve_upstream_revision(repo: &Path, target: &str) -> Option<String> {
+    for reference in [
+        format!("refs/heads/{target}"),
+        format!("refs/remotes/{target}"),
+    ] {
+        if let Ok(oid) = git(
+            repo,
+            &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
+        )
+        .await
+        {
+            return Some(oid);
+        }
+    }
+    let refs = git(
+        repo,
+        &["for-each-ref", "--format=%(refname)", "refs/remotes/"],
+    )
+    .await
+    .ok()?;
+    let matches: Vec<_> = refs
+        .lines()
+        .filter(|reference| {
+            reference
+                .strip_prefix("refs/remotes/")
+                .and_then(|remote| remote.split_once('/'))
+                .is_some_and(|(_, branch)| branch == target)
+        })
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+    git(
+        repo,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", matches[0]),
+        ],
+    )
+    .await
+    .ok()
+}
+
 #[derive(Debug, Serialize)]
 struct StackEntry {
     order: usize,
@@ -282,16 +327,12 @@ struct StackEntry {
     base_ref: String,
 }
 
-async fn stack_plan(repo: &Path, revision: &str, target: &str) -> Result<Vec<StackEntry>, UiError> {
-    let base = git(
-        repo,
-        &[
-            "rev-parse",
-            "--verify",
-            &format!("refs/heads/{target}^{{commit}}"),
-        ],
-    )
-    .await?;
+async fn stack_plan(
+    repo: &Path,
+    revision: &str,
+    target: &str,
+    base: &str,
+) -> Result<Vec<StackEntry>, UiError> {
     let commits = git(
         repo,
         &[
@@ -382,7 +423,7 @@ impl PublishRequest {
     fn prompt(&self) -> String {
         let mode = match self.strategy {
             "open-pr" => "Single PR: validate the entire committed canonical diff against the chosen upstream, push the canonical head safely, create one actual PR with that head/base, and report its actual URL and head SHA.",
-            "pr-stack" => "PR stack: derive an ordered list of accepted commits/branches from canonical history only. The stack array, when present, is an initial cumulative plan: each accepted_commit is a committed canonical ancestor, each head_ref is a separate cumulative branch, and each base_ref is the upstream for entry 1 or the preceding entry's head_ref. Reverify the plan against live history; if missing, construct this same structured plan with order, accepted_commit, head_ref and base_ref before writing. Preserve merge dependencies and the complete canonical final tree. Verify each head/base diff is nonempty and validate each dependent change. Create branches at their accepted commits without overwriting occupied unrelated refs; safely push them in dependency order, create an actual separate PR for EACH entry using its explicit dependent head/base, then report an ordered array of distinct actual PR URLs, head/base refs, SHAs and validation results. At least two separate PRs are required. Never describe a single PR or a list of proposed links as a stack; if fewer than two valid accepted units exist, report a blocker and require a fresh Single PR choice.",
+            "pr-stack" => "PR stack: resolve the exact chosen upstream and its actual PR repository/base branch before deriving history. Remote-tracking Git refs such as origin/main are comparison refs; verify the actual PR base branch name on that remote. If the snapshot is absent or ambiguous, fetch/resolve it on the actual host under this same chosen authorization; do not guess a remote or ask for a separate Prepare click. Derive an ordered list of accepted commits/branches from canonical history only. The stack array, when present, is an initial cumulative plan: each accepted_commit is a committed canonical ancestor, each head_ref is a separate cumulative branch, and each base_ref is the upstream for entry 1 or the preceding entry's head_ref. Reverify the plan against live history; if missing, construct this same structured plan with order, accepted_commit, head_ref and base_ref before writing. Preserve merge dependencies and the complete canonical final tree. Verify each head/base diff is nonempty and validate each dependent change. Create branches at their accepted commits without overwriting occupied unrelated refs; safely push them in dependency order, create an actual separate PR for EACH entry using its explicit dependent head/base, then report an ordered array of distinct actual PR URLs, head/base refs, SHAs and validation results. At least two separate PRs are required. Never describe a single PR or a list of proposed links as a stack; if fewer than two valid accepted units exist, report a blocker and require a fresh Single PR choice.",
             "land-locally" => "Land locally: squash committed canonical accepted state into the primary checkout's CURRENT branch, as captured in local_target. Reverify exact checkout, branch, target revision/status and canonical revision immediately before writing. If target changed, stop for fresh review. Preserve ALL foreign staged, unstaged and untracked target edits; use a separate temporary index/checkout when needed, never absorb foreign staging into the commit or use destructive resets/stashes. Validate/review and repair conflicts, then complete this same chosen squash in one request. Never push or open a PR. Report the actual target commit and checks.",
             "squash" => "Squash committed canonical changes into the chosen target, validate and report the actual target commit; do not push or open PRs.",
             "merge" => "Merge the committed canonical ref into the chosen target, validate and report the actual merge commit; do not push or open PRs.",
@@ -1421,6 +1462,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_only_stack_upstream_queues_explicit_and_recorded_bases_without_mutation() {
+        for (upstream, recorded) in [("main", false), ("origin/main", false), ("main", true)] {
+            let (repo, view, summary) = fixture(true);
+            let base = run(&repo.0, &["rev-parse", "HEAD"]);
+            run(&repo.0, &["update-ref", "refs/remotes/origin/main", &base]);
+            let before = run(&repo.0, &["show-ref"]);
+            write(&repo.0, "foreign-untracked.txt", "preserve editor save");
+            let mut replies = initial(&view, &summary);
+            replies.push(("/api/repos/branches", branches(&repo, true)));
+            if recorded {
+                replies.push(("/api/branches/list", json!([{"branch":"accepted/topic", "repo_root":repo.0, "base_branch":upstream}])));
+            }
+            queue(&mut replies, &view);
+            let (client, server) = mock(replies).await;
+            let result = publish(
+                &client,
+                &view.id,
+                "pr-stack",
+                (!recorded).then(|| upstream.into()),
+            )
+            .await
+            .unwrap();
+            assert!(!result.local);
+            assert!(result.landing.is_none());
+            let calls = server.await.unwrap();
+            let (request, prompt) = payload(calls.last().unwrap(), false);
+            assert_eq!(request["target_upstream"], upstream);
+            assert_eq!(request["target_revision"], base);
+            assert_eq!(request["stack"].as_array().unwrap().len(), 2);
+            assert_eq!(request["stack"][0]["base_ref"], upstream);
+            assert_eq!(
+                request["stack"][1]["base_ref"],
+                request["stack"][0]["head_ref"]
+            );
+            assert!(prompt.contains("actual PR base branch name"));
+            assert_eq!(run(&repo.0, &["show-ref"]), before);
+            assert_eq!(
+                std::fs::read_to_string(repo.0.join("foreign-untracked.txt")).unwrap(),
+                "preserve editor save"
+            );
+            assert!(calls.iter().all(|call| call["key"] != "publish_result"));
+            // Remote upstream resolution never broadens canonical source scope.
+            assert!(verify_ref(&repo.0, "origin/main").await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_ambiguous_stack_base_queues_complete_resolution_instead_of_prepare_error() {
+        for ambiguous in [false, true] {
+            let (repo, view, summary) = fixture(true);
+            let base = run(&repo.0, &["rev-parse", "HEAD"]);
+            if ambiguous {
+                for remote in ["origin", "upstream"] {
+                    run(
+                        &repo.0,
+                        &["update-ref", &format!("refs/remotes/{remote}/main"), &base],
+                    );
+                }
+            }
+            let before = run(&repo.0, &["show-ref"]);
+            let mut replies = initial(&view, &summary);
+            replies.push(("/api/repos/branches", branches(&repo, true)));
+            queue(&mut replies, &view);
+            let (client, server) = mock(replies).await;
+            let result = publish(&client, &view.id, "pr-stack", Some("main".into()))
+                .await
+                .unwrap();
+            assert!(!result.local);
+            assert!(result.landing.is_none());
+            let calls = server.await.unwrap();
+            let (request, prompt) = payload(calls.last().unwrap(), false);
+            assert!(request["target_revision"].is_null());
+            assert!(request["stack"].as_array().unwrap().is_empty());
+            assert!(request["repair_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Resolve/fetch"));
+            assert!(prompt.contains("do not guess a remote"));
+            assert!(prompt.contains("if missing, construct this same structured plan"));
+            assert_eq!(run(&repo.0, &["show-ref"]), before);
+        }
+    }
+
+    #[tokio::test]
     async fn stack_rejects_one_change_instead_of_pretending_single_pr_is_stack() {
         let (repo, view, summary) = fixture(true);
         run(&repo.0.join("accepted"), &["reset", "--hard", "HEAD~1"]);
@@ -1436,7 +1561,15 @@ mod tests {
 
     #[tokio::test]
     async fn root_track_marker_and_initialized_canonical_are_required() {
-        for condition in ["child", "standalone", "pending", "unverified", "mismatched-verification", "invalid", "missing"] {
+        for condition in [
+            "child",
+            "standalone",
+            "pending",
+            "unverified",
+            "mismatched-verification",
+            "invalid",
+            "missing",
+        ] {
             let (repo, mut view, mut summary) = fixture(true);
             match condition {
                 "child" => summary.parent_session_id = Some("parent".into()),

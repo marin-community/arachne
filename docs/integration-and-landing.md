@@ -213,3 +213,10 @@ human attention for agent-owned work, its parent takes ownership, routes the
 repair/review and has the child clear that status. Only a specific decision or
 access requirement the hierarchy cannot resolve, or human judgment of a
 concrete prepared result, warrants human attention.
+
+PR-stack preflight accepts local or unambiguous remote-tracking upstream
+comparisons, including a remote-only `main` or `origin/main`. Missing or
+ambiguous local upstream snapshots queue complete coordinator resolution and
+validation under the same chosen Publish action. The coordinator must verify
+the actual remote PR repository/base branch before deriving dependent layers;
+canonical accepted sources remain local Track refs. No queued plan is a PR.
