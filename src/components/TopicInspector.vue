@@ -8,7 +8,7 @@ import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import TrackActivity from "./TrackActivity.vue";
 import AutolandControl from "./AutolandControl.vue";
-import { canonicalTopicBranch, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
+import { canonicalTopicBranch, isTrackCoordinator, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
 import { landStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import SplitButton from "./SplitButton.vue";
 import {
@@ -217,7 +217,7 @@ watch(() => props.topic.id, () => {
       </div>
       <button title="Close inspector" aria-label="Close inspector" @click="emit('close')">×</button>
     </header>
-    <div class="canonical-policy">
+    <div v-if="isTrackCoordinator(topic)" class="canonical-policy">
       <span>Canonical destination: <code>{{ canonicalTopicBranch(topic) }}</code></span>
       <AutolandControl :session="topic" :track="topic" coordinator @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
     </div>
