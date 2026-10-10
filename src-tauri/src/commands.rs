@@ -64,6 +64,7 @@ pub async fn chat_older_cursor(
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatSnapshot {
     pub blocks: Vec<crate::blocks::DisplayBlock>,
+    pub older_cursor: Option<crate::loom::ChatCursorView>,
     pub live_turn: Option<i64>,
     pub pending_prompt: Option<String>,
     pub live_started_at: Option<String>,
@@ -623,8 +624,9 @@ pub async fn fetch_chat(
     };
     let chat = client.session_chat(&id, before.as_ref()).await?;
     let (live_started_at, live_progress_at) = ChatSnapshot::live_timing(&chat);
-    *state.older_cursor.write().await = chat.older_cursor;
+    *state.older_cursor.write().await = chat.older_cursor.clone();
     Ok(ChatSnapshot {
+        older_cursor: chat.older_cursor,
         blocks: chat
             .blocks
             .iter()

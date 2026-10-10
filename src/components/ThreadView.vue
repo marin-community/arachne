@@ -36,6 +36,7 @@ interface Cursor {
 // reload (the turn's opening message = start, newest block = progress).
 interface ChatSnapshot {
   blocks: ChatDisplayBlock[];
+  older_cursor: Cursor | null;
   metadata: AcpMetadata;
   live_turn: number | null;
   pending_prompt: string | null;
@@ -290,9 +291,26 @@ watch(() => props.topic?.id, () => {
 });
 const busy = ref(false);
 const loadingOlder = ref(false);
-const hasOlder = ref(true);
+const olderCursor = ref<Cursor | null>(null);
+const hasOlder = computed(() => olderCursor.value !== null);
+const olderError = ref(false);
 const convEl = ref<HTMLElement | null>(null);
 const unlisteners: UnlistenFn[] = [];
+const OLDER_PREFETCH_THRESHOLD = 240;
+let chatGeneration = 0;
+let disposed = false;
+const historyReady = ref(false);
+let lastConversationScrollTop = 0;
+let olderRequest: symbol | null = null;
+
+function invalidateChat() {
+  chatGeneration++;
+  historyReady.value = false;
+}
+
+function chatIsCurrent(generation: number, id: string, url: string) {
+  return !disposed && chatGeneration === generation && props.session.id === id && props.loomUrl === url;
+}
 
 // --- Live-turn state (the working spinner) ---------------------------------
 //
@@ -554,14 +572,22 @@ function atBottom(): boolean {
   return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
 }
 function scrollToBottom() {
+  const generation = chatGeneration;
+  const id = props.session.id;
+  const url = props.loomUrl;
   nextTick(() => {
-    if (convEl.value) convEl.value.scrollTop = convEl.value.scrollHeight;
+    if (convEl.value && chatIsCurrent(generation, id, url)) {
+      convEl.value.scrollTop = convEl.value.scrollHeight;
+      lastConversationScrollTop = convEl.value.scrollTop;
+    }
   });
 }
 
 // Debounced reload: SSE events arrive in bursts (one turn journals many
 // blocks); re-fetching per event hammers loom and re-renders constantly.
 let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+let reloadRequest: Promise<boolean> | null = null;
+let reloadQueued = false;
 function scheduleReload() {
   if (reloadTimer) return;
   reloadTimer = setTimeout(async () => {
@@ -570,61 +596,115 @@ function scheduleReload() {
   }, 300);
 }
 
-async function reload() {
+function reload(): Promise<boolean> {
+  if (reloadRequest) {
+    reloadQueued = true;
+    return reloadRequest;
+  }
+  const request = reloadSnapshot();
+  reloadRequest = request;
+  void request.finally(() => {
+    if (reloadRequest !== request) return;
+    reloadRequest = null;
+    if (reloadQueued && !disposed) {
+      reloadQueued = false;
+      scheduleReload();
+    }
+  });
+  return request;
+}
+
+async function reloadSnapshot() {
+  const wasReady = historyReady.value;
+  invalidateChat();
+  const generation = chatGeneration;
+  const id = props.session.id;
+  const url = props.loomUrl;
   const stick = atBottom();
   const fetchedAt = Date.now();
   try {
     const snap = await invoke<ChatSnapshot>("fetch_chat", {
-      id: props.session.id,
+      id,
     });
+    if (!chatIsCurrent(generation, id, url)) return false;
+    const stillAtBottom = atBottom();
     blocks.value = snap.blocks;
     metadata.value = snap.metadata;
     if (snap.live_turn != null) snapshotLiveTurn.value = snap.live_turn;
     else if (!turnLive.value) snapshotLiveTurn.value = null;
     applyLive(snap, fetchedAt);
-    const cursor = await invoke<Cursor | null>("chat_older_cursor");
-    hasOlder.value = cursor !== null;
-    if (stick) scrollToBottom();
+    olderCursor.value = snap.older_cursor ?? null;
+    await nextTick();
+    if (!chatIsCurrent(generation, id, url)) return false;
+    historyReady.value = true;
+    lastConversationScrollTop = convEl.value?.scrollTop ?? 0;
+    if (stick && stillAtBottom) scrollToBottom();
+    return true;
   } catch (e: any) {
-    emit("error", e?.message ?? String(e));
+    if (chatIsCurrent(generation, id, url)) {
+      // A failed refresh does not invalidate the displayed page's cursor.
+      historyReady.value = wasReady;
+      emit("error", e?.message ?? String(e));
+    }
+    return false;
   }
 }
 
 // Prepend the previous page of history, keeping the scroll anchored to
 // where the user is (loading older shouldn't jump the viewport).
-async function loadOlder() {
-  if (loadingOlder.value || !hasOlder.value) return;
-  const cursor = await invoke<Cursor | null>("chat_older_cursor");
-  if (!cursor) {
-    hasOlder.value = false;
-    return;
-  }
+async function loadOlder(automatic = false) {
+  if (!historyReady.value || loadingOlder.value || !olderCursor.value || (automatic && olderError.value)) return;
+  // The cursor belongs to the snapshot, so no unguarded/global lookup can
+  // race another request or a thread switch.
+  const cursor = olderCursor.value;
+  const generation = chatGeneration;
+  const id = props.session.id;
+  const url = props.loomUrl;
+  const request = Symbol();
+  olderRequest = request;
   loadingOlder.value = true;
+  olderError.value = false;
   try {
     // An older page carries its own (stale-tail) liveness fields; only the
     // blocks are wanted here — applyLive runs on newest-tail reloads only.
-    const older = (
-      await invoke<ChatSnapshot>("fetch_chat", {
-        id: props.session.id,
-        beforeTurn: cursor.turn,
-        beforeSeq: cursor.seq,
-      })
-    ).blocks;
-    if (older.length === 0) {
-      hasOlder.value = false;
-    } else {
-      const el = convEl.value;
-      const beforeHeight = el?.scrollHeight ?? 0;
-      blocks.value = [...older, ...blocks.value];
+    const page = await invoke<ChatSnapshot>("fetch_chat", {
+      id,
+      beforeTurn: cursor.turn,
+      beforeSeq: cursor.seq,
+    });
+    if (!chatIsCurrent(generation, id, url)) return;
+    const next = page.older_cursor;
+    // Empty pages and a cursor that makes no progress must never loop.
+    const advances = next && (next.turn < cursor.turn || (next.turn === cursor.turn && next.seq < cursor.seq));
+    olderCursor.value = page.blocks.length && advances ? next : null;
+    const el = convEl.value;
+    const beforeHeight = el?.scrollHeight ?? 0;
+    const beforeTop = el?.scrollTop ?? 0;
+    // Suppress browser compensation only for our own height adjustment.
+    // Restore it so images that load later can keep the reader anchored.
+    const previousAnchor = el?.style.overflowAnchor ?? "";
+    if (el) el.style.overflowAnchor = "none";
+    try {
+      blocks.value = [...page.blocks, ...blocks.value];
       await nextTick();
-      if (el) el.scrollTop += el.scrollHeight - beforeHeight;
+      if (!chatIsCurrent(generation, id, url)) return;
+      if (el && el === convEl.value) {
+        el.scrollTop = beforeTop + el.scrollHeight - beforeHeight;
+        lastConversationScrollTop = el.scrollTop;
+      }
+    } finally {
+      if (el) el.style.overflowAnchor = previousAnchor;
     }
-    const next = await invoke<Cursor | null>("chat_older_cursor");
-    hasOlder.value = next !== null;
   } catch (e: any) {
-    emit("error", e?.message ?? String(e));
+    if (chatIsCurrent(generation, id, url)) {
+      olderError.value = true;
+      emit("error", e?.message ?? String(e));
+    }
   } finally {
-    loadingOlder.value = false;
+    if (olderRequest === request) {
+      olderRequest = null;
+      loadingOlder.value = false;
+    }
   }
 }
 
@@ -654,6 +734,12 @@ function recomputeCorners() {
 }
 
 function onConversationScroll() {
+  const el = convEl.value;
+  if (el) {
+    const movingUp = el.scrollTop < lastConversationScrollTop;
+    lastConversationScrollTop = el.scrollTop;
+    if (movingUp && el.scrollTop <= OLDER_PREFETCH_THRESHOLD && !atBottom()) void loadOlder(true);
+  }
   if (cornerRaf != null) return;
   cornerRaf = requestAnimationFrame(() => {
     cornerRaf = null;
@@ -678,21 +764,21 @@ watch(collapsed, () => {
 
 onMounted(async () => {
   ticker = setInterval(() => (clock.value = Date.now()), 1000);
-  await reload();
-  scrollToBottom();
+  if (await reload()) scrollToBottom();
+  if (disposed) return;
   recomputeCorners();
-  unlisteners.push(
-    await listen("loom://chat-event", (event) => {
-      const frame = event.payload as ChatEventFrame;
-      if (frame.topic === "connection" && frame.event === "resync") { scheduleReload(); return; }
-      if (
-        frame.topic.startsWith("chat:") ||
-        frame.topic.startsWith("session:")
-      ) {
-        onChatFrame(frame);
-      }
-    }),
-  );
+  const unlisten = await listen("loom://chat-event", (event) => {
+    const frame = event.payload as ChatEventFrame;
+    if (frame.topic === "connection" && frame.event === "resync") { scheduleReload(); return; }
+    if (
+      frame.topic.startsWith("chat:") ||
+      frame.topic.startsWith("session:")
+    ) {
+      onChatFrame(frame);
+    }
+  });
+  if (disposed) unlisten();
+  else unlisteners.push(unlisten);
 });
 
 // Defense in depth: the parent keys this component by session id so a
@@ -700,25 +786,33 @@ onMounted(async () => {
 // a mounted instance (state desync, future refactor), refetch rather than
 // show the wrong thread.
 watch(
-  () => props.session.id,
-  async (newId, oldId) => {
-    if (newId !== oldId) {
-      collapsed.value = {};
-      hasOlder.value = true;
-      blocks.value = [];
-      turnLive.value = false;
-      turnStartedAt.value = null;
-      lastProgressAt.value = null;
-      pendingPrompt.value = null;
-      snapshotLiveTurn.value = null;
-      sseTurnAt = 0;
-      await reload();
-      scrollToBottom();
-    }
+  [() => props.session.id, () => props.loomUrl],
+  async () => {
+    invalidateChat();
+    if (reloadTimer) clearTimeout(reloadTimer);
+    reloadTimer = null;
+    reloadRequest = null;
+    reloadQueued = false;
+    olderRequest = null;
+    loadingOlder.value = false;
+    olderError.value = false;
+    collapsed.value = {};
+    olderCursor.value = null;
+    blocks.value = [];
+    turnLive.value = false;
+    turnStartedAt.value = null;
+    lastProgressAt.value = null;
+    pendingPrompt.value = null;
+    snapshotLiveTurn.value = null;
+    sseTurnAt = 0;
+    if (await reload()) scrollToBottom();
   },
+  { flush: "sync" },
 );
 
 onUnmounted(() => {
+  disposed = true;
+  invalidateChat();
   unlisteners.forEach((u) => u());
   if (reloadTimer) clearTimeout(reloadTimer);
   if (ticker) clearInterval(ticker);
@@ -1228,8 +1322,8 @@ async function onLand(strategy: string) {
     </div>
     <div class="conversation" ref="convEl" @scroll="onConversationScroll" @copy="onConversationCopy">
       <div v-if="hasOlder" class="load-older">
-        <button :disabled="loadingOlder" @click="loadOlder">
-          {{ loadingOlder ? "loading…" : "load older" }}
+        <button :disabled="loadingOlder || !historyReady" @click="loadOlder()">
+          {{ loadingOlder ? "loading…" : olderError ? "retry older messages" : "load older" }}
         </button>
       </div>
       <template v-for="row in rows" :key="row.key">

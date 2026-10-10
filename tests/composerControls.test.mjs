@@ -60,6 +60,8 @@ before(async () => {
   globalThis.ShadowRoot = class {};
   globalThis.document = { activeElement: null, addEventListener() {}, removeEventListener() {} };
   globalThis.localStorage = { getItem: () => null };
+  globalThis.requestAnimationFrame = (callback) => setImmediate(callback);
+  globalThis.cancelAnimationFrame = clearImmediate;
 });
 
 after(async () => {
@@ -68,12 +70,14 @@ after(async () => {
   delete globalThis.Document;
   delete globalThis.ShadowRoot;
   delete globalThis.localStorage;
+  delete globalThis.requestAnimationFrame;
+  delete globalThis.cancelAnimationFrame;
   if (directory) await rm(directory, { recursive: true, force: true });
 });
 
 function element(type, text = "") {
   return {
-    type, text, props: {}, children: [], parent: null, listeners: {},
+    type, text, props: {}, children: [], parent: null, listeners: {}, style: {},
     value: "", scrollHeight: 0, scrollTop: 0, clientHeight: 0,
     addEventListener(name, handler) { (this.listeners[name] ??= []).push(handler); },
     removeEventListener() {},
@@ -91,7 +95,26 @@ const renderer = createRenderer({
   createComment: (text) => element("#comment", text),
   setText: (node, text) => { node.text = text; },
   setElementText: (node, text) => { node.text = text; node.children = []; },
-  patchProp: (node, key, _previous, value) => { node.props[key] = value; },
+  patchProp: (node, key, _previous, value) => {
+    node.props[key] = value;
+    if (key === "class" && value === "conversation" && globalThis.__composerControls.geometry) {
+      // Model real scroll clamping and height changes as message rows and
+      // the fallback control render. This also catches double anchoring.
+      let top = 0;
+      let delayedHeight = 0;
+      node.clientHeight = 400;
+      Object.defineProperty(node, "scrollHeight", { get: () => 1000 + delayedHeight + node.children.reduce((height, child) =>
+        height + (child.props.class?.split(" ").includes("block") ? 300 : child.props.class === "load-older" ? 40 : 0), 0) });
+      Object.defineProperty(node, "scrollTop", {
+        get: () => top,
+        set: (value) => { top = Math.max(0, Math.min(value, node.scrollHeight - node.clientHeight)); },
+      });
+      node.growAboveViewport = (height) => {
+        delayedHeight += height;
+        if (node.style.overflowAnchor !== "none") node.scrollTop += height;
+      };
+    }
+  },
   parentNode: (node) => node.parent,
   nextSibling: (node) => node.parent?.children[node.parent.children.indexOf(node) + 1] ?? null,
   insert(node, parent, anchor = null) {
@@ -134,31 +157,33 @@ function session(status = "running", tags = [], protocol = "terminal") {
   return { ...fixture, status, protocol, branch: { ...fixture.branch, tags } };
 }
 
-async function mount(t, Component, initialProps, liveTurn = null) {
+async function mount(t, Component, initialProps, liveTurn = null, options = {}) {
   const calls = [];
   const errors = [];
   const props = reactive(initialProps);
   const bridge = {
-    snapshot: { blocks: [], metadata: { config_options: [], commands: [], modes: [], steering_supported: false }, live_turn: liveTurn, pending_prompt: null },
+    geometry: options.geometry,
+    snapshot: { blocks: [], metadata: { config_options: [], commands: [], modes: [], steering_supported: false }, live_turn: liveTurn, pending_prompt: null, older_cursor: null, ...options.snapshot },
     action: async () => {},
     async invoke(command, args) {
       calls.push({ command, args });
+      if (this.fetch && command === "fetch_chat") return this.fetch(args);
       if (command === "fetch_chat") return this.snapshot;
       if (command === "chat_older_cursor" || command === "work_summary") return null;
       if (["interrupt", "send_input", "clear_attention"].includes(command)) return this.action(command, args);
       throw new Error(`Unexpected native command: ${command}`);
     },
-    async listen() { return () => {}; },
+    async listen(_name, callback) { this.onFrame = callback; return () => {}; },
   };
   globalThis.__composerControls = bridge;
   const tree = element("root");
   const app = renderer.createApp({ render: () => h(Component, { ...props, onError: (error) => errors.push(error) }) });
   app.config.errorHandler = (error) => errors.push(error);
-  t.after(() => { app.unmount(); assert.deepEqual(errors, [], "component must not fail during lifecycle or actions"); });
+  t.after(() => { app.unmount(); assert.deepEqual(errors, options.expectedErrors ?? [], "component must not fail during lifecycle or actions"); });
   app.mount(tree);
   await flush();
   calls.length = 0;
-  return { tree, props, bridge, calls };
+  return { tree, props, bridge, calls, errors, app };
 }
 
 function threadProps(current) {
@@ -285,4 +310,275 @@ test("sidebar exposes archived Unarchive through the filter and disables only th
   assert.equal(button(restoredCard, "Unarchive"), null, "the restored track loses its archive action");
   assert.ok(button(tree, "Unarchive"), "the other archived track remains restorable");
   assert.equal(calls.length, 0, "restoration routes through the parent event");
+});
+
+const cursor = (turn) => ({ turn, seq: 0 });
+const historyPage = (turn = 10, older = cursor(9)) => ({
+  blocks: [{ kind: "plan", turn, seq: 1, entries: [[`turn ${turn}`, "completed"]] }],
+  older_cursor: older,
+});
+const conversation = (tree) => find(tree, (node) => node.props.class === "conversation");
+const hasTurn = (tree, turn) => !!find(tree, (node) => node.props["data-copy-host"] === `block:${turn}:1`);
+function scroll(tree, top) {
+  const el = conversation(tree);
+  el.scrollTop = top;
+  el.props.onScroll();
+}
+const deferred = () => {
+  let resolve, reject;
+  const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+  return { promise, resolve, reject };
+};
+async function mountHistory(t, options = {}) {
+  return mount(t, ThreadView, threadProps(session()), null, { geometry: true, snapshot: historyPage(), ...options });
+}
+const pageCalls = (calls) => calls.filter(({ command, args }) => command === "fetch_chat" && args.beforeTurn != null);
+
+// Exercise the real scroll handler, native paging boundary, and Vue render
+// flush; geometry reflects inserted rows and removal of the history control.
+test("near-top upward scroll prefetches once with the snapshot cursor and preserves the visible offset", async (t) => {
+  const { tree, bridge, calls } = await mountHistory(t);
+  const pending = deferred();
+  bridge.fetch = () => pending.promise;
+  const el = conversation(tree);
+  assert.equal(el.scrollTop, el.scrollHeight - el.clientHeight, "initial visit opens at the latest message");
+  scroll(tree, 241);
+  assert.equal(pageCalls(calls).length, 0);
+  scroll(tree, 240);
+  scroll(tree, 240); // identical synthetic events must not start another page
+  scroll(tree, 200);
+  button(tree, "load older").props.onClick(); // bypass the disabled button
+  assert.equal(pageCalls(calls).length, 1);
+  assert.deepEqual(pageCalls(calls)[0].args, { id: fixture.id, beforeTurn: 9, beforeSeq: 0 });
+  assert.equal(calls.some(({ command }) => command === "chat_older_cursor"), false, "cursor lookup cannot race or overlap paging");
+  const beforeHeight = el.scrollHeight;
+  pending.resolve({ ...bridge.snapshot, ...historyPage(8, cursor(7)) });
+  await flush();
+  assert.ok(hasTurn(tree, 8));
+  assert.ok(hasTurn(tree, 10));
+  assert.equal(el.scrollTop, 200 + el.scrollHeight - beforeHeight, "anchor uses the position at response time");
+  el.props.onScroll();
+  el.props.onScroll();
+  assert.equal(pageCalls(calls).length, 1, "prepend's scroll events do not chain requests");
+  bridge.fetch = async () => ({ ...bridge.snapshot, ...historyPage(6, null) });
+  scroll(tree, 240);
+  assert.equal(pageCalls(calls).length, 2, "scrolling up again pages from the returned cursor");
+  assert.equal(pageCalls(calls)[1].args.beforeTurn, 7);
+  await flush();
+  assert.ok(hasTurn(tree, 6));
+});
+
+test("equal-position events, downward scrolling, and a short bottom-pinned conversation do not prefetch", async (t) => {
+  const { tree, bridge, calls } = await mountHistory(t);
+  const el = conversation(tree);
+  el.props.onScroll();
+  el.props.onScroll();
+  scroll(tree, 300);
+  scroll(tree, 350);
+  assert.equal(pageCalls(calls).length, 0);
+  el.clientHeight = el.scrollHeight;
+  scroll(tree, 0);
+  assert.equal(pageCalls(calls).length, 0);
+  assert.ok(bridge.snapshot.older_cursor, "history exists but latest-message pinning wins");
+});
+
+for (const [name, page] of [
+  ["null cursor", historyPage(8, null)],
+  ["empty page", { blocks: [], older_cursor: cursor(7) }],
+  ["non-advancing cursor", historyPage(8, cursor(9))],
+]) {
+  test(`older history stops on ${name} and repeated scroll events cannot loop`, async (t) => {
+    const { tree, bridge, calls } = await mountHistory(t);
+    bridge.fetch = async () => ({ ...bridge.snapshot, ...page });
+    const el = conversation(tree);
+    scroll(tree, 100);
+    const beforeHeight = el.scrollHeight;
+    await flush();
+    assert.equal(el.scrollTop, 100 + el.scrollHeight - beforeHeight, "final control removal participates in anchoring");
+    assert.equal(button(tree, "load older"), null);
+    scroll(tree, 0);
+    el.props.onScroll();
+    scroll(tree, 50);
+    scroll(tree, 0);
+    assert.equal(pageCalls(calls).length, 1);
+  });
+}
+
+test("a failed prefetch pauses automatic retries while the manual fallback remains useful", async (t) => {
+  const { tree, bridge, calls, errors } = await mountHistory(t, { expectedErrors: ["offline"] });
+  bridge.fetch = async () => { throw new Error("offline"); };
+  scroll(tree, 200);
+  await flush();
+  assert.deepEqual(errors, ["offline"]);
+  assert.equal(button(tree, "retry older messages").props.disabled, false);
+  scroll(tree, 100);
+  scroll(tree, 50);
+  conversation(tree).props.onScroll();
+  await flush();
+  assert.equal(pageCalls(calls).length, 1);
+  bridge.fetch = async (args) => args.beforeTurn == null ? bridge.snapshot : { ...bridge.snapshot, ...historyPage(8) };
+  await resync(bridge);
+  scroll(tree, 25);
+  assert.equal(pageCalls(calls).length, 1, "live reloads must not silently resume failed prefetches");
+  click(button(tree, "retry older messages"));
+  await flush();
+  assert.ok(hasTurn(tree, 8));
+  assert.equal(pageCalls(calls).length, 2);
+});
+
+test("thread switches discard stale pages and old completion cannot unlock the new thread's request", async (t) => {
+  const { tree, props, bridge, calls } = await mountHistory(t);
+  const old = deferred();
+  const current = deferred();
+  bridge.fetch = (args) => args.beforeTurn == null
+    ? { ...bridge.snapshot, ...historyPage(20, cursor(19)) }
+    : args.id === fixture.id ? old.promise : current.promise;
+  scroll(tree, 200);
+  props.session = { ...props.session, id: "new-thread" };
+  await flush();
+  scroll(tree, 200);
+  await flush();
+  assert.equal(button(tree, "loading…").props.disabled, true);
+  old.resolve({ ...bridge.snapshot, ...historyPage(8) });
+  await flush();
+  assert.equal(hasTurn(tree, 8), false);
+  assert.ok(hasTurn(tree, 20));
+  assert.equal(button(tree, "loading…").props.disabled, true);
+  scroll(tree, 100);
+  assert.equal(pageCalls(calls).length, 2);
+  current.resolve({ ...bridge.snapshot, ...historyPage(18, null) });
+  await flush();
+  assert.ok(hasTurn(tree, 18));
+  assert.equal(hasTurn(tree, 10), false);
+});
+
+test("stale page failures after server changes or unmount do not emit errors or mutate history", async (t) => {
+  const { tree, props, bridge, app, errors } = await mountHistory(t);
+  const old = deferred();
+  bridge.fetch = (args) => args.beforeTurn == null ? bridge.snapshot : old.promise;
+  scroll(tree, 200);
+  props.loomUrl = "http://other-server:7878";
+  await flush();
+  old.reject(new Error("stale server"));
+  await flush();
+  assert.deepEqual(errors, []);
+  const unmounted = deferred();
+  bridge.fetch = () => unmounted.promise;
+  scroll(tree, 200);
+  app.unmount();
+  unmounted.reject(new Error("unmounted"));
+  await flush();
+  assert.deepEqual(errors, []);
+});
+
+async function resync(bridge) {
+  bridge.onFrame({ payload: { topic: "connection", event: "resync" } });
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  await flush();
+}
+
+test("latest-message reloads still autoscroll at the bottom and leave a reader above it in place", async (t) => {
+  const { tree, bridge } = await mountHistory(t);
+  const el = conversation(tree);
+  bridge.snapshot = { ...bridge.snapshot, blocks: [...bridge.snapshot.blocks, ...historyPage(11).blocks] };
+  await resync(bridge);
+  assert.equal(el.scrollTop, el.scrollHeight - el.clientHeight);
+  scroll(tree, 400);
+  bridge.snapshot = { ...bridge.snapshot, blocks: [...bridge.snapshot.blocks, ...historyPage(12).blocks] };
+  await resync(bridge);
+  assert.equal(el.scrollTop, 400);
+  assert.ok(hasTurn(tree, 12));
+});
+
+test("a reload invalidates an outstanding older page without causing scroll loops", async (t) => {
+  const { tree, bridge, calls } = await mountHistory(t);
+  const old = deferred();
+  bridge.fetch = (args) => args.beforeTurn == null ? { ...bridge.snapshot, ...historyPage(11) } : old.promise;
+  scroll(tree, 200);
+  await resync(bridge);
+  old.resolve({ ...bridge.snapshot, ...historyPage(8) });
+  await flush();
+  assert.equal(hasTurn(tree, 8), false);
+  assert.ok(hasTurn(tree, 11));
+  conversation(tree).props.onScroll();
+  conversation(tree).props.onScroll();
+  assert.equal(pageCalls(calls).length, 1);
+  assert.equal(button(tree, "load older").props.disabled, false);
+});
+
+test("latest reloads discard stale thread replies and respect scrolling during a pending request", async (t) => {
+  const { tree, props, bridge } = await mountHistory(t);
+  const pending = deferred();
+  bridge.fetch = () => pending.promise;
+  await resync(bridge);
+  scroll(tree, 400);
+  pending.resolve({ ...bridge.snapshot, ...historyPage(11) });
+  await flush();
+  assert.equal(conversation(tree).scrollTop, 400, "a reader who moves away during the fetch stays in place");
+  const stale = deferred();
+  bridge.fetch = () => stale.promise;
+  await resync(bridge);
+  bridge.fetch = () => ({ ...bridge.snapshot, ...historyPage(20) });
+  props.session = { ...props.session, id: "new-thread" };
+  await flush();
+  stale.resolve({ ...bridge.snapshot, ...historyPage(12) });
+  await flush();
+  assert.ok(hasTurn(tree, 20));
+  assert.equal(hasTurn(tree, 12), false);
+});
+
+test("continuous SSE refreshes coalesce behind a pending tail request without starving its response", async (t) => {
+  const { tree, bridge, calls } = await mountHistory(t);
+  const first = deferred();
+  const second = deferred();
+  let fetches = 0;
+  bridge.fetch = () => ++fetches === 1 ? first.promise : second.promise;
+  await resync(bridge);
+  await resync(bridge);
+  await resync(bridge);
+  assert.equal(calls.filter(({ command }) => command === "fetch_chat").length, 1, "SSE bursts share the current request");
+  first.resolve({ ...bridge.snapshot, ...historyPage(11) });
+  await flush();
+  assert.ok(hasTurn(tree, 11), "the pending response must reach the conversation despite newer events");
+  assert.equal(conversation(tree).scrollTop, conversation(tree).scrollHeight - conversation(tree).clientHeight);
+  await new Promise((resolve) => setTimeout(resolve, 320));
+  assert.equal(fetches, 2, "one trailing refresh catches events received during the fetch");
+  second.resolve({ ...bridge.snapshot, ...historyPage(12) });
+  await flush();
+  assert.ok(hasTurn(tree, 12));
+  assert.equal(button(tree, "load older").props.disabled, false);
+});
+
+test("a failed tail refresh keeps the displayed history cursor usable without starting an automatic retry", async (t) => {
+  const { tree, bridge, calls } = await mountHistory(t, { expectedErrors: ["tail offline"] });
+  bridge.fetch = async (args) => {
+    if (args.beforeTurn == null) throw new Error("tail offline");
+    return { ...bridge.snapshot, ...historyPage(8, null) };
+  };
+  await resync(bridge);
+  assert.ok(hasTurn(tree, 10));
+  assert.equal(button(tree, "load older").props.disabled, false);
+  conversation(tree).props.onScroll();
+  assert.equal(calls.filter(({ command }) => command === "fetch_chat").length, 1);
+  click(button(tree, "load older"));
+  await flush();
+  assert.ok(hasTurn(tree, 8));
+  assert.equal(pageCalls(calls).length, 1);
+});
+
+test("prepend compensation restores browser anchoring for delayed image height changes", async (t) => {
+  const { tree, bridge } = await mountHistory(t);
+  const pending = deferred();
+  bridge.fetch = () => pending.promise;
+  const el = conversation(tree);
+  el.style.overflowAnchor = "auto";
+  scroll(tree, 200);
+  pending.resolve({ ...bridge.snapshot, ...historyPage(8) });
+  await flush();
+  assert.equal(el.style.overflowAnchor, "auto", "temporary suppression must restore the previous anchor policy");
+  const offset = el.scrollHeight - el.scrollTop;
+  el.growAboveViewport(240); // native image content arrives after the prepend flush
+  assert.equal(el.scrollHeight - el.scrollTop, offset, "the browser can still compensate for delayed content above the reader");
+  el.props.onScroll();
+  assert.equal(el.style.overflowAnchor, "auto");
 });
