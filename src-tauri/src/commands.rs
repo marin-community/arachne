@@ -2389,17 +2389,6 @@ pub enum LandingTargetOrigin {
     Explicit,
 }
 
-impl LandingTargetOrigin {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::PrimaryCheckout => "primary-checkout",
-            Self::MainFallback => "main-fallback",
-            Self::RecordedBase => "recorded-base",
-            Self::Explicit => "explicit",
-        }
-    }
-}
-
 /// Resolve the landing target for a non-PR strategy: the primary checkout's
 /// currently checked out branch — the checkout a human actually opens —
 /// falling back to `main` when it cannot be resolved (no such branch, no
@@ -2412,6 +2401,7 @@ impl LandingTargetOrigin {
 /// loom marked every worktree's branch `current`. The topic's own branch is
 /// skipped when matched: landing into it would be a no-op self-merge, so the
 /// `main` fallback applies instead.
+#[cfg(test)]
 fn resolve_landing_target(
     repo_branches: &[crate::loom::RepoBranchView],
     repo_root: &str,
@@ -2445,7 +2435,7 @@ fn resolve_landing_target(
     None
 }
 
-/// The result of a Land action. The agent-mediated strategies just send a
+/// The result of a Track Publish action. Agent-mediated strategies send a
 /// request (their outcome is reported in the topic thread). A suitable
 /// `land-locally` fast path returns the completed squash-merge; queued
 /// preparation or repair always returns local=false.
@@ -2458,10 +2448,8 @@ pub struct LandResult {
     pub landing: Option<LocalLandingView>,
 }
 
-/// Land a topic: move accepted state toward the upstream target. Most
-/// strategies send a complete prepare-and-land request to the coordinator.
-/// A clean suitable `land-locally` source takes the synchronous squash path;
-/// preparation or safely recoverable repair continues through the coordinator.
+/// Compatibility name for Track Publish; resolve the canonical accepted ref.
+/// Worker acceptance uses land_thread instead.
 #[tauri::command]
 pub async fn land_topic(
     state: State<'_, LoomState>,
@@ -2474,6 +2462,7 @@ pub async fn land_topic(
     crate::publishing::publish_track(state, session_id, strategy, upstream).await
 }
 
+#[cfg(test)]
 async fn dispatch_landing(
     client: &LoomClient,
     view: &SessionView,
@@ -2534,6 +2523,7 @@ fn host_is_loopback(host: &str) -> bool {
 /// paths; a remote server would make Arachne run git against a
 /// server-side path that is meaningless here), and the topic must own a
 /// branch — an archived or branchless topic has nothing to land.
+#[cfg(test)]
 async fn land_topic_locally(
     client: Arc<LoomClient>,
     view: SessionView,
@@ -2676,6 +2666,7 @@ async fn land_topic_locally(
 
 /// A landing title for the squash commit: the topic's name, else the
 /// branch's title, else the branch name.
+#[cfg(test)]
 fn summary_title(summary: &SessionSummaryView, view: &SessionView) -> String {
     if !summary.branch.name.trim().is_empty() {
         return summary.branch.name.clone();
@@ -2694,17 +2685,6 @@ pub struct WorkSummary {
     pub deletions: u32,
     pub files: u32,
     pub has_commits: bool,
-}
-
-/// Find a branch's recorded base branch from `branches.list` rows.
-/// The DTO carries `base_branch` per branch (BranchView).
-fn branches_list_base(branches: &[serde_json::Value], branch: &str) -> Option<String> {
-    branches
-        .iter()
-        .find(|b| b.get("branch").and_then(|v| v.as_str()) == Some(branch))
-        .and_then(|b| b.get("base_branch"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
 }
 
 #[tauri::command]
