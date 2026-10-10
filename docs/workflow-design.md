@@ -293,56 +293,42 @@ This should be coordinator judgment or Track policy, not an inflexible runtime r
 
 ---
 
-# 10. Integration
+# 10. Thread Land into accepted Track state
 
-Worker completion and worker review do **not** automatically mutate the Track's accepted state.
+The Landing queue includes working, waiting and reported ready sources as
+well as stale/conflicted and actual landed outcomes. The coordinator and
+reviewer-only Threads are not acceptance candidates. A ready tag is not a
+prerequisite for a manual Land request; advisory source state is not verified
+readiness.
 
-Substantive coding work becomes an **integration candidate**.
+Land queues source wrap-up behind its active ACP turn and one complete
+coordinator request to inspect/review/repair/validate intended work, commit
+intended changes while preserving foreign edits, and apply the chosen
+acceptance operation without a second Prepare click. Terminal compatibility
+uses durable channel delivery, not input injection or a claimed ACP queue.
+Default acceptance is one squash into the canonical Track topic ref; merge,
+rebase and selective cherry-pick are optional acceptance strategies.
 
-The Track owns integration.
+New Tracks initialize real editable `arachne/tracks/<slug>` topic refs from
+the launch seed, persisted as `track_topic_branch`, independently of the
+Loom coordinator scratch branch. Legacy no-tag Tracks retain their accepted
+branch. Always reverify source identity/revision and current canonical target
+before writing, reconcile in isolation, and preserve foreign staged,
+unstaged and untracked work.
 
-Typical path:
+Autoland defaults Off on the Track, with per-thread Inherit/On/Off overrides
+persisted in Loom. Explicit policy instructions and existing typed-result
+wake routes drive coordinator review/repair/squash acceptance. Only complete
+successful intended implementations qualify; review-only, partial,
+checkpoint and parent-help notices do not. Reread live effective policy
+before automatic writes, suppressing stale queued requests after disabling.
+For nested sources, establish/verify real coordinator delivery subscriptions
+to the immediate-parent result-notification channel (or durable forwarding)
+before waiting. No scheduler, polling, implicit PR opening or main publication.
 
-```text
-implementation
-    ↓
-review
-    ↓
-candidate ready
-    ↓
-integrate into Track
-    ↓
-Track canonical/topic ref advances
-```
-
-Integration may use:
-
-- squash;
-- merge;
-- rebase;
-- cherry-pick;
-- PR into the Track branch;
-- coordinator-selected strategy.
-
-A clean mechanical integration should not require an LLM.
-
-Prefer a deterministic path using a disposable integration worktree:
-
-1. prepare target at current Track ref;
-2. apply candidate with chosen strategy;
-3. run configured validation;
-4. advance the target ref;
-5. clean up.
-
-Use an LLM/worker when:
-
-- conflicts arise;
-- tests fail;
-- integration requires interpretation;
-- several candidates must be reconciled;
-- strategy is ambiguous.
-
-The original worker is often the best first agent to wake for a conflict involving its own work.
+A queued Land is not a successful result. Report actual commits and current
+source/target validation; stamp `integration_result` only after acceptance
+succeeds. Review → Prepare remains separate optional preparation only.
 
 ---
 
@@ -418,45 +404,26 @@ Human approval does not necessarily mean immediate merge to main.
 
 ---
 
-# 13. Land
+# 13. Track Publish
 
-**Land** is distinct from Integrate.
+Thread **Land** accepts source work into the canonical Track topic branch.
+Track **Publish** moves only that accepted state to an external destination
+under the user's explicit chosen action. Autoland never supplies publishing
+authority; coordinator scratch work is not accepted publishing source.
 
-- **Integrate** moves child work into the Track's accepted state.
-- **Land** moves the Track's accepted state to its external destination.
+Choices include Single PR, a PR stack, or chosen local/upstream
+squash/merge/rebase/push. A stack defines ordered accepted changes, head refs
+and dependent bases, validates each layer, and creates/reports actual
+separate PR links; a single PR is not a stack. Local publishing uses the
+primary checkout's CURRENT branch with no assumed main/recorded-base
+fallback, preserving foreign staged/unstaged/untracked target work. Clean
+suitable local publication remains synchronous; recoverable staged-target
+or safely unwound conflict repair queues a complete chosen publication
+request, never a premature success state.
 
-Examples:
-
-```text
-workers
-   ↓ integrate
-feature/topic branch
-   ↓ land
-main
-```
-
-or:
-
-```text
-workers
-   ↓ integrate
-feature/topic branch
-   ↓ land
-GitHub PR → main
-```
-
-Land behavior is determined by Project/Track policy.
-
-Possible policies:
-
-- open PR;
-- squash into main;
-- merge;
-- rebase/fast-forward;
-- push long-lived feature branch;
-- custom landing skill.
-
-The user may explicitly press **Land**, or potentially authorize autonomous landing under a suitable policy later.
+`publish_result` records actual successful publication separately from
+worker acceptance. User review of coherent accepted state may precede Publish;
+partial results or stopping alone are not readiness for either operation.
 
 ---
 
@@ -940,7 +907,7 @@ First:
 3. give coordinator straightforward spawn/review/send-to-thread tools;
 4. normalize concise worker result/handoff;
 5. make review spawning easy;
-6. make Integrate available at Track level;
+6. make Thread Land available in the Track Landing queue;
 7. make Attention require explicit human escalation;
 8. improve UI visibility into active/ready/waiting/resting Threads.
 
@@ -974,11 +941,11 @@ workers execute
         ↓
 agents review
         ↓
-Track integrates
+Track accepts Thread Land into topic ref
         ↓
 human reviews coherent Track state
         ↓
-Land
+explicit Track Publish
 ```
 
 But the system must remain flexible enough to skip, recurse, retry, inspect, or restructure that flow when the work demands it.

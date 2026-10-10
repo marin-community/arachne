@@ -1,1043 +1,180 @@
-# Arachne Integration and Landing Spec
-
-## Purpose
-
-Arachne should make it easy to take work produced by one Thread/worker and
-incorporate it into its Track's accepted state without requiring the user to
-manually manage branches, worktrees, cherry-picks, merges, or PR creation.
-Recursive integration through a parent Thread remains possible, but the normal
-user-facing flow is worker → Track.
-
-The central idea is:
-
-> **Integration is a structured operation with an explicit strategy and a
-> deterministic fast path for clean mechanical work.**
-
-The UI provides **Integrate** and **Land**. Loom may complete a clean,
-unambiguous integration without an agent turn; it wakes the appropriate worker
-or coordinator when the operation needs repair or judgment.
-
-Validation and the resulting commit/PR are verified by the control plane.
-Agents handle conflicts, failed validation, ambiguity, and product decisions.
-
----
-
-# Terminology
-
-## Track
-
-A durable unit of work.
-
-A Track may contain:
-
-- a coordinator Thread;
-- worker Threads;
-- Resources;
-- Todos;
-- subscriptions/events;
-- one or more repositories.
-- integration candidates, queue, and outcomes.
-
-For each code repository, a Track may define a **track branch/ref** representing
-accepted/integrated state. It has no single universal branch across repos.
-
-Example:
-
-```text
-Track: Arachne
-
-repository: arachne
-track branch: arachne/dev
-```
-
-## Thread
-
-A conversational/execution context. New thread can be a standalone one-off;
-Convert to track retains its history while making it the coordinator of a
-longer effort. Track terminology is user-facing; existing `topic` API names
-and metadata keys remain compatible.
-
-A worker Thread may create commits on its own branch/worktree.
-
-## Integrate
-
-Move accepted work from a child scope upward into its parent scope.
-
-Usually:
-
-```text
-worker branch
-    ↓
-Integrate
-    ↓
-track branch (or explicit parent scope)
-```
-
-Integration may be recursive, but worker → Track is the default visible path.
-
-A child worker may integrate into its parent worker, which may later integrate into the Track.
-
-## Land
-
-Move the Track's accepted state into an external/upstream target.
-
-Usually:
-
-```text
-track branch
-    ↓
-Land
-    ↓
-PR or main/upstream branch
-```
-
-Integrate and Land are intentionally distinct concepts.
-
----
-
-# Product principle
-
-Do not make users perform routine git bookkeeping.
-
-A worker should usually be created in an isolated worktree automatically.
-
-When it finishes, the Thread should expose:
-
-```text
-✓ Zed remote integration
-
-3 commits
-tests passing
-
-[Review] [Integrate ▼]
-```
-
-The user may inspect the result or immediately integrate it.
-
-The coordinator may also choose to integrate workers autonomously when policy allows.
-
-The Track inspector's **Integrations** tab should show its queue: each
-candidate's source, target repo/ref, readiness and conflict status,
-validation, and outcome. The worker Thread can expose a link or action near
-its result without owning the queue. Selecting a Track opens its coordinator
-chat (or last-opened Thread), not this queue.
-
----
-
-# Integrate UI
-
-Use a split button:
-
-```text
-[ Integrate ▼ ]
-```
-
-## Primary click
-
-The primary button executes the currently selected/default integration strategy.
-
-Example:
-
-```text
-[ Integrate ] [▼]
-```
-
-If `Squash into topic` is the current default, clicking **Integrate** invokes that strategy immediately.
-
-## Dropdown
-
-The dropdown should expose applicable strategies.
-
-Initial set:
-
-```text
-Squash into track
-Merge into track
-Rebase onto track
-Cherry-pick commits
-Open PR into track
-Ask coordinator to decide
-```
-
-Only show strategies that make sense for the current Resource relationship.
-
-For example, a worker with no commits should not offer `Cherry-pick commits`.
-
----
-
-# Default strategy
-
-Integration strategy should be remembered.
-
-Suggested precedence:
-
-1. explicit Track integration configuration;
-2. last-used strategy for this repository within this Track;
-3. last-used strategy for this repository generally;
-4. repository convention/configuration;
-5. conservative fallback: `Ask coordinator to decide`.
-
-Do **not** use one global integration preference for all repositories.
-
-Example:
-
-```text
-Arachne repo
-default: squash
-
-Loom repo
-default: merge
-```
-
-The app should remember this naturally after use.
-
----
-
-# Integration strategies
-
-The strategy selected by the user is an **intent constraint**, not an instruction to execute one raw git command blindly.
-
-## Squash into track
-
-Intent:
-
-> Incorporate the worker's effective changes as one logical commit on the target branch.
-
-The coordinator/integration skill may:
-
-- inspect the worker diff;
-- rebase/update against target if necessary;
-- resolve conflicts;
-- run validation;
-- create the squash commit;
-- update the target branch.
-
-## Merge into track
-
-Intent:
-
-> Preserve worker branch history and merge it into the target branch.
-
-Normally produces a merge commit where appropriate.
-
-## Rebase onto track
-
-Intent:
-
-> Rebase worker commits onto the target branch and integrate the resulting history.
-
-Useful when linear history matters.
-
-## Cherry-pick commits
-
-Intent:
-
-> Selectively apply the worker's commits to the target.
-
-The integration skill may ask for clarification if the worker contains multiple commits and no obvious selection exists.
-
-## Open PR into track
-
-Intent:
-
-> Do not directly modify the target branch. Create a PR from the worker branch into the track branch.
-
-Useful for repositories where review should happen through GitHub.
-
-## Ask coordinator to decide
-
-Intent:
-
-> Inspect the worker result and repository context, choose the appropriate integration strategy, execute it, and explain what was chosen.
-
-This should be the safe fallback when policy is unclear.
-
----
-
-# Integration is a structured operation
-
-The UI button and a conversational request should resolve to the same
-structured operation. Neither route requires an LLM turn for a clean,
-mechanical integration.
-
-These should be equivalent:
-
-```text
-[Integrate]
-```
-
-and:
-
-```text
-"Integrate the Zed worker into the Arachne track."
-```
-
-The underlying request should be structured.
-
-Example conceptual payload:
-
-```json
-{
-  "action": "integrate",
-  "source_thread": "thread-zed-integration",
-  "source_resource": "worktree-zed",
-  "target_scope": "topic-arachne",
-  "target_resource": "repo-arachne-topic-branch",
-  "target_revision": "789abc",
-  "strategy": "squash",
-  "validation_policy": "topic-required-checks",
-  "requested_by": "user"
-}
-```
-
-Exact API/schema is implementation-defined.
-
-## Candidate readiness and preflight
-
-A worker stopping is not enough to make its result Ready. A coding worker
-should normally stabilize/commit changes, run required validation, summarize
-the result, and preflight mergeability against the current Track ref. The UI
-can then show `Ready · clean against Arachne@789abc`. Readiness records the
-target revision and validation evidence; it is not a timeless property of the
-worker branch. The worker can sleep while the candidate remains Ready.
-
-Loom should deterministically re-run conflict preflight for sleeping Ready
-candidates when Track state advances. A clean candidate records the new target
-revision and stays asleep. A new
-conflict becomes an Event, with the original worker preferred for reconciliation
-against the updated ref. Worker lifecycle and integration lifecycle are
-separate: sleeping, running, and archived are not synonyms for ready, stale,
-conflicting, integrated, or failed. A `git merge-tree` preview or equivalent
-can surface likely conflicts before the user chooses Integrate; applying the
-strategy in the disposable worktree and validating it remain authoritative.
-
-## Deterministic fast path
-
-For a clean candidate with a configured strategy and validation policy:
-
-1. Create a disposable integration worktree at the expected Track revision.
-2. Apply the selected strategy there.
-3. Run required validation and record evidence.
-4. Advance the Track ref only if its expected revision still matches.
-5. Record the resulting commit/PR and clean up the temporary checkout.
-
-An unsuccessful attempt leaves the canonical checkout and ref intact. If the
-ref moved, refresh preflight and retry within policy or mark the candidate
-stale. Conflicts, failing tests, ambiguity, or product judgment route to the
-original worker, coordinator, or an integration worker. Failed temporary
-checkouts may be retained briefly for diagnosis under a bounded cleanup
-policy, but are not the human-facing Track checkout.
-
----
-
-# Integration skill for nontrivial cases
-
-Provide a dedicated integration skill/instruction set for an agent when the
-deterministic path cannot finish or policy asks for review.
-
-The skill should tell the agent to:
-
-1. inspect source and target state;
-2. verify the source result is actually complete;
-3. identify relevant commits/diff;
-4. update/fetch target state;
-5. apply the requested integration strategy;
-6. resolve straightforward conflicts;
-7. run required validation/tests;
-8. update the target branch/resource;
-9. record resulting commits/PRs/resources;
-10. report a concise outcome.
-
-The skill should not assume every repository uses the same workflow.
-
-Repository/Track configuration may provide:
-
-```text
-target branch
-preferred integration strategy
-required tests
-direct push allowed?
-PR required?
-commit conventions
-merge policy
-```
-
----
-
-# Nontrivial integrations
-
-A selected strategy must not force naive mechanical execution.
-
-Example:
-
-User chooses:
-
-```text
-Squash into track
-```
-
-but the target branch has diverged.
-
-Correct behavior:
-
-```text
-Integrating Zed remote support…
-
-The track branch changed since this worker started.
-Resolving conflicts in:
-  src/resources.ts
-  src/zed.ts
-
-Running tests…
-```
-
-The LLM may perform whatever intermediate steps are required while preserving the requested end-state semantics.
-
-If the conflict requires product judgment, escalate rather than inventing a decision.
-
----
-
-# Integration worker
-
-The coordinator does not need to personally perform every difficult integration.
-
-For complicated cases, it may spawn an **integration worker**.
-
-Example:
-
-```text
-worker A ─┐
-          ├─> integration worker ─> track branch
-worker B ─┘
-```
-
-The integration worker receives:
-
-- target Track/resource;
-- source branch(es)/worktree(s);
-- selected integration strategy;
-- repository integration policy;
-- relevant design/docs/resources.
-
-It returns:
-
-```text
-status
-summary
-resulting commits
-resulting PR, if any
-validation status
-conflicts/decisions made
-unresolved issues
-```
-
-The coordinator remains responsible for accepting/escalating the result.
-
----
-
-# Integration target
-
-Do not assume Thread ancestry equals git ancestry.
-
-Default behavior:
-
-> Integrate into the Track's canonical ref for the relevant repository.
-
-Recursive worker → parent worker integration is an explicit path when the
-parent owns an intermediate accepted ref; it does not change the normal
-Track-level queue. If the Track has no canonical ref for that repository,
-Arachne must establish or select a target before claiming readiness.
-
-The target should always be inspectable/overrideable.
-
-Example:
-
-```text
-Integrate into:
-  Arachne / arachne repo / arachne-dev
-```
-
-Advanced users should be able to choose another target if necessary.
-
----
-
-# Track branches
-
-A Track may define one canonical branch/reference per repository.
-Its home Project can supply the repository set, branch creation policy, and
-integration defaults when the Track is created. The selected per-repository
-refs and policies belong to the Track thereafter. Changing a Project default
-does not silently retarget an active Track or its pending integration queue;
-applying such a change requires an explicit, reviewable Track update.
-
-Example:
-
-```text
-Track: Arachne
-
-Resources
-
-arachne
-  track branch: arachne-dev
-
-marin-community/loom
-  track branch: arachne
-```
-
-A Track therefore does not have one universal git branch.
-
-It may span multiple repositories, each with its own accepted state.
-
-Workers should normally fork from the current Track branch for the relevant repository.
-
-Important:
-
-> Worker hierarchy and git branch ancestry must remain independent.
-
-A child worker spawned for conceptual reasons should not automatically fork from its parent worker's branch unless explicitly requested.
-
-Default:
-
-```text
-new coding worker
-→ fork from current track branch
-```
-
-Explicit alternative:
-
-```text
-branch from this worker
-```
-
----
-
-# Integration worktree
-
-A Track may have an attached **integration worktree** for a repository.
-
-This is a concrete checkout of the Track branch.
-
-Example:
-
-```text
-Track: Arachne
-
-repo: arachne
-track branch: arachne-dev
-integration worktree:
-  runner: DGX
-  path: /...
-```
-
-The integration worktree is a Resource, not the Track itself.
-
-It may be deleted and reconstructed.
-
-The durable canonical object is the branch/ref.
-
-Default policy:
-
-> Ordinary workers should not directly write to the Track integration worktree.
-
-They receive isolated worktrees.
-
-Integration is the operation that moves their work into accepted Track state.
-
----
-
-# Manual edits
-
-The user may open either a worker worktree or the integration worktree in Zed and edit manually.
-
-This is valid.
-
-## Editing worker worktree
-
-Manual changes become part of that worker's result.
-
-The worker/thread should notice or at least accurately report the changed git state before integration.
-
-## Editing integration worktree
-
-Uncommitted manual changes are pending checkout state, not accepted Track ref
-state. Committing and advancing the ref changes canonical state. Before
-integrating another worker, Arachne/Loom must detect checkout dirtiness and
-refresh/reconcile the target ref rather than assuming the integration worktree
-is unchanged. A temporary integration checkout prevents an attempted merge
-from disturbing human edits.
-
----
-
-# Land UI
-
-At the Track level, use a separate split button:
-
-```text
-[ Land ▼ ]
-```
-
-Land means:
-
-> Move this Track's accepted state into its upstream/external destination.
-
-Possible strategies:
-
-```text
-Open PR
-Squash into main
-Merge into main
-Rebase / fast-forward into main
-Push track branch
-Squash into local checkout (land-locally)
-```
-
-Again, available options depend on repository policy.
-The Track's coordinator receives the Land request, so asking it to decide is
-not a distinct strategy. If policy does not set a default, the conservative
-primary action is **Open PR**. The coordinator can still escalate a genuine
-decision it encounters while carrying out a chosen strategy.
-
-### One-click preparation and landing
-
-Choosing **Land** authorizes the complete operation: prepare the source,
-then carry out the chosen strategy at its resolved destination. The
-coordinator reviews the intended changes, fixes straightforward issues,
-runs required validation, and commits the intended source changes before
-landing. It continues through the chosen operation without a second
-confirmation or stopping at a preparation/readiness report. Escalate only
-when judgment or access outside that authorization is required.
-
-**Review → Prepare landing** is an optional preparation-only action. It
-does not choose a strategy or authorize landing, pushing, or opening a PR,
-and is not a prerequisite for **Land**. Its agent report is not control-plane
-verified readiness.
-
-Preparation must preserve unrelated or foreign edits in both source and
-target checkouts, including staged changes and untracked files. Inspect
-ownership and relevance; commit only intended source changes and report
-excluded edits. Use visible Loom child sessions for delegated review or
-repair, with explicit source/target references and typed result handoffs.
-Before the final write, re-verify the exact source branch and revision,
-target repository, checkout, branch and revision, and target origin.
-If either revision changed during preparation or delegation, refresh the
-diff and validation for the actual revisions before proceeding.
-
-A queued response (`local=false`) acknowledges preparation and landing
-intent; it is not a completed landing and must not claim **Landed** or
-publish a completion tag. While submitting the request, the Thread says
-**Requesting preparation and landing…**; after acceptance it says
-**Preparation and landing requested. Follow the result in this thread.**
-Completion is reported only when the chosen operation actually succeeds.
-
-### Land locally
-
-`land-locally` offers a deterministic local fast path with coordinator
-preparation/repair when needed. Arachne itself squash-merges a clean track's
-branch into the primary checkout's currently checked out branch with no
-agent turn. It is offered only when the Loom server is loopback (its checkout
-paths are then local paths; a remote server's paths mean nothing on this machine), and it
-lands into the branch the primary checkout has checked out *right now*, not
-a remembered target. This strategy has **no `main` or recorded-base
-fallback**: if the primary checkout's current branch cannot be resolved,
-do not choose another destination.
-
-A dirty source, staged target changes, or a recoverable squash conflict
-queues preparation and local landing to the coordinator (`local=false`,
-without landing details or a completion tag). The coordinator repairs and
-validates, then completes the authorized squash into the primary checkout's
-current branch, preserving unrelated source and target edits. A detached
-primary, a primary already on the track branch, or another in-progress
-operation (merge/rebase/cherry-pick/revert/bisect) is refused. Failed fast-path
-attempts preserve checkout state, and a failed squash is unwound with
-`git reset --merge`, which preserves the user's unrelated unstaged changes
-and untracked files. A completed fast-path outcome is reported synchronously
-(commit, target branch, squashed count) and stamped on the track's branch as an
-`integration_result` tag, the same durable signal an agent-mediated
-integration writes.
-
-The Thread preserves synchronous local feedback: **Landed locally** with
-the commit, target and squash count, or an **already contained / nothing to
-do** message for an actual no-op. A queued local repair uses the same
-preparation-and-landing request feedback as other queued strategies.
-
-Example:
-
-```text
-Track: Arachne
-
-track branch: arachne-dev
-upstream: main
-
-[ Land ▼ ]
-```
-
-Primary click uses the remembered/default landing policy. A stored strategy
-that is no longer offered falls back to **Open PR**.
-
----
-
-# Landing target
-
-Non-PR strategies (`squash`, `merge`, `rebase`, `push`) do not target
-`origin/main` by default. They land into the **primary local checkout's
-currently checked out branch**, falling back to `main` when it cannot be
-resolved:
-
-1. an explicit target the user chose — use it;
-2. the primary checkout's current branch — the checkout a human actually
-   opens. The primary checkout is the repository's main working tree, not
-   a worker worktree;
-3. `main` — when the checkout is detached, unreadable, or the control plane
-cannot see it. The landing agent should attempt the primary-checkout
-resolution itself before settling for `main`.
-
-`land-locally` always squashes into the primary checkout's **current**
-branch, re-resolved immediately before writing. The fallback above does not
-apply to it; neither `main` nor the recorded base is a substitute.
-
-`open-pr` keeps the branch's recorded base (the remote's default branch) as
-its target, since a PR's destination is the remote's concern, not the local
-checkout's.
-
-Rationale: landing is the step that hands the work to a human. Writing to
-`origin/main` while the user's own checkout sits on `main` (or on `dev`)
-leaves the two out of sync — the user's checkout is the surface they read,
-so it is the surface landing must update. The request carries the resolved
-target plus its origin (`primary-checkout`, `main-fallback`,
-`recorded-base`, `explicit`) so the landing agent knows what to re-verify:
-a `primary-checkout` target can go stale when the user switches branches,
-and a `main-fallback` target invites the agent to re-resolve.
-
-The primary checkout may hold the user's uncommitted manual edits. Landing
-must reconcile around them (as it would for any dirty target), not destroy
-them.
-
----
-
-# Example repository policies
-
-## Arachne repository
-
-Possible configuration:
-
-```text
-worker integration:
-  default: squash
-
-track branch:
-  arachne-dev
-
-landing:
-  default: open PR
-  non-PR target: primary checkout's current branch, else main
-  PR target: main
-
-required validation:
-  cargo/test/etc.
-```
-
-Flow:
-
-```text
-worker branch
-   ↓ squash
-arachne-dev
-   ↓ PR (or squash into the primary checkout's current branch)
-main / the checkout's branch
-```
-
-## Loom repository
-
-Possible configuration:
-
-```text
-worker integration:
-  default: merge or cherry-pick
-
-track branch:
-  arachne
-
-landing:
-  none by default
-```
-
-Flow:
-
-```text
-worker branch
-   ↓ integrate
-long-lived loom/arachne branch
-```
-
-Individual changes may later be upstreamed to Loom main intentionally.
-
----
-
-# Thread UI
-
-A completed coding worker should expose integration near the result.
-Its Track's Integrations tab is the persistent place to inspect all candidates
-and outcomes while the main pane remains this Thread's conversation.
-
-Example:
-
-```text
-Zed remote support
-Done
-
-3 commits
-+382 -91
-Tests passing
-
-Resources
-  worktree: zed-remote
-  branch: arachne/zed-remote
-
-[Review Diff] [Open in Zed]
-
-[ Integrate ▼ ]
-```
-
-After integration:
-
-```text
-Integrated into Arachne
-squash · commit 7a29ef
-
-[View commit]
-```
-
-The button should no longer imply outstanding work.
-
----
-
-# Track integration queue and coordinator UX
-
-The right-side Integrations tab should show queued candidates and outcomes
-across the Track's workers, including target revision, preflight status, and
-validation. The top-level coordinator Thread also receives integration Events
-in its timeline. An Event can update the queue without immediately waking
-the coordinator. A deliberate Track Overview may summarize the same queue;
-it is not the default landing surface when selecting the Track.
-
-Example:
-
-```text
-[Worker]
-Zed remote support completed.
-
-3 commits · tests passing
-
-[Integrate ▼] [Open Thread]
-```
-
-After action:
-
-```text
-[Integration]
-Zed remote support integrated via squash.
-
-Target:
-  arachne-dev
-
-Commit:
-  7a29ef Add remote Zed checkout support
-
-Validation:
-  ✓ frontend tests
-  ✓ cargo test
-```
-
-This should become part of durable Track history.
-
----
-
-# Agent-initiated integration
-
-Eventually a coordinator may integrate workers without explicit user clicks.
-
-This should be governed by Track/repository policy.
-
-Example:
-
-```text
-auto-integrate:
-  allowed when:
-    tests passing
-    no conflicts
-    worker marked complete
-    integration strategy is configured
-```
-
-Anything outside policy should become coordinator or human attention.
-
-Do not implement broad autonomous integration before the manual flow is trustworthy.
-
----
-
-# Failure states
-
-Integration should distinguish:
-
-## Mechanical failure
-
-Examples:
-
-- git failure;
-- tests fail;
-- target unavailable.
-
-Result:
-
-```text
-Integration failed
-Tests failed in test_resource_binding
-```
-
-Coordinator may attempt repair.
-
-## Conflict requiring engineering work
-
-Spawn/continue integration reasoning.
-
-Do not immediately bother user.
-
-## Conflict requiring judgment
-
-Escalate.
-
-Example:
-
-```text
-Needs you
-
-Both implementations change the resource ownership model differently.
-
-Option A preserves…
-Option B changes…
-```
-
-## Stale source
-
-Worker branch has changed since review.
-
-Refresh and re-evaluate before integrating.
-
----
-
-# Resource updates
-
-After successful integration:
-
-- source worker remains historically linked;
-- target Resource records resulting commit;
-- PR association updates if appropriate;
-- worker result is marked integrated;
-- Track canonical state advances;
-- future workers should fork from the updated Track state.
-
-Do not delete the worker immediately.
-
-Archival/cleanup is a separate lifecycle concern.
-
----
-
-# Todo integration
-
-Arachne should eventually maintain a durable cross-track user-facing Todo
-list, separate from each Track's plan/backlog and from worker-internal todos.
-
-Integration actions may generate/remove user todos.
-
-Examples:
-
-```text
-□ Review attention UI worker
-□ Decide whether to integrate Loom API change
-□ Land Arachne track
-```
-
-After an action completes:
-
-```text
-✓ Review attention UI worker
-```
-
-Do not conflate this with the worker's own implementation checklist.
-
----
-
-# Phase 1 implementation scope
-
-For first dogfooding, keep this narrow.
-
-Required:
-
-1. completed worker knows its source branch/worktree;
-2. Track knows its target branch per repo;
-3. show `Integrate` split button;
-4. support at least:
-   - squash;
-   - merge;
-   - rebase;
-   - cherry-pick;
-   - open PR;
-   - ask coordinator;
-5. remember last-used strategy per repo;
-6. button sends a structured integration request to Loom;
-7. the coordinator skill handles nontrivial cases while clean cases can use a
-   deterministic temporary-worktree path;
-8. integration result appears in Track queue and Thread history;
-9. target git state updates;
-10. future workers fork from updated Track state;
-11. non-PR landing strategies resolve the primary checkout's current branch
-    (`main` fallback) and carry the target origin in the request.
-
-Nice to have after the manual loop works:
-
-- integration worker delegation;
-- tests displayed inline;
-- conflict escalation UI.
-- target-revision readiness and automatic re-preflight of sleeping candidates.
-
-Defer:
-
-- autonomous integration;
-- complex policy editor;
-- visual git graph;
-- broad autonomous merge queue;
-- distributed locking beyond basic Resource lease/reconciliation.
-
----
-
-# Dogfooding target
-
-Use this immediately for Arachne development.
-
-Expected workflow:
-
-```text
-Track: Arachne
-track branch: arachne-dev
-
-Workers:
-  ✓ Tauri bootstrap
-  ✓ Zed integration
-  ● Attention UI
-  ● SSE reconnect
-```
-
-User can:
-
-1. open any worker Thread;
-2. inspect its diff;
-3. open its worktree in Zed;
-4. make manual edits if desired;
-5. click `Integrate`;
-6. choose squash/merge/etc.;
-7. let the coordinator perform and validate integration;
-8. see the Track branch advance;
-9. launch subsequent workers from that updated Track state;
-10. eventually click `Land` to open/merge the Track into main.
-
-If this flow is smooth, Arachne should remove most of the branch/worktree bookkeeping currently required when developing with several agents in parallel.
+# Arachne Thread Landing and Track Publishing
+
+A worker **Thread** owns a bounded result. A **Track** owns the accepted Git
+state and its coordinator. **Land** accepts a Thread into that Track.
+**Publish** sends the Track's accepted state toward a PR or a local/upstream
+destination. These are separate authorizations.
+
+## Thread Land
+
+The worker header and the inspector's **Landing** queue expose **Land**. A
+primary click uses **Squash into track** by default: one logical commit on
+the Track's canonical topic branch. Merge, rebase, and selective cherry-pick
+are available when appropriate. Strategy selection constrains the final
+acceptance operation; it does not bypass inspection, review or validation.
+Thread Land never targets primary `main`, opens a PR, or publishes upstream.
+
+The queue includes working, waiting, reported ready, stale, conflicted and
+landed outcomes. It excludes the Track coordinator and reviewer-only
+Threads. Select a source to inspect/review its changes, then Land it, or
+Land directly while it is still working. Process state and reported
+readiness are advisory. An explicit ready tag is not required to request
+acceptance, and a sleeping worker is not automatically ready.
+
+One Land click authorizes the complete operation:
+
+1. Queue a wrap-up message to the original source behind its active ACP
+   turn, without interrupting the turn or redirecting the source to a new
+   repository/branch. A terminal source receives a durable channel message;
+   the app does not type into an active terminal or claim an ACP queue.
+2. Deliver one complete acceptance request to the Track coordinator. It
+   waits for a successful intended source result, reviews it independently
+   when risk warrants, repairs straightforward issues, and validates it.
+3. Commit only intended source changes, including intentional editor saves,
+   while preserving foreign staged, unstaged and untracked work. Never use
+   blanket add/commit or destructive cleanup to obtain an apparently clean
+   source. Preserve unrelated target work as well.
+4. Re-verify the original source identity, repository, branch and revision,
+   and the canonical Track target and current revision. Refresh inspection
+   and validation when either changes. Reconcile in isolated worktrees;
+   do not hijack a coordinator scratch branch or another writer's checkout.
+5. Complete the selected acceptance operation into the canonical topic ref
+   without asking for a separate **Prepare** click. Record the actual commit
+   and validation evidence, then stamp `integration_result` on the source.
+
+A queued request is preparation and acceptance requested, never a landed
+result. `landing_request=pending` may describe an advisory request; it must
+not imply readiness or successful acceptance. Stale, conflicting or partial
+work can be repaired under the original request, but a real product decision,
+missing access, changed source identity or unrelated in-progress Git
+operation remains an actionable blocker.
+
+**Review → Prepare** remains optional preparation only. It inspects,
+repairs, validates and commits intended source changes without accepting or
+publishing. Review compares against the canonical Track topic branch.
+Reviewer Threads report findings and are not acceptance candidates.
+
+## Canonical Track topic branches
+
+New Tracks use `arachne/tracks/<slug>` by default. The creation chat exposes
+an editable topic-branch field and persists it with the draft. Slugs are
+inferred from the Track title or launch title/task; explicit refs are
+validated. Duplicate defaults are disambiguated. An explicitly occupied or
+claimed unrelated branch cannot silently combine two Tracks.
+
+Loom still owns the coordinator's session branch, normally `weaver/<slug>`.
+Arachne records the acceptance ref separately in the durable
+`track_topic_branch` tag. Before substantive Track work or acceptance, the
+coordinator's explicit initialization instruction creates the **real Git
+ref** from the fresh launch seed revision and reports it. Displaying a tag
+alone does not initialize a branch. Initialization must preserve existing
+refs, primary HEAD and the live Loom-managed branch; remote Tracks receive
+a real initialization instruction as well. No remote create-branch endpoint
+is invented.
+
+An established Track without `track_topic_branch` retains its existing
+coordinator branch as its accepted ref. Legacy work is not silently
+migrated. Same-repository Track ancestry selects the coordinator, but its
+canonical tag selects the Git acceptance target; conversation ancestry is
+not Git ancestry. Child work should normally fork from the canonical
+accepted topic ref unless an explicit intermediate base is intended.
+
+## Autoland
+
+Autoland is durable coordinator policy, not a browser-only preference or a
+new background scheduler. It defaults **OFF** on the Track. Each source can
+**Inherit**, force **On**, or force **Off**. A source override wins over the
+Track setting. Turning Track-wide policy off leaves explicit source On
+overrides enabled; turning a source off suppresses its automatic acceptance.
+Manual Land remains a separate explicit authorization.
+
+Policy changes persist `track_autoland=on|off` and
+`thread_autoland=inherit|on|off` in Loom tags and deliver explicit coordinator
+instructions. The coordinator uses existing typed results and delivery
+wakeups to inspect successful complete work, delegate independent review and
+repair, and accept it as a squash into the canonical topic branch. Partial,
+checkpoint, incomplete or parent-help results are not completion/readiness.
+Review findings alone are not an implementation to accept.
+
+Immediately before **every automatic target write**, re-read the live Track
+and source policy, source identity/revision, canonical target and result
+status. An old queued instruction is not authority after effective policy
+becomes Off. If policy or target metadata cannot be read, do not guess.
+Autoland never opens a PR, pushes upstream or publishes to primary `main`.
+
+Direct children's typed results notify/wake their immediate parent. Nested
+sources require a real deliver subscription from the Track coordinator to
+the immediate-parent channel that receives those linked results (or a
+verified durable forwarding route). Policy setup and future enabled child
+launches establish this route through Loom's existing channel subscription
+API and verify the session subject/mode. A prose instruction to wait is not
+a delivery route. Before becoming idle, verify child parentage, an open own
+channel/delivery binding, and the obligation to publish typed results. Save
+state, set `ok` waiting status, and end the turn. Never poll fleet/channels
+or keep the turn alive with timed sleeps.
+
+## Explicit Track Publish
+
+The Track header exposes **Publish**, with separate chosen actions:
+
+- **Single PR** (`open-pr`): one PR for the canonical accepted topic state
+  against the recorded base or explicit destination.
+- **PR stack** (`pr-stack`): derive an ordered list of accepted changes from
+  canonical history/accepted branches. Define each head ref and dependent
+  base explicitly: the first targets the upstream base, subsequent PRs
+  target the previous stack head. Validate each change and the combined
+  stack. Create separate actual PRs and report their ordered URLs, bases,
+  heads and validation; one PR is not a stack. If there is only one
+  meaningful layer, report that honestly rather than claiming multiple PRs.
+- **Squash into local checkout** (`land-locally`): squash the committed
+  accepted topic ref into the primary checkout's **current** branch, often
+  local `main`. It is loopback-only. It has no assumed `main` or recorded-base
+  fallback, and must not act on a worker checkout. A detached/unavailable
+  primary, self-target or unrelated Git operation is a blocker.
+- Squash, merge, rebase or push toward the chosen external/local destination
+  where repository policy supports them. An explicit destination wins;
+  otherwise non-PR strategies resolve the primary current branch, with the
+  existing `main` fallback when it cannot be read. Resolve and verify that
+  policy immediately before writing.
+
+All publishing requires the user's explicit chosen action. Its source is
+always the **canonical accepted topic ref**, never incidental coordinator
+scratch work. Prepare/validate the accepted state and continue the chosen
+operation under that authorization. Keep unaccepted source/scratch edits
+separate; do not silently incorporate them in a publish.
+
+The clean local squash remains deterministic and synchronous. Preserve
+unrelated unstaged target edits and untracked files. A staged target must
+not ride along in the squash commit. Queue coordinator reconciliation for
+target staging or a safely unwound recoverable failure, with exact accepted
+source and primary target snapshots. Failed Git attempts must be cleaned up
+safely before dispatch; cleanup failures remain actionable errors. Do not
+discard staged/unstaged content or alter another in-progress Git operation.
+
+`LandResult.local=true` is compatibility wire naming for an actually
+completed synchronous local **publish**, with commit/target/count or a
+verified already-contained no-op. Queued publishing returns `local=false`
+with no completion detail. The UI says publishing was requested; it never
+claims queued work was published. Record `publish_result` only after actual
+success; worker `integration_result` remains distinct.
+
+## Evidence and boundaries
+
+Completion, sleeping and readiness are different facts. Validation and
+mergeability evidence must identify the source and current canonical target
+revisions. Never set `integration_ready` solely because an agent finished.
+A newly advanced target requires fresh inspection/revalidation; a result
+message is not control-plane verified readiness. Preserve branches and
+worktrees for history; archival is separate.
+
+Coordinators and workers delegate substantial implementation, review and
+repair through visible Loom children with explicit repository/base and
+bounded briefs. All handoffs are typed results on the child's own channel.
+The parent owns acceptance and synthesis; human attention is reserved for
+judgment or access the hierarchy cannot resolve. Ordinary repair, completion
+and waiting are `ok` states, not Needs You.
+
+The exact metadata and backend command contract lives in
+[thread-landing-contract.md](thread-landing-contract.md). Agent procedure is
+in [integration guidance](../skills/integration.md); role/wake guidance is
+in [coordinator](../skills/coordinator.md) and [worker](../skills/worker.md).

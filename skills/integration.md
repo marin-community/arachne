@@ -1,241 +1,142 @@
-# Integration skill
+# Thread Land and Track Publish procedure
 
-You are acting as the **coordinator** for an integration or landing request.
-These requests arrive as a structured prompt from Arachne's **Integrate** /
-**Land** buttons — but they are the same operation a user could have typed
-as a sentence, e.g. *"Integrate the Zed worker into the Arachne topic."*
-Treat the JSON payload and the prose statement as one intent.
+You are the coordinator for a structured Thread **Land** or Track **Publish**
+request from Arachne. Treat the JSON and prose as one authorized intent.
+Legacy integration command names mean Thread acceptance; they do not confer
+publishing authority. A chosen strategy constrains the final operation,
+while routine preparation, review, repair and validation are part of it.
 
-The central principle (spec: `docs/integration-and-landing.md`):
+## Resolve the acceptance scope
 
-> **Integration is an agent action with an explicit strategy, not a
-> hard-coded git operation.**
+Find the same-repository Track coordinator through the source's ancestors.
+Read its live `track_topic_branch` tag: that is the canonical accepted Git
+ref, independently of the coordinator's Loom scratch/session branch. With
+no canonical tag, an established Track retains its existing branch. Never
+substitute primary `main` or an incidental intermediate coordinator branch
+for Thread Land. New Track initialization must create the REAL topic ref
+from the fresh seed before substantive work, preserve existing unrelated
+refs, and report actual creation. A tag is not a Git branch.
 
-The strategy is an **intent constraint**, not an instruction to execute one
-raw git command. You remain responsible for inspecting the actual repository
-state, handling conflicts, running validation, and reporting the result.
+## Thread Land: prepare, then accept
 
----
+The request identifies the original source Thread, branch, repository,
+worktree, canonical target and strategy. Squash is the default, producing
+one logical accepted commit. Merge preserves history, rebase produces the
+selected linear history, and cherry-pick selects relevant commits when
+selection is meaningful. PR creation, upstream push and primary checkout
+publishing are not Thread acceptance strategies.
 
-## Request shapes
+1. Let an active source finish its current turn. A wrap-up request sits
+   behind active ACP work; terminal sources receive a durable channel
+   message, not injected terminal input. Do not interrupt/cancel the source
+   or claim its request was durably ACP-queued if it was not.
+2. Wait for successful completion of the intended source objective. Read
+   typed durable results, inspect the actual source changes and validation,
+   and distinguish complete implementation from checkpoint, incomplete,
+   partial or parent-help results. Those are not candidates to accept.
+3. Inspect intended staged/unstaged/untracked source changes, including
+   user editor saves. Preserve foreign edits in source and target; never
+   blanket git add/commit, destroy user work, or hijack an unrelated Git
+   operation. Commit only intended source changes after validation. Report
+   exclusions and escalate a real ownership/product decision when needed.
+4. Delegate substantial independent review or repair through visible Loom
+   children: `loom sessions launch "<bounded brief>" --repo <repository>
+   --base <appropriate ref>`. Include objective, source/current canonical
+   target references, Resources, constraints and validation. Reviewers get
+   no implementation transcript and report findings; they are not sources
+   to accept. Require typed own-channel results.
+5. Resolve straightforward conflicts and run required tests/typecheck/build.
+   Use isolated acceptance worktrees. **One active writer per worktree**:
+   do not alter another worker's checkout or the coordinator scratch to
+   impersonate the accepted ref. Preserve the source branch/history.
+6. Immediately before target advancement, re-verify source identity,
+   repository, branch/revision and intended diff; read the canonical tag
+   again and verify the target ref/revision and any target checkout's dirty
+   state. Refresh review/validation for changes. Advance only the verified
+   canonical acceptance ref while preserving foreign checkout/index state.
+7. Complete the chosen acceptance without stopping at preparation or asking
+   for a second Prepare click. Stamp source `integration_result` only after
+   actual successful target update and validation, with resulting commit and
+   strategy/target note. Pending request tags are advisory, not landed or
+   verified readiness. Report exact source/target commits, validation,
+   remaining status, and no-op/failure/judgment honestly.
 
-### Integrate (worker → topic)
+Manual Review → Prepare is separate optional preparation only. It does not
+accept a source, publish a Track, open a PR or push upstream.
 
-```json
-{
-  "action": "integrate",
-  "source_thread": "<worker session id>",
-  "source_resource": "<worker branch>",
-  "target_scope": "<topic name>",
-  "target_resource": "<topic branch for this repository>",
-  "strategy": "squash | merge | rebase | cherry-pick | open-pr | decide",
-  "requested_by": "user"
-}
-```
+## Autoland: live policy and real wake routes
 
-### Land (topic → upstream)
+Track `track_autoland` defaults Off. Source `thread_autoland` defaults
+Inherit; source On/Off overrides Track On/Off. Policy changes arrive as
+explicit durable instructions, and results arrive through existing Loom
+channel delivery. Do not add polling or a scheduler. Review/repair and accept
+successful intended work yourself into the canonical topic ref as a squash.
+Do not treat process exit, review findings, pending tags, incomplete/partial
+results or parent-help notices as completed implementation.
 
-```json
-{
-  "action": "land",
-  "source_resource": "<topic branch>",
-  "repository": "<repo root>",
-  "target_resource": "<resolved destination branch; primary current branch for land-locally>",
-  "target_origin": "primary-checkout | main-fallback | recorded-base | explicit",
-  "strategy": "open-pr | squash | merge | rebase | push | land-locally | decide",
-  "requested_by": "user"
-}
-```
+Before **every automatic target write**, read current Track/source policy
+and recompute effective policy. A stale queued automatic instruction must
+stop if effective policy is Off or metadata cannot be read. Re-verify source
+and canonical target/revisions and validation as for manual Land. Manual
+Land is a separate explicit authorization independent of autoland Off.
+**Autoland never publishes to main, opens PRs or pushes upstream.**
 
-**Landing target policy.** For non-PR strategies (`squash`, `merge`,
-`rebase`, `push`), the target is the **primary local checkout's currently
-checked out branch** — the checkout a human actually opens — falling back
-to `main` when it cannot be resolved. The primary checkout is the
-repository's main working tree, not a worker worktree. `target_origin`
-records how the control plane resolved the target:
+Direct child results link/wake the immediate parent. For nested/external
+sources, establish and verify a real deliver subscription to the channel
+receiving linked result notices (the immediate-parent channel), or a durable
+forwarding route through the hierarchy. The coordinator needs a delivery
+binding to receive that subscription. Policy setup/enabled nested launches
+must create the route through Loom, not merely promise in prose to monitor.
+Before waiting, verify parentage, own open channel/delivery binding and typed
+result obligation. Save state, set `ok` waiting status, and end the turn for
+Loom delivery. Never poll fleet/channels or loop over timed sleeps.
 
-- `primary-checkout`: resolved from the primary checkout's current branch.
-  Re-verify it against the live checkout before writing — the user may
-  have switched branches since the request was queued.
-- `main-fallback`: the control plane could not read the checkout
-  (detached HEAD, unreadable repo, or a scoped credential). Try resolving
-  the primary checkout's current branch yourself from `repository`
-  before settling for `main`.
-- `recorded-base`: the branch's recorded base (the remote's default
-  branch) — the normal target for `open-pr`.
-- `explicit`: the user chose the target; do not substitute another one
-  without asking.
+## Track Publish: explicit user action only
 
-`open-pr` targets the branch's recorded base. For strategies other than
-`land-locally`, an explicit `upstream` override beats defaults.
+Publish identifies the Track coordinator and the **canonical accepted topic
+ref**. Verify that ref exists and its accepted revision/history. An explicit
+canonical tag means coordinator scratch edits are not accepted source;
+never silently publish them. The original chosen action authorizes required
+preparation/validation/straightforward repair and its completion, not a
+substitute strategy. Live autoland policy is not publishing authorization.
 
-**`land-locally` is stricter:** it means squash the prepared source into the
-**primary checkout's currently checked out branch**, with target origin
-`primary-checkout`. Re-resolve that checkout and branch immediately before
-writing. It has no `main`, `main-fallback`, or recorded-base fallback and
-must not land into a worker checkout. If the current branch is unavailable,
-report the blocker rather than substituting another destination.
+- **Single PR** (`open-pr`): one actual PR from accepted state to the explicit
+  or recorded upstream base. Report actual head/base/URL and validation.
+- **PR stack** (`pr-stack`): inspect ordered accepted commits/branches;
+  define each layer's accepted source changes, head ref, and dependent base
+  explicitly. The first PR targets upstream, each next targets the previous
+  stack head. Prepare/validate each layer and combined result, create actual
+  separate PRs, and report ordered head/base/commit/URL/validation outcomes.
+  A single PR is not a stack; one meaningful layer must be reported as such.
+  Do not invent completed PR links or include unaccepted scratch work.
+- **Local checkout** (`land-locally`): squash committed accepted state into
+  the primary checkout's CURRENT branch. Resolve its path, branch and
+  revision immediately before writing. No `main` or recorded-base fallback,
+  no worker checkout substitution. Preserve staged/unstaged/untracked target
+  edits. Use isolation to reconcile staging/conflicts safely, then update
+  the authorized primary destination without absorbing foreign edits.
+- **Squash/merge/rebase/push**: honor an explicit destination; otherwise use
+  the primary current branch with the existing `main` fallback when that
+  resolution is unavailable. Re-resolve before writing; respect repository
+  access and chosen operation semantics.
 
-**Authorization includes preparation.** A queued Land request authorizes
-review, straightforward repair, required validation, committing intended
-source changes, and then completion of the chosen strategy. Continue through
-the operation without a second confirmation or stopping after a readiness
-report. This includes queued `land-locally` repair after dirty-source,
-staged-target, or recoverable conflict detection. Review → Prepare is an
-optional preparation-only request and does not authorize the landing action.
-`local=false` is an acknowledgement of queued preparation and landing,
-without landing details or a completion tag; report completion only after
-the chosen operation actually succeeds.
+Revalidate changed accepted source/target revisions, complete the actual
+chosen publish, and report commit/PR links/no-op and preserved dirty state.
+Stamp Track `publish_result` only after successful actual publishing and
+validation. Queued `local=false` is a request, not a published result.
+Never discard target user work or conclude an unrelated Git operation.
 
----
+## Results and escalation
 
-## Procedure
+Publish a concise typed own-channel result with Outcome complete/incomplete/
+needs parent help, source/current canonical target revisions, validation,
+Resources, actual accepted/published commits or URLs, limits and next step.
+Completion alone is not verified readiness; do not set `integration_ready`
+without actual current-target evidence. Parent owns acceptance/integration
+of delegated work unless the specific request explicitly authorizes it.
 
-1. **Inspect source and target state.** Find the worker session's worktree
-   (it is named in the request's `source_work` field when present, or
-   resolvable via `loom sessions get`). An archived worker may have no
-   checkout; use its durable branch and create a fresh worktree if needed.
-   Check both branches' actual state —
-   `git log`, `git status`, `git diff` — never assume.
-2. **Prepare and verify the source result.** Inspect uncommitted changes
-   and their ownership/relevance, including intentional manual edits.
-   Review and repair the intended result, run required validation, and
-   commit only intended source changes if the strategy operates on commits.
-   Preserve unrelated or foreign edits, staged changes, and untracked files
-   in both source and target checkouts; report exclusions. Never use a
-   blanket add, reset, or cleanup to absorb or discard another writer's work.
-   Delegate substantial review or repair through visible Loom child
-   sessions, including reviewers, with exact source/target references and
-   typed results on their own channels.
-3. **Identify the relevant commits/diff** the integration will carry.
-4. **Update/fetch target state.** If the target branch changed since the
-   worker started, reconcile rather than fail: the topic's canonical state
-   is the branch, and a stale integration worktree must be refreshed before
-   integrating (the user may have edited it directly too).
-5. **Re-verify and apply the requested integration strategy** (see below).
-   After preparation or delegation and immediately before writing, verify
-   the exact source repository, branch and revision and target repository,
-   checkout, branch, revision and origin. If either revision changed,
-   refresh the diff and required validation for the actual revisions.
-   Preserve the chosen strategy and destination semantics.
-6. **Resolve straightforward conflicts** yourself.
-7. **Run required validation** — tests, typecheck, build, whatever the
-   repository's conventions require. If the repo has no obvious convention,
-   run what exists.
-8. **Update the target branch.** Push if the repository expects it.
-   For **landing** with `squash`, `merge`, `rebase`, or `push`, honor an
-   explicit destination; otherwise use the primary local checkout's current
-   branch (`main` if it cannot be resolved). Resolve the checkout from the
-   request's `repository`,
-   re-verify which branch it has checked out now, and land there. Do not
-   land into a worker worktree. The primary checkout may be dirty with the
-   user's in-progress edits: integrate around them while preserving their
-   content and staged/unstaged state. For `land-locally`, squash into the
-   primary checkout's live current branch with **no fallback**. Use an
-   isolated checkout for preparation/conflict repair where needed, then
-   safely update the primary target without committing foreign target edits.
-   Complete the authorized operation without asking for confirmation again;
-   escalate only for judgment or access outside that authorization.
-9. **Record resulting commits/PRs** in your report; associate the PR if one
-   was created. For a completed worker integration, stamp the source session
-   with `loom sessions tags set integration_result <commit-or-PR-reference>
-   --session <source_thread> --note "<strategy> into <target branch>"`.
-   Do this only after the target update or PR creation and validation have
-   succeeded. A sent request or failed integration is not a result. If the
-   tag command fails, report that separately; the git result still stands.
-10. **Report a concise outcome** to the requesting thread (the parent
-    coordinator, or the user if you are the topic leader): what was
-    integrated, where, the commit hash or PR link, and validation results.
-
----
-
-## Strategies
-
-### `squash`
-
-Incorporate the worker's effective changes as **one logical commit** on the
-target branch. You may rebase/update against the target first, resolve
-conflicts, run validation, then create the squash commit. Preserve the
-worker's branch for history — do not delete it.
-
-### `merge`
-
-Preserve worker branch history and merge it into the target branch,
-normally producing a merge commit where appropriate.
-
-### `land-locally` (landing only)
-
-Squash the prepared topic's effective changes into one logical commit on
-the **primary checkout's currently checked out branch**. Re-resolve the
-primary checkout, current branch and revision before the final write; never
-use `main` or the recorded base as a fallback. Preserve unrelated or foreign
-source and target edits, including the target's staged/unstaged state and
-untracked files. Repair and validate recoverable issues, then complete the
-selected local landing under the original authorization. Report the actual
-target and resulting commit, or a verified already-contained no-op. A queued
-repair request is not a completed landing.
-
-### `rebase`
-
-Rebase worker commits onto the target branch and integrate the resulting
-history. Useful when linear history matters.
-
-### `cherry-pick`
-
-Selectively apply the worker's commits. If the worker has multiple commits
-and no obvious selection exists, ask for clarification in your report
-rather than guessing.
-
-### `open-pr`
-
-Do **not** directly modify the target branch. Create a PR from the worker
-branch into the topic branch. Report the PR number and link.
-
-### `push` (landing only)
-
-Push the topic branch itself as the landing action. Like the other non-PR
-strategies, the effective upstream target is the primary local checkout's
-checked out branch — update that branch (fast-forward it to the topic
-branch, or push the topic branch onto it) rather than assuming `main`.
-
-### `decide` (Ask coordinator to decide)
-
-Inspect the worker result and repository context, **choose** the appropriate
-strategy, execute it, and explain what was chosen and why. This is the safe
-fallback when policy is unclear.
-
----
-
-## Failure states — distinguish these
-
-- **Mechanical failure** (git failure, tests fail, target unavailable):
-  attempt repair yourself. If genuinely stuck, report the failure concisely.
-- **Conflict requiring engineering work**: keep working; spawn a child
-  integration worker if the reconciliation is substantial. Do not
-  immediately bother the user.
-- **Conflict requiring product judgment**: **escalate** — use
-  `loom status set --tag attention` and lay out the options. Never invent a
-  product decision.
-- **Stale source** (worker branch changed since review): refresh and
-  re-evaluate before integrating.
-
----
-
-## Policies
-
-- Do not assume every repository uses the same workflow. When a repository
-  or topic declares configuration (target branch, preferred strategy,
-  required tests, direct-push allowed, PR required), follow it.
-- One active writer per worktree: never write directly into another
-  worker's checkout. Create your own worktree for the target branch if you
-  need a checkout to operate in. For `land-locally`, prepare in isolation
-  and coordinate the authorized final update to the primary checkout;
-  preserve other writers' edits and re-verify its current branch/revision.
-- Worker hierarchy and git branch ancestry are independent. Fork new
-  integration work from the **topic branch**, not from the parent worker's
-  branch, unless the request says otherwise.
-- After a successful integration, future workers should fork from the
-  updated topic state — this happens naturally when you push the topic
-  branch; nothing else is required.
-- Do not delete the worker's branch or worktree after integration.
-  Archival is a separate lifecycle concern.
+Attempt ordinary engineering repair through the hierarchy. Escalate real
+product judgment or inaccessible permissions to the parent first. Use
+attention/blocked only when explicit human help is required after the
+hierarchy cannot resolve the issue. Preserve branches/worktrees after
+acceptance; cleanup/archive is a separate authorization.

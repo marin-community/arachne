@@ -46,7 +46,7 @@ an editable checkout with one action when that checkout is available.
 
 With no Project or Track selected, **Tracks home** is an aggregate fleet view
 across all Projects and Tracks. It shows Needs You first and prominently (or
-“Nothing needs you”), then Working, Ready to Integrate, and collapsed Waiting /
+“Nothing needs you”), then Working, Reported Ready, and collapsed Waiting /
 Resting. Every row names its Project and parent Track and opens its Thread
 conversation. Selecting a Project opens the same status groups filtered to that
 Project's Tracks. A
@@ -73,14 +73,15 @@ The right pane is a **Track inspector** with tabs:
   Place New Thread here.
 - **Resources:** Track resources and refs, with Thread resources distinguished
   when viewing a worker. Keep Open in Zed prominent here or in the chat header.
-- **Integrations:** the Track-owned candidate queue, preflight/validation
-  state, review links, and Integrate actions. Land remains a separate Track
-  action toward upstream.
+- **Landing:** selectable worker Threads, including working/waiting,
+  reported ready/stale/conflict and actual landed outcomes, with review and
+  Thread Land actions. The canonical topic destination and Track/per-thread
+  autoland controls are visible. Publish is a separate explicit Track action.
 - **Todos:** a Track-filtered view of the durable cross-track user Todo list.
   Track plans and worker-internal checklists remain separate.
 
 An **Overview** action in the Track or coordinator header opens the scoped
-dashboard deliberately: Needs You, Working, Ready to Integrate, Waiting /
+dashboard deliberately: Needs You, Working, Reported Ready, Waiting /
 Resting, summary, and resources. It is not the default Track destination.
 Events feed these surfaces and Attention; do not add an Events inspector tab
 until a concrete workflow calls for it. The chat header stays compact: Track,
@@ -100,13 +101,14 @@ Project opens the new-track chat preselected to that Project; it does not
 permanently occupy sidebar space. Inbox may remain a separate tab, but its purpose is
 cross-Track human attention and reviewable events, rather than an
 unrelated second list. The aggregate Tracks home still shows Needs You even
-when Inbox exists. Ready to Integrate requires explicit verified candidate
-state from Loom; a stopped or sleeping worker is not sufficient evidence.
+when Inbox exists. Reported Ready is an advisory fact from explicit source
+state, not verified control-plane readiness. A stopped/sleeping worker is
+not sufficient evidence, and a ready tag is not required to request Land.
 
 **New thread** starts a standalone conversation for a one-off task (a form
 sheet). **New track** opens a chat immediately: the same shape as a live
 thread — header, conversation, composer — with the setup choices (title,
-repository and base, inherited project resources) in a setup card above
+repository, seed base and editable canonical topic branch, inherited project resources) in a setup card above
 the chat box, where the conversation will land. The setup disappears once
 the model starts. Loom's launch needs the first message, so the first
 send from the chat box both delivers that message and launches the Track;
@@ -223,38 +225,49 @@ attach the ones the track should remember durably (skills/resources.md).
 One active writer per mutable checkout remains the
 default; other workers get isolated worktrees.
 
-## Integration
+## Thread landing and Track publishing
 
-The Track owns integration candidates from its workers, with a queue and
-status visible in the inspector's Integrations tab. **Integrate** absorbs a
-candidate into the Track's accepted ref for the relevant repository. **Land**
-moves that accepted state upstream — non-PR strategies target the primary
-local checkout's currently checked out branch (`main` as fallback), while
-`open-pr` targets the remote's default branch. A nested
-worker may integrate through its parent, but worker → Track is the normal
-visible path.
+**Land** accepts a worker Thread into its same-repository Track's canonical
+topic ref, defaulting to a single squash commit. The inspector's Landing
+queue permits active sources, exposes honest advisory states and actual
+successful outcomes, and excludes the coordinator/reviewer-only sources.
+A click queues wrap-up behind active ACP work without interrupting it,
+then asks the coordinator to review/repair/validate and complete chosen
+acceptance without another Prepare click. Terminal sources receive durable
+channel messages rather than injected input or false queue guarantees.
 
-Worker lifecycle and integration lifecycle are separate. Stopping does not
-make a coding result Ready. The worker normally commits or stabilizes its
-changes, runs required validation, summarizes the result, and preflights it
-against a specific Track revision. Readiness records that revision (for
-example, `Ready · clean against Arachne@789abc`); the worker can then sleep.
-When the Track ref advances, Loom should deterministically recheck sleeping
-Ready candidates. Clean candidates get an updated readiness revision and stay
-asleep. A new conflict emits an event
-and preferentially wakes the original worker to reconcile.
+New Tracks default to editable `arachne/tracks/<slug>` accepted branches,
+with real ref initialization from the launch seed. `track_topic_branch`
+records that canonical ref separately from coordinator scratch state. A
+legacy Track without the tag retains its existing accepted branch. Duplicate
+new branches must not combine unrelated Tracks or overwrite existing refs.
 
-Integrate is a structured operation: source, target, strategy, target revision,
-validation policy, and result. Strategies include squash, merge, rebase,
-cherry-pick, PR, and ask coordinator. A preflight conflict preview (for
-example, `git merge-tree`) informs the UI before an attempt; the actual apply
-and validation remain authoritative. For a clean,
-unambiguous candidate, Loom can prepare a disposable worktree, apply the
-strategy, validate, atomically advance the Track ref, and clean up without an
-LLM call. Failed attempts leave the canonical checkout and ref intact.
-Conflicts, failing validation, ambiguity, and product judgment route to the
-original worker, coordinator, or an integration worker as appropriate. A
-request is not a success state; Arachne shows the verified commit or PR result.
+Autoland defaults Off (`track_autoland`), with per-source
+`thread_autoland=inherit|on|off` overrides. Policy changes persist in Loom
+and instruct the coordinator; existing result delivery wakes it for review,
+repair and squash acceptance. Partial/help/checkpoint results are not
+completed implementations. Nested sources need verified real subscription
+or forwarding routes to the canonical coordinator. Reread live policy before
+an automatic write; effective Off suppresses stale queued auto-acceptance.
+Autoland never opens PRs, pushes upstream or publishes to main.
+
+**Publish** is separate explicit user authorization from canonical accepted
+state: Single PR, a genuine ordered PR stack with dependent bases and actual
+individual URLs, or the chosen local/upstream strategy. It never substitutes
+coordinator scratch work. Clean local publishing remains synchronous and
+preserves foreign checkout edits; staged targets/safely unwound failures
+queue coordinator repair and chosen publication. Queued work is not an
+actual landed/published result. Thread `integration_result` and Track
+`publish_result` are distinct actual outcomes.
+
+Worker lifecycle, advisory readiness, acceptance and publication are distinct.
+Re-verify source and current canonical target revisions and refresh validation
+when they change. Never infer verified readiness from stopping. Preserve
+foreign source/target staged, unstaged and untracked work; use isolated
+worktrees for reconciliation. Review → Prepare stays optional preparation
+only. Exact procedure and metadata are in
+[integration-and-landing.md](integration-and-landing.md) and
+[thread-landing-contract.md](thread-landing-contract.md).
 
 ## Events and attention
 
@@ -286,9 +299,9 @@ scope.
 
 1. A track can bind and preview this document without depending on which
    session created it.
-2. A worker's current diff and target branch are visible before Integrate.
-3. The coordinator receives an integration request without interrupting a
-   running turn, and its outcome is easy to find.
+2. A worker's current diff and canonical topic target are visible before Land.
+3. Source wrap-up and coordinator acceptance are queued without interrupting
+   active ACP turns; actual outcomes are distinguishable from requests.
 4. An archived worker's branch and PR remain navigable; a checkout can be
    reconstructed when code needs editing again.
 5. The complete loop works against the remote Loom host and Zed checkout.
