@@ -11,6 +11,7 @@ import SplitButton from "./SplitButton.vue";
 import CodeActions from "./CodeActions.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
+import { landResultFeedback, type LandResult } from "../landFeedback";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
 import ChatMarkdown from "./ChatMarkdown.vue";
@@ -1018,9 +1019,9 @@ const integrateOptions = computed(() => allIntegrateOptions.filter((option) =>
   option.value !== "cherry-pick" || workSummary.value?.has_commits === true,
 ));
 // The deterministic fast path: no agent turn, Arachne squash-merges the
-// topic into the primary checkout's current branch itself. Loom's API has
-// no git writes, so Arachne runs git itself — valid only when the server
-// is loopback, since its checkout paths are then local paths.
+// topic into the primary checkout's current branch itself. Recoverable
+// preparation/repair goes to the coordinator. Local landing is offered only
+// for a loopback server, since its checkout paths are then local paths.
 const loomIsLocal = computed(() => {
   try {
     const host = new URL(props.loomUrl).hostname;
@@ -1041,16 +1042,6 @@ interface IntegrationTarget {
   coordinator_id: string;
   target_branch: string;
   coordinator_name: string;
-}
-interface LandResult {
-  local: boolean;
-  landing?: {
-    landed: boolean;
-    target_branch: string;
-    commit?: string;
-    commits_squashed: number;
-    primary_checkout: string;
-  };
 }
 const integrating = ref(false);
 const landing = ref(false);
@@ -1091,19 +1082,15 @@ async function onIntegrate(strategy: string) {
 async function onLand(strategy: string) {
   if (landing.value) return;
   landing.value = true;
-  integrationNote.value = "";
+  integrationNote.value = strategy === "land-locally"
+    ? "Landing locally…"
+    : "Requesting preparation and landing…";
   try {
     const result = await invoke<LandResult>("land_topic", { sessionId: props.session.id, strategy });
     localStorage.setItem(`arachne:strategy:land:${sessionRepo.value}`, strategy);
-    if (result.local && result.landing) {
-      const { landing: done } = result;
-      integrationNote.value = done.landed
-        ? `Landed locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch} · ${done.commit}`
-        : `${done.target_branch} already contained this track's changes — nothing to do.`;
-    } else {
-      integrationNote.value = "Landing request sent. Follow the result in this thread.";
-    }
+    integrationNote.value = landResultFeedback(result);
   } catch (e: any) {
+    integrationNote.value = "";
     emit("error", e?.message ?? String(e));
   } finally {
     landing.value = false;

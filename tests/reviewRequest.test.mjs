@@ -26,3 +26,14 @@ test("unresolved or cross-repository parents never fabricate an integration dest
   assert.match(preparationRequest(false, "HEAD abc", null), /No integration target is resolved/);
   assert.match(preparationRequest(true, "HEAD abc", null), /landing strategy and destination have not been selected/);
 });
+
+test("manual Review Prepare remains optional preparation without landing authorization", () => {
+  for (const isTrack of [true, false]) {
+    const prompt = preparationRequest(isTrack, "HEAD abc", session("track"), ["src/app.ts"]);
+    assert.match(prompt, /optional agent preparation/);
+    assert.match(prompt, /visible Loom child sessions, including reviewers/);
+    assert.match(prompt, /preserving unrelated manual edits/);
+    assert.match(prompt, /Re-verify the exact source branch and revision and the exact target/);
+    assert.match(prompt, /Do not integrate, land, push, or open a PR until I choose that action/);
+  }
+});

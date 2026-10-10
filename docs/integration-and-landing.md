@@ -597,24 +597,68 @@ not a distinct strategy. If policy does not set a default, the conservative
 primary action is **Open PR**. The coordinator can still escalate a genuine
 decision it encounters while carrying out a chosen strategy.
 
+### One-click preparation and landing
+
+Choosing **Land** authorizes the complete operation: prepare the source,
+then carry out the chosen strategy at its resolved destination. The
+coordinator reviews the intended changes, fixes straightforward issues,
+runs required validation, and commits the intended source changes before
+landing. It continues through the chosen operation without a second
+confirmation or stopping at a preparation/readiness report. Escalate only
+when judgment or access outside that authorization is required.
+
+**Review → Prepare landing** is an optional preparation-only action. It
+does not choose a strategy or authorize landing, pushing, or opening a PR,
+and is not a prerequisite for **Land**. Its agent report is not control-plane
+verified readiness.
+
+Preparation must preserve unrelated or foreign edits in both source and
+target checkouts, including staged changes and untracked files. Inspect
+ownership and relevance; commit only intended source changes and report
+excluded edits. Use visible Loom child sessions for delegated review or
+repair, with explicit source/target references and typed result handoffs.
+Before the final write, re-verify the exact source branch and revision,
+target repository, checkout, branch and revision, and target origin.
+If either revision changed during preparation or delegation, refresh the
+diff and validation for the actual revisions before proceeding.
+
+A queued response (`local=false`) acknowledges preparation and landing
+intent; it is not a completed landing and must not claim **Landed** or
+publish a completion tag. While submitting the request, the Thread says
+**Requesting preparation and landing…**; after acceptance it says
+**Preparation and landing requested. Follow the result in this thread.**
+Completion is reported only when the chosen operation actually succeeds.
+
 ### Land locally
 
-`land-locally` is the exception to "the coordinator receives the request":
-Arachne itself squash-merges the track's branch into the primary checkout's
-currently checked out branch — deterministically, with no agent turn. It is
-offered only when the Loom server is loopback (its checkout paths are then
-local paths; a remote server's paths mean nothing on this machine), and it
+`land-locally` offers a deterministic local fast path with coordinator
+preparation/repair when needed. Arachne itself squash-merges a clean track's
+branch into the primary checkout's currently checked out branch with no
+agent turn. It is offered only when the Loom server is loopback (its checkout
+paths are then local paths; a remote server's paths mean nothing on this machine), and it
 lands into the branch the primary checkout has checked out *right now*, not
-a remembered target. The fast path refuses rather than reconciles anything
-that would need judgment: a conflicted merge, a detached primary, a primary
-already on the track branch, staged changes, or another in-progress
-operation (merge/rebase/cherry-pick/revert/bisect) — in every refusal case
-the checkout is left untouched, and a failed squash is unwound with
+a remembered target. This strategy has **no `main` or recorded-base
+fallback**: if the primary checkout's current branch cannot be resolved,
+do not choose another destination.
+
+A dirty source, staged target changes, or a recoverable squash conflict
+queues preparation and local landing to the coordinator (`local=false`,
+without landing details or a completion tag). The coordinator repairs and
+validates, then completes the authorized squash into the primary checkout's
+current branch, preserving unrelated source and target edits. A detached
+primary, a primary already on the track branch, or another in-progress
+operation (merge/rebase/cherry-pick/revert/bisect) is refused. Failed fast-path
+attempts preserve checkout state, and a failed squash is unwound with
 `git reset --merge`, which preserves the user's unrelated unstaged changes
-and untracked files. The outcome is reported synchronously (commit, target
-branch, squashed count) and stamped on the track's branch as an
+and untracked files. A completed fast-path outcome is reported synchronously
+(commit, target branch, squashed count) and stamped on the track's branch as an
 `integration_result` tag, the same durable signal an agent-mediated
 integration writes.
+
+The Thread preserves synchronous local feedback: **Landed locally** with
+the commit, target and squash count, or an **already contained / nothing to
+do** message for an actual no-op. A queued local repair uses the same
+preparation-and-landing request feedback as other queued strategies.
 
 Example:
 
@@ -646,6 +690,10 @@ resolved:
 3. `main` — when the checkout is detached, unreadable, or the control plane
 cannot see it. The landing agent should attempt the primary-checkout
 resolution itself before settling for `main`.
+
+`land-locally` always squashes into the primary checkout's **current**
+branch, re-resolved immediately before writing. The fallback above does not
+apply to it; neither `main` nor the recorded base is a substitute.
 
 `open-pr` keeps the branch's recorded base (the remote's default branch) as
 its target, since a PR's destination is the remote's concern, not the local
