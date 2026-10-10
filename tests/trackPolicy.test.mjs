@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
 import { canonicalTopicBranch, resolveTrack, effectiveAutoland, trackAutoland, threadAutoland, inferTopicBranch, topicBranchError, isValidTopicBranch, threadLandFeedback, launchTopicBranch } from "../src/trackPolicy.ts";
+import { independentReviewRequest, preparationRequest } from "../src/reviewRequest.ts";
 
 const session = (id, parent = null, tags = [], repo = "/repo") => ({
   id, status: "running", parent_session_id: parent, parent_id: null,
@@ -24,6 +25,30 @@ test("canonical accepted ref differs from scratch; legacy absence preserves scra
   const track = session("track", null, [tag("track_topic_branch", "arachne/tracks/task")]);
   assert.equal(canonicalTopicBranch(track), "arachne/tracks/task");
   assert.equal(canonicalTopicBranch(session("legacy")), "weaver/legacy");
+});
+
+test("untagged new Track resolves its durable initialization destination before legacy fallback", () => {
+  const track = session("new-track");
+  track.branch.goal = "Implement the task.\r\nArachne canonical Track initialization required: arachne/tracks/task\r\nInitialize from the launch seed before accepting changes.";
+  assert.equal(canonicalTopicBranch(track), "arachne/tracks/task");
+  for (const prompt of [independentReviewRequest("HEAD source", track), preparationRequest(false, "HEAD source", track)]) {
+    assert.match(prompt, /arachne\/tracks\/task/);
+    assert.doesNotMatch(prompt, /weaver\/new-track/);
+  }
+  // Once stamped, the durable canonical tag remains the primary authority.
+  track.branch.tags.push(tag("track_topic_branch", "arachne/tracks/stamped"));
+  assert.equal(canonicalTopicBranch(track), "arachne/tracks/stamped");
+});
+
+test("invalid or empty initialization markers never display a legacy scratch destination", () => {
+  for (const required of ["", "HEAD", "refs/heads/topic", "bad ref"]) {
+    const track = session("new-track");
+    track.branch.goal = `Task\nArachne canonical Track initialization required: ${required}\n`;
+    assert.equal(canonicalTopicBranch(track), "", required);
+  }
+  const legacy = session("legacy");
+  legacy.branch.goal = "An ordinary task mentioning Arachne canonical Track initialization required: topic inline.";
+  assert.equal(canonicalTopicBranch(legacy), "weaver/legacy");
 });
 
 test("Track resolution follows both parent identifiers, same-repository boundaries and cycle guards", () => {

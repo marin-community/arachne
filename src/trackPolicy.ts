@@ -8,6 +8,7 @@ export interface PolicySession {
     id: string;
     branch: string;
     repo_root: string;
+    goal?: string;
     tags: { key: string; value: string; note?: string }[];
   };
 }
@@ -22,8 +23,20 @@ export function isTrackCoordinator(session: PolicySession): boolean {
 }
 
 export function canonicalTopicBranch(session: Pick<PolicySession, "branch">): string {
+  const tagged = tagValue(session, "track_topic_branch");
+  if (tagged !== undefined) return tagged;
+  // New Tracks retain the required destination in their durable goal even
+  // when tag stamping fails. This records intent, not completed initialization.
+  const prefix = "Arachne canonical Track initialization required:";
+  const instruction = session.branch.goal?.split(/\r?\n/)
+    .map(line => line.trim()).find(line => line.startsWith(prefix));
+  if (instruction !== undefined) {
+    const required = instruction.slice(prefix.length).trim();
+    // A malformed initialization marker must not masquerade as a legacy Track.
+    return isValidTopicBranch(required) ? required : "";
+  }
   // A legacy Track keeps its existing accepted branch. Never migrate it implicitly.
-  return tagValue(session, "track_topic_branch") ?? session.branch.branch;
+  return session.branch.branch;
 }
 
 export function resolveTrack<T extends PolicySession>(fleet: readonly T[], sourceId: string): T | null {
