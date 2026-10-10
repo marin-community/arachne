@@ -4570,6 +4570,15 @@ mod landing_dispatch_tests {
             "unstaged target\n"
         );
         assert_eq!(git(&repo.0, &["rev-parse", "HEAD"]), before_head);
+        assert_eq!(
+            std::fs::read_to_string(source.join("topic.txt")).unwrap(),
+            "editor save\n"
+        );
+        assert_eq!(git(source, &["show", ":unrelated.txt"]), "foreign source\n");
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("untracked.txt")).unwrap(),
+            "foreign target\n"
+        );
     }
     #[tokio::test]
     async fn clean_source_lands_immediately_and_tags_only_the_completed_result() {
@@ -4648,6 +4657,11 @@ mod landing_dispatch_tests {
     #[tokio::test]
     async fn true_local_blockers_do_not_dispatch_or_mutate_checkouts() {
         let (repo, view, summary) = fixture();
+        std::fs::write(
+            Path::new(&view.work_dir).join("topic.txt"),
+            "pending editor save\n",
+        )
+        .unwrap();
         let local = Arc::new(LoomClient::new("http://127.0.0.1:1/", None).unwrap());
         let remote = Arc::new(LoomClient::new("http://remote.example/", None).unwrap());
         assert!(land_topic_locally(remote, view.clone(), &summary)
