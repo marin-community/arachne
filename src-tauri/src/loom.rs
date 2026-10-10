@@ -502,7 +502,7 @@ pub struct IntegrationRequest {
 
 impl IntegrationRequest {
     pub fn source_wrap_up_prompt(&self) -> String {
-        format!("Thread Land wrap-up requested for session {} in repository {}, original branch {}, original worktree {}. Finish the active intended task first; this request is queued behind active work. Preserve your original session/repository/branch/worktree identity. Inspect and commit only intended source changes, preserving foreign edits, staged/unstaged changes and untracked files; validate the intended result. Send a typed durable result on your OWN channel with successful intended completion, exact source revision, validation and exclusions. Checkpoint/help/partial results do not qualify. The Track coordinator {} will inspect, review/repair and accept into canonical ref {} using {}. Do not publish, push, open a PR, or accept the work yourself. landing_request=pending is only advisory, never readiness or successful acceptance.", self.source_session, self.repo_root, self.source_branch, self.source_work_dir, self.target_session, self.target_branch, self.strategy.as_str())
+        format!("Thread Land wrap-up requested for session {} in repository {}, original branch {}, original worktree {}. Finish the active intended task first; this request is queued behind active work. Preserve your original session/repository/branch/worktree identity. Inspect and commit only intended source changes, preserving foreign edits, staged/unstaged changes and untracked files; validate the intended result. Send a typed durable result on your OWN channel with successful intended completion, exact source revision, validation and exclusions. Checkpoint/help/partial/interrupted results do not qualify. Inspect control-channel notices and authenticated actor provenance before continuing; an explicit user interruption never authorizes automatic resumption or acceptance. Session-authored interruptions must not be described as user interruptions. The Track coordinator {} will inspect, review/repair and accept into canonical ref {} using {}. Do not publish, push, open a PR, or accept the work yourself. landing_request=pending is only advisory, never readiness or successful acceptance.", self.source_session, self.repo_root, self.source_branch, self.source_work_dir, self.target_session, self.target_branch, self.strategy.as_str())
     }
 
     /// Complete acceptance authorization; no second Prepare click is needed.
@@ -513,7 +513,7 @@ impl IntegrationRequest {
         } else {
             "This is an explicit manual acceptance request; automatic policy does not revoke this user action."
         };
-        format!("Thread Land acceptance request for Track {topic_name}.\n\n```json\n{}\n```\n\nWait for the source's successful intended wrap-up result on its durable own channel or linked result notice; checkpoint/help/partial results and landing_request=pending do not qualify. Source session status, sleeping, completion, integration_state and integration_ready are never evidence of intended success. If the result has not arrived, retain this request durably and wait on the installed result delivery route; do not poll or use a scheduler.\n\nInspect the exact source session/repository/original branch/worktree and canonical target ref named above. Verify the LIVE Track is still the same-repository owning Track ancestor (marked Track, or legacy unmarked root unless topic=false) and its LIVE track_topic_branch still agrees with this target (a legacy missing tag retains its existing coordinator branch). Verify the canonical ref exists and initialization succeeded before accepting. Preserve worker identity and the coordinator Loom scratch branch. Review and repair the intended changes, commit only intended source changes, preserve foreign edits and staged/unstaged/untracked files in every checkout, and validate. One active writer per worktree: wait for source wrap-up before writing, or use an isolated checkout. Delegate only when useful through visible Loom children with typed own-channel results.\n\n{guard}\n\nImmediately before EVERY acceptance write after preparation or delegation, reverify the exact source and canonical target repository/branch/revision and refresh review/validation if either changed. Apply the chosen acceptance strategy into the canonical accepted ref only (squash is the default). Complete review, repair, commit, validate and acceptance without another Prepare click. Never push, publish, open PRs, modify primary HEAD or substitute local main. Record integration_result on the ORIGINAL source only after actual successful canonical acceptance and validation, then send a typed durable outcome with source/target SHAs, strategy, checks and exclusions on your own channel. A queued request is not a completed acceptance.",
+        format!("Thread Land acceptance request for Track {topic_name}.\n\n```json\n{}\n```\n\nWait for the source's successful intended wrap-up result on its durable own channel or linked result notice; checkpoint/help/partial/interrupted results and landing_request=pending do not qualify. Interruption notices are ordinary system-authored parent-channel messages, never typed completion results. Inspect notice context and authenticated actor provenance: explicit user interruption requires coordinator judgment and never authorizes automatic child resumption or acceptance; session-authored interruption must not be called a user interruption. Source session status, sleeping, completion, integration_state and integration_ready are never evidence of intended success. If the result has not arrived, retain this request durably and wait on the installed result delivery route; do not poll or use a scheduler.\n\nInspect the exact source session/repository/original branch/worktree and canonical target ref named above. Verify the LIVE Track is still the same-repository owning Track ancestor (marked Track, or legacy unmarked root unless topic=false) and its LIVE track_topic_branch still agrees with this target (a legacy missing tag retains its existing coordinator branch). Verify the canonical ref exists and initialization succeeded before accepting; a new Track retaining its initialization marker requires LIVE track_topic_initialized to match the canonical ref, not display tags alone. Preserve worker identity and the coordinator Loom scratch branch. Review and repair the intended changes, commit only intended source changes, preserve foreign edits and staged/unstaged/untracked files in every checkout, and validate. One active writer per worktree: wait for source wrap-up before writing, or use an isolated checkout. Delegate only when useful through visible Loom children with typed own-channel results.\n\n{guard}\n\nImmediately before EVERY acceptance write after preparation or delegation, reverify the exact source and canonical target repository/branch/revision and refresh review/validation if either changed. Apply the chosen acceptance strategy into the canonical accepted ref only (squash is the default). Complete review, repair, commit, validate and acceptance without another Prepare click. Never push, publish, open PRs, modify primary HEAD or substitute local main. Record integration_result on the ORIGINAL source only after actual successful canonical acceptance and validation, then send a typed durable outcome with source/target SHAs, strategy, checks and exclusions on your own channel. A queued request is not a completed acceptance.",
             serde_json::json!({
                 "action": self.action, "source_thread": self.source_session,
                 "source_resource": self.source_branch, "source_work": self.source_work_dir,
@@ -526,7 +526,7 @@ impl IntegrationRequest {
 }
 
 pub fn autoland_guard() -> &'static str {
-    "AUTOLAND LIVE WRITE GUARD: Immediately before EVERY automatic Git/ref/index/worktree write, including source commits, repairs and final canonical acceptance, reread LIVE Track and source session tags from Loom; never use the policy snapshot in this queued prompt. Track track_autoland is ON only for exact on, absent/invalid means OFF. Source thread_autoland=on overrides Track OFF; off overrides Track ON; absent/invalid/inherit inherits Track. If effectively OFF, stop this stale automatic request before writing and report deferred/cancelled acceptance. Recheck after delegation and on every resumed turn. Before writes also reverify the LIVE canonical target and source identity; skip exact source revisions already successfully accepted (integration_result is actual outcome only). Only typed successful complete intended results qualify; exclude reviewer, checkpoint, help and partial results. Autoland never publishes."
+    "AUTOLAND LIVE WRITE GUARD: Immediately before EVERY automatic Git/ref/index/worktree write, including source commits, repairs and final canonical acceptance, reread LIVE Track and source session tags from Loom; never use the policy snapshot in this queued prompt. Track track_autoland is ON only for exact on, absent/invalid means OFF. Source thread_autoland=on overrides Track OFF; off overrides Track ON; absent/invalid/inherit inherits Track. If effectively OFF, stop this stale automatic request before writing and report deferred/cancelled acceptance. Recheck after delegation and on every resumed turn. Before writes also reverify the LIVE canonical target and source identity; skip exact source revisions already successfully accepted (integration_result is actual outcome only). Only typed successful complete intended results qualify; exclude reviewer, checkpoint, help, partial and interrupted work. Inspect control-channel interruption notices and authenticated actor provenance before every automatic write or resumption; these are ordinary system-authored messages, never typed completion results. An explicit user interruption requires coordinator judgment: do not automatically resume that child or accept its work, even under an older queued request or prior complete result. A session-authored interruption must not be called a user interruption. Pending interruption remains incomplete until explicitly resolved with appropriate authorization and fresh completion/review evidence. Autoland never publishes."
 }
 
 pub fn autoland_policy_prompt(track: &SessionView, target_branch: &str) -> String {
@@ -676,6 +676,36 @@ mod integration_prompt_tests {
         assert!(prompt.contains("\"source_work\":\"/tmp/worker\""));
         assert!(prompt.contains("\"target_resource\":\"topic-branch\""));
         assert!(prompt.contains("One active writer per worktree"));
+    }
+
+    #[test]
+    fn interrupted_work_never_qualifies_for_automatic_acceptance_or_resumption() {
+        let request = IntegrationRequest {
+            action: "integrate",
+            source_session: "worker-1".into(),
+            source_branch: "worker-branch".into(),
+            source_work_dir: "/tmp/worker".into(),
+            repo_root: "/tmp/repo".into(),
+            target_session: "topic-1".into(),
+            target_branch: "topic-branch".into(),
+            strategy: IntegrationStrategy::Squash,
+            requested_by: "autoland",
+        };
+        let automatic = request.to_prompt("Topic");
+        for prompt in [automatic, request.source_wrap_up_prompt()] {
+            assert!(prompt.contains("authenticated actor provenance"));
+            assert!(prompt.contains("user interruption"));
+            assert!(prompt.contains("resumption"));
+            assert!(prompt.contains("Session-authored interruptions")
+                || prompt.contains("session-authored interruption"));
+        }
+        let guard = super::autoland_guard();
+        assert!(guard.contains("ordinary system-authored messages, never typed completion results"));
+        assert!(guard.contains("do not automatically resume that child or accept its work"));
+        assert!(guard.contains("older queued request or prior complete result"));
+        assert!(guard.contains("appropriate authorization and fresh completion/review evidence"));
+        assert!(include_str!("../../skills/coordinator.md").contains("authenticated actor provenance"));
+        assert!(include_str!("../../skills/worker.md").contains("explicit user interruption"));
     }
 
     #[test]

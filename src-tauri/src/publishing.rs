@@ -199,6 +199,16 @@ async fn publish(
         .find(|branch| branch.name == source)
         .and_then(|branch| branch.worktree.clone());
     if local_client(client) {
+        request.target_revision = git(
+            Path::new(&view.branch.repo_root),
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", request.target_upstream),
+            ],
+        )
+        .await
+        .ok();
         request.source_revision =
             Some(verify_ref(Path::new(&view.branch.repo_root), &source).await?);
         if !explicit {
@@ -331,6 +341,7 @@ struct PublishRequest {
     legacy_source_state: Option<SourceCheckoutState>,
     strategy: &'static str,
     target_upstream: String,
+    target_revision: Option<String>,
     target_origin: String,
     local_target: Option<LocalLandingTarget>,
     repair_reason: Option<String>,
@@ -361,6 +372,7 @@ impl PublishRequest {
             legacy_source_state: None,
             strategy: strategy.wire(),
             target_upstream: target,
+            target_revision: None,
             target_origin: origin.into(),
             local_target: None,
             repair_reason: None,
@@ -383,7 +395,7 @@ impl PublishRequest {
         } else {
             "Legacy Track without a canonical tag: its coordinator branch remains canonical. Inspect/review and validate intended staged, unstaged and untracked source edits, commit only intended changes preserving foreign work, and refresh the committed canonical revision before performing this same chosen publish. Do not require a second Prepare click."
         };
-        format!("Explicit Track Publish request\n\n```json\n{}\n```\n\nThis request authorizes ONLY the chosen {} action now; acceptance/autoland never authorizes publishing. Re-read LIVE Track marker, parentage and track_topic_branch before writing; stop if they disagree with the request. Verify the canonical ref really exists as a commit in this exact repository and matches source_revision when recorded, not metadata alone; stop for fresh review if accepted history moved. One active writer per checkout; queue behind current work and establish child result channel wake delivery before waiting for any required acceptance.\n\n{preparation}\n\nInspect, review, repair and validate the accepted changes and chosen destination. For primary-checkout/main-fallback destinations, resolve the primary current branch again before writing; a main fallback is advisory and never authorizes a different destination without fresh review. {mode}\n\nA queued request is NOT a successful publish. Only after the actual chosen operation succeeds, stamp publish_result on this Track with actual commit/ref/PR URLs and report a typed result with chosen strategy, canonical source ref/SHA, target, actual outputs and checks. Never stamp integration_result for publishing. On partial stack failure, report each actual successful PR and each failure without stamping whole-stack success. No automatic or follow-up publish without explicit user choice.",
+        format!("Explicit Track Publish request\n\n```json\n{}\n```\n\nThis request authorizes ONLY the chosen {} action now; acceptance/autoland never authorizes publishing. Re-read LIVE Track marker, parentage and track_topic_branch before writing. If canonical metadata or accepted history changed, preserve this same chosen Publish authorization, perform fresh review and validation of the LIVE canonical accepted ref, refresh source/ref/revision and target snapshots, then continue this chosen operation. Never write the stale snapshot or substitute coordinator scratch. Stop for true repository/ownership/access blockers. For a new Track retaining the initialization goal marker, require the LIVE track_topic_initialized verification tag to exactly match the canonical ref; display tags or a coincidentally existing branch are insufficient. Verify the canonical ref really exists as a commit in this exact repository and matches source_revision when recorded, not metadata alone; perform fresh review before continuing if accepted history moved. One active writer per checkout; queue behind current work and establish child result channel wake delivery before waiting for any required acceptance.\n\n{preparation}\n\nInspect, review, repair and validate the accepted changes and chosen destination. For primary-checkout/main-fallback destinations, resolve the primary current branch again before writing; a main fallback is advisory and never authorizes a different destination without fresh review. {mode}\n\nA queued request is NOT a successful publish. Only after the actual chosen operation succeeds, stamp publish_result on this Track with actual commit/ref/PR URLs and report a typed result with chosen strategy, canonical source ref/SHA, target, actual outputs and checks. Never stamp integration_result for publishing. On partial stack failure, report each actual successful PR and each failure without stamping whole-stack success. No automatic or follow-up publish without explicit user choice.",
             serde_json::to_string(self).expect("publish request serialization"), self.strategy)
     }
 }
@@ -394,24 +406,13 @@ async fn dispatch(
     request: PublishRequest,
 ) -> Result<LandResult, UiError> {
     let prompt = request.prompt();
-    if view.protocol == "terminal" {
-        // Durable delivery, never type into an active terminal.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        client
-            .send_to_thread(
-                &view.id,
-                &prompt,
-                serde_json::to_value(&request).expect("publish request"),
-                &format!("arachne-publish-{}-{nonce}", view.id),
-            )
-            .await?;
-    } else {
-        client.resume_if_orphaned(&view.id).await?;
-        client.queue_prompt(&view.id, &prompt).await?;
-    }
+    client
+        .deliver_request(
+            view,
+            &prompt,
+            serde_json::to_value(&request).expect("publish request"),
+        )
+        .await?;
     Ok(LandResult {
         local: false,
         landing: None,
@@ -457,7 +458,13 @@ async fn publish_local(
         None
     };
     let refreshed = verify_ref(repo, source).await?;
-    let reason = if revision != refreshed {
+    let summary_source = crate::track_policy::canonical_topic_branch(&summary.branch);
+    let metadata_changed = summary_source != Some(source)
+        || summary.branch.repo_root != view.branch.repo_root
+        || crate::track_policy::tag(&summary.branch, "topic") == Some("false");
+    let reason = if metadata_changed {
+        Some("Canonical Track metadata changed between session and fleet reads; refresh the LIVE owning Track/source and review before this same chosen publish.".into())
+    } else if revision != refreshed {
         Some(
             "Canonical accepted revision moved during preflight; refresh review and validation."
                 .into(),
@@ -481,8 +488,32 @@ async fn publish_local(
     } else {
         &view.branch.title
     };
+    // The first session/fleet reads selected a destination; immediately before
+    // synchronous Git writes, check that LIVE metadata still selects that ref.
+    let reason = if reason.is_none() {
+        let live = client.get_session(&view.id).await?;
+        let fleet = client.list_sessions().await?;
+        let owner = fleet.iter().find(|session| session.id == view.id);
+        let unchanged = live.id == view.id
+            && live.status != "archived"
+            && live.branch.repo_root == view.branch.repo_root
+            && canonical_source(&live)
+                .is_ok_and(|(branch, mode)| branch == source && mode == explicit)
+            && owner.is_some_and(|session| {
+                session.parent_id.is_none()
+                    && session.parent_session_id.is_none()
+                    && session.branch.repo_root == view.branch.repo_root
+                    && crate::track_policy::canonical_topic_branch(&session.branch) == Some(source)
+                    && crate::track_policy::tag(&session.branch, "topic") != Some("false")
+            });
+        (!unchanged).then(|| "Canonical Track metadata changed before synchronous publication; reread LIVE ownership/ref and refresh review before the chosen publish.".into())
+    } else {
+        reason
+    };
     let (completed, reason) = if reason.is_none() {
-        match landing::squash_into_primary_checkout(repo, source, title).await {
+        match landing::squash_into_primary_checkout_pinned(repo, source, &refreshed, &target, title)
+            .await
+        {
             Ok(result) => (Some(result), None),
             Err(LandingError::StagedChanges) => (
                 None,
@@ -497,17 +528,33 @@ async fn publish_local(
     } else {
         (None, reason)
     };
-    if let Some(result) = completed {
-        let target_sha = git(Path::new(&result.primary_checkout), &["rev-parse", "HEAD"]).await?;
+    if let Some(mut result) = completed {
+        // The squash has already completed. A follow-up read cannot turn that
+        // success into an ordinary failure inviting a duplicate Publish click.
+        let target_sha = if result.landed {
+            result.commit.clone()
+        } else {
+            Some(target.revision.clone())
+        };
         let note = format!(
-            "land-locally: published refs/heads/{source} at {refreshed} into {} at {target_sha}",
-            result.target_branch
+            "land-locally: published refs/heads/{source} at {refreshed} into {} at {}",
+            result.target_branch,
+            target_sha
+                .as_deref()
+                .unwrap_or("revision unavailable after completed Git operation")
         );
         // Git success stands even if metadata delivery fails, as in the existing
         // local helper. The UI still receives the completed Git result.
-        let _ = client
-            .set_tag(&view.id, "publish_result", &target_sha, &note)
-            .await;
+        if let Some(target_sha) = target_sha {
+            if let Err(error) = client
+                .set_tag(&view.id, "publish_result", &target_sha, &note)
+                .await
+            {
+                result.warnings.push(format!(
+                    "Git publication completed, but its result tag could not be confirmed: {error}"
+                ));
+            }
+        }
         return Ok(LandResult {
             local: true,
             landing: Some(result.into()),
@@ -529,6 +576,7 @@ async fn publish_local(
         Some(view.work_dir.clone())
     };
     request.legacy_source_state = legacy;
+    request.target_revision = Some(target.revision.clone());
     request.local_target = Some(target);
     request.repair_reason = reason;
     dispatch(client, view, request).await
@@ -657,8 +705,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let mut requests = vec![];
-            for (path, body) in replies {
+            let mut requests: Vec<Value> = vec![];
+            for (path, mut body) in replies {
                 let (mut socket, _) =
                     tokio::time::timeout(Duration::from_secs(10), listener.accept())
                         .await
@@ -694,8 +742,26 @@ mod tests {
                     bytes.extend_from_slice(&chunk[..count]);
                 }
                 requests.push(serde_json::from_slice(&bytes[start..start + len]).unwrap());
+                // Controlled Git change exactly at a metadata response proves
+                // preflight races without relying on process timing.
+                if let Some(change) = body.get("_test_git_before_reply") {
+                    let args: Vec<_> = change["args"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|arg| arg.as_str().unwrap())
+                        .collect();
+                    run(Path::new(change["repo"].as_str().unwrap()), &args);
+                }
+                if body["_test_echo_receipt"] == true {
+                    let sent = requests.last().unwrap();
+                    body = json!({"id":"message", "channel_id":sent["channel"],
+                        "kind":"message", "body":sent["body"].as_str().unwrap().trim(),
+                        "payload":sent["payload"]});
+                }
+                let status = body["_test_status"].as_u64().unwrap_or(200);
                 let body = body.to_string();
-                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 {status} Response\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
             }
             requests
         });
@@ -712,10 +778,21 @@ mod tests {
     }
     fn queue(replies: &mut Vec<Reply>, view: &SessionView) {
         if view.protocol == "terminal" {
-            replies.push(("/api/channels/messages/create", json!({"id":"message"})));
+            replies.push((
+                "/api/channels/subscription/set",
+                json!({"channel_id":view.id,
+                "subject_kind":"session", "subject_id":view.id, "mode":"deliver"}),
+            ));
+            replies.push((
+                "/api/channels/messages/create",
+                json!({"_test_echo_receipt":true}),
+            ));
         } else {
             replies.push(("/api/sessions/get", json!(view)));
-            replies.push(("/api/sessions/prompt/create", json!({"queued":true})));
+            replies.push((
+                "/api/sessions/prompt/create",
+                json!({"queued":true,"turn":null}),
+            ));
         }
     }
     fn payload(body: &Value, terminal: bool) -> (Value, String) {
@@ -759,6 +836,8 @@ mod tests {
         let scratch_status = run(&repo.0.join("scratch"), &["status", "--porcelain"]);
         let accepted_status = run(&repo.0.join("accepted"), &["status", "--porcelain"]);
         let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
         replies.push(("/api/sessions/tags/set", json!({})));
         let (client, server) = mock(replies).await;
         let result = publish(&client, &view.id, "land-locally", None)
@@ -801,6 +880,8 @@ mod tests {
         run(&repo.0, &["worktree", "remove", "accepted"]);
         view.work_dir = "/not/a/local/checkout".into();
         let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
         replies.push(("/api/sessions/tags/set", json!({})));
         let (client, server) = mock(replies).await;
         assert!(
@@ -820,6 +901,8 @@ mod tests {
         summary.branch = view.branch.clone();
         let scratch_head = run(&repo.0.join("scratch"), &["rev-parse", "HEAD"]);
         let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
         replies.push(("/api/sessions/tags/set", json!({})));
         let (client, server) = mock(replies).await;
         let result = publish(&client, &view.id, "land-locally", None)
@@ -833,6 +916,308 @@ mod tests {
         );
         let requests = server.await.unwrap();
         assert_eq!(requests.last().unwrap()["key"], "publish_result");
+    }
+
+    #[tokio::test]
+    async fn stale_fleet_canonical_metadata_queues_review_without_publishing_old_selection() {
+        let (repo, view, mut summary) = fixture(true);
+        run(&repo.0, &["branch", "accepted/replacement"]);
+        summary
+            .branch
+            .tags
+            .iter_mut()
+            .find(|tag| tag.key == "track_topic_branch")
+            .unwrap()
+            .value = "accepted/replacement".into();
+        let head = run(&repo.0, &["rev-parse", "HEAD"]);
+        let mut replies = initial(&view, &summary);
+        queue(&mut replies, &view);
+        let (client, server) = mock(replies).await;
+        let result = publish(&client, &view.id, "land-locally", None)
+            .await
+            .unwrap();
+        assert!(!result.local);
+        let requests = server.await.unwrap();
+        let (request, prompt) = payload(requests.last().unwrap(), false);
+        assert!(request["repair_reason"]
+            .as_str()
+            .unwrap()
+            .contains("metadata changed"));
+        assert!(prompt.contains("preserve this same chosen Publish authorization"));
+        assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), head);
+        assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+    }
+
+    #[tokio::test]
+    async fn live_canonical_change_before_write_queues_fresh_review_without_target_changes() {
+        let (repo, view, summary) = fixture(true);
+        run(&repo.0, &["branch", "accepted/replacement"]);
+        let mut live = view.clone();
+        live.branch
+            .tags
+            .iter_mut()
+            .find(|tag| tag.key == "track_topic_branch")
+            .unwrap()
+            .value = "accepted/replacement".into();
+        let mut owner = summary.clone();
+        owner.branch = live.branch.clone();
+        let head = run(&repo.0, &["rev-parse", "HEAD"]);
+        let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(live)));
+        replies.push(("/api/sessions/summary/list", json!([owner])));
+        queue(&mut replies, &view);
+        let (client, server) = mock(replies).await;
+        assert!(
+            !publish(&client, &view.id, "land-locally", None)
+                .await
+                .unwrap()
+                .local
+        );
+        let requests = server.await.unwrap();
+        let (request, _) = payload(requests.last().unwrap(), false);
+        assert!(request["repair_reason"]
+            .as_str()
+            .unwrap()
+            .contains("metadata changed"));
+        assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), head);
+        assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+    }
+
+    #[tokio::test]
+    async fn accepted_ref_advance_during_final_metadata_check_never_silently_publishes_new_content()
+    {
+        let (repo, view, summary) = fixture(true);
+        let original = run(&repo.0, &["rev-parse", "accepted/topic"]);
+        commit(
+            &repo.0.join("accepted"),
+            "late-accepted.txt",
+            "not reviewed
+",
+        );
+        let advanced = run(&repo.0, &["rev-parse", "accepted/topic"]);
+        run(
+            &repo.0,
+            &[
+                "update-ref",
+                "refs/heads/accepted/topic",
+                &original,
+                &advanced,
+            ],
+        );
+        let head = run(&repo.0, &["rev-parse", "HEAD"]);
+        let mut response = json!(view);
+        response["_test_git_before_reply"] = json!({"repo":repo.0,
+            "args":["update-ref", "refs/heads/accepted/topic", advanced, original]});
+        let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", response));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
+        queue(&mut replies, &view);
+        let (client, server) = mock(replies).await;
+        assert!(
+            !publish(&client, &view.id, "land-locally", None)
+                .await
+                .unwrap()
+                .local
+        );
+        let requests = server.await.unwrap();
+        let (request, _) = payload(requests.last().unwrap(), false);
+        assert!(request["repair_reason"]
+            .as_str()
+            .unwrap()
+            .contains("changed"));
+        assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), head);
+        assert!(!repo.0.join("late-accepted.txt").exists());
+        assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+    }
+
+    #[tokio::test]
+    async fn primary_ref_advance_during_final_metadata_check_queues_without_a_squash() {
+        let (repo, view, summary) = fixture(true);
+        let original = run(&repo.0, &["rev-parse", "HEAD"]);
+        let tree = run(&repo.0, &["rev-parse", "HEAD^{tree}"]);
+        let advanced = run(
+            &repo.0,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &original,
+                "-m",
+                "concurrent primary update",
+            ],
+        );
+        let mut response = json!(view);
+        response["_test_git_before_reply"] = json!({"repo":repo.0,
+            "args":["update-ref", "refs/heads/current-dev", advanced, original]});
+        let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", response));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
+        queue(&mut replies, &view);
+        let (client, server) = mock(replies).await;
+        assert!(
+            !publish(&client, &view.id, "land-locally", None)
+                .await
+                .unwrap()
+                .local
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), advanced);
+        assert!(!repo.0.join("accepted-one.txt").exists());
+        assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+    }
+
+    #[tokio::test]
+    async fn ignored_foreign_collision_queues_preservation_repair_without_overwriting() {
+        let (repo, view, summary) = fixture(true);
+        commit(
+            &repo.0.join("accepted"),
+            "private.env",
+            "accepted example
+",
+        );
+        let excludes = repo.0.join(".git/info/exclude");
+        let mut contents = std::fs::read_to_string(&excludes).unwrap();
+        contents.push_str(
+            "private.env
+",
+        );
+        std::fs::write(excludes, contents).unwrap();
+        write(
+            &repo.0,
+            "private.env",
+            "foreign secret bytes
+",
+        );
+        let head = run(&repo.0, &["rev-parse", "HEAD"]);
+        let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
+        queue(&mut replies, &view);
+        let (client, server) = mock(replies).await;
+        assert!(
+            !publish(&client, &view.id, "land-locally", None)
+                .await
+                .unwrap()
+                .local
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("private.env")).unwrap(),
+            "foreign secret bytes
+"
+        );
+        assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run(&repo.0, &["status", "--porcelain"]), "");
+        assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_terminal_publish_receipt_preserves_stable_retry_identity_without_success() {
+        let (repo, mut view, summary) = fixture(true);
+        view.protocol = "terminal".into();
+        write(
+            &repo.0,
+            "foreign.txt",
+            "foreign staging
+",
+        );
+        run(&repo.0, &["add", "foreign.txt"]);
+        let head = run(&repo.0, &["rev-parse", "HEAD"]);
+        let mut keys = Vec::new();
+        for _ in 0..2 {
+            let mut replies = initial(&view, &summary);
+            queue(&mut replies, &view);
+            replies.last_mut().unwrap().1 = json!({}); // authorization received, receipt malformed
+            let (client, server) = mock(replies).await;
+            let error = publish(&client, &view.id, "land-locally", None)
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("may already"), "{}", error.message);
+            let requests = server.await.unwrap();
+            let sent = requests.last().unwrap();
+            keys.push(sent["idempotency_key"].as_str().unwrap().to_owned());
+            assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+        }
+        assert_eq!(keys[0], keys[1]);
+        assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), head);
+        assert_eq!(run(&repo.0, &["show", ":foreign.txt"]), "foreign staging");
+    }
+
+    #[tokio::test]
+    async fn uncertain_acp_publish_receipt_is_reported_as_uncertain_not_confirmed_queue() {
+        let (repo, view, summary) = fixture(true);
+        write(
+            &repo.0,
+            "foreign.txt",
+            "foreign staging
+",
+        );
+        run(&repo.0, &["add", "foreign.txt"]);
+        let mut replies = initial(&view, &summary);
+        queue(&mut replies, &view);
+        replies.last_mut().unwrap().1 = json!({});
+        let (client, server) = mock(replies).await;
+        let error = publish(&client, &view.id, "land-locally", None)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("may already"), "{}", error.message);
+        let requests = server.await.unwrap();
+        assert!(!requests.iter().any(|body| body["key"] == "publish_result"));
+    }
+
+    #[tokio::test]
+    async fn terminal_publish_requires_verified_delivery_route_before_authorization_dispatch() {
+        let (repo, mut view, summary) = fixture(true);
+        view.protocol = "terminal".into();
+        write(
+            &repo.0,
+            "foreign.txt",
+            "foreign staging
+",
+        );
+        run(&repo.0, &["add", "foreign.txt"]);
+        let mut replies = initial(&view, &summary);
+        replies.push((
+            "/api/channels/subscription/set",
+            json!({"channel_id":view.id,
+            "subject_kind":"session", "subject_id":view.id, "mode":"observe"}),
+        ));
+        let (client, server) = mock(replies).await;
+        assert!(publish(&client, &view.id, "land-locally", None)
+            .await
+            .is_err());
+        let requests = server.await.unwrap();
+        assert_eq!(requests.last().unwrap()["mode"], "deliver");
+        assert!(!requests.iter().any(|body| body.get("body").is_some()));
+    }
+
+    #[tokio::test]
+    async fn completed_git_publish_survives_failed_result_metadata_delivery() {
+        let (repo, view, summary) = fixture(true);
+        let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
+        replies.push((
+            "/api/sessions/tags/set",
+            json!({"_test_status":503,"message":"metadata unavailable"}),
+        ));
+        let (client, server) = mock(replies).await;
+        let result = publish(&client, &view.id, "land-locally", None)
+            .await
+            .unwrap();
+        assert!(result.local);
+        let landing = result.landing.unwrap();
+        assert!(landing.landed);
+        assert_eq!(
+            landing.commit.as_deref(),
+            Some(run(&repo.0, &["rev-parse", "HEAD"]).as_str())
+        );
+        assert!(landing
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("completed") && warning.contains("tag")));
+        assert_eq!(run(&repo.0, &["show", "HEAD:accepted-one.txt"]), "one");
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -906,6 +1291,8 @@ mod tests {
         let status = run(&repo.0, &["status", "--porcelain"]);
         let head = run(&repo.0, &["rev-parse", "HEAD"]);
         let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
         queue(&mut replies, &view);
         let (client, server) = mock(replies).await;
         let result = publish(&client, &view.id, "land-locally", None)
@@ -952,6 +1339,8 @@ mod tests {
         assert_eq!(run(&repo.0, &["rev-parse", "HEAD"]), head);
         std::fs::remove_file(repo.0.join("scratch/intended-new.txt")).unwrap();
         let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
         replies.push(("/api/sessions/tags/set", json!({})));
         let (client, server) = mock(replies).await;
         assert!(
@@ -1047,7 +1436,7 @@ mod tests {
 
     #[tokio::test]
     async fn root_track_marker_and_initialized_canonical_are_required() {
-        for condition in ["child", "standalone", "pending", "invalid", "missing"] {
+        for condition in ["child", "standalone", "pending", "unverified", "mismatched-verification", "invalid", "missing"] {
             let (repo, mut view, mut summary) = fixture(true);
             match condition {
                 "child" => summary.parent_session_id = Some("parent".into()),
@@ -1067,6 +1456,23 @@ mod tests {
                         "{} accepted/topic",
                         crate::track_policy::CANONICAL_INITIALIZATION_MARKER
                     );
+                }
+                "unverified" | "mismatched-verification" => {
+                    // Existing real ref plus launch/display tags cannot prove
+                    // this new Track created it, especially after a collision.
+                    view.branch.goal = format!(
+                        "{} accepted/topic",
+                        crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+                    );
+                    if condition == "mismatched-verification" {
+                        view.branch.tags.push(crate::loom::TagView {
+                            key: "track_topic_initialized".into(),
+                            value: "other-track/ref".into(),
+                            note: String::new(),
+                            set_at: String::new(),
+                            set_by: String::new(),
+                        });
+                    }
                 }
                 "invalid" => {
                     view.branch
@@ -1135,6 +1541,8 @@ mod tests {
         run(&repo.0, &["merge", "--ff-only", "accepted/topic"]);
         let head = run(&repo.0, &["rev-parse", "HEAD"]);
         let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/get", json!(view)));
+        replies.push(("/api/sessions/summary/list", json!([summary])));
         replies.push(("/api/sessions/tags/set", json!({})));
         let (client, server) = mock(replies).await;
         let result = publish(&client, &view.id, "land-locally", None)

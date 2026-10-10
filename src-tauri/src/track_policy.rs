@@ -27,6 +27,13 @@ pub fn pending_topic_branch(branch: &BranchSummaryView) -> Option<&str> {
 
 /// A missing tag is the legacy accepted branch. An invalid tag fails closed.
 pub fn canonical_topic_branch(branch: &BranchSummaryView) -> Option<&str> {
+    if let Some(required) = pending_topic_branch(branch) {
+        if tag(branch, "track_topic_initialized") != Some(required)
+            || tag(branch, "track_topic_branch") != Some(required)
+        {
+            return None;
+        }
+    }
     match tag(branch, "track_topic_branch") {
         Some(name) => valid_topic_branch(name).then_some(name),
         None if pending_topic_branch(branch).is_some() => None,
@@ -182,7 +189,7 @@ fn shell_quote(value: &str) -> String {
 pub fn initialization_prompt(branch: &str) -> String {
     let reference = shell_quote(&format!("refs/heads/{branch}"));
     let branch_arg = shell_quote(branch);
-    format!("{CANONICAL_INITIALIZATION_MARKER} {branch}\nCanonical Track initialization (required BEFORE substantive work or delegation):\n\nCapture the fresh launch seed with `seed=$(git rev-parse --verify HEAD)` in this new Track checkout before making any commit. Create the real canonical accepted ref {branch:?} at that exact seed using `git update-ref {reference} \"$seed\" \"$(git hash-object --stdin </dev/null | sed 's/./0/g')\"`. This is an exclusive create: if the ref exists or creation fails, STOP and report the collision/failure; never overwrite an existing ref, rename the live Loom branch, checkout another branch, or change primary HEAD. Verify `git rev-parse --verify {reference}` equals the captured seed, then persist `loom sessions tags set track_topic_branch {branch_arg}` BEFORE `loom sessions tags set topic true`. Reread the LIVE session tags and verify both exact values; if any metadata write or verification fails, STOP before work/acceptance/publishing and report a recoverable initialization blocker. The durable canonical initialization marker must remain until the canonical tag is verified; never treat missing tags on this new Track as legacy scratch acceptance. Send a durable initialization result with the canonical ref and seed SHA. Metadata alone does not initialize a branch. Do not accept or publish until the real ref is verified. Keep all substantive coordinator work on the original Loom scratch branch; accepted worker results update only this canonical ref.\n\n")
+    format!("{CANONICAL_INITIALIZATION_MARKER} {branch}\nCanonical Track initialization (required BEFORE substantive work or delegation):\n\nCapture the fresh launch seed with `seed=$(git rev-parse --verify HEAD)` in this new Track checkout before making any commit. Create the real canonical accepted ref {branch:?} at that exact seed using `git update-ref {reference} \"$seed\" \"$(git hash-object --stdin </dev/null | sed 's/./0/g')\"`. This is an exclusive create: if the ref exists or creation fails, STOP and report the collision/failure; never overwrite an existing ref, rename the live Loom branch, checkout another branch, or change primary HEAD. Verify `git rev-parse --verify {reference}` equals the captured seed, then persist `loom sessions tags set track_topic_branch {branch_arg}`, followed by `loom sessions tags set track_topic_initialized {branch_arg}` ONLY after successful exclusive creation and seed verification, BEFORE `loom sessions tags set topic true`. Never stamp track_topic_initialized after a collision or on metadata alone. Reread the LIVE session tags and verify all three exact values; if any metadata write or verification fails, STOP before work/acceptance/publishing and report a recoverable initialization blocker. Preserve the durable canonical initialization marker in the goal; native acceptance/publishing requires its matching track_topic_initialized verification tag, independently of the display/launch tags; never treat missing tags on this new Track as legacy scratch acceptance. Send a durable initialization result with the canonical ref and seed SHA. Metadata alone does not initialize a branch. Do not accept or publish until the real ref is verified. Keep all substantive coordinator work on the original Loom scratch branch; accepted worker results update only this canonical ref.\n\n")
 }
 
 #[cfg(test)]
@@ -247,7 +254,14 @@ mod tests {
         tagged(&mut track, "topic", "true");
         assert!(canonical_topic_branch(&track).is_none());
         tagged(&mut track, "track_topic_branch", "arachne/tracks/new");
+        // Display tags stamped by launch cannot authorize a colliding ref.
+        assert!(canonical_topic_branch(&track).is_none());
+        tagged(&mut track, "track_topic_initialized", "arachne/tracks/other");
+        assert!(canonical_topic_branch(&track).is_none());
+        tagged(&mut track, "track_topic_initialized", "arachne/tracks/new");
         assert_eq!(canonical_topic_branch(&track), Some("arachne/tracks/new"));
+        tagged(&mut track, "track_topic_branch", "arachne/tracks/other");
+        assert!(canonical_topic_branch(&track).is_none());
     }
     #[test]
     fn durable_initialization_recipe_creates_real_seed_ref_without_head_or_worktree_mutation() {

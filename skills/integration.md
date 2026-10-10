@@ -74,6 +74,8 @@ successful intended work yourself into the canonical topic ref as a squash.
 Do not treat process exit, review findings, pending tags, incomplete/partial
 results or parent-help notices as completed implementation.
 
+Interruption notices are ordinary system-authored parent-channel messages, never typed completion results. Inspect notice context and authenticated actor provenance: partial, checkpoint and interrupted work is incomplete and requires coordinator judgment. An explicit user interruption never authorizes automatic child resumption or acceptance, including stale queued autoland requests or earlier complete results; retain the pause until appropriately authorized and reverified. Session-authored interruptions must not be described as user interruptions. Do not infer completion or readiness from the notice. Loom owns parent notification; do not send a duplicate from the Arachne client.
+
 Before **every automatic target write**, read current Track/source policy
 and recompute effective policy. A stale queued automatic instruction must
 stop if effective policy is Off or metadata cannot be read. Re-verify source

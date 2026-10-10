@@ -88,6 +88,8 @@ accepted topic ref unless an explicit intermediate base is intended.
 
 ## Autoland
 
+New Track initialization retains its durable goal marker and sets `track_topic_initialized` to the canonical ref only after exclusive Git creation and seed verification. Acceptance and publishing fail closed until that verification matches the canonical tag; launch display tags alone cannot authorize a colliding unrelated ref.
+
 Autoland is durable coordinator policy, not a browser-only preference or a
 new background scheduler. It defaults **OFF** on the Track. Each source can
 **Inherit**, force **On**, or force **Off**. A source override wins over the
@@ -109,6 +111,8 @@ and source policy, source identity/revision, canonical target and result
 status. An old queued instruction is not authority after effective policy
 becomes Off. If policy or target metadata cannot be read, do not guess.
 Autoland never opens a PR, pushes upstream or publishes to primary `main`.
+
+Interruption notices are ordinary system-authored parent-channel messages, never typed completion results. Inspect notice context and authenticated actor provenance: partial, checkpoint and interrupted work is incomplete and requires coordinator judgment. An explicit user interruption never authorizes automatic child resumption or acceptance, including stale queued autoland requests or earlier complete results; retain the pause until appropriately authorized and reverified. Session-authored interruptions must not be described as user interruptions. Do not infer completion or readiness from the notice. Loom owns parent notification; do not send a duplicate from the Arachne client.
 
 Direct children's typed results notify/wake their immediate parent. Nested
 sources require a real deliver subscription from the Track coordinator to

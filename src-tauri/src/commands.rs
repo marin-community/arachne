@@ -2562,6 +2562,7 @@ pub struct LocalLandingView {
     pub commits_squashed: u32,
     /// The primary checkout the squash landed into (absolute path).
     pub primary_checkout: String,
+    pub warnings: Vec<String>,
 }
 
 impl From<LocalLanding> for LocalLandingView {
@@ -2572,6 +2573,7 @@ impl From<LocalLanding> for LocalLandingView {
             commit: landing.commit,
             commits_squashed: landing.commits_squashed,
             primary_checkout: landing.primary_checkout,
+            warnings: landing.warnings,
         }
     }
 }
