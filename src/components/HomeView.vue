@@ -141,20 +141,33 @@ let todosDisposed = false;
 let todoRequest = 0;
 let todosDirty = false;
 const todoTopicIds = computed(() => [...new Set(scoped.value.map((s) => rootOf(s).id))].sort());
+const todoScope = computed(() => JSON.stringify([
+  props.topic?.id ?? null,
+  props.project ? props.project.id ?? "ungrouped" : null,
+  todoTopicIds.value,
+]));
+const settledTodoScope = ref<string | null>(null);
+// Request activity disables Refresh, but only an unsettled scope hides the
+// empty state. Background fleet refreshes retain the last result until changed.
+const todosPending = computed(() => settledTodoScope.value !== todoScope.value);
 const visibleTodos = computed(() => userTodos.value.filter((todo) => todoTopicIds.value.includes(todo.topic_id)));
 async function refreshUserTodos() {
   if (todosDisposed) return;
   if (todosLoading.value) { todosDirty = true; return; }
   const request = ++todoRequest;
+  const scope = todoScope.value;
   todosLoading.value = true;
   try {
     const result = await invoke<{ todos: UserTodo[]; warnings: string[] }>("user_todos", { topicIds: todoTopicIds.value });
-    if (todosDisposed || request !== todoRequest) return;
+    if (todosDisposed || request !== todoRequest || scope !== todoScope.value) return;
     userTodos.value = result.todos;
     todoWarnings.value = result.warnings;
   } catch (error: any) {
-    if (!todosDisposed) todoWarnings.value = [`Could not load user Todos: ${error?.message ?? String(error)}`];
+    if (!todosDisposed && request === todoRequest && scope === todoScope.value) {
+      todoWarnings.value = [`Could not load user Todos: ${error?.message ?? String(error)}`];
+    }
   } finally {
+    if (!todosDisposed && request === todoRequest && scope === todoScope.value) settledTodoScope.value = scope;
     todosLoading.value = false;
     if (todosDirty && !todosDisposed) { todosDirty = false; scheduleTodos(); }
   }
@@ -183,7 +196,14 @@ onMounted(async () => {
   } catch { /* Manual refresh remains available without the event bridge. */ }
 });
 onUnmounted(() => { todosDisposed = true; todoRequest++; todoUnlisten?.(); if (todoTimer) clearTimeout(todoTimer); });
-watch(() => todoTopicIds.value.join(","), scheduleTodos);
+watch(todoScope, () => {
+  // Invalidate in-flight results (including failures) from the previous scope.
+  todoRequest++;
+  settledTodoScope.value = null;
+  userTodos.value = [];
+  todoWarnings.value = [];
+  scheduleTodos();
+});
 
 const sections = computed(() => [
   { name: "Needs You", rows: needs.value, kind: "needs" },
@@ -261,7 +281,7 @@ const readyGroups = computed(() => groupByProject(ready.value));
 
       <div v-for="section in sections" :key="section.kind" class="section" :class="`${section.kind}-section`">
         <div class="section-title">{{ section.name }} <span class="home-section-count">{{ section.rows.length }}</span></div>
-        <div v-if="!section.rows.length && (section.kind !== 'needs' || (!visibleTodos.length && !todosLoading && !todoWarnings.length))" :class="section.kind === 'needs' ? 'all-calm compact-calm' : 'home-section-empty'">
+        <div v-if="!section.rows.length && (section.kind !== 'needs' || (!visibleTodos.length && !todosPending && !todoWarnings.length))" :class="section.kind === 'needs' ? 'all-calm compact-calm' : 'home-section-empty'">
           {{ section.kind === "needs" ? "Nothing needs you." : section.kind === "ready" ? "No candidates reported by Loom yet." : "No threads working." }}
         </div>
         <!-- Needs You stays flat: it's the priority inbox, one glance. The
@@ -292,9 +312,9 @@ const readyGroups = computed(() => groupByProject(ready.value));
           </div>
           <section class="home-user-todos section" aria-label="Your Todos">
             <div class="home-todos-heading"><div class="section-title">Your Todos <span class="home-section-count">{{ visibleTodos.length }}</span></div>
-              <button type="button" :disabled="todosLoading" @click="refreshUserTodos">{{ todosLoading ? "Loading…" : "Refresh" }}</button></div>
+              <button type="button" :disabled="todosLoading || todosPending" @click="refreshUserTodos">{{ todosLoading || todosPending ? "Loading…" : "Refresh" }}</button></div>
             <p v-for="warning in todoWarnings" :key="warning" class="home-todo-error" role="alert">{{ warning }}</p>
-            <div v-if="!visibleTodos.length && !todosLoading && !todoWarnings.length" class="home-section-empty">No open user Todos.</div>
+            <div v-if="!visibleTodos.length && !todosPending && !todoWarnings.length" class="home-section-empty">No open user Todos.</div>
             <div v-for="todo in visibleTodos" :key="todo.id" class="home-todo-row">
               <button type="button" class="home-todo-complete" :disabled="todoBusy !== null" :aria-label="`Complete ${todo.text}`" title="Mark complete" @click="completeTodo(todo)">{{ todoBusy === todo.id ? "…" : "✓" }}</button>
               <div class="row-main"><div>{{ todo.text }}</div><button class="home-todo-track" type="button" @click="emit('select', todo.topic_id)">{{ byId.get(todo.topic_id)?.branch.title || byId.get(todo.topic_id)?.branch.name || "Open Track" }}</button></div>
