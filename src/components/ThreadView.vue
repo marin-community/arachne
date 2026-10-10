@@ -14,6 +14,7 @@ import { reviewIntegrationTarget } from "../reviewRequest";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
 import ChatMarkdown from "./ChatMarkdown.vue";
+import type { ArtifactTarget } from "../artifactLinks";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
 import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, resolveContextUsage, commandReplyTurns, type ChatDisplayBlock } from "../chatRows";
@@ -68,6 +69,7 @@ const currentUsage = computed(() => {
   return resolveContextUsage(blocks.value, summary?.usage ?? props.session.usage);
 });
 const emit = defineEmits<{
+  (e: "open-artifact", target: ArtifactTarget): void;
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
   (e: "unarchive", id: string): void;
@@ -1260,7 +1262,7 @@ async function onLand(strategy: string) {
               </template>
               <template v-else>
                 <span class="tool-summary">{{ member.summary || (member.text ?? '').slice(0, 160) }}</span>
-                <div class="thought-body"><ChatMarkdown :text="member.text ?? ''" /></div>
+                <div class="thought-body"><ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="member.text ?? ''" /></div>
               </template>
               <ChatImages :block="member" :session-id="session.id" />
             </div>
@@ -1280,7 +1282,7 @@ async function onLand(strategy: string) {
               <span class="tool-summary">{{ row.block.summary || (row.block.text ?? '').slice(0, 160) }}</span>
             </div>
             <div v-if="!isCollapsed(row.key)" class="body thought-body">
-              <ChatMarkdown :text="row.block.text ?? ''" />
+              <ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="row.block.text ?? ''" />
             </div>
           </div>
         </template>
@@ -1297,7 +1299,7 @@ async function onLand(strategy: string) {
             </div>
             <CopyButton :corner="cornerOf(row.key)" :text="blockCopyText(row.block)" label="Copy thinking" />
             <div v-if="!isCollapsed(row.key)" class="body thought-body">
-              <ChatMarkdown :text="row.block.text ?? ''" />
+              <ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="row.block.text ?? ''" />
             </div>
           </div>
         </template>
@@ -1349,7 +1351,7 @@ async function onLand(strategy: string) {
                so the goal leads. -->
           <template v-if="row.block.kind === 'user_message' && splitEntrance(row.block.text ?? '').entrance">
             <div v-if="splitEntrance(row.block.text ?? '').goal" class="body">
-              <ChatMarkdown :text="splitEntrance(row.block.text ?? '').goal" />
+              <ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="splitEntrance(row.block.text ?? '').goal" />
             </div>
             <div class="entrance">
               <div class="entrance-line" role="button" tabindex="0"
@@ -1361,12 +1363,12 @@ async function onLand(strategy: string) {
                 <span class="chevron">{{ isCollapsed(row.key) ? "▸" : "▾" }}</span>
               </div>
               <div v-if="!isCollapsed(row.key)" class="body entrance-body">
-                <ChatMarkdown :text="splitEntrance(row.block.text ?? '').entrance ?? ''" />
+                <ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="splitEntrance(row.block.text ?? '').entrance ?? ''" />
               </div>
             </div>
           </template>
           <div v-else-if="isCommandReply(row.block)" class="body">{{ row.block.text ?? "" }}</div>
-          <div v-else class="body"><ChatMarkdown :text="row.block.text ?? ''" /></div>
+          <div v-else class="body"><ChatMarkdown :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :text="row.block.text ?? ''" /></div>
           <ChatImages :block="row.block" :session-id="session.id" />
         </div>
         <!-- Exceptional turn boundaries must stay visible. In particular,

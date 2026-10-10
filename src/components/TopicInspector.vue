@@ -3,6 +3,7 @@ import { computed, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary } from "../App.vue";
 import ResourcePanel from "./ResourcePanel.vue";
+import type { ArtifactTarget } from "../artifactLinks";
 import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import TrackActivity from "./TrackActivity.vue";
@@ -27,9 +28,11 @@ const props = defineProps<{
   fleet: SessionSummary[];
   selectedId: string | null;
   loomUrl?: string;
+  artifactRequest?: ArtifactTarget | null;
 }>();
 
 const emit = defineEmits<{
+  (e: "open-artifact", target: ArtifactTarget): void;
   (e: "close"): void;
   (e: "error", message: string): void;
   (e: "select", id: string): void;
@@ -39,6 +42,7 @@ const emit = defineEmits<{
 
 const candidateLabels = { ready: "Ready", stale: "Needs recheck", conflicted: "Conflict", integrated: "Integrated" };
 const tab = ref<"threads" | "review" | "resources" | "integrations" | "todos" | "activity" | "handoffs">("threads");
+watch(() => props.artifactRequest, target => { if (target) tab.value = "resources"; }, { immediate: true });
 const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId) ?? props.topic);
 const canEdit = computed(() => {
   try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(props.loomUrl ?? "").hostname); }
@@ -279,7 +283,7 @@ watch(() => props.topic.id, () => {
     </div>
 
     <div v-else-if="tab === 'handoffs'" class="inspector-body inspector-body-flush">
-      <TrackActivity :topic="topic" results-only @select="emit('select', $event)" />
+      <TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topic" results-only @select="emit('select', $event)" />
     </div>
 
     <!-- Resources: the topic's attached resources and refs (ResourcePanel's
@@ -288,9 +292,9 @@ watch(() => props.topic.id, () => {
       <div class="inspector-review-context">{{ reviewSession.branch.title || reviewSession.branch.name }}</div>
       <ChangeReview :session-id="reviewSession.id" :is-topic="reviewSession.id === topic.id" :integration-target="reviewIntegrationTarget(fleet, reviewSession.id)" :can-edit="canEdit" embedded @saved="emit('checkout-saved', reviewSession.id)" />
     </div>
-    <div v-else-if="tab === 'activity'" class="inspector-body inspector-body-flush"><TrackActivity :topic="topic" @select="emit('select', $event)" /></div>
+    <div v-else-if="tab === 'activity'" class="inspector-body inspector-body-flush"><TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topic" @select="emit('select', $event)" /></div>
     <div v-else-if="tab === 'resources'" class="inspector-body inspector-body-flush">
-      <ResourcePanel :topic="topic" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
+      <ResourcePanel :key="loomUrl" :artifact-request="artifactRequest" :topic="topic" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
     </div>
 
     <!-- Integrations: the Topic-owned candidate queue. Only verified
