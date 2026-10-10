@@ -513,8 +513,7 @@ impl IntegrationRequest {
             IntegrationStrategy::OpenPr => "open-pr".to_string(),
             IntegrationStrategy::Push => "push".to_string(),
             IntegrationStrategy::Ask => "decide".to_string(),
-            // Land-locally never travels as a prompt: `land_topic` executes
-            // it directly. Reached only by misuse — name it, don't panic.
+            // Local landing repair preserves this strategy when delegated.
             IntegrationStrategy::LandLocally => "land-locally".to_string(),
         };
         let request = format!(
@@ -557,6 +556,11 @@ decision.\n\
 #[serde(rename_all = "snake_case")]
 pub struct LandingRequest {
     pub action: &'static str,
+    pub source_session: String,
+    pub source_work_dir: String,
+    pub source_state: Option<crate::landing::SourceCheckoutState>,
+    pub local_target: Option<crate::landing::LocalLandingTarget>,
+    pub repair_reason: Option<String>,
     pub source_branch: String,
     /// The resolved landing target. For non-PR strategies this is the
     /// primary checkout's currently checked out branch (or `main` when that
@@ -618,11 +622,26 @@ located at `{repo}`, using strategy **{strategy}**.\n\
 \n\
 Target: {target}.\n\
 \n\
-Apply the integration skill's landing rules: inspect the topic branch state, run required \
-validation, create the PR or update the target branch, and report the outcome. Non-PR \
-strategies land into the primary checkout's currently checked out branch — the checkout a \
-human actually opens — falling back to `main` when it cannot be resolved; re-verify the \
-target against the live checkout before writing. Prefer opening a PR when policy is unclear.\n\
+This click authorizes one complete preparation-and-landing operation using the chosen \
+strategy; do not ask for another click or confirmation for routine preparation. Inspect the \
+intended user changes in the source checkout (including editor saves, staged, unstaged and \
+untracked files), review and repair straightforward issues, and run required validation. \
+Delegate substantial independent review or repair through visible Loom children using \
+`loom sessions launch` with explicit repository and base; require typed results on their own \
+channels and verify parentage and wake delivery before waiting. Commit only intended source \
+changes after validation, preserving unrelated manual work; never blanket git add/commit \
+foreign edits. If intended versus unrelated changes require a real decision, report it. \
+Re-verify the source branch, revision, status and destination immediately before landing. \
+Then perform the chosen landing without stopping at a prepared/ready report. For land-locally, \
+squash into the primary checkout's CURRENT branch; never substitute recorded base or main, \
+never push or open a PR. Preserve all staged, unstaged and untracked target changes; use an \
+isolated checkout for reconciliation and advance/update the target safely, without absorbing \
+foreign staged changes or using destructive resets/stashes. A changed target requires fresh \
+validation; unrelated in-progress Git operations are blockers. Other non-PR strategies use \
+the resolved target policy above and re-verify it against the live checkout. Report the actual \
+completed commit/PR or no-op, exact source/target revisions, validation and remaining git \
+status. Stamp integration_result only after actual successful landing and validation; queued \
+preparation is not landed or verified readiness.\n\
 \n\
 ```json\n{json}\n```",
             branch = self.source_branch,
@@ -632,7 +651,12 @@ target against the live checkout before writing. Prefer opening a PR when policy
             target = target,
             json = serde_json::json!({
                 "action": "land",
-                "source_thread": topic_name,
+                "source_thread": self.source_session,
+                "source_work": self.source_work_dir,
+                "source_state": self.source_state,
+                "local_target": self.local_target,
+                "repair_reason": self.repair_reason,
+                "prepare_then_land": true,
                 "source_resource": self.source_branch,
                 "repository": self.repo_root,
                 "target_resource": self.target_upstream,
@@ -679,6 +703,11 @@ mod integration_prompt_tests {
         );
         let prompt = LandingRequest {
             action: "land",
+            source_session: "topic-1".into(),
+            source_work_dir: "/tmp/source".into(),
+            source_state: None,
+            local_target: None,
+            repair_reason: None,
             source_branch: "topic-branch".into(),
             target_upstream: "origin/main".into(),
             target_origin: "recorded-base".into(),
@@ -696,6 +725,11 @@ mod integration_prompt_tests {
     fn landing_prompt_carries_primary_checkout_policy() {
         let prompt = LandingRequest {
             action: "land",
+            source_session: "topic-1".into(),
+            source_work_dir: "/tmp/source".into(),
+            source_state: None,
+            local_target: None,
+            repair_reason: None,
             source_branch: "weaver/topic".into(),
             target_upstream: "dev".into(),
             target_origin: "primary-checkout".into(),
@@ -713,9 +747,52 @@ mod integration_prompt_tests {
     }
 
     #[test]
+    fn every_landing_strategy_authorizes_complete_preparation_and_chosen_landing() {
+        for strategy in [
+            IntegrationStrategy::OpenPr,
+            IntegrationStrategy::Squash,
+            IntegrationStrategy::Merge,
+            IntegrationStrategy::Rebase,
+            IntegrationStrategy::Push,
+            IntegrationStrategy::LandLocally,
+        ] {
+            let prompt = LandingRequest {
+                action: "land",
+                source_session: "topic-1".into(),
+                source_work_dir: "/tmp/source".into(),
+                source_state: None,
+                local_target: None,
+                repair_reason: None,
+                source_branch: "weaver/topic".into(),
+                target_upstream: "dev".into(),
+                target_origin: "primary-checkout".into(),
+                repo_root: "/tmp/repo".into(),
+                strategy,
+                requested_by: "user",
+            }
+            .to_prompt("Topic");
+            assert!(prompt.contains("\"prepare_then_land\":true"));
+            assert!(prompt.contains("\"source_thread\":\"topic-1\""));
+            assert!(prompt.contains("\"source_work\":\"/tmp/source\""));
+            assert!(prompt.contains("Commit only intended source"));
+            assert!(prompt.contains("Then perform the chosen landing"));
+            assert!(prompt.contains("do not ask for another click"));
+            assert!(prompt.contains("visible Loom children"));
+            assert!(
+                prompt.contains("Stamp integration_result only after actual successful landing")
+            );
+        }
+    }
+
+    #[test]
     fn landing_prompt_marks_main_fallback_for_agent_resolution() {
         let prompt = LandingRequest {
             action: "land",
+            source_session: "topic-1".into(),
+            source_work_dir: "/tmp/source".into(),
+            source_state: None,
+            local_target: None,
+            repair_reason: None,
             source_branch: "weaver/topic".into(),
             target_upstream: "main".into(),
             target_origin: "main-fallback".into(),

@@ -2,21 +2,13 @@
 //! checkout's currently checked out branch (spec:
 //! docs/integration-and-landing.md, "Land locally").
 //!
-//! The other Land strategies are intent constraints handed to the topic's
-//! coordinator; this one is the deterministic fast path — Arachne runs git
-//! itself against the repository's primary checkout, the main working tree
-//! a human actually opens, with no agent turn. It deliberately does exactly
-//! one thing: squash the topic branch onto the checkout's current branch,
-//! or refuse with an explanation.
+//! Clean suitable sources land immediately. Dirty sources, target staging and
+//! safely unwound conflicts are handed to the coordinator for preparation and
+//! the chosen landing. Target/access blockers remain actionable errors.
 //!
-//! It never destroys the checkout's uncommitted state. Unrelated unstaged
-//! changes and untracked files survive the landing (git's merge machinery
-//! refuses to touch overlapping dirt before writing anything); a failed or
-//! conflicted attempt is unwound with `git reset --merge`, which restores
-//! HEAD and the index while keeping unstaged changes. Anything that would
-//! make the squash commit absorb foreign work — staged changes, an
-//! in-progress merge/rebase/cherry-pick — is refused up front rather than
-//! reconciled: reconciliation is the agent-mediated strategies' job.
+//! Unrelated unstaged and untracked target changes survive the deterministic
+//! path. Staged target changes are never absorbed into a squash commit. A
+//! failed attempt is recoverable only after `git reset --merge` succeeds.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -56,6 +48,9 @@ pub enum LandingError {
     StagedChanges,
     #[error("a {what} is already in progress in the primary checkout; conclude it before landing")]
     OperationInProgress { what: String },
+    /// Recoverable only after the attempted squash has been safely unwound.
+    #[error("{detail}")]
+    RepairNeeded { detail: String },
     #[error("{detail}")]
     Failed { detail: String },
 }
@@ -70,9 +65,23 @@ struct PrimaryWorktree {
     bare: bool,
 }
 
-/// Local landing works from committed branch state. Refuse a source checkout
-/// with manual edits so an in-app save cannot be silently omitted from a land.
-pub async fn ensure_clean_source_checkout(checkout: &Path, branch: &str) -> Result<(), String> {
+/// Capture source changes for preparation instead of silently omitting editor
+/// saves from committed branch state. Branch switches/foreign operations block.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCheckoutState {
+    pub revision: String,
+    pub status: String,
+}
+
+pub async fn inspect_source_checkout(
+    checkout: &Path,
+    branch: &str,
+) -> Result<SourceCheckoutState, String> {
+    if checkout.as_os_str().is_empty() || !checkout.is_dir() {
+        return Err(
+            "The source checkout is unavailable; refresh the thread before landing.".into(),
+        );
+    }
     let timeout = Duration::from_secs(15);
     let actual = git(
         checkout,
@@ -85,14 +94,43 @@ pub async fn ensure_clean_source_checkout(checkout: &Path, branch: &str) -> Resu
             "The source checkout changed branches. Refresh the thread before landing.".into(),
         );
     }
+    // Resolve state paths through git: linked worktrees have a .git file.
+    for name in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+        "BISECT_LOG",
+    ] {
+        let state_path = git(checkout, &["rev-parse", "--git-path", name], timeout).await?;
+        if checkout.join(state_path.trim()).exists() {
+            return Err(format!("An unrelated Git operation ({name}) is in progress in the source checkout; conclude it before landing."));
+        }
+    }
+    let revision = git(checkout, &["rev-parse", "HEAD"], timeout).await?;
     let status = git(
         checkout,
         &["status", "--porcelain", "--untracked-files=normal"],
         timeout,
     )
     .await?;
-    if !status.trim().is_empty() {
-        return Err("This thread has uncommitted edits. Use Review → Prepare landing to validate and commit them before landing locally.".into());
+    Ok(SourceCheckoutState {
+        revision: revision.trim().into(),
+        status,
+    })
+}
+
+/// Do not pair a source checkout with an unrelated repository's branch of
+/// the same name. Worktrees share this canonical Git directory.
+pub async fn ensure_same_repository(source: &Path, repo: &Path) -> Result<(), String> {
+    let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+    let source_dir = git(source, &args, Duration::from_secs(15)).await?;
+    let repo_dir = git(repo, &args, Duration::from_secs(15)).await?;
+    let source_dir = std::fs::canonicalize(source_dir.trim()).map_err(|e| e.to_string())?;
+    let repo_dir = std::fs::canonicalize(repo_dir.trim()).map_err(|e| e.to_string())?;
+    if source_dir != repo_dir {
+        return Err("The source checkout belongs to a different repository; refresh the thread before landing.".into());
     }
     Ok(())
 }
@@ -216,26 +254,19 @@ async fn unwind(primary: &Path) -> Result<(), String> {
         .map(|_| ())
 }
 
-/// Squash-merge `topic_branch` onto the primary checkout's currently
-/// checked out branch, creating one commit there.
-///
-/// `repo_root` may be any directory of the repository (loom reports the
-/// canonical repo root, but the primary is resolved here regardless); the
-/// landing always runs in the primary checkout itself — the surface a
-/// human actually opens — never a worker worktree. The target is whatever
-/// branch that checkout has checked out *now*: a deterministic landing
-/// must not act on a remembered target that can go stale.
-pub async fn squash_into_primary_checkout(
+/// Verified local destination, captured before either a squash or dispatch.
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalLandingTarget {
+    pub branch: String,
+    pub checkout: String,
+    pub revision: String,
+    pub status: String,
+}
+
+pub async fn inspect_local_target(
     repo_root: &Path,
     topic_branch: &str,
-    title: &str,
-) -> Result<LocalLanding, LandingError> {
-    let topic_branch = topic_branch.trim();
-    if topic_branch.is_empty() {
-        return Err(LandingError::Failed {
-            detail: "the topic has no branch to land".into(),
-        });
-    }
+) -> Result<LocalLandingTarget, LandingError> {
     // Resolve the primary checkout (the main working tree).
     let listing = git(
         repo_root,
@@ -283,6 +314,56 @@ pub async fn squash_into_primary_checkout(
             what: what.to_owned(),
         });
     }
+    let revision = git(
+        &primary.path,
+        &["rev-parse", "HEAD"],
+        Duration::from_secs(20),
+    )
+    .await
+    .map_err(|detail| LandingError::Failed { detail })?;
+    let status = git(
+        &primary.path,
+        &["status", "--porcelain", "--untracked-files=normal"],
+        Duration::from_secs(20),
+    )
+    .await
+    .map_err(|detail| LandingError::Failed { detail })?;
+    Ok(LocalLandingTarget {
+        branch: target_branch,
+        checkout: primary.path.display().to_string(),
+        revision: revision.trim().into(),
+        status,
+    })
+}
+
+/// Squash-merge `topic_branch` onto the primary checkout's currently
+/// checked out branch, creating one commit there.
+///
+/// `repo_root` may be any directory of the repository (loom reports the
+/// canonical repo root, but the primary is resolved here regardless); the
+/// landing always runs in the primary checkout itself — the surface a
+/// human actually opens — never a worker worktree. The target is whatever
+/// branch that checkout has checked out *now*: a deterministic landing
+/// must not act on a remembered target that can go stale.
+pub async fn squash_into_primary_checkout(
+    repo_root: &Path,
+    topic_branch: &str,
+    title: &str,
+) -> Result<LocalLanding, LandingError> {
+    let topic_branch = topic_branch.trim();
+    if topic_branch.is_empty() {
+        return Err(LandingError::Failed {
+            detail: "the topic has no branch to land".into(),
+        });
+    }
+    let target = inspect_local_target(repo_root, topic_branch).await?;
+    let target_branch = target.branch;
+    let primary = PrimaryWorktree {
+        path: PathBuf::from(target.checkout),
+        branch: None,
+        bare: false,
+    };
+    let topic_ref = format!("refs/heads/{topic_branch}");
     // Staged changes would ride along inside the squash commit — refuse.
     if has_staged_changes(&primary.path)
         .await
@@ -308,8 +389,9 @@ pub async fn squash_into_primary_checkout(
                 " (cleanup also failed: {cleanup}; run `git reset --merge` in {} yourself)",
                 primary.path.display()
             ));
+            return Err(LandingError::Failed { detail: message });
         }
-        return Err(LandingError::Failed { detail: message });
+        return Err(LandingError::RepairNeeded { detail: message });
     }
     // An up-to-date squash stages nothing: the target already contains the
     // topic's changes. Unwind the leftover squash state and report the no-op.
@@ -388,8 +470,9 @@ pub async fn squash_into_primary_checkout(
                 " (cleanup also failed: {cleanup}; run `git reset --merge` in {} yourself)",
                 primary.path.display()
             ));
+            return Err(LandingError::Failed { detail: message });
         }
-        return Err(LandingError::Failed { detail: message });
+        return Err(LandingError::RepairNeeded { detail: message });
     }
     let commit = git(
         &primary.path,
@@ -528,22 +611,23 @@ worktree /repo/.worktrees/topic\nHEAD def\nbranch refs/heads/weaver/topic\n";
     }
 
     #[tokio::test]
-    async fn source_preflight_rejects_uncommitted_editor_changes() {
+    async fn source_preflight_reports_uncommitted_editor_changes() {
         let dir = repo_with_topic("source-edits");
         sh(&dir, &["checkout", "-q", "weaver/topic"]);
-        assert!(super::ensure_clean_source_checkout(&dir, "weaver/topic")
+        assert!(super::inspect_source_checkout(&dir, "weaver/topic")
             .await
             .is_ok());
         std::fs::write(dir.join("topic.txt"), "manual edit\n").unwrap();
-        let error = super::ensure_clean_source_checkout(&dir, "weaver/topic")
+        let state = super::inspect_source_checkout(&dir, "weaver/topic")
             .await
-            .unwrap_err();
-        assert!(error.contains("uncommitted edits"));
+            .unwrap();
+        assert!(state.status.contains(" M topic.txt"));
+        assert!(!state.revision.is_empty());
         assert_eq!(
             std::fs::read_to_string(dir.join("topic.txt")).unwrap(),
             "manual edit\n"
         );
-        assert!(super::ensure_clean_source_checkout(&dir, "another-branch")
+        assert!(super::inspect_source_checkout(&dir, "another-branch")
             .await
             .is_err());
         std::fs::remove_dir_all(dir).unwrap();

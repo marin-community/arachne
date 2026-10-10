@@ -2197,8 +2197,9 @@ fn resolve_landing_target(
 }
 
 /// The result of a Land action. The agent-mediated strategies just send a
-/// request (their outcome is reported in the topic thread); `land-locally`
-/// runs synchronously and returns the completed squash-merge.
+/// request (their outcome is reported in the topic thread). A suitable
+/// `land-locally` fast path returns the completed squash-merge; queued
+/// preparation or repair always returns local=false.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct LandResult {
@@ -2209,11 +2210,9 @@ pub struct LandResult {
 }
 
 /// Land a topic: move accepted state toward the upstream target. Most
-/// strategies send a structured landing request to the topic leader (its
-/// coordinator thread); `land-locally` is the deterministic exception —
-/// Arachne squash-merges the topic into the primary checkout's current
-/// branch itself, with no agent turn, and reports the result
-/// synchronously.
+/// strategies send a complete prepare-and-land request to the coordinator.
+/// A clean suitable `land-locally` source takes the synchronous squash path;
+/// preparation or safely recoverable repair continues through the coordinator.
 #[tauri::command]
 pub async fn land_topic(
     state: State<'_, LoomState>,
@@ -2256,18 +2255,14 @@ pub async fn land_topic(
             unreachable: false,
         });
     }
-    // The deterministic fast path: `land-locally` runs the squash-merge
-    // right here — no agent turn. Loom's API has no git write operations,
+    // A clean local source can squash immediately; preparation/repair is
+    // queued as one complete coordinator request. Loom has no git writes,
     // so Arachne runs git itself, and only where its paths are meaningful:
     // a loopback server runs sessions in checkouts on this same machine.
     // A remote server's `repo_root` is a server-side path, never a local
     // one — remote landings stay with the agent-mediated strategies.
     if strategy.is_local() {
-        let landing = land_topic_locally(client, view, summary).await?;
-        return Ok(LandResult {
-            local: true,
-            landing: Some(landing),
-        });
+        return land_topic_locally(client, view, summary).await;
     }
     // Resolve the landing target. Non-PR strategies land into the primary
     // checkout's currently checked out branch — the checkout a human
@@ -2278,14 +2273,20 @@ pub async fn land_topic(
     let branches = client.list_branches().await?;
     let (upstream, target_origin) = if matches!(strategy, crate::loom::IntegrationStrategy::OpenPr)
     {
-        let upstream = upstream
+        let explicit = upstream.filter(|value| !value.trim().is_empty());
+        let origin = if explicit.is_some() {
+            LandingTargetOrigin::Explicit
+        } else {
+            LandingTargetOrigin::RecordedBase
+        };
+        let upstream = explicit
             .or_else(|| branches_list_base(&branches, &view.branch.branch))
             .filter(|value| !value.trim().is_empty())
             .ok_or_else(|| UiError {
                 message: "no upstream branch is recorded for this topic".into(),
                 unreachable: false,
             })?;
-        (upstream, LandingTargetOrigin::RecordedBase)
+        (upstream, origin)
     } else {
         // Resolve the primary checkout's current branch via `repos.branches`.
         // A failed lookup (scoped token, unreadable checkout, missing repo) is
@@ -2319,6 +2320,11 @@ pub async fn land_topic(
 
     let request = crate::loom::LandingRequest {
         action: "land",
+        source_session: view.id.clone(),
+        source_work_dir: view.work_dir.clone(),
+        source_state: None,
+        local_target: None,
+        repair_reason: None,
         source_branch: view.branch.branch.clone(),
         target_upstream: upstream.clone(),
         target_origin: target_origin.as_str().to_string(),
@@ -2326,6 +2332,14 @@ pub async fn land_topic(
         strategy,
         requested_by: "user",
     };
+    dispatch_landing(&client, &view, request).await
+}
+
+async fn dispatch_landing(
+    client: &LoomClient,
+    view: &SessionView,
+    request: crate::loom::LandingRequest,
+) -> Result<LandResult, UiError> {
     let prompt = request.to_prompt(&view.branch.name);
     client.resume_if_orphaned(&view.id).await?;
     if view.protocol == "terminal" {
@@ -2333,7 +2347,7 @@ pub async fn land_topic(
     } else {
         client.queue_prompt(&view.id, &prompt).await?;
     }
-    // Do not mark the topic landed before the coordinator reports success.
+    // A request is never a completed landing and must not stamp landed tags.
     Ok(LandResult {
         local: false,
         landing: None,
@@ -2374,7 +2388,7 @@ fn host_is_loopback(host: &str) -> bool {
 
 /// The deterministic fast path behind the `land-locally` strategy: squash
 /// the topic's branch into the primary checkout's currently checked out
-/// branch, locally, with no agent turn.
+/// branch, or queue preparation/repair and that same chosen landing.
 ///
 /// Preconditions beyond `squash_into_primary_checkout`'s own preflight:
 /// the Loom server must be loopback (its `repo_root` paths are local
@@ -2385,7 +2399,7 @@ async fn land_topic_locally(
     client: Arc<LoomClient>,
     view: SessionView,
     summary: &SessionSummaryView,
-) -> Result<LocalLandingView, UiError> {
+) -> Result<LandResult, UiError> {
     let host = client.server_host().unwrap_or("").to_owned();
     if !host_is_loopback(&host) {
         return Err(UiError {
@@ -2401,24 +2415,90 @@ async fn land_topic_locally(
             unreachable: false,
         });
     }
-    if !view.work_dir.is_empty() && std::path::Path::new(&view.work_dir).exists() {
-        crate::landing::ensure_clean_source_checkout(
-            std::path::Path::new(&view.work_dir),
-            &view.branch.branch,
-        )
-        .await
-        .map_err(resource_error)?;
-    }
-    let result = crate::landing::squash_into_primary_checkout(
-        std::path::Path::new(&view.branch.repo_root),
+    let source = crate::landing::inspect_source_checkout(
+        std::path::Path::new(&view.work_dir),
         &view.branch.branch,
-        &summary_title(summary, &view),
     )
     .await
-    .map_err(|e| UiError {
-        message: e.to_string(),
-        unreachable: false,
-    })?;
+    .map_err(resource_error)?;
+    crate::landing::ensure_same_repository(
+        std::path::Path::new(&view.work_dir),
+        std::path::Path::new(&view.branch.repo_root),
+    )
+    .await
+    .map_err(resource_error)?;
+    let target = crate::landing::inspect_local_target(
+        std::path::Path::new(&view.branch.repo_root),
+        &view.branch.branch,
+    )
+    .await
+    .map_err(|e| resource_error(e.to_string()))?;
+    // Target inspection runs several git reads; refresh source immediately
+    // before selecting the synchronous path so intervening saves aren't omitted.
+    let refreshed = crate::landing::inspect_source_checkout(
+        std::path::Path::new(&view.work_dir),
+        &view.branch.branch,
+    )
+    .await
+    .map_err(resource_error)?;
+    let source_moved = refreshed.revision != source.revision;
+    let source = refreshed;
+    let reason = if !source.status.trim().is_empty() {
+        Some("The source checkout has uncommitted edits requiring inspection, validation and intended-source commits.".to_string())
+    } else if source_moved {
+        Some("The source revision changed during preflight; refresh review and validation before landing.".into())
+    } else if target
+        .status
+        .lines()
+        .any(|line| !line.starts_with("??") && !line.starts_with(' '))
+    {
+        Some("The primary checkout has staged changes; preserve the user's index and working tree during landing.".to_string())
+    } else {
+        None
+    };
+    let attempt = if reason.is_none() {
+        Some(
+            crate::landing::squash_into_primary_checkout(
+                std::path::Path::new(&view.branch.repo_root),
+                &view.branch.branch,
+                &summary_title(summary, &view),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let (result, reason) = match attempt {
+        Some(Ok(result)) => (Some(result), None),
+        Some(Err(crate::landing::LandingError::StagedChanges)) => (
+            None,
+            Some(
+                "The primary checkout acquired staged changes; preserve them while landing.".into(),
+            ),
+        ),
+        Some(Err(crate::landing::LandingError::RepairNeeded { detail })) => (None, Some(detail)),
+        Some(Err(error)) => return Err(resource_error(error.to_string())),
+        None => (None, reason),
+    };
+    let Some(result) = result else {
+        // Snapshot exact local destination, never recorded base/main. The
+        // coordinator must refresh both snapshots before it writes.
+        let request = crate::loom::LandingRequest {
+            action: "land",
+            source_session: view.id.clone(),
+            source_work_dir: view.work_dir.clone(),
+            source_state: Some(source),
+            target_upstream: target.branch.clone(),
+            target_origin: "primary-checkout".into(),
+            local_target: Some(target),
+            repair_reason: reason,
+            source_branch: view.branch.branch.clone(),
+            repo_root: view.branch.repo_root.clone(),
+            strategy: crate::loom::IntegrationStrategy::LandLocally,
+            requested_by: "user",
+        };
+        return dispatch_landing(&client, &view, request).await;
+    };
     // Record the outcome on the topic's branch — the same durable signal the
     // integration skill stamps for a completed integration, so every fleet
     // surface (dashboards, inspectors) sees the topic as landed without an
@@ -2449,7 +2529,10 @@ async fn land_topic_locally(
             &note,
         )
         .await;
-    Ok(LocalLandingView::from(result))
+    Ok(LandResult {
+        local: true,
+        landing: Some(LocalLandingView::from(result)),
+    })
 }
 
 /// A landing title for the squash commit: the topic's name, else the
@@ -4292,4 +4375,335 @@ pub async fn save_checkout_file(
     })
     .await
     .map_err(|e| resource_error(e.to_string()))?
+}
+
+#[cfg(test)]
+mod landing_dispatch_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    struct Repo(PathBuf);
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+    fn fixture() -> (Repo, SessionView, SessionSummaryView) {
+        let dir = std::env::temp_dir().join(format!(
+            "arachne-land-dispatch-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "dev"]);
+        git(&dir, &["config", "user.name", "Test"]);
+        git(&dir, &["config", "user.email", "test@example.com"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+        git(&dir, &["add", "base.txt"]);
+        git(&dir, &["commit", "-qm", "base"]);
+        git(&dir, &["worktree", "add", "-qb", "weaver/topic", "source"]);
+        let source = dir.join("source");
+        std::fs::write(source.join("topic.txt"), "topic\n").unwrap();
+        git(&source, &["add", "topic.txt"]);
+        git(&source, &["commit", "-qm", "topic"]);
+        // Exclude the fixture's nested linked checkout from target status.
+        std::fs::write(dir.join(".git/info/exclude"), "source/\n").unwrap();
+        let value = serde_json::json!({
+            "id":"topic-session", "status":"running", "profile":"default", "class":"interactive",
+            "origin":"user", "agent_kind":"codex", "model":"", "effort":"", "protocol":"acp",
+            "work_dir":source, "term_session":"runtime", "turn_count":0,
+            "created_by":null, "created_at":"now", "last_activity_at":"now",
+            "branch":{"id":"topic-branch", "branch":"weaver/topic", "name":"Topic", "title":"Topic",
+                      "repo_root":dir, "tags":[]}
+        });
+        (
+            Repo(dir),
+            serde_json::from_value(value.clone()).unwrap(),
+            serde_json::from_value(value).unwrap(),
+        )
+    }
+    async fn mock(
+        view: &SessionView,
+        paths: Vec<&'static str>,
+    ) -> (
+        Arc<LoomClient>,
+        tokio::task::JoinHandle<Vec<serde_json::Value>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let session = serde_json::to_value(view).unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for path in paths {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let (header_end, length) = loop {
+                    let mut buf = [0; 4096];
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        assert!(headers.starts_with(&format!("POST {path} ")), "{headers}");
+                        let len: usize = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|n| n.trim().parse().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, len);
+                    }
+                };
+                while request.len() < header_end + length {
+                    let mut buf = [0; 4096];
+                    let count = socket.read(&mut buf).await.unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buf[..count]);
+                }
+                bodies.push(
+                    serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
+                );
+                let body = if path == "/api/sessions/get" {
+                    session.clone()
+                } else {
+                    serde_json::json!({"queued":true})
+                }
+                .to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        (
+            Arc::new(LoomClient::new(&format!("http://{addr}/"), None).unwrap()),
+            server,
+        )
+    }
+    async fn queued(view: SessionView, summary: &SessionSummaryView) -> String {
+        let path = if view.protocol == "terminal" {
+            "/api/sessions/send"
+        } else {
+            "/api/sessions/prompt/create"
+        };
+        let (client, server) = mock(&view, vec!["/api/sessions/get", path]).await;
+        let result = land_topic_locally(client, view, summary).await.unwrap();
+        assert!(!result.local);
+        assert!(result.landing.is_none());
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[1]["session"], "topic-session");
+        if path.ends_with("send") {
+            assert_eq!(bodies[1]["submit"], true);
+        } else {
+            assert_eq!(bodies[1]["send_now"], false);
+        }
+        bodies[1]["text"].as_str().unwrap().to_owned()
+    }
+    fn request(prompt: &str) -> serde_json::Value {
+        serde_json::from_str(
+            prompt
+                .split("```json\n")
+                .nth(1)
+                .unwrap()
+                .split("\n```")
+                .next()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn dirty_editor_edits_queue_complete_chosen_local_landing_without_touching_foreign_work()
+    {
+        let (repo, view, summary) = fixture();
+        let source = Path::new(&view.work_dir);
+        std::fs::write(source.join("topic.txt"), "editor save\n").unwrap();
+        std::fs::write(source.join("unrelated.txt"), "foreign source\n").unwrap();
+        git(source, &["add", "unrelated.txt"]);
+        std::fs::write(repo.0.join("base.txt"), "staged target\n").unwrap();
+        git(&repo.0, &["add", "base.txt"]);
+        std::fs::write(repo.0.join("base.txt"), "unstaged target\n").unwrap();
+        std::fs::write(repo.0.join("untracked.txt"), "foreign target\n").unwrap();
+        let before_source = git(source, &["status", "--porcelain"]);
+        let before_target = git(&repo.0, &["status", "--porcelain"]);
+        let before_head = git(&repo.0, &["rev-parse", "HEAD"]);
+        let prompt = queued(view.clone(), &summary).await;
+        let payload = request(&prompt);
+        assert_eq!(payload["strategy"], "land-locally");
+        assert_eq!(payload["prepare_then_land"], true);
+        assert_eq!(payload["source_thread"], view.id);
+        assert_eq!(payload["source_work"], view.work_dir);
+        assert_eq!(payload["repository"], view.branch.repo_root);
+        assert_eq!(payload["target_resource"], "dev");
+        assert_eq!(payload["target_origin"], "primary-checkout");
+        assert_eq!(payload["local_target"]["checkout"], view.branch.repo_root);
+        assert_eq!(payload["local_target"]["revision"], before_head.trim());
+        assert_eq!(payload["source_state"]["status"], before_source);
+        assert!(prompt.contains("do not ask for another click"));
+        assert!(prompt.contains("never blanket git add/commit"));
+        assert!(prompt.contains("Then perform the chosen landing"));
+        assert_eq!(git(source, &["status", "--porcelain"]), before_source);
+        assert_eq!(git(&repo.0, &["status", "--porcelain"]), before_target);
+        assert_eq!(git(&repo.0, &["show", ":base.txt"]), "staged target\n");
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("base.txt")).unwrap(),
+            "unstaged target\n"
+        );
+        assert_eq!(git(&repo.0, &["rev-parse", "HEAD"]), before_head);
+    }
+    #[tokio::test]
+    async fn clean_source_lands_immediately_and_tags_only_the_completed_result() {
+        let (repo, view, summary) = fixture();
+        std::fs::write(repo.0.join("base.txt"), "unrelated unstaged\n").unwrap();
+        std::fs::write(repo.0.join("untracked.txt"), "keep\n").unwrap();
+        for expected_landed in [true, false] {
+            let (client, server) = mock(&view, vec!["/api/sessions/tags/set"]).await;
+            let result = land_topic_locally(client, view.clone(), &summary)
+                .await
+                .unwrap();
+            assert!(result.local);
+            let landing = result.landing.unwrap();
+            assert_eq!(landing.landed, expected_landed);
+            assert_eq!(landing.target_branch, "dev");
+            assert_eq!(landing.commit.is_some(), expected_landed);
+            let bodies = server.await.unwrap();
+            assert_eq!(bodies[0]["key"], "integration_result");
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("base.txt")).unwrap(),
+            "unrelated unstaged\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("untracked.txt")).unwrap(),
+            "keep\n"
+        );
+        assert_eq!(
+            git(&repo.0, &["status", "--porcelain"]),
+            " M base.txt\n?? untracked.txt\n"
+        );
+    }
+    #[tokio::test]
+    async fn staged_target_queues_preservation_repair_even_for_clean_source() {
+        let (repo, mut view, summary) = fixture();
+        view.protocol = "terminal".into();
+        std::fs::write(repo.0.join("base.txt"), "foreign staged\n").unwrap();
+        git(&repo.0, &["add", "base.txt"]);
+        let prompt = queued(view, &summary).await;
+        assert!(request(&prompt)["repair_reason"]
+            .as_str()
+            .unwrap()
+            .contains("staged changes"));
+        assert_eq!(git(&repo.0, &["status", "--porcelain"]), "M  base.txt\n");
+        assert!(!repo.0.join("topic.txt").exists());
+    }
+    #[tokio::test]
+    async fn local_conflict_queues_exact_repair_context_after_safe_unwind() {
+        let (repo, view, summary) = fixture();
+        let source = Path::new(&view.work_dir);
+        std::fs::write(source.join("base.txt"), "topic divergence\n").unwrap();
+        git(source, &["add", "base.txt"]);
+        git(source, &["commit", "-qm", "diverge source"]);
+        std::fs::write(repo.0.join("base.txt"), "target divergence\n").unwrap();
+        git(&repo.0, &["add", "base.txt"]);
+        git(&repo.0, &["commit", "-qm", "diverge target"]);
+        std::fs::write(repo.0.join("untracked.txt"), "keep\n").unwrap();
+        let head = git(&repo.0, &["rev-parse", "HEAD"]);
+        let prompt = queued(view, &summary).await;
+        let payload = request(&prompt);
+        assert_eq!(payload["target_resource"], "dev");
+        assert!(payload["repair_reason"]
+            .as_str()
+            .unwrap()
+            .contains("CONFLICT"));
+        assert_eq!(git(&repo.0, &["rev-parse", "HEAD"]), head);
+        assert_eq!(
+            git(&repo.0, &["status", "--porcelain"]),
+            "?? untracked.txt\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join("base.txt")).unwrap(),
+            "target divergence\n"
+        );
+    }
+    #[tokio::test]
+    async fn true_local_blockers_do_not_dispatch_or_mutate_checkouts() {
+        let (repo, view, summary) = fixture();
+        let local = Arc::new(LoomClient::new("http://127.0.0.1:1/", None).unwrap());
+        let remote = Arc::new(LoomClient::new("http://remote.example/", None).unwrap());
+        assert!(land_topic_locally(remote, view.clone(), &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("remotely"));
+        let mut missing = view.clone();
+        missing.work_dir = "".into();
+        assert!(land_topic_locally(local.clone(), missing, &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("unavailable"));
+        let source = Path::new(&view.work_dir);
+        git(source, &["checkout", "-qb", "changed"]);
+        assert!(land_topic_locally(local.clone(), view.clone(), &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("changed branches"));
+        git(source, &["checkout", "-q", "weaver/topic"]);
+        git(&repo.0, &["checkout", "-q", "--detach"]);
+        assert!(land_topic_locally(local.clone(), view.clone(), &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("detached"));
+        git(&repo.0, &["checkout", "-q", "dev"]);
+        std::fs::write(repo.0.join(".git/CHERRY_PICK_HEAD"), "foreign operation\n").unwrap();
+        assert!(land_topic_locally(local.clone(), view.clone(), &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("in progress"));
+        assert_eq!(
+            std::fs::read_to_string(repo.0.join(".git/CHERRY_PICK_HEAD")).unwrap(),
+            "foreign operation\n"
+        );
+        std::fs::remove_file(repo.0.join(".git/CHERRY_PICK_HEAD")).unwrap();
+        let operation = git(source, &["rev-parse", "--git-path", "MERGE_HEAD"]);
+        std::fs::write(source.join(operation.trim()), "foreign source operation\n").unwrap();
+        assert!(land_topic_locally(local.clone(), view.clone(), &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("in progress"));
+        std::fs::remove_file(source.join(operation.trim())).unwrap();
+        let (_other, mut other_view, _) = fixture();
+        other_view.branch.repo_root = view.branch.repo_root.clone();
+        assert!(land_topic_locally(local, other_view, &summary)
+            .await
+            .unwrap_err()
+            .message
+            .contains("different repository"));
+        assert_eq!(git(&repo.0, &["status", "--porcelain"]), "");
+        assert!(!repo.0.join("topic.txt").exists());
+    }
 }
