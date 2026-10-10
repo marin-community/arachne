@@ -102,7 +102,7 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocumentClick));
           <dd class="mono">{{ branch || "Unavailable" }}</dd>
         </div>
         <div v-if="integrationBranch">
-          <dt>Integrates into</dt>
+          <dt>Land destination</dt>
           <dd class="mono">{{ integrationBranch }}</dd>
         </div>
         <div>

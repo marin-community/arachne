@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import CheckoutEditor from "./CheckoutEditor.vue";
 import type { SessionSummary } from "../App.vue";
 import { launchSelection } from "../launch";
-import { preparationRequest } from "../reviewRequest";
+import { preparationRequest, independentReviewRequest } from "../reviewRequest";
 
 interface ChangeLine {
   kind: "context" | "addition" | "deletion";
@@ -63,7 +63,7 @@ function prepareRequest(mode: "review" | "prepare") {
   requestMode.value = mode;
   const revision = changes.value?.head_oid ? `The preview showed HEAD ${changes.value.head_oid}; re-read the current checkout, including uncommitted manual edits.` : "Inspect the current checkout, including uncommitted manual edits.";
   requestText.value = mode === "review"
-    ? `Review this thread's changes for correctness, regressions, and missing validation. ${revision} Act independently in a fresh review thread. Report actionable findings with file locations and distinguish verified checks from unverified claims. Do not integrate, land, push, or open a PR as part of this review.`
+    ? independentReviewRequest(revision, props.integrationTarget ?? null, props.isTopic)
     : preparationRequest(props.isTopic, revision, props.integrationTarget ?? null, editedPaths.value);
 }
 async function sendRequest() {
@@ -149,7 +149,7 @@ function lineNumber(value: number | null): string {
     </div>
     <div class="review-toolbar">
       <button :disabled="loading || requesting" @click="prepareRequest('review')">Launch reviewer</button>
-      <button :disabled="loading || requesting" @click="prepareRequest('prepare')">Prepare {{ isTopic ? "landing" : "integration" }}</button>
+      <button :disabled="loading || requesting" @click="prepareRequest('prepare')">Prepare {{ isTopic ? "publishing" : "landing" }}</button>
     </div>
     <div v-if="requestMode" class="review-request">
       <label :for="`review-request-${sessionId}`">{{ requestMode === 'review' ? "Review request" : "Preparation request" }}</label>

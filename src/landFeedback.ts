@@ -9,13 +9,13 @@ export interface LandResult {
   };
 }
 
-/** Queued requests acknowledge preparation and landing intent, not completion. */
+/** Queued requests acknowledge explicit publishing intent, not completion. */
 export function landResultFeedback(result: LandResult): string {
   if (result.local && result.landing) {
     const done = result.landing;
     return done.landed
-      ? `Landed locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch} · ${done.commit}`
+      ? `Published locally: squash of ${done.commits_squashed} commit${done.commits_squashed === 1 ? "" : "s"} into ${done.target_branch} · ${done.commit}`
       : `${done.target_branch} already contained this track's changes — nothing to do.`;
   }
-  return "Preparation and landing requested. Follow the result in this thread.";
+  return "Publish requested. Follow the actual result in this thread.";
 }

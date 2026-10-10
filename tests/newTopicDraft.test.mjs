@@ -26,7 +26,7 @@ const DRAFT_STORAGE_KEY = draftStorageKey(store());
 test("emptyDraft has the launch-sheet defaults", () => {
   assert.deepEqual(emptyDraft(), {
     project: null,
-    title: "", body: "", repo: "", base: "",
+    title: "", topicBranch: "", body: "", repo: "", base: "",
     profile: "default", agent: "", model: "", effort: "",
     mentions: [], attachments: [],
   });
@@ -63,6 +63,7 @@ test("saveDraft + readDraft round-trip (ignoring transient fields)", () => {
   const draft = {
     project: null,
     title: "Ship the sheet",
+    topicBranch: "arachne/tracks/custom",
     body: "Fix the flow\n\n@{design doc}",
     repo: "marin-community/arachne",
     base: "weaver/my-branch",
@@ -91,7 +92,7 @@ test("readDraft accepts string scalars and drops nulls", () => {
   }));
   assert.deepEqual(readDraft(s), {
     project: { id: "g", name: "n" },
-    title: "t", body: "", repo: "", base: "",
+    title: "t", topicBranch: "", body: "", repo: "", base: "",
     profile: "default", agent: "", model: "", effort: "",
     mentions: [], attachments: [],
   });
@@ -172,4 +173,17 @@ test("drafts stay scoped to their server and legacy migration belongs to startup
   s.setItem("loomUrl", "http://first:7878/");
   assert.equal(readDraft(s).body, "legacy work");
   assert.equal(readDraft(s).mentions[0].resourceId, "first-resource");
+});
+
+
+test("canonical branch draft survives close, preserves empty inference and ignores corrupt types", () => {
+  const storage = store();
+  const draft = { ...emptyDraft(), topicBranch: "feature/canonical" };
+  assert.equal(draftHasContent(draft), true);
+  saveDraft(storage, draft);
+  assert.equal(readDraft(storage).topicBranch, "feature/canonical");
+  saveDraft(storage, { ...draft, topicBranch: "" });
+  assert.equal(readDraft(storage).topicBranch, "");
+  storage.setItem(DRAFT_STORAGE_KEY, JSON.stringify({ topicBranch: 42 }));
+  assert.equal(readDraft(storage).topicBranch, "");
 });

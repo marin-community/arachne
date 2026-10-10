@@ -4,7 +4,7 @@ import {
   badgeLabel,
   composerSendAsDismiss,
   dismissibleAttention,
-  integrationCandidates,
+  landingCandidates,
   isIdle,
   isReadyCandidate,
   loudTag,
@@ -159,7 +159,7 @@ test("readiness requires explicit verified candidate state, not lifecycle", () =
   assert.equal(isReadyCandidate(notReady), false);
 });
 
-test("candidate queue: verified ready first, integrated outcomes after, topic excluded", () => {
+test("candidate queue: reported ready first, landed outcomes after, topic excluded", () => {
   const fleet = [
     session("topic"),
     session("ready", { parent_session_id: "topic", last_activity_at: "2026-01-01T00:00:00Z" }),
@@ -174,13 +174,13 @@ test("candidate queue: verified ready first, integrated outcomes after, topic ex
     return s;
   });
   const rows = topicThreadRows(taggedFleet, "topic", new Set());
-  const candidates = integrationCandidates(rows, "topic");
+  const candidates = landingCandidates(rows, "topic");
   assert.deepEqual(candidates.map((c) => c.session.id), ["ready", "integrated"]);
-  assert.deepEqual(candidates.map((c) => c.state), ["ready", "integrated"]);
+  assert.deepEqual(candidates.map((c) => c.state), ["ready", "landed"]);
   assert.equal(candidates[0].note, "clean against topic@789abc");
   assert.equal(candidates[1].note, "squash into topic");
-  // A worker already integrated is not offered Integrate again.
-  assert.equal(candidates.find((c) => c.session.id === "integrated").state, "integrated");
+  // A landed outcome does not offer Land again.
+  assert.equal(candidates.find((c) => c.session.id === "integrated").state, "landed");
   // Stopped and sleeping workers never appear.
   assert.ok(!candidates.some((c) => c.session.id === "stopped"));
   assert.ok(!candidates.some((c) => c.session.id === "sleeping"));
@@ -231,7 +231,7 @@ test("new stale/conflict facts supersede old readiness and reviewers never becom
   assert.equal(threadStatus(stale).kind, "stale");
   const reviewer = withTag(withTag(session("reviewer", { parent_session_id: "track" }), "role", "reviewer"), "integration_ready", "true");
   const rows = topicThreadRows([session("track"), conflict, reviewer], "track", new Set());
-  assert.deepEqual(integrationCandidates(rows, "track").map(c => [c.session.id, c.state]), [["worker", "conflicted"]]);
+  assert.deepEqual(landingCandidates(rows, "track").map(c => [c.session.id, c.state]), [["worker", "conflicted"]]);
   const integrated = withTag(ready, "integration_result", "commit123");
   assert.equal(isReadyCandidate(integrated), false);
 });
@@ -242,4 +242,28 @@ test("waiting PRs and resolved wait tags do not imply human attention", () => {
   assert.equal(threadStatus(idle).label, "waiting on CI");
   assert.equal(attentionLevel(idle), "ok");
   assert.equal(threadStatus(withTag(withTag(session("done"), "idle", "true"), "waiting", "resolved")).kind, "resting");
+});
+
+
+test("Landing queue includes working and waiting without inventing readiness; excludes reviewers, coordinators and foreign repositories", () => {
+  const track = session("track"); // Legacy no-tag root remains accepted.
+  const worker = session("working", { parent_session_id: "track" });
+  const nested = session("nested", { parent_id: worker.branch.id });
+  const waiting = withTag(session("waiting", { parent_session_id: "track" }), "waiting", "CI");
+  const pending = withTag(session("pending", { parent_session_id: "track" }), "landing_request", "pending");
+  const stale = withTag(session("stale", { parent_session_id: "track" }), "integration_state", "stale");
+  const ready = withTag(session("ready", { parent_session_id: "track" }), "integration_ready", "true");
+  const landed = withTag(session("landed", { parent_session_id: "track", status: "archived" }), "integration_result", "accepted-sha");
+  const reviewer = withTag(session("reviewer", { parent_session_id: "track" }), "role", "reviewer");
+  const coordinator = withTag(session("coordinator", { parent_session_id: "track" }), "topic", "true");
+  const foreign = session("foreign", { parent_session_id: "track" });
+  foreign.branch.repo_root = "/other";
+  const rows = topicThreadRows([track, worker, nested, waiting, pending, stale, ready, landed, reviewer, coordinator, foreign], "track", new Set());
+  assert.deepEqual(landingCandidates(rows, "track").map(c => [c.session.id, c.state]), [
+    ["stale", "stale"], ["ready", "ready"], ["waiting", "waiting"], ["pending", "waiting"],
+    ["working", "working"], ["nested", "working"], ["landed", "landed"],
+  ]);
+  for (const s of [worker, waiting, pending]) assert.equal(isReadyCandidate(s), false);
+  assert.equal(threadStatus(landed).kind, "landed");
+  assert.equal(threadStatus(pending).kind, "waiting");
 });

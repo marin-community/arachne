@@ -1,10 +1,11 @@
 /**
  * Pure logic for the Topic inspector (design.md "Navigation"): the topic's
- * thread tree, per-row states, and the integration candidate queue. Kept out
+ * thread tree, per-row states, and the Landing queue. Kept out
  * of the component so it can be tested directly (mirrors chatRows.ts).
  */
 
 import type { SessionSummary } from "./App.vue";
+import { isTrackCoordinator, resolveTrack, tagValue } from "./trackPolicy.ts";
 
 // --- Fleet row state ---------------------------------------------------------
 
@@ -178,15 +179,9 @@ export function topicThreadRows(
   return rows;
 }
 
-// --- Integration candidates --------------------------------------------------
+// --- Landing candidates ------------------------------------------------------
 
-/**
- * Verified candidate state from Loom. A worker is ready ONLY when it carries
- * an explicit readiness tag — design.md: "Ready to Integrate requires
- * explicit verified candidate state from Loom; a stopped or sleeping worker
- * is not sufficient evidence." Worker lifecycle (stopped/sleeping/archived)
- * never implies readiness.
- */
+/** Readiness is advisory and explicitly reported, never inferred from lifecycle. */
 export function isReadyCandidate(s: SessionSummary): boolean {
   if (integrationResult(s) || s.branch.tags.some(t => t.key === "role" && t.value === "reviewer")) return false;
   const state = s.branch.tags.find(t => t.key === "integration_state")?.value;
@@ -199,24 +194,23 @@ export function isReadyCandidate(s: SessionSummary): boolean {
 }
 
 export type ThreadFactKind = "archived" | "needs-you" | "parent-help" | "error" | "conflicted" | "stale"
-  | "ready" | "reviewing" | "working" | "integrated" | "waiting" | "resting";
+  | "ready" | "reviewing" | "working" | "landed" | "waiting" | "resting";
 
 /** Advisory facts, independent of the process lifecycle and Git ancestry. */
 export function threadStatus(s: SessionSummary): { kind: ThreadFactKind; label: string; detail: string } {
   const tag = (key: string) => s.branch.tags.find(t => t.key === key);
   const fact = (kind: ThreadFactKind, label: string, detail = "") => ({ kind, label, detail });
+  const result = integrationResult(s);
+  if (result) return fact("landed", "landed", result.note || result.value);
   if (s.status === "archived") return fact("archived", "archived");
   if (loudTag(s)) return fact("needs-you", "needs you", attentionReason(s) ?? "");
   if (tag("parent_help")?.value === "requested") return fact("parent-help", "needs parent", tag("parent_help")?.note);
   if (s.status === "error") return fact("error", "error", "Inspect the error; escalate explicitly if human action is needed.");
   const integration = tag("integration_state");
-  if (integration?.value === "conflicted") return fact("conflicted", "integration conflict", integration.note);
+  if (integration?.value === "conflicted") return fact("conflicted", "landing conflict", integration.note);
   if (integration?.value === "stale") return fact("stale", "needs recheck", integration.note);
-  if (isReadyCandidate(s)) return fact("ready", "ready to integrate", tag("integration_ready")?.note || integration?.note);
-  if (s.status === "running" && !isIdle(s)) return tag("role")?.value === "reviewer"
-    ? fact("reviewing", "reviewing") : fact("working", "working");
-  const result = integrationResult(s);
-  if (result) return fact("integrated", "integrated", result.note || result.value);
+  if (isReadyCandidate(s)) return fact("ready", "reported ready", tag("integration_ready")?.note || integration?.note);
+  if (tag("landing_request")?.value === "pending") return fact("waiting", "Land requested", "Waiting for successful wrap-up and acceptance.");
   const waiting = tag("waiting");
   if (waiting && !["false", "done", "resolved"].includes(waiting.value)) return fact("waiting", "waiting", waiting.note || waiting.value);
   const pr = s.branch.github;
@@ -224,6 +218,8 @@ export function threadStatus(s: SessionSummary): { kind: ThreadFactKind; label: 
     const checks = pr.checks?.toLowerCase();
     return fact("waiting", checks && ["pending", "queued", "in_progress"].includes(checks) ? "waiting on CI" : "waiting on PR", `PR #${pr.pr_number}`);
   }
+  if (s.status === "running" && !isIdle(s)) return tag("role")?.value === "reviewer"
+    ? fact("reviewing", "reviewing") : fact("working", "working");
   return fact("resting", "resting");
 }
 
@@ -232,49 +228,37 @@ export function integrationResult(s: SessionSummary) {
   return s.branch.tags.find((t) => t.key === "integration_result");
 }
 
-export interface IntegrationCandidate {
+export interface LandingCandidate {
   session: SessionSummary;
-  state: "ready" | "stale" | "conflicted" | "integrated";
-  /** Readiness revision / outcome reference from the tag. */
+  state: "working" | "waiting" | "ready" | "stale" | "conflicted" | "landed";
   note: string;
 }
 
-/**
- * The Topic-owned candidate queue from a topic's thread rows: verified
- * ready candidates first, then integrated outcomes. The topic coordinator
- * itself is never a candidate.
- */
-export function integrationCandidates(
-  rows: ThreadRow[],
-  topicId: string,
-): IntegrationCandidate[] {
-  const out: IntegrationCandidate[] = [];
+/** Active workers and advisory reports coexist with durable acceptance outcomes.
+ * Lifecycle and pending wrap-up requests never imply successful readiness. */
+export function landingCandidates(rows: ThreadRow[], topicId: string): LandingCandidate[] {
+  const fleet = rows.map(row => row.session);
+  const out: LandingCandidate[] = [];
   for (const { session: s } of rows) {
-    if (s.id === topicId || s.branch.tags.some(t => t.key === "role" && t.value === "reviewer")) continue;
+    if (s.id === topicId || tagValue(s, "role") === "reviewer" || isTrackCoordinator(s)
+      || resolveTrack(fleet, s.id)?.id !== topicId) continue;
     const result = integrationResult(s);
     if (result) {
-      out.push({ session: s, state: "integrated", note: result.note || result.value });
+      out.push({ session: s, state: "landed", note: result.note || result.value });
       continue;
     }
-    const state = s.branch.tags.find(t => t.key === "integration_state");
+    const state = s.branch.tags.find(tag => tag.key === "integration_state");
     if (state?.value === "stale" || state?.value === "conflicted") {
-      out.push({ session: s, state: state.value, note: state.note || "Reconcile and revalidate against the current Track." });
-      continue;
-    }
-    if (isReadyCandidate(s)) {
-      // The readiness tag's note carries the recorded target revision
-      // ("clean against <topic>@<rev>", spec "Candidate readiness").
-      const ready = s.branch.tags.find(
-        (t) =>
-          (t.key === "integration_ready" || t.key === "integration_state") &&
-          (t.value === "true" || t.value === "ready"),
-      );
-      out.push({ session: s, state: "ready", note: ready?.note || ready?.value || "" });
+      out.push({ session: s, state: state.value, note: state.note || "Reconcile and revalidate against the canonical branch." });
+    } else if (isReadyCandidate(s)) {
+      const ready = s.branch.tags.find(tag => ["integration_ready", "integration_state"].includes(tag.key) && ["true", "ready"].includes(tag.value));
+      out.push({ session: s, state: "ready", note: ready?.note || "Reported ready; acceptance still requires review and validation." });
+    } else {
+      const fact = threadStatus(s);
+      if (fact.kind === "working" || fact.kind === "waiting") out.push({ session: s, state: fact.kind, note: fact.detail });
+      else if (s.status === "running" && !isIdle(s)) out.push({ session: s, state: "working", note: fact.detail || fact.label });
     }
   }
-  return out.sort((a, b) => {
-    const rank = { conflicted: 0, stale: 1, ready: 2, integrated: 3 };
-    if (a.state !== b.state) return rank[a.state] - rank[b.state];
-    return b.session.last_activity_at.localeCompare(a.session.last_activity_at);
-  });
+  const rank = { conflicted: 0, stale: 1, ready: 2, waiting: 3, working: 4, landed: 5 };
+  return out.sort((a, b) => rank[a.state] - rank[b.state] || b.session.last_activity_at.localeCompare(a.session.last_activity_at));
 }

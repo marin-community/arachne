@@ -8,6 +8,9 @@ import ContextTelemetry from "./ContextTelemetry.vue";
 import { useSlashCommands, type SlashCommand } from "../useSlashCommands";
 import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
+import AutolandControl from "./AutolandControl.vue";
+import { canonicalTopicBranch, isTrackCoordinator, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
+import { landStrategies, publishStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import CodeActions from "./CodeActions.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
@@ -74,6 +77,7 @@ const emit = defineEmits<{
   (e: "delegate", parentId: string, task: string, completed: (success: boolean) => void): void;
   (e: "handoff", id: string): void;
   (e: "refresh", id: string): void;
+  (e: "policy-updated", session: SessionView): void;
   (e: "open-topic", id: string): void;
   (e: "overview", id: string): void;
   (e: "open-coordinator", id: string): void;
@@ -993,7 +997,8 @@ function messageAuthor(block: ChatDisplayBlock): string {
 
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
 const isReviewer = computed(() => currentSummary.value?.branch.tags.some(tag => tag.key === "role" && tag.value === "reviewer"));
-const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id));
+const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id) && !isTrackCoordinator(currentSummary.value!));
+const lastPublish = computed(() => currentSummary.value?.branch.tags.find(tag => tag.key === "publish_result"));
 const lastIntegration = computed(() => currentSummary.value?.branch.tags.find((tag) => tag.key === "integration_result"));
 const integrationTarget = computed(() => reviewIntegrationTarget(props.fleet, props.session.id));
 // Every root conversation is a topic, including older single-prompt launches
@@ -1007,21 +1012,8 @@ async function convertToTrack() {
   finally { converting.value = false; }
 }
 const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
-const allIntegrateOptions = [
-  { value: "squash", label: "Squash into track" },
-  { value: "merge", label: "Merge into track" },
-  { value: "rebase", label: "Rebase onto track" },
-  { value: "cherry-pick", label: "Cherry-pick commits" },
-  { value: "open-pr", label: "Open PR into track" },
-  { value: "ask", label: "Ask coordinator to decide" },
-];
-const integrateOptions = computed(() => allIntegrateOptions.filter((option) =>
-  option.value !== "cherry-pick" || workSummary.value?.has_commits === true,
-));
-// The deterministic fast path: no agent turn, Arachne squash-merges the
-// topic into the primary checkout's current branch itself. Recoverable
-// preparation/repair goes to the coordinator. Local landing is offered only
-// for a loopback server, since its checkout paths are then local paths.
+const landOptions = computed(() => landStrategies(workSummary.value?.has_commits === true));
+// Local primary publishing is available only for a loopback Loom server.
 const loomIsLocal = computed(() => {
   try {
     const host = new URL(props.loomUrl).hostname;
@@ -1030,19 +1022,8 @@ const loomIsLocal = computed(() => {
     return false;
   }
 });
-const landOptions = computed(() => [
-  { value: "open-pr", label: "Open PR" },
-  { value: "squash", label: "Squash into upstream" },
-  { value: "merge", label: "Merge into upstream" },
-  { value: "rebase", label: "Rebase / fast-forward" },
-  { value: "push", label: "Push track branch" },
-  ...(loomIsLocal.value ? [{ value: "land-locally", label: "Squash into local checkout" }] : []),
-]);
-interface IntegrationTarget {
-  coordinator_id: string;
-  target_branch: string;
-  coordinator_name: string;
-}
+const publishOptions = computed(() => publishStrategies(loomIsLocal.value));
+const canonicalDestination = computed(() => integrationTarget.value ? canonicalTopicBranch(integrationTarget.value) : null);
 const integrating = ref(false);
 const landing = ref(false);
 const integrationNote = ref("");
@@ -1062,35 +1043,40 @@ async function refreshWorkSummary(id = props.session.id) {
 }
 watch(() => props.session.id, (id) => {
   showChanges.value = false;
+  integrationNote.value = "";
   workSummary.value = null;
   void refreshWorkSummary(id);
 }, { immediate: true });
-async function onIntegrate(strategy: string) {
+async function onThreadLand(strategy: string) {
   if (integrating.value) return;
   integrating.value = true;
+  const id = props.session.id;
+  const repo = sessionRepo.value;
   integrationNote.value = "";
   try {
-    const target = await invoke<IntegrationTarget>("integrate_session", { sessionId: props.session.id, strategy });
-    localStorage.setItem(`arachne:strategy:integrate:${sessionRepo.value}`, strategy);
-    integrationNote.value = `Sent to ${target.coordinator_name} (${target.target_branch}). Follow the integration in that thread.`;
+    const target = await invoke<IntegrationTarget>("land_thread", { sessionId: id, strategy });
+    try { localStorage.setItem(strategyMemoryKey("land", repo), strategy); } catch { /* unavailable storage */ }
+    if (props.session.id === id) integrationNote.value = threadLandFeedback(target);
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   } finally {
     integrating.value = false;
   }
 }
-async function onLand(strategy: string) {
+async function onPublish(strategy: string) {
   if (landing.value) return;
   landing.value = true;
+  const id = props.session.id;
+  const repo = sessionRepo.value;
   integrationNote.value = strategy === "land-locally"
-    ? "Landing locally…"
-    : "Requesting preparation and landing…";
+    ? "Publishing to local primary current branch…"
+    : "Requesting publish…";
   try {
-    const result = await invoke<LandResult>("land_topic", { sessionId: props.session.id, strategy });
-    localStorage.setItem(`arachne:strategy:land:${sessionRepo.value}`, strategy);
-    integrationNote.value = landResultFeedback(result);
+    const result = await invoke<LandResult>("publish_track", { sessionId: id, strategy });
+    try { localStorage.setItem(strategyMemoryKey("publish", repo), strategy); } catch { /* unavailable storage */ }
+    if (props.session.id === id) integrationNote.value = landResultFeedback(result);
   } catch (e: any) {
-    integrationNote.value = "";
+    if (props.session.id === id) integrationNote.value = "";
     emit("error", e?.message ?? String(e));
   } finally {
     landing.value = false;
@@ -1113,10 +1099,10 @@ async function onLand(strategy: string) {
           {{ session.turn_count }}
         </div>
       </div>
-      <!-- The scoped dashboard (Needs You / Working / Ready to Integrate) is an
+      <!-- The scoped dashboard (Needs You / Working / Reported ready to Land) is an
            explicit detour, not the default Track view — the main pane stays a
            conversation whenever a Track is open. -->
-      <button v-if="topic" title="Open this track's dashboard (Needs You, Working, Ready to Integrate)" @click="emit('overview', topic.id)">Overview</button>
+      <button v-if="topic" title="Open this track's dashboard (Needs You, Working, Reported ready to Land)" @click="emit('overview', topic.id)">Overview</button>
       <!-- The explicit back-to-coordinator action (docs/design.md
            "Navigation"): from a worker thread, jump to the track's
            coordinator chat without remembered-thread restoration. -->
@@ -1144,15 +1130,15 @@ async function onLand(strategy: string) {
         :review-decision="pr?.review_decision"
         :checks="pr?.checks"
         :branch="session.branch.branch"
-        :integration-branch="isWorker && integrationTarget ? integrationTarget.branch.branch : null"
+        :integration-branch="isWorker ? canonicalDestination : null"
         :work-summary="workSummary"
         @open-checkout="zedTarget ? openInZed() : recover()"
         @open-terminal="openTerminal"
         @open-resource="openResource"
       />
       <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
-      <SplitButton v-if="isWorker && !isReviewer" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
-      <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
+      <SplitButton v-if="isWorker && !isReviewer" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="integrating" :disabled="!integrationTarget || session.status === 'archived'" @run="onThreadLand" />
+      <SplitButton v-if="isTopic" kind="publish" :repo="sessionRepo" :options="publishOptions" label="Publish" :busy="landing" :disabled="session.status === 'archived'" @run="onPublish" />
       <button v-if="!isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
       <button @click="interrupt">Interrupt</button>
       <button class="danger" @click="archive">Archive</button>
@@ -1161,9 +1147,15 @@ async function onLand(strategy: string) {
       </button>
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
     </div>
+    <div v-if="isTopic || (isWorker && !isReviewer)" class="integrate-note">
+      <span>{{ isTopic ? 'Publish source' : 'Land destination' }}: <code>{{ canonicalDestination || 'No same-repository Track resolved' }}</code></span>
+      <AutolandControl :session="currentSummary ?? session" :track="integrationTarget" :coordinator="isTopic" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
+      <span v-if="isTopic">Autoland accepts worker results; Publish is an explicit action.</span>
+    </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
+    <div v-if="isTopic && lastPublish" class="integrate-note" :title="lastPublish.note">Last publish result: {{ lastPublish.value }}<span v-if="lastPublish.note"> · {{ lastPublish.note }}</span></div>
     <div v-if="isWorker && !isReviewer && lastIntegration" class="integrate-note" :title="lastIntegration.note">
-      Last integrated result: {{ lastIntegration.value }}<span v-if="lastIntegration.note"> · {{ lastIntegration.note }}</span>
+      Last landed result: {{ lastIntegration.value }}<span v-if="lastIntegration.note"> · {{ lastIntegration.note }}</span>
     </div>
     <div v-if="showSendToThread" class="send-thread-box">
       <label>

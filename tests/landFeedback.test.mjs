@@ -10,10 +10,10 @@ const landing = {
   primary_checkout: "/repo",
 };
 
-test("queued landing, including local repair, reports preparation and landing intent", () => {
+test("queued publishing, including local repair, reports intent without completion", () => {
   const note = landResultFeedback({ local: false });
-  assert.equal(note, "Preparation and landing requested. Follow the result in this thread.");
-  assert.doesNotMatch(note, /landed|already contained|nothing to do/i);
+  assert.equal(note, "Publish requested. Follow the actual result in this thread.");
+  assert.doesNotMatch(note, /landed|published|already contained|nothing to do/i);
 });
 
 test("local=false cannot claim completion even with a landing payload", () => {
@@ -24,9 +24,9 @@ test("local=false cannot claim completion even with a landing payload", () => {
 
 test("completed local landing preserves commit, target and squash count", () => {
   assert.equal(landResultFeedback({ local: true, landing }),
-    "Landed locally: squash of 2 commits into dev · abc123");
+    "Published locally: squash of 2 commits into dev · abc123");
   assert.equal(landResultFeedback({ local: true, landing: { ...landing, commits_squashed: 1 } }),
-    "Landed locally: squash of 1 commit into dev · abc123");
+    "Published locally: squash of 1 commit into dev · abc123");
 });
 
 test("local no-op preserves actual already-contained feedback", () => {

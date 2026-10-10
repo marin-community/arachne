@@ -188,7 +188,7 @@ watch(() => todoTopicIds.value.join(","), scheduleTodos);
 const sections = computed(() => [
   { name: "Needs You", rows: needs.value, kind: "needs" },
   { name: "Working", rows: working.value, kind: "working" },
-  { name: "Ready to Integrate", rows: ready.value, kind: "ready" },
+  { name: "Reported ready to Land", rows: ready.value, kind: "ready" },
 ]);
 
 // Below the attention/priority inbox, Working and Ready rows group by

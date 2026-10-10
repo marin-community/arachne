@@ -1,15 +1,6 @@
 <script setup lang="ts">
-// IntegrateSplitButton — the [ Integrate ▼ ] / [ Land ▼ ] split button
-// (spec: docs/integration-and-landing.md, "Integrate UI" / "Land UI").
-//
-// Primary click runs the remembered/default strategy immediately; the
-// dropdown exposes applicable strategies. Strategy memory is per-repo
-// (spec: "Do not use one global integration preference for all
-// repositories") — precedence: last-used for this repo, else the
-// conservative fallback: `Ask coordinator to decide` for Integrate, or
-// `Open PR` for Land.
-
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { strategyMemoryKey, selectedStrategy, type StrategyKind } from "../trackStrategies.ts";
 
 export interface StrategyOption {
   value: string;
@@ -17,8 +8,8 @@ export interface StrategyOption {
 }
 
 const props = defineProps<{
-  /** "integrate" or "land" — the primary label and storage key. */
-  kind: "integrate" | "land";
+  /** Worker Land or root Publish, each with separate strategy memory. */
+  kind: StrategyKind;
   /** Repo slug for per-repo strategy memory (owner/name). */
   repo: string;
   /** Offered strategies; only those that make sense for this worker. */
@@ -37,17 +28,15 @@ const open = ref(false);
 const rootEl = ref<HTMLElement | null>(null);
 
 const memoryKey = computed(
-  () => `arachne:strategy:${props.kind}:${props.repo}`,
+  () => strategyMemoryKey(props.kind, props.repo),
 );
 
-const fallback = computed(() => props.kind === "land" ? "open-pr" : "ask");
 const selected = ref("");
 
 function loadMemory() {
-  // Per-repo last-used strategy. An old remembered `ask` for Land is ignored.
-  const stored = localStorage.getItem(memoryKey.value);
-  selected.value =
-    stored && props.options.some((o) => o.value === stored) ? stored : fallback.value;
+  let stored: string | null = null;
+  try { stored = localStorage.getItem(memoryKey.value); } catch { /* unavailable storage */ }
+  selected.value = selectedStrategy(props.kind, props.options, stored);
 }
 
 function onDocClick(e: MouseEvent) {
@@ -66,11 +55,12 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocClick));
 watch([memoryKey, () => props.options], loadMemory);
 
 function primary() {
-  if (props.disabled || props.busy) return;
+  if (props.disabled || props.busy || !selected.value) return;
   emit("run", selected.value);
 }
 
 function choose(value: string) {
+  if (props.disabled || props.busy || !props.options.some(option => option.value === value)) return;
   selected.value = value;
   open.value = false;
   emit("run", value);
@@ -80,7 +70,7 @@ const selectedLabel = computed(
   () =>
     props.options.find((o) => o.value === selected.value)?.label ??
     props.options[0]?.label ??
-    (props.kind === "land" ? "Open PR" : "Ask coordinator to decide"),
+    (props.kind === "land" ? "Squash" : "Single PR"),
 );
 </script>
 
@@ -93,7 +83,7 @@ const selectedLabel = computed(
       :title="`${selectedLabel} (remembered for ${props.repo})`"
       @click="primary()"
     >
-      {{ props.busy ? "…" : `${props.label ?? (props.kind === "land" ? "Land" : "Integrate")}` }}
+      {{ props.busy ? "…" : `${props.label ?? (props.kind === "land" ? "Land" : "Publish")}` }}
     </button>
     <button
       class="split-caret"

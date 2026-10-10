@@ -15,6 +15,7 @@ import ProjectSheet from "./components/ProjectSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { FileAttachment } from "./attachments";
 import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
+import { launchTopicBranch } from "./trackPolicy.ts";
 import { clearDraftOnLaunch, initializeDraftStorage } from "./newTopicDraft";
 import {
   resolveTopicThread,
@@ -387,7 +388,7 @@ async function openTopicChat(id: string) {
 }
 
 // The explicit scoped dashboard (HomeView topic mode): Needs You, Working,
-// Ready to Integrate, and the topic summary. Reached deliberately through
+// Reported ready to Land, and the topic summary. Reached deliberately through
 // the Overview action in the Topic/coordinator chat header — the main pane
 // stays a conversation whenever a Topic is open.
 function showTopicOverview(id: string) {
@@ -505,7 +506,7 @@ function onHome() {
 async function launchTask(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[]; asTrack?: boolean },
+  meta?: { topicBranch?: string; title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[]; asTrack?: boolean },
   completed?: (success: boolean) => void,
 ) {
   launching.value = true;
@@ -527,6 +528,7 @@ async function launchTask(
       // the creation form overrides the project's defaults).
       hiddenBindingKeys: meta?.hiddenBindingKeys ?? [],
       asTrack: meta?.asTrack ?? false,
+      topicBranch: launchTopicBranch(meta?.topicBranch, meta?.asTrack ?? false),
     });
     // A new topic activates immediately: route through selectSession
     // so open_session runs (chat forwarder + cursor reset + fresh view),
@@ -556,7 +558,7 @@ async function launchTask(
 function launchTopic(
   task: string,
   repo: string,
-  meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
+  meta?: { topicBranch?: string; title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
 ) {
   launchTask(task, repo, { ...meta, asTrack: true }, (success) => {
     if (success) {
@@ -581,6 +583,12 @@ function launchThread(
   launchTask(task, repo, meta, (success) => {
     if (success) closeNewThreadSheet();
   });
+}
+
+// The durable command returns fresh tags. Reflect them across both panes immediately.
+function onPolicyUpdated(view: SessionView) {
+  fleet.value = fleet.value.map(session => session.id === view.id ? { ...session, branch: view.branch } : session);
+  if (selectedView.value?.id === view.id) selectedView.value = { ...selectedView.value, branch: view.branch };
 }
 
 // Edit a topic's card: title (CAS-fenced against the value the card last
@@ -804,6 +812,7 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       @delegate="delegateFromThread"
       @handoff="selectSession"
       @refresh="selectSession"
+      @policy-updated="onPolicyUpdated"
       @open-topic="selectTopic"
       @overview="showTopicOverview"
       @open-coordinator="openCoordinatorThread"
@@ -825,7 +834,7 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       @error="connError = $event"
     />
     <TopicInspector v-if="!showNewThread && !showNewTopic && !showProjectSheet && viewMode !== 'home' && selectedTopic && showResources" :topic="selectedTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
-      @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" />
+      @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" @policy-updated="onPolicyUpdated" />
     <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && !showProjectSheet && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
     <CommandPalette v-if="showSearch" :fleet="fleet" @close="showSearch = false" @select="selectSession" @action="command" />
     <div v-if="connError && !showSettings && !showNewThread && !showNewTopic" class="app-error" role="alert"><span>{{ connError }}</span><button @click="showSettings = true" v-if="!connected">Connection settings</button><button aria-label="Dismiss error" @click="connError = null">×</button></div>

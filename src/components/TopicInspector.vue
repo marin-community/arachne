@@ -1,26 +1,25 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import type { SessionSummary } from "../App.vue";
+import type { SessionSummary, SessionView } from "../App.vue";
 import ResourcePanel from "./ResourcePanel.vue";
 import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import TrackActivity from "./TrackActivity.vue";
+import AutolandControl from "./AutolandControl.vue";
+import { canonicalTopicBranch, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
+import { landStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import SplitButton from "./SplitButton.vue";
 import {
-  integrationCandidates,
-  type IntegrationCandidate,
+  landingCandidates,
+  type LandingCandidate,
   pendingPermissionSummary,
   statusClass,
   topicThreadRows,
   threadStatus,
 } from "../topicInspector";
 
-// The Topic inspector (docs/design.md "Navigation"): the right pane while a
-// Topic is open, with one tab per view of that topic — Threads, Resources,
-// Integrations, Todos. Land is deliberately NOT here: it is a Topic action
-// toward upstream, not an inspector view. The pure row/candidate logic
-// lives in src/topicInspector.ts so it stays testable.
+// Track inspector: workers, review, and the canonical Landing queue.
 
 const props = defineProps<{
   topic: SessionSummary;
@@ -35,10 +34,11 @@ const emit = defineEmits<{
   (e: "select", id: string): void;
   (e: "new-thread"): void;
   (e: "checkout-saved", sessionId: string): void;
+  (e: "policy-updated", session: SessionView): void;
 }>();
 
-const candidateLabels = { ready: "Ready", stale: "Needs recheck", conflicted: "Conflict", integrated: "Integrated" };
-const tab = ref<"threads" | "review" | "resources" | "integrations" | "todos" | "activity" | "handoffs">("threads");
+const candidateLabels = { working: "Working", waiting: "Waiting", ready: "Reported ready", stale: "Needs recheck", conflicted: "Conflict", landed: "Landed" };
+const tab = ref<"threads" | "review" | "resources" | "landing" | "todos" | "activity" | "handoffs">("threads");
 const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId) ?? props.topic);
 const canEdit = computed(() => {
   try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(props.loomUrl ?? "").hostname); }
@@ -68,43 +68,27 @@ function toggle(id: string) {
   else collapsed.value.add(id);
 }
 
-// --- Integrations tab -------------------------------------------------------
-//
-// The Topic-owned candidate queue. A worker qualifies ONLY on verified
-// candidate state reported by Loom (design.md: "Ready to Integrate requires
-// explicit verified candidate state from Loom; a stopped or sleeping worker
-// is not sufficient evidence"). Workers with a recorded `integration_result`
-// are shown as integrated outcomes. Land is not here — it is a Topic action.
-
-const candidates = computed(() => integrationCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id));
-
-const integrateOptions = [
-  { value: "squash", label: "Squash into track" },
-  { value: "merge", label: "Merge into track" },
-  { value: "rebase", label: "Rebase onto track" },
-  { value: "cherry-pick", label: "Cherry-pick commits" },
-  { value: "open-pr", label: "Open PR into track" },
-  { value: "ask", label: "Ask coordinator to decide" },
-];
+// Queue membership does not depend on the Threads tree's collapse state.
+const candidates = computed(() => landingCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id));
+const landOptions = landStrategies();
 
 const sessionRepo = (s: SessionSummary) => s.github_repo || s.branch.repo_root;
 const integratingId = ref<string | null>(null);
 const integrationNote = ref("");
 
-// The integrate path mirrors ThreadView.onIntegrate: the structured request
-// goes to the worker's coordinator (the topic here), strategy memory is
-// per-repo, and a sent request is not a success state.
-async function onIntegrate(candidate: IntegrationCandidate, strategy: string) {
+// Land requests wrap-up and acceptance; only a reported outcome means completion.
+async function onLand(candidate: LandingCandidate, strategy: string) {
   if (integratingId.value) return;
   integratingId.value = candidate.session.id;
+  const topicId = props.topic.id;
   integrationNote.value = "";
   try {
-    const target = await invoke<{ coordinator_id: string; target_branch: string; coordinator_name: string }>(
-      "integrate_session",
+    const target = await invoke<IntegrationTarget>(
+      "land_thread",
       { sessionId: candidate.session.id, strategy },
     );
-    localStorage.setItem(`arachne:strategy:integrate:${sessionRepo(candidate.session)}`, strategy);
-    integrationNote.value = `Sent to ${target.coordinator_name} (${target.target_branch}). Follow the integration in that thread.`;
+    try { localStorage.setItem(strategyMemoryKey("land", sessionRepo(candidate.session)), strategy); } catch { /* unavailable storage */ }
+    if (props.topic.id === topicId) integrationNote.value = threadLandFeedback(target);
   } catch (error: any) {
     emit("error", error?.message ?? String(error));
   } finally {
@@ -229,13 +213,17 @@ watch(() => props.topic.id, () => {
       </div>
       <button title="Close inspector" aria-label="Close inspector" @click="emit('close')">×</button>
     </header>
+    <div class="canonical-policy">
+      <span>Canonical destination: <code>{{ canonicalTopicBranch(topic) }}</code></span>
+      <AutolandControl :session="topic" :track="topic" coordinator @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
+    </div>
     <div class="tab-bar inspector-tab-bar" role="tablist">
       <button class="tab" :class="{ active: tab === 'threads' }" role="tab" :aria-selected="tab === 'threads'" @click="tab = 'threads'">Threads</button>
       <button class="tab" :class="{ active: tab === 'review' }" role="tab" :aria-selected="tab === 'review'" @click="tab = 'review'">Review</button>
       <button class="tab" :class="{ active: tab === 'handoffs' }" role="tab" :aria-selected="tab === 'handoffs'" @click="tab = 'handoffs'">Handoffs</button>
       <button class="tab" :class="{ active: tab === 'activity' }" role="tab" :aria-selected="tab === 'activity'" @click="tab = 'activity'">Activity</button>
       <button class="tab" :class="{ active: tab === 'resources' }" role="tab" :aria-selected="tab === 'resources'" @click="tab = 'resources'">Resources</button>
-      <button class="tab" :class="{ active: tab === 'integrations' }" role="tab" :aria-selected="tab === 'integrations'" @click="tab = 'integrations'">Integrations</button>
+      <button class="tab" :class="{ active: tab === 'landing' }" role="tab" :aria-selected="tab === 'landing'" @click="tab = 'landing'">Landing</button>
       <button class="tab" :class="{ active: tab === 'todos' }" role="tab" :aria-selected="tab === 'todos'" @click="tab = 'todos'">Todos</button>
     </div>
 
@@ -293,35 +281,35 @@ watch(() => props.topic.id, () => {
       <ResourcePanel :topic="topic" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
     </div>
 
-    <!-- Integrations: the Topic-owned candidate queue. Only verified
-         candidate state from Loom qualifies; a stopped or sleeping worker is
-         not evidence of readiness. -->
-    <div v-else-if="tab === 'integrations'" class="inspector-body">
+    <!-- Landing includes active work, advisory readiness, and accepted outcomes. -->
+    <div v-else-if="tab === 'landing'" class="inspector-body">
       <div v-if="integrationNote" class="inspector-note">{{ integrationNote }}</div>
       <div v-if="!candidates.length" class="inspector-empty">
-        No integration candidates yet.<br />
-        <small>Loom reports readiness explicitly — a stopped or sleeping worker is not a candidate.</small>
+        No landing candidates yet.<br />
+        <small>Working and waiting threads appear here. Readiness is reported explicitly.</small>
       </div>
-      <div v-for="candidate in candidates" :key="candidate.session.id" class="inspector-candidate">
+      <div v-for="candidate in candidates" :key="candidate.session.id" class="inspector-candidate" :class="{ selected: candidate.session.id === selectedId }">
         <div class="inspector-candidate-head">
-          <span class="name">{{ candidate.session.branch.title || candidate.session.branch.name }}</span>
-          <span class="badge" :class="candidate.state === 'ready' ? 'done' : 'dim'">
+          <button class="link name" :aria-pressed="candidate.session.id === selectedId" @click="emit('select', candidate.session.id)">{{ candidate.session.branch.title || candidate.session.branch.name }}</button>
+          <span class="badge" :class="candidate.state === 'landed' ? 'done' : 'dim'">
             {{ candidateLabels[candidate.state] }}
           </span>
         </div>
         <div class="inspector-candidate-sub">
           {{ candidate.note || candidate.session.branch.branch }}
         </div>
+        <AutolandControl :session="candidate.session" :track="topic" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
         <div class="inspector-candidate-actions">
           <button class="link" @click="reviewCandidate(candidate.session.id)">{{ candidate.state === 'stale' || candidate.state === 'conflicted' ? "Reconcile / review" : "Review" }}</button>
           <SplitButton
-            v-if="candidate.state === 'ready'"
-            kind="integrate"
+            v-if="candidate.state !== 'landed'"
+            kind="land"
             :repo="sessionRepo(candidate.session)"
-            :options="integrateOptions"
-            label="Integrate"
+            :options="landOptions"
+            label="Land"
             :busy="integratingId === candidate.session.id"
-            @run="(strategy: string) => onIntegrate(candidate, strategy)"
+            :disabled="!!integratingId || candidate.session.status === 'archived'"
+            @run="(strategy: string) => onLand(candidate, strategy)"
           />
         </div>
       </div>
@@ -360,4 +348,6 @@ watch(() => props.topic.id, () => {
 .inspector-tab-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .inspector-tab-bar .tab { padding: 7px 6px; }
 .inspector-review-context { padding: 8px 12px; font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+.canonical-policy { display: flex; flex-direction: column; gap: 7px; padding: 10px 12px; font-size: 12px; overflow-wrap: anywhere; }
+.inspector-candidate.selected { outline: 1px solid var(--accent); }
 </style>

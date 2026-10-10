@@ -43,6 +43,8 @@ export interface NewTopicDraft {
   project: { id: string; name: string } | null;
   /** Optional card label; empty until typed. */
   title: string;
+  /** Empty requests backend canonical branch inference. */
+  topicBranch: string;
   /** The body: the agent's opening message and durable topic description. */
   body: string;
   /** owner/name to fork. */
@@ -65,6 +67,7 @@ export function emptyDraft(): NewTopicDraft {
   return {
     project: null,
     title: "",
+    topicBranch: "",
     body: "",
     repo: DEFAULT_REPO,
     base: "",
@@ -119,6 +122,7 @@ export function readDraft(storage: DraftStorage): NewTopicDraft {
     return {
       project: parseProject(parsed.project),
       title: str(parsed.title),
+      topicBranch: str(parsed.topicBranch),
       body: str(parsed.body),
       repo: str(parsed.repo, empty.repo),
       base: str(parsed.base),
@@ -191,7 +195,7 @@ export function clearDraftOnLaunch(storage: DraftStorage): void {
  * honest.
  */
 export function draftHasContent(draft: NewTopicDraft): boolean {
-  return !!(draft.title.trim() || draft.body.trim() || draft.mentions.length || draft.attachments.length);
+  return !!(draft.title.trim() || draft.topicBranch.trim() || draft.body.trim() || draft.mentions.length || draft.attachments.length);
 }
 
 /**

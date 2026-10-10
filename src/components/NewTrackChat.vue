@@ -8,6 +8,7 @@ import { readDraft, saveDraft, mergeLaunchConfig, type NewTopicDraft } from "../
 import { recentRepositories, rememberRepository, readProjectDefaults } from "../launchDefaults";
 import { layoutProjects } from "../projects";
 import { useFileCompletion } from "../useFileCompletion";
+import { inferTopicBranch, topicBranchError } from "../trackPolicy.ts";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 // The new-track chat (docs/design.md "Navigation"): New track opens a chat
@@ -50,7 +51,7 @@ const emit = defineEmits<{
     e: "launch",
     task: string,
     repo: string,
-    meta?: { title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
+    meta?: { topicBranch?: string; title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
   ): void;
 }>();
 
@@ -73,6 +74,8 @@ const draftStorage = {
   removeItem: (key: string) => localStorage.removeItem(key),
 };
 const draft: NewTopicDraft = reactive(readDraft(draftStorage));
+const branchError = computed(() => topicBranchError(draft.topicBranch));
+const inferredBranch = computed(() => inferTopicBranch(draft.title, draft.body || (draft.attachments[0] ? `Review ${draft.attachments[0].name}` : "")));
 const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
 
 // The project picker: the layout's non-system groups, "No project" first.
@@ -111,7 +114,7 @@ const projectDefaults = computed(() => project.value?.id ? readProjectDefaults(l
 // Repo/base defaults for a fresh launch: the selected project's saved
 // launch defaults, falling back to the remembered repo. A composed draft
 // (restored) keeps its own repo/base — defaults only seed a blank one.
-if (!draft.title && !draft.body && !draft.attachments.length && !draft.mentions.length) {
+if (!draft.title && !draft.topicBranch && !draft.body && !draft.attachments.length && !draft.mentions.length) {
   if (draft.project?.id) {
     const inherited = readProjectDefaults(localStorage, draft.project.id);
     if (inherited) { draft.repo = draft.repo || inherited.repo; draft.base = draft.base || inherited.base; }
@@ -120,7 +123,7 @@ if (!draft.title && !draft.body && !draft.attachments.length && !draft.mentions.
 }
 // A fresh empty draft switching projects retargets repo/base to the
 // project's saved defaults; an empty project (No project) keeps them.
-const fresh = computed(() => !draft.title && !draft.body && !draft.attachments.length && !draft.mentions.length);
+const fresh = computed(() => !draft.title && !draft.topicBranch && !draft.body && !draft.attachments.length && !draft.mentions.length);
 watch(project, (current, previous) => {
   if (!previous && !current) return;
   if (!fresh.value || !current?.id) return;
@@ -508,13 +511,14 @@ onUnmounted(() => {
 function send() {
   const t = title.value.trim();
   const b = body.value.trim();
-  if ((!t && !b && !attachments.value.length) || props.launching || attachmentLoading.value) return;
+  if ((!t && !b && !attachments.value.length) || props.launching || attachmentLoading.value || branchError.value) return;
   // The message is both the agent's initial goal and the durable branch
   // description; either alone can seed a track. The draft is not cleared
   // here: App clears it on successful launch (this view unmounts), and
   // every other exit (failure, Esc, navigation) keeps it for reopening.
   rememberRepository(localStorage, repo.value);
   emit("launch", b || t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
+    topicBranch: draft.topicBranch || undefined,
     title: t || undefined,
     description: b || undefined,
     base: base.value.trim() || undefined,
@@ -616,6 +620,11 @@ function onComposerKeydown(event: KeyboardEvent) {
             <span class="nts-hint">New tracks inherit the project's resource bindings.</span>
           </label>
           <RepoBaseFields v-model:repo="repo" v-model:base="base" :repositories="repositorySuggestions" />
+          <label class="topic-branch-field">
+            <span>Canonical topic branch</span>
+            <input v-model="draft.topicBranch" :placeholder="inferredBranch" aria-label="Canonical topic branch" :aria-invalid="!!branchError" aria-describedby="topic-branch-help" />
+          </label>
+          <small id="topic-branch-help">{{ branchError || `Leave empty to create ${inferredBranch} (a unique suffix is added when needed).` }}</small>
           <span v-if="projectDefaults" class="nts-hint">Repository and base default to this project’s saved settings on this device.</span>
 
           <!-- Project resource bindings (design.md "Project defaults and
@@ -784,7 +793,7 @@ function onComposerKeydown(event: KeyboardEvent) {
           <button
             class="composer-send"
             type="button"
-            :disabled="(!title.trim() && !body.trim() && !attachments.length) || props.launching || attachmentLoading"
+            :disabled="(!title.trim() && !body.trim() && !attachments.length) || props.launching || attachmentLoading || !!branchError"
             :title="props.launching ? 'Launching…' : 'Send — launches the track (⌘/Ctrl + Enter)'"
             aria-label="Send and launch track"
             @click="send"
@@ -797,3 +806,8 @@ function onComposerKeydown(event: KeyboardEvent) {
     </div>
   </section>
 </template>
+
+<style scoped>
+.topic-branch-field { display: flex; flex-direction: column; gap: 4px; margin-top: 12px; }
+.topic-branch-field input { width: 100%; box-sizing: border-box; }
+</style>

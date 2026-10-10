@@ -55,7 +55,7 @@ async function save() {
     await invoke("save_checkout_file", { sessionId: props.sessionId, path: props.path, checkout: checkout.value, original: original.value, content: saved });
     original.value = saved;
     content.value = saved;
-    notice.value = "Saved to this checkout. Ask the agent to validate before integrating or landing.";
+    notice.value = "Saved to this checkout. Ask the agent to validate before landing or publishing.";
     remember();
     emit("saved");
   } catch (e) { error.value = errorMessage(e); }
