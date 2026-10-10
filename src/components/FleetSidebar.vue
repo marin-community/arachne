@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, nextTick, watch } from "vue";
+import { ref, computed, watch } from "vue";
 import { isStandalone } from "../threadKind";
 import { invoke } from "@tauri-apps/api/core";
 import type { SessionSummary, SessionLayout } from "../App.vue";
@@ -24,6 +24,7 @@ const props = defineProps<{
   selectedId: string | null;
   showNewThread?: boolean;
   showNewTopic?: boolean;
+  showNewProject?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -37,6 +38,7 @@ const emit = defineEmits<{
   ): void;
   (e: "new-thread"): void;
   (e: "new-topic"): void;
+  (e: "new-project"): void;
   // Tracks [+] on a project heading: open the new-track chat preselected
   // to that project (null = the Ungrouped section).
   (e: "new-topic-in-project", project: ProjectRef | null): void;
@@ -446,44 +448,7 @@ function saveEdit(s: SessionSummary) {
   editingId.value = null;
 }
 
-// --- Projects: create, and move a topic into one --------------------------
-
-// A Project is a loom layout group (filing only — no execution state).
-// The home for creating and filing into groups: the user's own space when
-// it exists (where loom's Inbox lives), else the first space, else the
-// first space at all — mirrors the userInboxId fallback the Inbox tab uses.
-function projectSpaceId(): string | undefined {
-  const spaces = props.layout?.spaces ?? [];
-  const user = spaces.find((s) => s.system_key === "user" || s.name === "User");
-  const home = user ?? spaces.find((s) => s.groups.some((g) => !g.system_key)) ?? spaces[0];
-  return home?.id;
-}
-
-const showNewProject = ref(false);
-const newProjectName = ref("");
-const newProjectError = ref("");
-const newProjectEl = ref<HTMLInputElement | null>(null);
-function openNewProject() {
-  showNewProject.value = true;
-  newProjectError.value = "";
-  nextTick(() => newProjectEl.value?.focus());
-}
-async function submitNewProject() {
-  const name = newProjectName.value.trim();
-  const spaceId = projectSpaceId();
-  if (!name) return;
-  if (!spaceId) {
-    newProjectError.value = "no space available to create the project in";
-    return;
-  }
-  try {
-    await invoke("create_group", { spaceId, name });
-    newProjectName.value = "";
-    showNewProject.value = false;
-  } catch (e: any) {
-    newProjectError.value = e?.message ?? String(e);
-  }
-}
+// --- Move a topic into a project -----------------------------------------
 
 // Move to Project: a small menu of the available projects (plus the user
 // Inbox, which files the topic back to unfiled).
@@ -809,34 +774,16 @@ async function archiveRow(id: string) {
             type="button"
             class="toolbar-new-project"
             :title="'New project (a place to file tracks)'"
-            :aria-expanded="showNewProject"
-            aria-controls="new-project-card"
-            @click="showNewProject ? (showNewProject = false) : openNewProject()"
+            :class="{ active: props.showNewProject }"
+            :aria-expanded="!!props.showNewProject"
+            aria-controls="project-sheet"
+            @click="emit('new-project')"
           >
             + Project
           </button>
           <!-- Composing a new track takes over the main panel (like the
                new-thread sheet), not a floating overlay here. -->
           <button type="button" aria-label="New track" title="New track" :class="{ active: props.showNewTopic }" @click="emit('new-topic')">+</button>
-        </div>
-      </div>
-      <div v-if="showNewProject" class="new-project-card" id="new-project-card" role="dialog" aria-modal="false" aria-label="New project">
-        <div class="new-project-head">
-          <span>New project</span>
-          <button type="button" aria-label="Close new project" @click="showNewProject = false">×</button>
-        </div>
-        <input
-          ref="newProjectEl"
-          v-model="newProjectName"
-          placeholder="Project name"
-          aria-label="Project name"
-          @keydown.enter.prevent="submitNewProject"
-          @keydown.esc.stop="showNewProject = false"
-        />
-        <div v-if="newProjectError" class="new-project-error">{{ newProjectError }}</div>
-        <div class="new-project-foot">
-          <span class="new-project-hint">A place to file related tracks.</span>
-          <button type="button" class="primary" :disabled="!newProjectName.trim()" @click="submitNewProject">Create</button>
         </div>
       </div>
 

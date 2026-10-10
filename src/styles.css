@@ -191,40 +191,6 @@ body {
 }
 .topic-empty-toggle:hover { background: none; color: var(--text); }
 
-/* New Project inline card (topics tab) — same shape as the sheet inputs. */
-.new-project-card {
-  margin: 6px 10px 2px;
-  padding: 8px 10px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-raised);
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-}
-.new-project-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--text-dim);
-}
-.new-project-head button { padding: 0 4px; font-size: 14px; }
-.new-project-card input {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  color: var(--text);
-  padding: 6px 8px;
-  font-size: 12px;
-  outline: none;
-}
-.new-project-card input:focus { border-color: var(--accent); }
-.new-project-foot { display: flex; align-items: center; gap: 8px; }
-.new-project-hint { flex: 1; font-size: 11px; color: var(--text-dim); }
-.new-project-error { color: var(--blocked); font-size: 11.5px; }
-
 /* Project headings in the Topics tab: select filters the main-pane home. */
 /* The section (heading + cards + empty state) is the drop zone: a drag over
    a project's cards files into that project, and an empty project still
@@ -2026,7 +1992,7 @@ button.danger:hover { border-color: var(--blocked); }
 .nts-binding-remove:hover { color: var(--blocked); background: var(--bg-hover); }
 .nts-binding-actions { display: flex; }
 .nts-binding-actions .link { border: 0; background: transparent; color: var(--accent); cursor: pointer; padding: 2px 0; font-size: 11px; }
-.nts-binding-form { display: grid; gap: 6px; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
+.nts-binding-form { display: grid; min-width: 0; margin: 0; gap: 6px; border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
 .nts-binding-form label { display: grid; gap: 3px; color: var(--text-dim); font-size: 11px; }
 .nts-binding-form input, .nts-binding-form select {
   width: 100%; min-width: 0; background: var(--bg); color: var(--text);
