@@ -68,35 +68,16 @@ fn local_client(client: &LoomClient) -> bool {
     )
 }
 
-// Mirror Git's short local-branch syntax without executing server-side paths
-// on a remote connection. Local use also runs check-ref-format below.
+// Share short-ref syntax with Track creation, acceptance and frontend fixtures.
 fn valid_branch(value: &str) -> bool {
-    !value.is_empty()
-        && value != "@"
-        && value != "HEAD"
-        && !value.starts_with('-')
-        && !value.starts_with("refs/")
-        && !value.contains("..")
-        && !value.contains("@{")
-        && !value
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace() || "~^:?*[\\".contains(c))
-        && value.split('/').all(|part| {
-            !part.is_empty()
-                && !part.starts_with('.')
-                && !part.ends_with('.')
-                && !part.ends_with(".lock")
-        })
+    crate::track_policy::valid_topic_branch(value)
 }
 
 fn canonical_source(view: &SessionView) -> Result<(String, bool), UiError> {
-    if !view
-        .branch
-        .tags
-        .iter()
-        .any(|tag| tag.key == "topic" && tag.value == "true")
-    {
-        return Err(error("Publish belongs to a root Track marked topic=true; accept this Thread into its Track first."));
+    if crate::track_policy::tag(&view.branch, "topic") == Some("false") {
+        return Err(error(
+            "Publish belongs to a root Track; accept this Thread into its Track first.",
+        ));
     }
     let tags: Vec<_> = view
         .branch
@@ -108,13 +89,9 @@ fn canonical_source(view: &SessionView) -> Result<(String, bool), UiError> {
         return Err(error("The Track has conflicting canonical branch tags; repair its metadata before publishing."));
     }
     let explicit = !tags.is_empty();
-    let branch = tags
-        .first()
-        .map(|tag| tag.value.as_str())
-        .unwrap_or(&view.branch.branch);
-    if !valid_branch(branch) {
-        return Err(error("The Track's canonical topic branch is invalid; initialize a valid local branch before publishing."));
-    }
+    let branch = crate::track_policy::canonical_topic_branch(&view.branch).ok_or_else(|| {
+        error("The Track's canonical topic branch is invalid or not initialized; finish canonical initialization before publishing. Never substitute coordinator scratch.")
+    })?;
     Ok((branch.into(), explicit))
 }
 
@@ -837,6 +814,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmarked_legacy_root_publishes_its_existing_accepted_branch() {
+        let (repo, mut view, mut summary) = fixture(false);
+        view.branch.tags.retain(|tag| tag.key != "topic");
+        summary.branch = view.branch.clone();
+        let scratch_head = run(&repo.0.join("scratch"), &["rev-parse", "HEAD"]);
+        let mut replies = initial(&view, &summary);
+        replies.push(("/api/sessions/tags/set", json!({})));
+        let (client, server) = mock(replies).await;
+        let result = publish(&client, &view.id, "land-locally", None)
+            .await
+            .unwrap();
+        assert!(result.local);
+        assert_eq!(run(&repo.0, &["show", "HEAD:accepted-one.txt"]), "one");
+        assert_eq!(
+            run(&repo.0.join("scratch"), &["rev-parse", "HEAD"]),
+            scratch_head
+        );
+        let requests = server.await.unwrap();
+        assert_eq!(requests.last().unwrap()["key"], "publish_result");
+    }
+
+    #[tokio::test]
     async fn foreign_staging_queues_exact_canonical_target_context_without_any_mutation() {
         for terminal in [false, true] {
             let (repo, mut view, summary) = fixture(true);
@@ -1048,11 +1047,27 @@ mod tests {
 
     #[tokio::test]
     async fn root_track_marker_and_initialized_canonical_are_required() {
-        for condition in ["child", "unmarked", "invalid", "missing"] {
+        for condition in ["child", "standalone", "pending", "invalid", "missing"] {
             let (repo, mut view, mut summary) = fixture(true);
             match condition {
                 "child" => summary.parent_session_id = Some("parent".into()),
-                "unmarked" => view.branch.tags.retain(|tag| tag.key != "topic"),
+                "standalone" => {
+                    view.branch
+                        .tags
+                        .iter_mut()
+                        .find(|tag| tag.key == "topic")
+                        .unwrap()
+                        .value = "false".into()
+                }
+                "pending" => {
+                    view.branch
+                        .tags
+                        .retain(|tag| tag.key != "track_topic_branch");
+                    view.branch.goal = format!(
+                        "{} accepted/topic",
+                        crate::track_policy::CANONICAL_INITIALIZATION_MARKER
+                    );
+                }
                 "invalid" => {
                     view.branch
                         .tags
