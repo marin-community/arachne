@@ -21,7 +21,7 @@ import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
 import { isStandalone } from "../threadKind";
-import { dismissibleAttention, composerSendAsDismiss } from "../topicInspector";
+import { dismissibleAttention, composerSendAsDismiss, composerSendAsStop } from "../topicInspector";
 
 interface Cursor {
   turn: number;
@@ -62,7 +62,7 @@ interface ChatEventFrame {
   data?: any;
 }
 
-const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string }>();
+const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string; unarchiving: boolean }>();
 const currentUsage = computed(() => {
   const summary = props.fleet.find((item) => item.id === props.session.id);
   return resolveContextUsage(blocks.value, summary?.usage ?? props.session.usage);
@@ -70,6 +70,7 @@ const currentUsage = computed(() => {
 const emit = defineEmits<{
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
+  (e: "unarchive", id: string): void;
   (e: "delegate", parentId: string, task: string, completed: (success: boolean) => void): void;
   (e: "handoff", id: string): void;
   (e: "refresh", id: string): void;
@@ -264,8 +265,7 @@ function onComposerKeydown(event: KeyboardEvent) {
   if (completion.onKeydown(event)) { mentionRange.value = null; return; }
   if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
-    // Empty composer + idle agent + flagged thread: the send button is the
-    // dismiss button, so ⌘/Ctrl+Enter affirms the same way.
+    // The send shortcut can dismiss idle attention; stopping uses an explicit click.
     if (sendAsDismiss.value) void dismissAttention();
     else void send();
     return;
@@ -436,6 +436,7 @@ const currentStatus = computed(() =>
   props.fleet.find((s) => s.id === props.session.id)?.status ?? props.session.status,
 );
 const canSend = computed(() => currentStatus.value === "running" || currentStatus.value === "orphaned");
+const stopping = ref(false);
 // The composer's send button doubles as the dismiss button when the
 // thread is flagged, the agent is resting, and nothing is queued: the
 // yellow attention circle with a checkmark instead of the send arrow.
@@ -449,14 +450,19 @@ const idleMark = computed(() =>
 const sendAsDismiss = computed(() =>
   composerSendAsDismiss({
     dismissible: canDismiss.value,
-    working: turnLive.value || busy.value || pendingPrompt.value != null || attachmentLoading.value ||
+    working: turnLive.value || busy.value || stopping.value || pendingPrompt.value != null || attachmentLoading.value ||
       (props.session.protocol !== "acp" && currentStatus.value === "running" && !idleMark.value),
     hasContent: !!draft.value.trim() || attachments.value.length > 0,
   }),
 );
 const canInterrupt = computed(() =>
-  currentStatus.value === "running" && (props.session.protocol !== "acp" || turnLive.value),
+  currentStatus.value === "running" && (props.session.protocol === "acp" ? turnLive.value : !idleMark.value),
 );
+const sendAsStop = computed(() => composerSendAsStop({
+  interruptible: canInterrupt.value,
+  hasContent: !!draft.value.trim() || attachments.value.length > 0,
+  preparing: busy.value || attachmentLoading.value,
+}));
 const profileAgent = computed(() =>
   props.launchOptions?.profiles.find((p) => p.name === handoffProfile.value)?.agent_kind ||
   props.launchOptions?.default_agent || "",
@@ -719,7 +725,7 @@ onUnmounted(() => {
 
 async function send() {
   const text = draft.value.trim();
-  if (!canSend.value || (!text && !attachments.value.length) || busy.value || attachmentLoading.value) return;
+  if (!canSend.value || (!text && !attachments.value.length) || busy.value || stopping.value || attachmentLoading.value) return;
   const wasOrphaned = currentStatus.value === "orphaned";
   busy.value = true;
   try {
@@ -764,11 +770,15 @@ async function compactContext() {
 
 
 async function interrupt() {
-  if (!canInterrupt.value) return;
+  if (!canInterrupt.value || stopping.value) return;
+  stopping.value = true;
   try {
     await invoke("interrupt", { id: props.session.id });
+    await reload();
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
+  } finally {
+    stopping.value = false;
   }
 }
 
@@ -1167,8 +1177,8 @@ async function onLand(strategy: string) {
       <SplitButton v-if="isWorker && !isReviewer" kind="integrate" :repo="sessionRepo" :options="integrateOptions" label="Integrate" :busy="integrating" :disabled="!integrationTarget" @run="onIntegrate" />
       <SplitButton v-if="isTopic" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="landing" :disabled="session.status === 'archived'" @run="onLand" />
       <button v-if="!isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
-      <button @click="interrupt">Interrupt</button>
-      <button class="danger" @click="archive">Archive</button>
+      <button v-if="currentStatus === 'archived'" :disabled="unarchiving" @click="emit('unarchive', session.id)">{{ unarchiving ? 'Unarchiving…' : 'Unarchive' }}</button>
+      <button v-else class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate ? showDelegate = false : openDelegate()">
         Delegate
       </button>
@@ -1537,14 +1547,16 @@ async function onLand(strategy: string) {
         <button v-if="metadata?.commands.length" class="composer-icon-button slash-button" type="button" title="Browse agent commands" aria-label="Browse agent commands" @click="slash.show">/</button>
         <button
           class="composer-send"
-          :class="{ 'send-dismiss': sendAsDismiss }"
+          :class="{ 'send-dismiss': sendAsDismiss, 'send-stop': sendAsStop }"
           type="button"
-          :disabled="sendAsDismiss ? dismissing : (!canSend || (!draft.trim() && !attachments.length) || busy || attachmentLoading)"
-          :title="sendAsDismiss ? 'Dismiss attention — clear this thread\'s flag (⌘/Ctrl + Enter)' : busy ? 'Sending…' : 'Send message (⌘/Ctrl + Enter)'"
-          :aria-label="sendAsDismiss ? 'Dismiss attention' : 'Send message'"
-          @click="sendAsDismiss ? dismissAttention() : send()"
+          :disabled="sendAsStop ? stopping : sendAsDismiss ? dismissing : (!canSend || (!draft.trim() && !attachments.length) || busy || stopping || attachmentLoading)"
+          :title="sendAsStop ? (stopping ? 'Stopping…' : 'Stop the current turn') : sendAsDismiss ? 'Dismiss attention — clear this thread\'s flag (⌘/Ctrl + Enter)' : busy ? 'Sending…' : 'Send message (⌘/Ctrl + Enter)'"
+          :aria-label="sendAsStop ? 'Stop' : sendAsDismiss ? 'Dismiss attention' : 'Send message'"
+          @click="sendAsStop ? interrupt() : sendAsDismiss ? dismissAttention() : send()"
         >
-          <span v-if="sendAsDismiss && dismissing">…</span>
+          <span v-if="sendAsStop && stopping">…</span>
+          <svg v-else-if="sendAsStop" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" /></svg>
+          <span v-else-if="sendAsDismiss && dismissing">…</span>
           <svg v-else-if="sendAsDismiss" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M9.55 17.6 4.4 12.45l1.6-1.6 3.55 3.55 8.5-8.5 1.6 1.6Z"/></svg>
           <span v-else-if="busy">…</span><span v-else aria-hidden="true">↑</span>
         </button>

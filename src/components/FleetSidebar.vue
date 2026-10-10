@@ -25,6 +25,7 @@ const props = defineProps<{
   showNewThread?: boolean;
   showNewTopic?: boolean;
   showNewProject?: boolean;
+  unarchivingIds: Set<string>;
 }>();
 
 const emit = defineEmits<{
@@ -54,6 +55,7 @@ const emit = defineEmits<{
   ): void;
   (e: "delete-lane", laneId: string): void;
   (e: "archive", id: string): void;
+  (e: "unarchive", id: string): void;
   // Selecting a project heading filters the main-pane home to that
   // project's topics (null = the unfiltered Tracks home).
   (e: "select-project", project: ProjectRef | null): void;
@@ -945,6 +947,13 @@ async function archiveRow(id: string) {
               >
                 edit
               </button>
+              <button
+                v-if="t.session.status === 'archived'"
+                type="button"
+                title="Unarchive this track and restore its checkout and agent"
+                :disabled="unarchivingIds.has(t.session.id)"
+                @click.stop="emit('unarchive', t.session.id)"
+              >{{ unarchivingIds.has(t.session.id) ? 'Unarchiving…' : 'Unarchive' }}</button>
               <!-- TODO: topic config (agent, model, repo defaults, automation
                    triggers) — the settings surface this stub grows into. -->
               <span class="topic-config-soon" title="topic config — coming soon"

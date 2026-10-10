@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   badgeLabel,
   composerSendAsDismiss,
+  composerSendAsStop,
   dismissibleAttention,
   integrationCandidates,
   isIdle,
@@ -37,6 +38,18 @@ const session = (id, overrides = {}) => ({
 const withTag = (s, key, value, note = "") => ({
   ...s,
   branch: { ...s.branch, tags: [...s.branch.tags, { key, value, note, set_at: "", set_by: "arachne" }] },
+});
+
+test("empty working composer offers Stop; drafts and attachments keep Send available", () => {
+  const working = { interruptible: true, hasContent: false, preparing: false };
+  assert.equal(composerSendAsStop(working), true);
+  assert.equal(composerSendAsStop({ ...working, hasContent: true }), false);
+  assert.equal(composerSendAsStop({ ...working, preparing: true }), false);
+  assert.equal(composerSendAsStop({ ...working, interruptible: false }), false);
+  // An active flagged turn must offer Stop, never Dismiss.
+  assert.equal(composerSendAsDismiss({ dismissible: true, working: true, hasContent: false }), false);
+  // A resting flagged thread retains its existing Dismiss action.
+  assert.equal(composerSendAsDismiss({ dismissible: true, working: false, hasContent: false }), true);
 });
 
 test("topic thread rows root at the topic and nest workers at depth", () => {

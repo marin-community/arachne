@@ -165,6 +165,7 @@ const DEFAULT_URL = "http://127.0.0.1:7878";
 const connected = ref(false);
 const connError = ref<string | null>(null);
 const launching = ref(false);
+const unarchivingIds = ref(new Set<string>());
 const fleet = ref<SessionSummary[]>([]);
 const layout = ref<SessionLayout | null>(null);
 const launchOptions = ref<LaunchOptions | null>(null);
@@ -696,6 +697,24 @@ async function onArchived(id: string) {
   }
 }
 
+async function onUnarchived(id: string) {
+  if (unarchivingIds.value.has(id)) return;
+  const generation = connectionGeneration;
+  unarchivingIds.value.add(id);
+  try {
+    const view = await invoke<SessionView>("unarchive_session", { id });
+    if (generation !== connectionGeneration) return;
+    // Keep the selected chat and sidebar usable even before the fleet event arrives.
+    const summary = fleet.value.find((session) => session.id === id);
+    if (summary) Object.assign(summary, view);
+    if (selectedId.value === id && viewMode.value === "thread") await selectSession(id);
+  } catch (e: any) {
+    if (generation === connectionGeneration) connError.value = e?.message ?? String(e);
+  } finally {
+    unarchivingIds.value.delete(id);
+  }
+}
+
 const connClass = computed(() =>
   connected.value ? "ok" : connError.value ? "bad" : "warn",
 );
@@ -760,6 +779,8 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       @reparent="reparentSession"
       @delete-lane="deleteLane"
       @archive="onArchived"
+      :unarchiving-ids="unarchivingIds"
+      @unarchive="onUnarchived"
     />
     <NewTrackChat
       v-if="showNewTopic"
@@ -801,6 +822,8 @@ const showProjectSheet = computed(() => showNewProject.value || !!projectResourc
       :loom-url="loomUrl"
       @error="connError = $event"
       @archive="onArchived"
+      :unarchiving="unarchivingIds.has(selectedId)"
+      @unarchive="onUnarchived"
       @delegate="delegateFromThread"
       @handoff="selectSession"
       @refresh="selectSession"
