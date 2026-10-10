@@ -16,6 +16,7 @@ pub mod blocks;
 pub mod client;
 pub mod commands;
 pub mod editor;
+pub mod file_completion;
 pub mod landing;
 pub mod loom;
 pub mod resources;

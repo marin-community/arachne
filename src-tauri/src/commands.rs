@@ -654,15 +654,49 @@ pub async fn set_session_config(
         .map_err(Into::into)
 }
 
-/// Complete file mentions from the session's checkout on the loom host.
+/// Complete file mentions from a session checkout, or the repository selected
+/// before launch. Server-side paths are only read locally for loopback Loom.
 #[tauri::command]
 pub async fn complete_files(
     state: State<'_, LoomState>,
-    id: String,
+    id: Option<String>,
+    repo: Option<String>,
     query: String,
 ) -> Result<Vec<String>, UiError> {
     let client = state_client(&state).await?;
-    client.session_files(&id, &query).await.map_err(Into::into)
+    if let Some(id) = id.filter(|id| !id.is_empty()) {
+        return client.session_files(&id, &query).await.map_err(Into::into);
+    }
+    let repo = repo.unwrap_or_default();
+    let repo = repo.trim();
+    if repo.is_empty() {
+        return Ok(Vec::new());
+    }
+    let managed = client.list_repos().await.unwrap_or_default();
+    let root = managed
+        .iter()
+        .find(|r| r.slug == repo || r.path == repo)
+        .map(|r| r.path.as_str())
+        .unwrap_or(repo);
+    if client.server_host().is_some_and(host_is_loopback) {
+        return crate::file_completion::repository_files(std::path::Path::new(root), &query)
+            .await
+            .map_err(resource_error);
+    }
+    // Remote repositories use Loom's existing checkout listing; never treat
+    // their paths as paths on the Mac running Arachne.
+    let sessions = client.list_sessions().await?;
+    for session in sessions.iter().filter(|session| {
+        session.worktree_present
+            && (session.branch.repo_root == root || session.github_repo.as_deref() == Some(repo))
+    }) {
+        if let Ok(files) = client.session_files(&session.id, &query).await {
+            return Ok(files);
+        }
+    }
+    Err(resource_error(
+        "no available checkout for repository file completion",
+    ))
 }
 
 /// Return a bounded raster image attached to a session as a data URL. Loom
