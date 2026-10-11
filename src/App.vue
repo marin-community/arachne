@@ -206,6 +206,7 @@ function openArtifact(target: ArtifactTarget) {
   reviewRequest.value = null;
 }
 const showResources = ref(localStorage.getItem("arachne.inspector") !== "false");
+const landingRequest = ref(0);
 watch(showResources, value => localStorage.setItem("arachne.inspector", String(value)));
 const showSearch = ref(false);
 const settingsSaving = ref(false);
@@ -978,6 +979,7 @@ const expandedInspectorVisible = computed(() => inspectorVisible.value && inspec
       @open-artifact="openArtifact"
       @error="connError = $event"
       @archive="onArchived"
+      @open-changes="showResources = true; landingRequest++"
       :unarchiving="unarchivingIds.has(selectedId)"
       @unarchive="onUnarchived"
       @delegate="delegateFromThread"
@@ -1013,6 +1015,7 @@ const expandedInspectorVisible = computed(() => inspectorVisible.value && inspec
       :scope-id="inspectorAnchor?.id ?? inspectorTopic.id"
       :expanded="expandedInspectorVisible" :can-expand="viewMode === 'thread' && !!selectedView"
       :review-request="reviewRequest" @toggle-expanded="inspectorExpanded = !inspectorExpanded" :topic="inspectorTopic" :selected-view="selectedView" :fleet="inspectorFleet" :selected-id="selectedId" :loom-url="inspectorServer"
+      :landing-request="landingRequest"
       :artifact-request="artifactRequest" @open-artifact="openArtifact"
       @close="showResources = false" @error="connError = $event" @select="selectInspectorSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" @policy-updated="onPolicyUpdated" />
     <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && !showProjectSheet && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />

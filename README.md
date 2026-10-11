@@ -48,9 +48,26 @@ While the agent is working, an empty composer shows **Stop** in place of Send. T
 
 The thread's resource strip shows the checkout and any associated pull request. **Open in Zed** opens a local checkout directly or a remote checkout over SSH, using the active session's path from Loom.
 
-A session that needs a person — a blocking question, a decision, or work ready for review — carries an `attention` or `blocked` flag and lands in the home's **Needs You** bucket. A tag-raised flag can be dismissed without opening the thread: the **✕** on any Needs You row, sidebar track card, or thread-header **Dismiss** button clears it. Tool-approval attention (an unanswered permission request) has no dismiss — it is answered in the thread's approval prompt.
+A session that needs a person — a specific decision or access request that its hierarchy cannot resolve — carries an `attention` or `blocked` flag and lands in the home's **Needs You** bucket. A tag-raised flag can be dismissed without opening the thread: the **✕** on any Needs You row, sidebar track card, or thread-header **Dismiss** button clears it. Tool-approval attention (an unanswered permission request) has no dismiss — it is answered in the thread's approval prompt.
 
-**Review** in the inspector and **Review diff** in the header show Loom's current change set with file hunks and line numbers. Worker threads offer **Land** into their Track’s canonical topic branch, defaulting to a single squash commit. The inspector’s **Landing** queue includes working and waiting Threads as well as reported ready, stale/conflicted and landed outcomes; select a source to review it or Land while it works. One click queues source wrap-up behind the active turn and asks the coordinator to complete preparation, review, repair, validation and acceptance. A separate **Prepare** click is optional. New Tracks default to an editable `arachne/tracks/<slug>` accepted topic ref, distinct from the coordinator’s Loom scratch branch. Legacy Tracks retain their accepted ref. Track-wide **Autoland** defaults Off, with per-thread Inherit/On/Off overrides persisted in Loom; it uses result wakeups for coordinator review and acceptance, never upstream publication. Coordinator threads offer **Publish**: Single PR, a genuine PR stack, or the chosen local/upstream operation from accepted topic state. Publishing requires the explicit chosen action. Queued requests are not completed results.
+**Review** in the inspector shows selected declared Changes with file hunks and
+line numbers. Threads produce zero, one or multiple outputs: successful review,
+research or coordination with no produced Change needs no Land. The inspector's
+**Landing** queue contains explicit Changes with stable IDs, pinned scopes and
+independent outcomes. Select one to review or Land; one click queues a working
+output's wrap-up behind active work and asks the coordinator to complete review,
+repair, commit, validation and acceptance. Completed ranges reuse their original
+completion without resuming the source. Default acceptance is a squash into
+the canonical topic branch. Optional **Prepare** remains preparation only.
+Later outputs from the same Thread remain eligible, and historical completions
+never reappear as new deltas. See [Change v1 contract](docs/thread-landing-contract.md).
+New Tracks use editable `arachne/tracks/<slug>` accepted refs, distinct from Loom
+scratch; legacy Tracks retain their accepted ref. **Autoland** policy lives in
+the inspector, defaults Off, and uses actual successful explicit-output result
+wakeups with live policy guards. Chat has no autoland controls. Coordinator
+**Publish** remains a separate explicit chosen action on accepted Track state:
+Single PR, genuine PR stack, or the chosen local/upstream operation. Queued
+requests are not completed results.
 
 The **Resources** rail shows a track's live set first — its repository, every thread's pull requests (state, review, CI), the GitHub issues its threads work, and the checkout — then durable attachments: design documents, files, PRs, and issues bound as versioned Loom artifacts on the track branch. Attachments preview through Loom's server-side checkout and open the exact file in Zed; the binding survives an archived session (previewing a repo file then needs an active track checkout). When a checkout is gone, its row recovers it via `repos.worktrees.ensure`. Agents keep the set current: claiming a GitHub issue with `loom issues add` puts it in the panel, and `skills/resources.md` tells agents to durably attach PRs and issues the track should remember. [docs/design.md](docs/design.md) is the current Arachne design document.
 
@@ -72,7 +89,7 @@ Codex can use an existing ChatGPT subscription login on the runner. Run `codex l
 npm test
 npm run typecheck
 npm run build
-cargo test --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml --locked
 ```
 
 Loom changes live in the sibling `../loom` checkout and follow its own build and test instructions. See [docs/handoff.md](docs/handoff.md) for the longer design and phased acceptance test.

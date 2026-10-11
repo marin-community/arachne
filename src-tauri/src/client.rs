@@ -117,11 +117,17 @@ impl LoomError {
         matches!(self, LoomError::Connection(_))
     }
 
-    fn after_dispatch(self, session_id: &str, path: &str, key: Option<&str>) -> Self {
+    fn after_dispatch(mut self, session_id: &str, path: &str, key: Option<&str>) -> Self {
         // A timeout, invalid receipt or server failure can follow a successful
         // durable write, including a delivery-layer 4xx after append. Only
         // authentication/access denial occurs before the operation runs.
         // The ACP prompt API has no idempotency operand.
+        if let Self::DeliveryUncertain { request_key, .. } = &mut self {
+            if request_key.is_none() {
+                *request_key = key.map(str::to_owned);
+            }
+            return self;
+        }
         if matches!(
             self,
             Self::Api {
@@ -144,6 +150,7 @@ pub struct LoomClient {
     http: reqwest::Client,
     base: reqwest::Url,
     token: Option<String>,
+    selected_action: Option<tokio_util::sync::CancellationToken>,
 }
 
 impl LoomClient {
@@ -169,10 +176,75 @@ impl LoomClient {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| LoomError::Connection(format!("building HTTP client: {e}")))?;
-        Ok(Self { http, base, token })
+        Ok(Self {
+            http,
+            base,
+            token,
+            selected_action: None,
+        })
+    }
+
+    /// A private action client keeps the original transport/credentials and a
+    /// lease canceled by owning-backend outage or client retirement. It never
+    /// looks up a replacement client halfway through selected authorization.
+    pub(crate) fn for_selected_action(&self, cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            http: self.http.clone(),
+            base: self.base.clone(),
+            token: self.token.clone(),
+            selected_action: Some(cancel),
+        }
     }
 
     pub(crate) async fn op<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl serde::Serialize,
+    ) -> Result<T, LoomError> {
+        if let Some(cancel) = &self.selected_action {
+            let started = std::sync::atomic::AtomicBool::new(false);
+            let request = async {
+                started.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.op_unfenced(path, body).await
+            };
+            let invalidated = || {
+                let error = LoomError::Connection("Selected Loom backend became unavailable or was replaced; refresh before proceeding.".into());
+                if started.load(std::sync::atomic::Ordering::Relaxed)
+                    && matches!(
+                        path,
+                        "/api/sessions/launch"
+                            | "/api/sessions/adopt"
+                            | "/api/sessions/send"
+                            | "/api/sessions/prompt/create"
+                            | "/api/channels/messages/create"
+                    )
+                {
+                    let value = serde_json::to_value(body).unwrap_or_default();
+                    let destination = value["session"]
+                        .as_str()
+                        .or_else(|| value["channel"].as_str())
+                        .unwrap_or("new reviewer");
+                    error.after_dispatch(destination, path, None)
+                } else {
+                    error
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(invalidated()),
+                result = request => {
+                    if cancel.is_cancelled() {
+                        return Err(invalidated());
+                    }
+                    result
+                }
+            }
+        } else {
+            self.op_unfenced(path, body).await
+        }
+    }
+
+    async fn op_unfenced<T: DeserializeOwned>(
         &self,
         path: &str,
         body: &impl serde::Serialize,
@@ -393,6 +465,21 @@ impl LoomClient {
         self.op(
             "/api/sessions/changes",
             &serde_json::json!({ "session": id }),
+        )
+        .await
+    }
+
+    /// Read bounded original history without changing a user's read marker.
+    pub async fn channel_results(
+        &self,
+        channel: &str,
+        after: i64,
+    ) -> Result<Vec<crate::change::ResultMessage>, LoomError> {
+        self.op(
+            "/api/channels/messages/list",
+            &serde_json::json!({
+                "channel": channel, "after": after, "limit": 500, "kinds": ["result"], "peek": true
+            }),
         )
         .await
     }

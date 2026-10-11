@@ -128,6 +128,19 @@ pub struct ServerEntry {
 struct FleetPublication {
     generation: u64,
     available: bool,
+    action_cancel: CancellationToken,
+}
+
+impl FleetPublication {
+    fn set_available(&mut self, available: bool, retired: &CancellationToken) {
+        if !available {
+            self.action_cancel.cancel();
+        } else if !self.available {
+            // Recovery permits new actions, never an old preflight to continue.
+            self.action_cancel = retired.child_token();
+        }
+        self.available = available;
+    }
 }
 
 #[derive(Default)]
@@ -147,14 +160,17 @@ pub struct PageTicket {
 
 impl ServerEntry {
     pub(crate) fn new(client: Arc<LoomClient>) -> Self {
+        let fleet_cancel = CancellationToken::new();
+        let action_cancel = fleet_cancel.child_token();
         Self {
             client,
-            fleet_cancel: CancellationToken::new(),
+            fleet_cancel,
             fleet_reconcile: Arc::new(Notify::new()),
             chat: Mutex::default(),
             publication: Mutex::new(FleetPublication {
                 generation: 0,
                 available: true,
+                action_cancel,
             }),
         }
     }
@@ -164,7 +180,7 @@ impl ServerEntry {
         let mut state = self.publication.lock().unwrap();
         if !self.fleet_cancel.is_cancelled() {
             state.generation += 1;
-            state.available = available;
+            state.set_available(available, &self.fleet_cancel);
             publish();
         }
     }
@@ -182,7 +198,7 @@ impl ServerEntry {
             return false;
         }
         state.generation += 1;
-        state.available = available;
+        state.set_available(available, &self.fleet_cancel);
         publish();
         true
     }
@@ -220,12 +236,19 @@ impl ServerEntry {
         (!self.fleet_cancel.is_cancelled() && state.available).then_some(state.generation)
     }
 
+    /// Selected actions share one availability/retirement lease across all HTTP
+    /// reads and writes. Healthy fleet publications do not invalidate it.
+    pub(crate) fn selected_action_token(&self) -> Option<CancellationToken> {
+        let state = self.publication.lock().unwrap();
+        (!self.fleet_cancel.is_cancelled() && state.available).then(|| state.action_cancel.clone())
+    }
+
     /// Serialize with retirement AND availability changes while REST was in flight.
     pub fn publish_mutation(&self, ticket: u64, available: bool, publish: impl FnOnce()) -> bool {
         let mut state = self.publication.lock().unwrap();
         if !self.fleet_cancel.is_cancelled() && state.available && state.generation == ticket {
             state.generation += 1;
-            state.available = available;
+            state.set_available(available, &self.fleet_cancel);
             publish();
             if !available {
                 // Wake only this entry's actor. The permit is retained even

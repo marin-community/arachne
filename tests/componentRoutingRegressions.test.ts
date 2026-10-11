@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { nextTick } from "vue";
 import { scopeSession, scopedId } from "../src/backendIdentity.ts";
+import { pinSelection } from "../src/durableChange.ts";
+import { declaration } from "./fixtures/durable-change.mjs";
 import { deferred, mountRoutingComponent, settle } from "./componentRoutingHarness.ts";
 
 const a = "https://a.example", b = "https://b.example";
@@ -116,9 +118,10 @@ test("an old A catalog failure cannot clear the successfully loaded B catalog", 
 
 test("actual ChangeReview preparation sends a raw coordinator identity while preserving user text", async t => {
   const calls: { command: string; args: any }[] = [];
-  const review = mountRoutingComponent("ChangeReview", { backendUrl: a, sessionId: scopedId(a, "worker"), integrationTarget: topic(a, "coordinator"), isTopic: false }, async (command, args) => {
+  const selected = declaration();
+  const review = mountRoutingComponent("ChangeReview", { backendUrl: a, sessionId: scopedId(a, "worker"), selectedChange: pinSelection(scopedId(a, "worker"), selected), integrationTarget: topic(a, "coordinator"), isTopic: false }, async (command, args) => {
     calls.push({ command, args });
-    if (command === "work_changes") return { source_ref: "weaver/worker", accepted_source: false, head_oid: "abc", base: { state: "available", reference: "weaver/track", oid: "def" }, files: [], totals: {} };
+    if (command === "change_changes") return { source_ref: "weaver/worker", accepted_source: false, head_oid: selected.scope.head_oid, base: { state: "available", reference: selected.scope.base_oid, oid: selected.scope.base_oid }, files: [], totals: {} };
     return null;
   });
   t.after(review.stop); await settle();
@@ -131,7 +134,8 @@ test("actual ChangeReview preparation sends a raw coordinator identity while pre
   const sent = calls.find(call => call.command === "send_input")!;
   assert.equal(sent.args.baseUrl, a); assert.equal(sent.args.id, "worker");
   assert.match(sent.args.text, /session coordinator\)/);
-  assert.ok(sent.args.text.endsWith(userText));
+  assert.ok(sent.args.text.includes(userText));
+  assert.ok(sent.args.text.includes(JSON.stringify(selected)), "selected declaration remains mandatory after user edits");
 });
 
 test("an older catalog request cannot erase a later generation after returning to A", async t => {

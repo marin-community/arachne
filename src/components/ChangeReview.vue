@@ -5,7 +5,9 @@ import { useBackendInvoke } from "../backendInvoke";
 import CheckoutEditor from "./CheckoutEditor.vue";
 import type { SessionSummary } from "../App.vue";
 import { useLaunchSelection } from "../launch";
-import { preparationRequest, independentReviewRequest, reviewPreviewEvidence } from "../reviewRequest";
+import { preparationRequest, independentReviewRequest, reviewPreviewEvidence, selectedChangeInstructions } from "../reviewRequest";
+import { selectedChangePayload, type ChangeSelection } from "../durableChange.ts";
+import { backendOf } from "../backendIdentity.ts";
 
 const invoke = useBackendInvoke();
 
@@ -42,11 +44,13 @@ interface ChangeSet {
   truncated: boolean;
 }
 
-const launchSelection = useLaunchSelection();
-
-const props = withDefaults(defineProps<{ sessionId: string; canEdit?: boolean; isTopic?: boolean | null; integrationTarget?: SessionSummary | null; embedded?: boolean }>(), { canEdit: false, isTopic: false, embedded: false });
-const reviewingTrack = computed(() => changes.value?.accepted_source ?? props.isTopic);
-const checkoutEditable = computed(() => props.canEdit && reviewingTrack.value === false);
+const props = withDefaults(defineProps<{ sessionId: string; selectedChange?: ChangeSelection | null; selectionError?: string; canEdit?: boolean; isTopic?: boolean | null; integrationTarget?: SessionSummary | null; embedded?: boolean }>(), { canEdit: false, isTopic: false, embedded: false });
+const launchSelection = useLaunchSelection(() => backendOf(props.sessionId));
+const reviewingTrack = computed(() => props.selectedChange ? false : changes.value?.accepted_source ?? props.isTopic);
+const checkoutEditable = computed(() => props.canEdit && reviewingTrack.value === false && !props.selectedChange);
+const selectedProblem = computed(() => props.selectionError || (props.selectedChange && props.selectedChange.sourceId !== props.sessionId
+  ? "The selected Change belongs to another source or Loom backend." : "") || (props.integrationTarget && backendOf(props.integrationTarget.id) !== backendOf(props.sessionId)
+  ? "The canonical target belongs to another Loom backend." : ""));
 const emit = defineEmits<{ (e: "requested"): void; (e: "saved"): void }>();
 const editPath = ref<string | null>(null);
 const editedPaths = ref<string[]>([]);
@@ -62,8 +66,10 @@ const requestScope = ref("");
 const currentRequestScope = computed(() => JSON.stringify([
   reviewingTrack.value, props.integrationTarget?.id,
   props.integrationTarget?.branch.repo_root, props.integrationTarget?.branch.branch,
-  props.integrationTarget?.branch.tags.find(tag => tag.key === "track_topic_branch")?.value,
-  reviewPreviewEvidence(changes.value),
+  props.integrationTarget?.branch.goal,
+  JSON.stringify(props.integrationTarget?.branch.tags.filter(tag => ["track_topic_branch", "track_topic_initialized"].includes(tag.key))),
+  reviewPreviewEvidence(changes.value, props.selectedChange?.change),
+  JSON.stringify(props.selectedChange),
 ]));
 const requestStale = computed(() => requestScope.value !== currentRequestScope.value);
 const requesting = ref(false);
@@ -79,32 +85,42 @@ watch(fileQuery, async query => {
   } catch { /* The diff remains usable when completion is unavailable. */ }
 });
 function prepareRequest(mode: "review" | "prepare") {
-  if (reviewingTrack.value === null) return;
+  if (reviewingTrack.value === null || selectedProblem.value || (mode === "prepare" && !reviewingTrack.value && !props.selectedChange)) return;
   requestMode.value = mode;
   requestScope.value = currentRequestScope.value;
-  const revision = reviewPreviewEvidence(changes.value);
+  const revision = reviewPreviewEvidence(changes.value, props.selectedChange?.change);
   requestText.value = mode === "review"
-    ? independentReviewRequest(revision, props.integrationTarget ?? null, reviewingTrack.value === true)
-    : preparationRequest(reviewingTrack.value === true, revision, props.integrationTarget ?? null, editedPaths.value);
+    ? independentReviewRequest(revision, props.integrationTarget ?? null, reviewingTrack.value === true, props.selectedChange?.change)
+    : preparationRequest(reviewingTrack.value === true, revision, props.integrationTarget ?? null, editedPaths.value, props.selectedChange?.change);
 }
 async function sendRequest() {
-  if (loading.value || requestStale.value || requesting.value || !requestText.value.trim()) return;
+  if (requestStale.value || reviewingTrack.value === null || requesting.value || loading.value || error.value || !requestText.value.trim() || selectedProblem.value || !requestMode.value) return;
+  if (requestMode.value === "prepare" && !reviewingTrack.value && !props.selectedChange) return;
   const id = props.sessionId;
+  const selected = props.selectedChange ? selectedChangePayload(props.selectedChange) : null;
+  const mode = requestMode.value;
+  const text = requestText.value + (selected ? `\n${selectedChangeInstructions(selected.expectedChange)}` : "");
   const request = ++requestGeneration;
   requesting.value = true;
   requestNote.value = "";
   try {
     let note: string;
-    if (requestMode.value === "review") {
+    if (mode === "review") {
       const selection = launchSelection.value;
       const result = await invoke<{ session: { id: string }; warnings: string[] }>("review_session", {
-        sourceId: id, brief: requestText.value,
+        sourceId: id, brief: text,
+        ...(selected ? { changeId: selected.changeId, expectedChange: selected.expectedChange } : {}),
         profile: null, agent: selection.agent || null,
         model: selection.model || null, effort: selection.effort || null,
       });
       note = `Independent reviewer ${result.session.id} launched. Its durable handoff will appear under Handoffs. ${result.warnings.join(" ")}`;
     } else {
-      await invoke("send_input", { id, text: requestText.value });
+      if (selected) {
+        // Re-read registry and exact snapshot before delivering selected preparation.
+        await invoke("change_changes", selected);
+        if (id !== props.sessionId || request !== requestGeneration || selectedProblem.value || requestStale.value) return;
+      }
+      await invoke("send_input", { id, text, ...(selected ? { changeId: selected.changeId, expectedChange: selected.expectedChange } : {}) });
       note = "Preparation sent to this thread. Validation results will appear in its conversation.";
     }
     if (id !== props.sessionId || request !== requestGeneration) return;
@@ -130,7 +146,10 @@ async function refresh() {
   loading.value = true;
   error.value = "";
   try {
-    const result = await invoke<ChangeSet>("work_changes", { sessionId });
+    if (selectedProblem.value) throw new Error(selectedProblem.value);
+    const result = props.selectedChange
+      ? await invoke<ChangeSet>("change_changes", selectedChangePayload(props.selectedChange))
+      : await invoke<ChangeSet>("work_changes", { sessionId });
     if (current === generation && sessionId === props.sessionId) changes.value = result;
   } catch (e: unknown) {
     if (current === generation) {
@@ -142,7 +161,7 @@ async function refresh() {
   }
 }
 
-watch(() => props.sessionId, () => {
+watch(() => [props.sessionId, JSON.stringify(props.selectedChange), selectedProblem.value], () => {
   changes.value = null;
   editPath.value = null;
   editedPaths.value = [];
@@ -155,8 +174,12 @@ watch(() => props.sessionId, () => {
 }, { immediate: true });
 
 watch(() => [props.isTopic, props.integrationTarget?.id, props.integrationTarget?.branch.branch,
-  props.integrationTarget?.branch.tags.find(tag => tag.key === "track_topic_branch")?.value], () => {
+  props.integrationTarget?.branch.repo_root, props.integrationTarget?.branch.goal,
+  JSON.stringify(props.integrationTarget?.branch.tags.filter(tag => ["track_topic_branch", "track_topic_initialized"].includes(tag.key)))], () => {
   changes.value = null;
+  if (props.selectedChange) requestMode.value = null;
+  requestGeneration++;
+  requesting.value = false;
   void refresh();
 });
 
@@ -169,23 +192,25 @@ function lineNumber(value: number | null): string {
   <section class="change-review" :class="{ embedded }" aria-label="Review changes">
     <div class="change-review-heading">
       <div>
-        <strong>Review changes</strong>
+        <strong>{{ selectedChange ? selectedChange.change.title : 'Review changes' }}</strong>
         <span v-if="changes?.base.state === 'available'" class="change-review-count">{{ changes.totals.files }} files · +{{ changes.totals.additions }} −{{ changes.totals.deletions }}</span>
       </div>
       <button :disabled="loading" @click="refresh">{{ loading ? "Loading…" : "Refresh" }}</button>
     </div>
     <div class="review-toolbar">
-      <button :disabled="loading || requesting || reviewingTrack === null" @click="prepareRequest('review')">Launch reviewer</button>
-      <button :disabled="loading || requesting || reviewingTrack === null" @click="prepareRequest('prepare')">Prepare {{ reviewingTrack === null ? "changes" : reviewingTrack ? "publishing" : "landing" }}</button>
+      <button :disabled="loading || requesting || reviewingTrack === null || !!selectedProblem || !!error" @click="prepareRequest('review')">Launch reviewer</button>
+      <button v-if="reviewingTrack || selectedChange" :disabled="loading || requesting || reviewingTrack === null || !!selectedProblem || !!error" @click="prepareRequest('prepare')">Prepare {{ reviewingTrack ? "publishing" : "selected Change" }}</button>
     </div>
     <div v-if="requestMode" class="review-request">
       <label :for="`review-request-${sessionId}`">{{ requestMode === 'review' ? "Review request" : "Preparation request" }}</label>
       <textarea :id="`review-request-${sessionId}`" v-model="requestText" :disabled="requesting" rows="5" />
       <p v-if="requestStale && !loading" role="status">The comparison changed. Keep your draft or replace it with a request for the current comparison.</p>
       <button v-if="requestStale" :disabled="loading || requesting || reviewingTrack === null" @click="prepareRequest(requestMode)">Replace with current comparison</button>
-      <div><button :disabled="requesting" @click="requestMode = null">Cancel</button><button class="primary" :disabled="loading || requestStale || requesting || !requestText.trim()" @click="sendRequest">{{ requesting ? "Sending…" : (requestMode === 'review' ? "Launch reviewer" : "Send to agent") }}</button></div>
+      <div><button :disabled="requesting" @click="requestMode = null">Cancel</button><button class="primary" :disabled="loading || requestStale || requesting || !!selectedProblem || !!error || !requestText.trim()" @click="sendRequest">{{ requesting ? "Sending…" : (requestMode === 'review' ? "Launch reviewer" : "Send to agent") }}</button></div>
     </div>
     <div v-if="requestNote" class="change-review-state" role="status">{{ requestNote }}</div>
+    <div v-if="selectedChange" class="change-review-state">{{ selectedChange.change.source_session }}/{{ selectedChange.change.id }} · {{ selectedChange.change.scope.kind }} · {{ selectedChange.change.scope.paths.length ? selectedChange.change.scope.paths.join(', ') : 'entire pinned range' }}</div>
+    <div v-else-if="!reviewingTrack" class="change-review-state">Select an explicit Change in the inspector’s Landing queue to prepare or Land an output.</div>
     <div class="review-file-picker">
       <input v-model="fileQuery" :list="`review-files-${sessionId}`" placeholder="Filter changes or open a file…" aria-label="Find a checkout file" @keydown.enter.prevent="checkoutEditable && fileQuery.trim() && (editPath = fileQuery.trim())" />
       <datalist :id="`review-files-${sessionId}`"><option v-for="path in fileOptions" :key="path" :value="path" /></datalist>
@@ -205,7 +230,7 @@ function lineNumber(value: number | null): string {
         <div v-if="changes.truncated || changes.totals.truncated" class="change-review-state" role="status">
           Large diff: this preview is limited. Open the checkout for the complete changes.
         </div>
-        <div v-if="changes.head_oid" class="change-review-base">Source {{ changes.source_ref }} · {{ changes.head_oid.slice(0, 10) }} · {{ changes.accepted_source ? "committed accepted state" : "includes worker checkout edits" }}</div>
+        <div v-if="changes.head_oid" class="change-review-base">Source {{ changes.source_ref }} · {{ changes.head_oid.slice(0, 10) }} · {{ selectedChange ? (selectedChange.change.scope.kind === 'range' ? 'pinned committed range' : 'bounded working snapshot') : changes.accepted_source ? "committed accepted state" : "includes worker checkout edits" }}</div>
         <div v-if="changes.files.length === 0" class="change-review-state">No changes against this comparison ref.</div>
         <div v-else-if="!visibleFiles.length" class="change-review-state">No changed files match this filter.</div>
         <div v-else class="change-review-files">

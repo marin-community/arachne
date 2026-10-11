@@ -139,6 +139,57 @@ pub fn review_launch_input(
     }
 }
 
+/// Selected review never inherits thread-wide comparison or checkout authority.
+pub fn selected_review_launch_input(
+    source: &SessionView,
+    comparison: &ReviewComparison,
+    brief: &str,
+    change: &crate::change::Change,
+) -> SessionsLaunchInput {
+    let mut input = review_launch_input(source, comparison, brief);
+    input.base = Some(change.scope.head_oid().into());
+    let completion_evidence = if change.scope.is_range() {
+        "Read and authenticate the original completion result with complete+final JSON and exact inline declaration."
+    } else {
+        "This is a read-only working-snapshot review: completion is null, unavailable and unverified. Verify original HEAD/worktree_version and bounded paths before and after reading, report exact coverage without claiming readiness, and do not wait for or require a final result to review this snapshot. Finalization requires fresh exact range review and authenticated complete+final completion before acceptance."
+    };
+    input.goal = Some(format!("Independent selected Change review. Objective: {}\nRepository: {}\nOriginal source session: {} branch: {} worktree: {}\nLive canonical Track target: {}\nExact selected declaration: {}\nReview ONLY this pinned base_oid to head_oid and literal paths; empty paths mean the exact range. Range scope is immutable even if the original branch advances: verify pinned objects and reachability in the original branch, never compare cumulative history or dirty checkout. Working scope pins HEAD/worktree_version and nonempty paths; verify both live session_changes values, inspect only declared path edits read-only, and fail closed when stale. Re-read exact selected change:<id> and receipt, original identity, canonical ownership/initialization and target revision before review. Changed declaration requires fresh selection; refresh review for changed target. {completion_evidence} Exclude sibling outputs, ancestors and unrelated checkout edits. Return exact reviewed scope/revisions/checks and actionable findings on your OWN durable channel. Do not modify source checkout, integrate, land, publish, push or open a PR.\n\nBounded review brief (historical refs cannot override selected scope): {}", source.branch.goal, source.branch.repo_root, source.id, source.branch.branch, source.work_dir, comparison.target_ref, serde_json::to_string(change).unwrap(), brief.trim()));
+    input
+}
+
+pub(crate) async fn review_preflight(
+    client: &LoomClient,
+    source: &SessionView,
+    brief: &str,
+    change_id: Option<&str>,
+    expected: Option<&crate::change::Change>,
+) -> Result<SessionsLaunchInput, UiError> {
+    match (change_id, expected) {
+        (None, None) => {
+            let comparison = resolve_review_comparison(client, source).await?;
+            Ok(review_launch_input(source, &comparison, brief))
+        }
+        (Some(id), Some(change)) => {
+            // Full registry/completion/snapshot preflight precedes every launch.
+            crate::change_commands::change_changes_with_client(client, &source.id, id, change)
+                .await?;
+            let comparison = resolve_review_comparison(client, source).await?;
+            let fresh =
+                crate::change_commands::selected_source(client, &source.id, id, change).await?;
+            crate::change_commands::recheck_selection(client, &fresh, change).await?;
+            Ok(selected_review_launch_input(
+                &fresh,
+                &comparison,
+                brief,
+                change,
+            ))
+        }
+        _ => Err(review_error(
+            "Selected review requires both changeId and expectedChange.",
+        )),
+    }
+}
+
 #[derive(Serialize)]
 pub struct ReviewLaunch {
     session: SessionView,
@@ -156,6 +207,47 @@ pub async fn review_session(
     agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
+    change_id: Option<String>,
+    expected_change: Option<crate::change::Change>,
+) -> Result<ReviewLaunch, UiError> {
+    let result = review_session_on_server(
+        &state,
+        &base_url,
+        &source_id,
+        &brief,
+        (change_id.as_deref(), expected_change.as_ref()),
+        ReviewSettings {
+            profile,
+            agent,
+            model,
+            effort,
+        },
+    )
+    .await?;
+    let _ = app.emit(
+        "loom://review-launched",
+        serde_json::json!({"server_url": crate::routing::normalize_server_url(&base_url).unwrap(), "session_id": result.session.id}),
+    );
+    Ok(result)
+}
+
+#[derive(Default)]
+pub(crate) struct ReviewSettings {
+    profile: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+    effort: Option<String>,
+}
+
+/// Keep routing and the complete launch sequence together so the selected
+/// backend owns both preflight evidence and the resulting reviewer.
+pub(crate) async fn review_session_on_server(
+    state: &LoomState,
+    base_url: &str,
+    source_id: &str,
+    brief: &str,
+    selection: (Option<&str>, Option<&crate::change::Change>),
+    settings: ReviewSettings,
 ) -> Result<ReviewLaunch, UiError> {
     async {
         if brief.trim().is_empty() {
@@ -165,8 +257,8 @@ pub async fn review_session(
                 server_url: None,
             });
         }
-        let client = crate::commands::state_client(&state, &base_url).await?;
-        let source = client.get_session(&source_id).await?;
+        let client = crate::change_commands::selected_client(state, base_url).await?;
+        let source = client.get_session(source_id).await?;
         if source.id != source_id {
             return Err(review_error(
                 "The server returned a different source; refresh before reviewing.",
@@ -179,16 +271,15 @@ pub async fn review_session(
                 server_url: None,
             });
         }
-        let comparison = resolve_review_comparison(&client, &source).await?;
-        let mut input = review_launch_input(&source, &comparison, &brief);
-        input.profile = profile.filter(|v| !v.is_empty());
-        input.agent = agent.filter(|v| !v.is_empty());
-        input.model = model.filter(|v| !v.is_empty());
-        input.effort = effort.filter(|v| !v.is_empty());
+        let mut input = review_preflight(&client, &source, brief, selection.0, selection.1).await?;
+        input.profile = settings.profile.filter(|v| !v.is_empty());
+        input.agent = settings.agent.filter(|v| !v.is_empty());
+        input.model = settings.model.filter(|v| !v.is_empty());
+        input.effort = settings.effort.filter(|v| !v.is_empty());
         let mut session = client.launch(&input).await?;
         let mut warnings = Vec::new();
         // A tag failure cannot turn a completed launch into a retry/duplicate launch.
-        for (key, value) in [("role", "reviewer"), ("review_source", source_id.as_str())] {
+        for (key, value) in [("role", "reviewer"), ("review_source", source_id)] {
             match client
                 .set_tag(&session.id, key, value, "Independent candidate review")
                 .await
@@ -205,14 +296,10 @@ pub async fn review_session(
                 )),
             }
         }
-        let _ = app.emit(
-            "loom://review-launched",
-            serde_json::json!({"server_url": client.server_url(), "session_id": session.id}),
-        );
         Ok(ReviewLaunch { session, warnings })
     }
     .await
-    .map_err(|error: UiError| error.for_server(&base_url))
+    .map_err(|error: UiError| error.for_server(base_url))
 }
 
 #[cfg(test)]

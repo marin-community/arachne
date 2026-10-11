@@ -1,0 +1,277 @@
+{
+  "version": 1,
+  "change": {
+    "version": 1,
+    "id": "text-output",
+    "title": "Output title",
+    "source_session": "worker",
+    "repo_root": "/repo",
+    "source_branch": "weaver/worker",
+    "source_work_dir": "/repo/.worktrees/worker",
+    "scope": {
+      "kind": "range",
+      "base_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "paths": [
+        "src/selected.ts"
+      ]
+    },
+    "completion": {
+      "channel_id": "worker",
+      "message_id": "result-1"
+    }
+  },
+  "receipt": {
+    "version": 1,
+    "change_id": "text-output",
+    "source_session": "worker",
+    "scope": {
+      "kind": "range",
+      "base_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "head_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "paths": [
+        "src/selected.ts"
+      ]
+    },
+    "target_session": "track",
+    "target_branch": "accepted/topic",
+    "target_oid": "cccccccccccccccccccccccccccccccccccccccc",
+    "outcome": "accepted",
+    "completion": {
+      "channel_id": "worker",
+      "message_id": "result-1"
+    }
+  },
+  "cases": [
+    {
+      "name": "ordinary title",
+      "kind": "change",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "name": "multiline title unsupported",
+      "kind": "change",
+      "patch": {
+        "title": "Line one\nLine two"
+      },
+      "valid": false
+    },
+    {
+      "name": "control title unsupported",
+      "kind": "change",
+      "patch": {
+        "title": "title\u007f"
+      },
+      "valid": false
+    },
+    {
+      "name": "empty title unsupported",
+      "kind": "change",
+      "patch": {
+        "title": " \u00a0\ufeff"
+      },
+      "valid": false
+    },
+    {
+      "name": "unicode title preserved",
+      "kind": "change",
+      "patch": {
+        "title": "Parser \u0394 \u65e5\u672c\u8a9e"
+      },
+      "valid": true
+    },
+    {
+      "name": "unicode non-JS-whitespace preserved",
+      "kind": "change",
+      "patch": {
+        "title": "\u0085"
+      },
+      "valid": true
+    },
+    {
+      "name": "source session control unsupported",
+      "kind": "change",
+      "patch": {
+        "source_session": "worker\n"
+      },
+      "valid": false
+    },
+    {
+      "name": "repo control unsupported",
+      "kind": "change",
+      "patch": {
+        "repo_root": "/repo\n"
+      },
+      "valid": false
+    },
+    {
+      "name": "worktree control unsupported",
+      "kind": "change",
+      "patch": {
+        "source_work_dir": "/repo/\u007fworker"
+      },
+      "valid": false
+    },
+    {
+      "name": "completion control unsupported",
+      "kind": "change",
+      "patch": {
+        "completion": {
+          "message_id": "result\t1"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "completion whitespace unsupported",
+      "kind": "change",
+      "patch": {
+        "completion": {
+          "message_id": " \ufeff"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "whitespace-only literal path unsupported",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "paths": [
+            " "
+          ]
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "control filename unsupported",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "paths": [
+            "src/a\nb.ts"
+          ]
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "literal glob filename preserved",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "paths": [
+            "src/literal*.ts"
+          ]
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "embedded and leading spaces in path preserved",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "paths": [
+            " src/my file.ts "
+          ]
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "unicode literal filename preserved",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "paths": [
+            "src/\u65e5\u672c\u8a9e.ts"
+          ]
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "working ordinary version",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "kind": "working",
+          "worktree_version": "v1"
+        },
+        "completion": null
+      },
+      "valid": true
+    },
+    {
+      "name": "working control version unsupported",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "kind": "working",
+          "worktree_version": "v\n1"
+        },
+        "completion": null
+      },
+      "valid": false
+    },
+    {
+      "name": "working whitespace version unsupported",
+      "kind": "change",
+      "patch": {
+        "scope": {
+          "kind": "working",
+          "worktree_version": "\ufeff"
+        },
+        "completion": null
+      },
+      "valid": false
+    },
+    {
+      "name": "ordinary receipt",
+      "kind": "receipt",
+      "patch": {},
+      "valid": true
+    },
+    {
+      "name": "receipt target session control unsupported",
+      "kind": "receipt",
+      "patch": {
+        "target_session": "track\n"
+      },
+      "valid": false
+    },
+    {
+      "name": "receipt target whitespace unsupported",
+      "kind": "receipt",
+      "patch": {
+        "target_session": " \ufeff"
+      },
+      "valid": false
+    },
+    {
+      "name": "receipt completion control unsupported",
+      "kind": "receipt",
+      "patch": {
+        "completion": {
+          "message_id": "result\u0001"
+        }
+      },
+      "valid": false
+    },
+    {
+      "name": "receipt path whitespace unsupported",
+      "kind": "receipt",
+      "patch": {
+        "scope": {
+          "paths": [
+            " "
+          ]
+        }
+      },
+      "valid": false
+    }
+  ]
+}

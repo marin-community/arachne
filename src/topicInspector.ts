@@ -5,7 +5,8 @@
  */
 
 import type { SessionSummary } from "./App.vue";
-import { isTrackCoordinator, resolveTrack, tagValue } from "./trackPolicy.ts";
+import { resolveTrack } from "./trackPolicy.ts";
+import { changeRegistry, type DurableChange } from "./durableChange.ts";
 
 // --- Fleet row state ---------------------------------------------------------
 
@@ -238,39 +239,33 @@ export function integrationResult(s: SessionSummary) {
 }
 
 export interface LandingCandidate {
+  key: string;
+  change: DurableChange;
   session: SessionSummary;
-  state: "working" | "waiting" | "ready" | "stale" | "conflicted" | "landed";
+  state: "working" | "waiting" | "landed" | "blocked";
   note: string;
 }
 
-/** Active workers and advisory reports coexist with durable acceptance outcomes.
- * Lifecycle and pending wrap-up requests never imply successful readiness. */
-export function landingCandidates(rows: ThreadRow[], topicId: string): LandingCandidate[] {
-  const fleet = rows.map(row => row.session);
+/** Only explicit bounded outputs enter the queue. Thread facts remain advisory. */
+export function landingCandidates(rows: ThreadRow[], topicId: string, fleet: SessionSummary[] = rows.map(row => row.session)): LandingCandidate[] {
   const out: LandingCandidate[] = [];
+  const seen = new Set<string>();
   for (const { session: s } of rows) {
-    if (s.id === topicId || tagValue(s, "role") === "reviewer" || isTrackCoordinator(s)
-      || resolveTrack(fleet, s.id)?.id !== topicId) continue;
-    const result = integrationResult(s);
-    if (result) {
-      out.push({ session: s, state: "landed", note: result.note || result.value });
-      continue;
-    }
-    const state = s.branch.tags.find(tag => tag.key === "integration_state");
-    if (state?.value === "stale" || state?.value === "conflicted") {
-      out.push({ session: s, state: state.value, note: state.note || "Reconcile and revalidate against the canonical branch." });
-    } else if (isReadyCandidate(s)) {
-      const ready = s.branch.tags.find(tag => ["integration_ready", "integration_state"].includes(tag.key) && ["true", "ready"].includes(tag.value));
-      out.push({ session: s, state: "ready", note: ready?.note || "Reported ready; acceptance still requires review and validation." });
-    } else {
-      const fact = threadStatus(s);
-      if (fact.kind === "working" || fact.kind === "waiting") out.push({ session: s, state: fact.kind, note: fact.detail });
-      else if (s.status === "running" && !isIdle(s)) out.push({ session: s, state: "working", note: fact.detail || fact.label });
-      else if (s.status !== "archived" && s.branch.branch) out.push({
-        session: s, state: "waiting", note: fact.detail || `${fact.label}; Land can request wrap-up without implying readiness.`,
-      });
+    if (seen.has(s.id) || s.id === topicId || resolveTrack(fleet, s.id)?.id !== topicId) continue;
+    seen.add(s.id);
+    const snapshots = fleet.filter(source => source.id === s.id);
+    const source = { ...s, branch: { ...s.branch, tags: snapshots.flatMap(source => source.branch.tags) } };
+    for (const entry of changeRegistry(source).entries) {
+      const identityConflict = snapshots.some(other => other.work_dir !== s.work_dir
+        || other.branch.repo_root !== s.branch.repo_root || other.branch.branch !== s.branch.branch);
+      const blocked = identityConflict ? "Conflicting duplicate source identity." : entry.blocked;
+      const state = blocked ? "blocked" : entry.acceptance ? "landed" : entry.change.scope.kind === "working" ? "working" : "waiting";
+      out.push({ key: entry.key, change: entry.change, session: source, state,
+        note: blocked || (entry.acceptance ? `Accepted into ${entry.acceptance.target_branch} at ${entry.acceptance.target_oid}`
+          : entry.change.scope.kind === "working" ? "Bounded working snapshot; completion and fresh scope review still required."
+          : "Pinned committed output; completion evidence, review and canonical validation required.") });
     }
   }
-  const rank = { conflicted: 0, stale: 1, ready: 2, waiting: 3, working: 4, landed: 5 };
-  return out.sort((a, b) => rank[a.state] - rank[b.state] || b.session.last_activity_at.localeCompare(a.session.last_activity_at));
+  const rank = { blocked: 0, waiting: 1, working: 2, landed: 3 };
+  return out.sort((a, b) => rank[a.state] - rank[b.state] || b.session.last_activity_at.localeCompare(a.session.last_activity_at) || a.key.localeCompare(b.key));
 }

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { preparationRequest, reviewIntegrationTarget, independentReviewRequest, reviewPreviewEvidence } from "../src/reviewRequest.ts";
+import { declaration } from "./fixtures/durable-change.mjs";
 
 const session = (id, parent = null, repo = "/repo", tags = []) => ({
   id, status: "running", parent_session_id: parent, parent_id: null,
@@ -11,7 +12,7 @@ test("preparation routes nested workers to same-repository track rather than mai
   const parent = session("parent", "track");
   const worker = session("worker", "parent");
   assert.equal(reviewIntegrationTarget([track, parent, worker], "worker"), track);
-  const prompt = preparationRequest(false, "HEAD abc", track, ["src/app.ts"]);
+  const prompt = preparationRequest(false, "HEAD abc", track, ["src/app.ts"], declaration());
   assert.match(prompt, /branch work\/track, repository \/repo/);
   assert.match(prompt, /src\/app\.ts/);
   assert.match(prompt, /If any intended source edits remain uncommitted/);
@@ -23,13 +24,13 @@ test("unresolved or cross-repository parents never fabricate an integration dest
   const worker = session("worker", "parent");
   assert.equal(reviewIntegrationTarget([track, parent, worker], "worker"), null);
   assert.equal(reviewIntegrationTarget([track, worker], "worker"), null);
-  assert.match(preparationRequest(false, "HEAD abc", null), /No landing target is resolved/);
+  assert.match(preparationRequest(false, "HEAD abc", null, [], declaration()), /No landing target is resolved/);
   assert.match(preparationRequest(true, "HEAD abc", null), /publishing strategy and destination have not been selected/);
 });
 
 test("manual Review Prepare remains optional preparation without landing authorization", () => {
   for (const isTrack of [true, false]) {
-    const prompt = preparationRequest(isTrack, "HEAD abc", session("track"), ["src/app.ts"]);
+    const prompt = preparationRequest(isTrack, "HEAD abc", session("track"), ["src/app.ts"], isTrack ? null : declaration());
     assert.match(prompt, /optional agent preparation/);
     assert.match(prompt, /visible Loom child sessions, including reviewers/);
     assert.match(prompt, /preserving unrelated manual edits/);
@@ -45,7 +46,7 @@ test("both preparation and independent review name the canonical accepted ref", 
   ]);
   const worker = session("worker", "track");
   const target = reviewIntegrationTarget([track, worker], worker.id);
-  for (const prompt of [preparationRequest(false, "HEAD source", target), independentReviewRequest("HEAD source", target)]) {
+  for (const prompt of [preparationRequest(false, "HEAD source", target, [], declaration()), independentReviewRequest("HEAD source", target, false, declaration())]) {
     assert.match(prompt, /arachne\/tracks\/accepted/);
     assert.doesNotMatch(prompt, /work\/track/);
     assert.match(prompt, /Do not land, publish, push/);
@@ -79,9 +80,27 @@ test("preview evidence records actual accepted or worker source and target snaps
   assert.doesNotMatch(reviewPreviewEvidence({ ...snapshot, head_oid: null, base: { state: "unavailable", reference: "release" } }), /at null|at undefined|It covered|It included/);
 });
 
-test("worker review includes inherited unaccepted changes and verifies target again", () => {
-  const prompt = independentReviewRequest("", session("track"));
-  assert.match(prompt, /Fork the original worker branch/);
-  assert.match(prompt, /inherited unaccepted changes/);
-  assert.match(prompt, /Inspect uncommitted worker edits read-only/);
+test("selected review carries exact scope and excludes cumulative branch and live edits", () => {
+  const change = declaration();
+  const prompt = independentReviewRequest("", session("track"), false, change);
+  assert.ok(prompt.includes(JSON.stringify(change)));
+  assert.match(prompt, /immutable base_oid→head_oid range and literal paths; exclude live checkout edits/);
+  assert.match(prompt, /Do not replace the selected range/);
+  assert.match(prompt, /Do not expand to sibling outputs/);
+  assert.doesNotMatch(prompt, /Fork the original worker branch|including inherited unaccepted changes/);
+});
+
+test("unselected source cannot receive broad preparation", () => {
+  assert.match(preparationRequest(false, "", session("track")), /No Change is selected. Do not prepare this source/);
+  assert.match(independentReviewRequest("", session("track")), /unselected inspection only/);
+});
+
+test("working preparation pins version and declares fresh review on finalization", () => {
+  const change = { ...declaration("working", undefined, { kind: "working", paths: ["src/app.ts"], worktree_version: "snapshot-1" }), completion: null };
+  const prompt = preparationRequest(false, "", session("track"), [], change);
+  assert.ok(prompt.includes(JSON.stringify(change)));
+  assert.match(prompt, /commit only its declared paths/);
+  assert.match(prompt, /retain its ID and original identity/);
+  assert.match(prompt, /require fresh scope review/);
+  assert.match(prompt, /Do not prepare unselected source changes/);
 });

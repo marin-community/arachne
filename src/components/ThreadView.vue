@@ -12,8 +12,9 @@ import ContextTelemetry from "./ContextTelemetry.vue";
 import { useSlashCommands, type SlashCommand } from "../useSlashCommands";
 import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
-import { canonicalTopicBranch, isTrackCoordinator, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
-import { landStrategies, publishStrategies, strategyMemoryKey } from "../trackStrategies.ts";
+import { canonicalTopicBranch, isTrackCoordinator } from "../trackPolicy.ts";
+import { publishStrategies, strategyMemoryKey } from "../trackStrategies.ts";
+import { changeRegistry } from "../durableChange.ts";
 import CodeActions from "./CodeActions.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import { landResultFeedback, type LandResult } from "../landFeedback";
@@ -80,6 +81,7 @@ const currentUsage = computed(() => {
 const emit = defineEmits<{
   (e: "open-artifact", target: ArtifactTarget): void;
   (e: "review", sessionId: string): void;
+  (e: "open-changes"): void;
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
   (e: "unarchive", id: string): void;
@@ -1125,6 +1127,7 @@ function messageAuthor(block: ChatDisplayBlock): string {
 }
 
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
+const hasExplicitChanges = computed(() => changeRegistry(currentSummary.value ?? props.session).entries.length > 0);
 const isReviewer = computed(() => currentSummary.value?.branch.tags.some(tag => tag.key === "role" && tag.value === "reviewer"));
 const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id) && !isTrackCoordinator(currentSummary.value!));
 const lastPublish = computed(() => currentSummary.value?.branch.tags.find(tag => tag.key === "publish_result"));
@@ -1141,7 +1144,6 @@ async function convertToTrack() {
   finally { converting.value = false; }
 }
 const sessionRepo = computed(() => props.session.github_repo || props.session.branch.repo_root);
-const landOptions = computed(() => landStrategies(workSummary.value?.has_commits === true));
 // Local primary publishing is available only for a loopback Loom server.
 const loomIsLocal = computed(() => {
   try {
@@ -1153,7 +1155,6 @@ const loomIsLocal = computed(() => {
 });
 const publishOptions = computed(() => publishStrategies(loomIsLocal.value));
 const canonicalDestination = computed(() => integrationTarget.value ? canonicalTopicBranch(integrationTarget.value) : null);
-const integrating = ref(false);
 const landing = ref(false);
 const integrationNote = ref("");
 const workSummary = ref<{ files: number; additions: number; deletions: number; has_commits: boolean } | null>(null);
@@ -1174,22 +1175,6 @@ watch(() => props.session.id, (id) => {
   workSummary.value = null;
   void refreshWorkSummary(id);
 }, { immediate: true });
-async function onThreadLand(strategy: string) {
-  if (integrating.value) return;
-  integrating.value = true;
-  const id = props.session.id;
-  const repo = sessionRepo.value;
-  integrationNote.value = "";
-  try {
-    const target = await invoke<IntegrationTarget>("land_thread", { sessionId: id, strategy });
-    try { localStorage.setItem(strategyMemoryKey("land", repo), strategy); } catch { /* unavailable storage */ }
-    if (props.session.id === id) integrationNote.value = threadLandFeedback(target);
-  } catch (e: any) {
-    emit("error", e?.message ?? String(e));
-  } finally {
-    integrating.value = false;
-  }
-}
 async function onPublish(strategy: string) {
   if (landing.value) return;
   landing.value = true;
@@ -1267,7 +1252,7 @@ async function onPublish(strategy: string) {
         @open-resource="openResource"
       />
       <button :disabled="!session.work_dir" aria-controls="topic-inspector" @click="emit('review', session.id)">Review diff</button>
-      <SplitButton v-if="isWorker && !isReviewer" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="integrating" :disabled="!integrationTarget || session.status === 'archived'" @run="onThreadLand" />
+      <button v-if="isWorker && hasExplicitChanges && integrationTarget" @click="emit('open-changes')">Changes</button>
       <SplitButton v-if="isTopic" kind="publish" :repo="sessionRepo" :options="publishOptions" label="Publish" :busy="landing" :disabled="session.status === 'archived'" @run="onPublish" />
       <button v-if="currentSummary && !isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
       <button v-if="currentStatus === 'archived'" :disabled="unarchiving" @click="emit('unarchive', session.id)">{{ unarchiving ? 'Unarchiving…' : 'Unarchive' }}</button>
@@ -1277,11 +1262,15 @@ async function onPublish(strategy: string) {
       </button>
       <button @click="showSendToThread = !showSendToThread">Send to thread…</button>
     </div>
-    <div v-if="isTopic || (isWorker && !isReviewer)" class="integrate-note">
-      <span>{{ isTopic ? 'Publish source' : 'Land destination' }}: <code>{{ canonicalDestination || 'No same-repository Track resolved' }}</code></span>
+    <details v-if="isTopic" class="integrate-note">
+      <summary>Publish details</summary>
+      <div>Source branch: <code>{{ canonicalDestination || 'No same-repository Track resolved' }}</code></div>
+      <div v-if="lastPublish">Previous publish: <code>{{ lastPublish.value }}</code><span v-if="lastPublish.note"> · {{ lastPublish.note }}</span></div>
+    </details>
+    <div v-if="isWorker && hasExplicitChanges" class="integrate-note">
+      <span>Land destination: <code>{{ canonicalDestination || 'No same-repository Track resolved' }}</code></span>
     </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
-    <div v-if="isTopic && lastPublish" class="integrate-note" :title="lastPublish.note">Last publish result: {{ lastPublish.value }}<span v-if="lastPublish.note"> · {{ lastPublish.note }}</span></div>
     <div v-if="isWorker && !isReviewer && lastIntegration" class="integrate-note" :title="lastIntegration.note">
       Last landed result: {{ lastIntegration.value }}<span v-if="lastIntegration.note"> · {{ lastIntegration.note }}</span>
     </div>

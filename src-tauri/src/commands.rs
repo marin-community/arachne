@@ -953,8 +953,32 @@ pub async fn send_input(
     topic_id: Option<String>,
     resource_ids: Option<Vec<String>>,
     attachments: Option<Vec<crate::loom::ScratchUpload>>,
+    change_id: Option<String>,
+    expected_change: Option<crate::change::Change>,
 ) -> Result<(), UiError> {
     async {
+        match (change_id.as_deref(), expected_change.as_ref()) {
+            (Some(change_id), Some(change)) => {
+                if topic_id.is_some()
+                    || resource_ids.as_ref().is_some_and(|ids| !ids.is_empty())
+                    || attachments.as_ref().is_some_and(|files| !files.is_empty())
+                {
+                    return Err(resource_error(
+                        "Selected preparation requires only its bounded text and declaration.",
+                    ));
+                }
+                return crate::change_commands::selected_preparation_on_server(
+                    &state, &base_url, &id, change_id, change, &text,
+                )
+                .await;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(resource_error(
+                    "Selected preparation requires both changeId and expectedChange.",
+                ))
+            }
+        }
         let client = state_client(&state, &base_url).await?;
         let mut prompt = text;
         let ids = resource_ids.unwrap_or_default();
@@ -2460,7 +2484,7 @@ pub fn resolve_integration_target(
 
 /// Direct results already link to the parent. Nested results link to their
 /// immediate parent's channel, so THAT channel must deliver to the Track.
-async fn ensure_acceptance_route(
+pub(crate) async fn ensure_acceptance_route(
     client: &LoomClient,
     fleet: &[SessionSummaryView],
     source: &SessionSummaryView,
@@ -2957,7 +2981,7 @@ impl From<LocalLanding> for LocalLandingView {
 
 /// True when a Loom server host runs sessions on this machine — the
 /// precondition for running git against its checkout paths locally.
-fn host_is_loopback(host: &str) -> bool {
+pub(crate) fn host_is_loopback(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
 
@@ -3221,7 +3245,7 @@ async fn review_changes_for_source(
 
 /// Bounded read-only Git capture. Disable optional index writes, external diff
 /// drivers and text conversion; a preview never fetches or runs repo helpers.
-async fn review_git(
+pub(crate) async fn review_git(
     root: &std::path::Path,
     args: &[&str],
     cap: usize,
@@ -3292,7 +3316,7 @@ async fn review_git(
     output
 }
 
-async fn review_oid(root: &std::path::Path, reference: &str) -> Result<String, UiError> {
+pub(crate) async fn review_oid(root: &std::path::Path, reference: &str) -> Result<String, UiError> {
     let (bytes, truncated) = review_git(
         root,
         &["rev-parse", "--verify", &format!("{reference}^{{commit}}")],
@@ -3308,12 +3332,15 @@ async fn review_oid(root: &std::path::Path, reference: &str) -> Result<String, U
     Ok(oid)
 }
 
-fn review_path(raw: &[u8]) -> serde_json::Value {
+pub(crate) fn review_path(raw: &[u8]) -> serde_json::Value {
     serde_json::json!({"display":String::from_utf8_lossy(raw),
         "bytes":base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)})
 }
 
-fn review_hunks(patch: &[u8], line_budget: &mut usize) -> (Vec<serde_json::Value>, u32, u32, bool) {
+pub(crate) fn review_hunks(
+    patch: &[u8],
+    line_budget: &mut usize,
+) -> (Vec<serde_json::Value>, u32, u32, bool) {
     let mut hunks = Vec::new();
     let mut header = String::new();
     let mut lines = Vec::new();
@@ -3590,7 +3617,7 @@ async fn local_review_changes(
     })
 }
 
-fn resource_error(message: impl Into<String>) -> UiError {
+pub(crate) fn resource_error(message: impl Into<String>) -> UiError {
     UiError {
         message: message.into(),
         unreachable: false,
@@ -7090,7 +7117,7 @@ mod landing_dispatch_tests {
 }
 
 #[cfg(test)]
-mod thread_landing_contract_tests {
+pub(crate) mod thread_landing_contract_tests {
     use super::*;
     use serde_json::{json, Value};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7139,7 +7166,7 @@ mod thread_landing_contract_tests {
     fn sub(channel: &str, session: &str) -> Value {
         json!({"channel_id":channel,"subject_kind":"session","subject_id":session,"mode":"deliver"})
     }
-    async fn mock(
+    pub(crate) async fn mock(
         script: Vec<(&'static str, Value)>,
     ) -> (LoomClient, tokio::task::JoinHandle<Vec<(String, Value)>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

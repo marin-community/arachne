@@ -7,6 +7,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { parse, compileScript } from "@vue/compiler-sfc";
 import { createRenderer, h, nextTick, reactive } from "vue";
+import { declaration, changeTag } from "./fixtures/durable-change.mjs";
 import { scopedId } from "../src/backendIdentity.ts";
 
 const localUrl = "http://127.0.0.1:7878";
@@ -195,6 +196,12 @@ async function mount(t, Component, initialProps, liveTurn = null, options = {}) 
       if (command === "chat_older_cursor") return null;
       if (command === "work_summary") return { files: 1, additions: 1, deletions: 0, has_commits: true };
       if (command === "topic_todos") return { todos: [], revision: 0 };
+      if (command === "change_changes") return {
+        accepted_source: false, source_ref: args.expectedChange.source_branch, head_oid: args.expectedChange.scope.head_oid,
+        base: { state: "available", reference: args.expectedChange.scope.base_oid, oid: args.expectedChange.scope.base_oid },
+        totals: { files: 0, additions: 0, deletions: 0, truncated: false }, files: [], truncated: false,
+      };
+      if (command === "land_change") return { coordinator_id: "track", coordinator_name: "Track", target_branch: "arachne/tracks/test" };
       if (command === "work_changes" && this.workChanges) return this.workChanges(args);
       if (command === "work_changes") return {
         accepted_source: args.sessionId === "track", source_ref: args.sessionId === "track" ? "arachne/tracks/test" : "weaver/" + args.sessionId,
@@ -227,6 +234,7 @@ const track = { ...session("running"), id: "track", parent_session_id: null, par
 const worker = { ...session("running"), id: "worker", parent_session_id: "track", parent_id: "track-branch",
   branch: { ...fixture.branch, id: "worker-branch", title: "Worker", branch: "weaver/worker", repo_root: "/repo", goal: "", tags: [] } };
 const fleet = [track, worker];
+const declaredWorker = (...ids) => ({ ...worker, branch: { ...worker.branch, tags: ids.map(id => changeTag(declaration(id, worker))) } });
 const hasClass = (node, name) => node.props.class?.split(" ").includes(name);
 async function openThread(t, id = "worker", sessions = fleet) {
   const mounted = await mount(t, App, {}, null, { fleet: sessions });
@@ -276,7 +284,7 @@ test("review opens the inspector and expansion/restore/close preserve mounted co
 });
 
 test("Changes menu and Landing review route to the selected worker without remounting it", async t => {
-  const { tree, calls } = await openThread(t);
+  const { tree, calls } = await openThread(t, "worker", [track, declaredWorker("first")]);
   const textarea = find(tree, n => n.type === "textarea");
   await typeDraft(tree, "Keep me");
   click(button(tree, "More code actions and checkout details")); await flush();
@@ -285,7 +293,7 @@ test("Changes menu and Landing review route to the selected worker without remou
   assert.equal(button(tree, "Review").props["aria-selected"], true);
   click(button(tree, "Landing")); await flush();
   const candidate = find(tree, n => hasClass(n, "inspector-candidate"));
-  click(button(candidate, "Review")); await flush();
+  click(button(candidate, "Select / review")); await flush();
   assert.equal(button(tree, "Review").props["aria-selected"], true);
   assert.equal(find(tree, n => n.type === "textarea"), textarea);
   assert.equal(textarea.value, "Keep me");
@@ -318,7 +326,7 @@ test("standalone review opens inspector as a worker checkout, retaining edit/sav
   assert.equal(button(tree, "Close inspector"), null);
   click(button(tree, "Review diff")); await flush();
   assert.equal(button(tree, "Review").props["aria-selected"], true);
-  assert.ok(button(tree, "Prepare landing"));
+  assert.ok(button(tree, "Launch reviewer"));
   const picker = find(tree, n => n.type === "input" && n.props["aria-label"] === "Find a checkout file");
   picker.props["onUpdate:modelValue"]("src/test.ts"); await flush();
   click(button(tree, "Edit file")); await flush();
@@ -342,7 +350,7 @@ test("delayed fleet snapshots cannot redirect the selected worker review to the 
   click(button(tree, "Review diff")); await flush();
   assert.equal(calls.filter(c => c.command === "work_changes").at(-1).args.sessionId, "worker");
   assert.ok(textOf(tree).includes("Source weaver/worker"));
-  assert.ok(button(tree, "Land"));
+  assert.equal(button(tree, "Land"), null, "unselected chat has no Land action");
   assert.equal(button(tree, "Publish"), null);
 });
 
@@ -386,7 +394,7 @@ const standalone = { ...worker, id: "standalone", parent_id: null, parent_sessio
 for (const selected of [standalone, track, worker]) test(`pre-fleet ${selected.id} review follows server comparison, then retains arriving ancestry across gaps`, async t => {
   const sessions = selected === standalone ? [standalone] : fleet;
   const { tree, bridge, calls } = await openBeforeFleet(t, selected, sessions);
-  assert.ok(button(tree, selected === track ? "Prepare publishing" : "Prepare landing"));
+  assert.ok(button(tree, selected === track ? "Prepare publishing" : "Launch reviewer"));
   assert.ok(textOf(tree).includes(selected === track ? "Source arachne/tracks/test" : "Source weaver/" + selected.id));
   assert.ok(textOf(tree).includes(selected === worker ? "Compared with arachne/tracks/test" : "Compared with main"));
   click(button(tree, "Launch reviewer")); await flush();
@@ -415,7 +423,7 @@ for (const selected of [standalone, track, worker]) test(`pre-fleet ${selected.i
     assert.equal(calls.filter(c => c.command === "work_changes").at(-1).args.sessionId, "worker");
     assert.equal(find(tree, n => hasClass(n, "canonical-policy")), null);
   }
-  if (selected === worker) { assert.ok(button(tree, "Land")); assert.equal(button(tree, "Publish"), null); }
+  if (selected === worker) { assert.equal(button(tree, "Land"), null, "unselected chat has no Land action"); assert.equal(button(tree, "Publish"), null); }
   else if (selected === track) assert.ok(button(tree, "Publish"));
   else { assert.equal(button(tree, "Publish"), null); assert.equal(find(tree, n => hasClass(n, "canonical-policy")), null); }
 });
@@ -426,13 +434,13 @@ test("unknown pre-fleet ancestry stays unclassified until the server comparison 
   let resolve;
   bridge.workChanges = () => new Promise(done => { resolve = done; });
   click(button(tree, "Review diff")); await flush();
-  assert.ok(button(tree, "Prepare changes").props.disabled);
+  assert.equal(button(tree, "Prepare changes"), null);
   assert.ok(button(tree, "Launch reviewer").props.disabled);
   assert.equal(button(tree, "Edit file"), null);
   resolve({ accepted_source: false, source_ref: "weaver/worker", base: { state: "available", reference: "arachne/tracks/test", oid: "abc123456789" },
     head_oid: "def123456789", totals: { files: 0, additions: 0, deletions: 0, truncated: false }, files: [], truncated: false });
   await flush();
-  assert.ok(button(tree, "Prepare landing"));
+  assert.ok(button(tree, "Launch reviewer"));
 });
 
 const emitFleet = (bridge, sessions) => bridge.listeners.get("loom://fleet")({ payload: {
@@ -440,7 +448,7 @@ const emitFleet = (bridge, sessions) => bridge.listeners.get("loom://fleet")({ p
 } });
 const reviewRequestText = tree => find(tree, n => n.type === "textarea" && n.props.id?.startsWith("review-request-"));
 
-test("latest Track metadata survives a selected-row gap and reviewer/preparation briefs match backend scope", async t => {
+test("latest Track metadata survives a selected-row gap and reviewer/publishing-preparation briefs match backend scope", async t => {
   const { tree, bridge, calls } = await openThread(t, "track");
   const composer = find(tree, n => n.type === "textarea");
   await typeDraft(tree, "Canonical follow-up");
@@ -476,21 +484,18 @@ test("latest Track metadata survives a selected-row gap and reviewer/preparation
   assert.equal(calls.filter(c => c.command === "open_session").length, 1);
 });
 
-for (const entry of ["direct tab", "Landing candidate", "Review diff"]) test(`${entry} review preserves expanded inspector/editor/request/composer through ancestor gaps and rearrival`, async t => {
+for (const entry of ["direct tab", "Review diff"]) test(`${entry} review preserves expanded inspector/editor/request/composer through ancestor gaps and rearrival`, async t => {
   const { tree, bridge, calls } = await openThread(t);
   await typeDraft(tree, "Composer survives ancestor gaps");
   const composer = find(tree, n => n.type === "textarea");
   const input = find(tree, n => n.type === "input" && n.props.type === "file");
   await input.props.onChange({ target: { files: [{ name: "gap.txt", size: 2, type: "text/plain", base64: "aGk=" }] } });
-  if (entry === "Landing candidate") {
-    click(button(tree, "Landing")); await flush();
-    click(button(find(tree, n => hasClass(n, "inspector-candidate")), "Review"));
-  } else click(button(tree, entry === "direct tab" ? "Review" : "Review diff"));
+  click(button(tree, entry === "direct tab" ? "Review" : "Review diff"));
   await flush();
   click(button(tree, "Expand inspector")); await flush();
   const inspector = find(tree, n => n.props.id === "topic-inspector");
   const review = find(tree, n => hasClass(n, "change-review"));
-  click(button(tree, "Prepare landing")); await flush();
+  click(button(tree, "Launch reviewer")); await flush();
   const request = reviewRequestText(tree);
   request.props["onUpdate:modelValue"](request.value + " User-specific instructions to retain."); await flush();
   const draft = request.value;
@@ -518,13 +523,13 @@ for (const entry of ["direct tab", "Landing candidate", "Review diff"]) test(`${
     assert.equal(calls.filter(c => c.command === "work_changes").at(-1).args.sessionId, "worker");
     if (!sessions.some(s => s.id === "track")) {
       assert.equal(find(tree, n => hasClass(n, "canonical-policy")), null);
-      assert.ok(button(request.parent, "Send to agent").props.disabled, "brief's missing canonical target is unverified");
-      click(button(request.parent, "Send to agent")); await flush();
+      assert.ok(button(request.parent, "Launch reviewer").props.disabled, "brief's missing canonical target is unverified");
+      click(button(request.parent, "Launch reviewer")); await flush();
       assert.equal(calls.filter(c => c.command === "send_input").length, 0);
     }
   }
   assert.equal(calls.filter(c => c.command === "read_checkout_file").length, editorReads);
-  assert.equal(button(request.parent, "Send to agent").props.disabled, false, "same verified scope restored");
+  assert.equal(button(request.parent, "Launch reviewer").props.disabled, false, "same verified scope restored");
   click(button(tree, "Save")); await flush();
   assert.equal(calls.find(c => c.command === "save_checkout_file").args.sessionId, "worker");
   assert.equal(calls.find(c => c.command === "save_checkout_file").args.content, "Unsaved editor content");
@@ -554,12 +559,12 @@ test("navigation away during an ancestor gap clears retained inspector scope and
   assert.ok(reviewRequestText(tree).value.includes("No same-repository Track is resolved"));
 });
 
-for (const arrival of ["together", "selected then ancestor"]) test(`pre-fleet worker inspector retains live state when first ancestry arrives ${arrival}`, async t => {
+for (const arrival of ["together", "selected then ancestor"]) test(`pre-fleet worker inspector retains read-only request/editor state when first ancestry arrives ${arrival}`, async t => {
   const { tree, bridge, calls } = await openBeforeFleet(t, worker, fleet);
   await typeDraft(tree, "Composer during ancestry discovery");
   const composer = find(tree, n => n.type === "textarea");
   click(button(tree, "Expand inspector")); await flush();
-  click(button(tree, "Prepare landing")); await flush();
+  click(button(tree, "Launch reviewer")); await flush();
   const request = reviewRequestText(tree);
   request.props["onUpdate:modelValue"](request.value + " Customized request to preserve."); await flush();
   const requestDraft = request.value;
@@ -591,15 +596,15 @@ for (const arrival of ["together", "selected then ancestor"]) test(`pre-fleet wo
     assert.equal(calls.filter(c => c.command === "work_changes").at(-1).args.sessionId, "worker");
     const resolved = sessions.some(s => s.id === "track");
     assert.equal(!!find(tree, n => hasClass(n, "canonical-policy")), resolved);
-    assert.equal(button(request.parent, "Send to agent").props.disabled, resolved,
+    assert.equal(button(request.parent, "Launch reviewer").props.disabled, resolved,
       "a brief prepared without a Track becomes stale only when the target is resolved");
   }
   assert.equal(calls.filter(c => c.command === "read_checkout_file").length, reads);
-  click(button(request.parent, "Send to agent")); await flush();
+  click(button(request.parent, "Launch reviewer")); await flush();
   assert.equal(calls.filter(c => c.command === "send_input").length, 0);
   click(button(tree, "Replace with current comparison")); await flush();
-  assert.ok(request.value.includes("branch arachne/tracks/test"));
-  assert.equal(button(request.parent, "Send to agent").props.disabled, false);
+  assert.ok(request.value.includes("canonical accepted branch: arachne/tracks/test"));
+  assert.equal(button(request.parent, "Launch reviewer").props.disabled, false);
   click(button(tree, "Save")); await flush();
   assert.equal(calls.find(c => c.command === "save_checkout_file").args.content, "Unsaved enrichment edit");
   assert.equal(calls.find(c => c.command === "save_checkout_file").args.sessionId, "worker");
@@ -615,7 +620,7 @@ test("source navigation retains the tab within a known Track and resets the insp
   const { tree, calls } = await openThread(t, "worker", [...fleet, sibling, otherTrack, otherWorker]);
   click(button(tree, "Review")); await flush();
   click(button(tree, "Expand inspector")); await flush();
-  click(button(tree, "Prepare landing")); await flush();
+  click(button(tree, "Launch reviewer")); await flush();
   reviewRequestText(tree).props["onUpdate:modelValue"]("Old source request"); await flush();
   const picker = find(tree, n => n.props["aria-label"] === "Find a checkout file");
   picker.props["onUpdate:modelValue"]("src/navigation.ts"); await flush();
@@ -630,8 +635,8 @@ test("source navigation retains the tab within a known Track and resets the insp
   assert.equal(picker.value, "", "new source resets its diff filter");
   assert.ok(find(tree, n => n.type === "textarea") !== oldComposer);
   assert.equal(calls.filter(c => c.command === "work_changes").at(-1).args.sessionId, "sibling");
-  click(button(tree, "Prepare landing")); await flush();
-  assert.ok(reviewRequestText(tree).value.includes("branch arachne/tracks/test"));
+  click(button(tree, "Launch reviewer")); await flush();
+  assert.ok(reviewRequestText(tree).value.includes("canonical accepted branch: arachne/tracks/test"));
   click(button(tree, "Select other-worker")); await flush();
   assert.ok(find(tree, n => n.props.id === "topic-inspector") !== inspector);
   assert.equal(button(tree, "Threads").props["aria-selected"], true);
@@ -639,15 +644,15 @@ test("source navigation retains the tab within a known Track and resets the insp
   assert.ok(textOf(find(tree, n => hasClass(n, "canonical-policy"))).includes("arachne/tracks/other"));
   click(button(tree, "Review")); await flush();
   assert.equal(calls.filter(c => c.command === "work_changes").at(-1).args.sessionId, "other-worker");
-  click(button(tree, "Prepare landing")); await flush();
-  assert.ok(reviewRequestText(tree).value.includes("branch arachne/tracks/other"));
+  click(button(tree, "Launch reviewer")); await flush();
+  assert.ok(reviewRequestText(tree).value.includes("canonical accepted branch: arachne/tracks/other"));
 });
 
 test("switching selected backends clears cached ancestry and inspector identity even when the source ID is reused", async t => {
   const { tree, bridge } = await openThread(t);
   click(button(tree, "Review")); await flush();
   click(button(tree, "Expand inspector")); await flush();
-  click(button(tree, "Prepare landing")); await flush();
+  click(button(tree, "Launch reviewer")); await flush();
   const inspector = find(tree, n => n.props.id === "topic-inspector");
   // Retain a source snapshot just before switching to a server with no summary.
   emitFleet(bridge, []); await flush();
@@ -667,8 +672,8 @@ test("switching selected backends clears cached ancestry and inspector identity 
   assert.ok(find(tree, n => n.props.id === "topic-inspector") !== inspector);
   assert.equal(reviewRequestText(tree), null);
   assert.equal(find(tree, n => hasClass(n, "canonical-policy")), null);
-  click(button(tree, "Prepare landing")); await flush();
-  assert.ok(reviewRequestText(tree).value.includes("No landing target is resolved"));
+  click(button(tree, "Launch reviewer")); await flush();
+  assert.ok(reviewRequestText(tree).value.includes("No same-repository Track is resolved"));
   emitFleet(bridge, fleet); await flush(); // The old backend remains live but cannot enrich this selection.
   assert.equal(find(tree, n => hasClass(n, "canonical-policy")), null);
   const currentInspector = find(tree, n => n.props.id === "topic-inspector");
@@ -676,7 +681,7 @@ test("switching selected backends clears cached ancestry and inspector identity 
   await flush();
   assert.ok(find(tree, n => n.props.id === "topic-inspector") === currentInspector);
   assert.ok(textOf(find(tree, n => hasClass(n, "canonical-policy"))).includes("arachne/tracks/test"));
-  assert.ok(button(reviewRequestText(tree).parent, "Send to agent").props.disabled);
+  assert.ok(button(reviewRequestText(tree).parent, "Launch reviewer").props.disabled);
 });
 
 async function registerRemote(tree, bridge, url, sessions) {
@@ -695,7 +700,7 @@ test("remote inspector comparisons, reviewer requests and expanded composer keep
   await typeDraft(tree, "Local draft");
   click(button(tree, "Review")); await flush();
   click(button(tree, "Expand inspector")); await flush();
-  click(button(tree, "Prepare landing")); await flush();
+  click(button(tree, "Launch reviewer")); await flush();
   const localComposer = find(tree, n => n.type === "textarea");
   const localInspector = find(tree, n => n.props.id === "topic-inspector");
   const localRequest = reviewRequestText(tree);
@@ -743,4 +748,66 @@ test("an unavailable selected backend hides inspector actions while another back
   assert.equal(calls.filter(c => c.command === "open_session").at(-1).args.baseUrl, localUrl);
   assert.ok(find(tree, n => n.type === "textarea"), "selected backend reconnect restores its composer");
   assert.ok(button(tree, "Expand inspector"));
+});
+
+for (const ids of [[], ["first"], ["first", "second"]]) test(`rendered Changes queue has exactly ${ids.length} explicit outputs and preserves expanded composer`, async t => {
+  const declared = declaredWorker(...ids);
+  const { tree, bridge, calls } = await openThread(t, "worker", [track, declared]);
+  await typeDraft(tree, "Keep selected output composer");
+  const composer = find(tree, n => n.type === "textarea");
+  assert.equal(button(tree, "Land"), null, "chat never lands an implicit cumulative output");
+  if (ids.length) click(button(tree, "Changes"));
+  else click(button(tree, "Landing"));
+  await flush();
+  const candidates = tree => {
+    const rows = [];
+    const visit = node => { if (hasClass(node, "inspector-candidate")) rows.push(node); node.children.forEach(visit); };
+    visit(tree); return rows;
+  };
+  assert.equal(candidates(tree).length, ids.length);
+  if (!ids.length) {
+    assert.ok(textOf(tree).includes("No declared Changes"));
+    assert.equal(button(tree, "Prepare selected Change"), null);
+    return;
+  }
+  const id = ids.at(-1), expected = declaration(id, worker);
+  assert.ok(candidates(tree).every(row => button(row, "Land").props.disabled));
+  click(button(candidates(tree).at(-1), "Select / review")); await flush();
+  click(button(tree, "Expand inspector")); await flush();
+  assert.equal(find(tree, n => n.type === "textarea"), composer);
+  assert.equal(composer.value, "Keep selected output composer");
+  assert.equal(button(tree, "Edit file"), null, "immutable Change cannot open an editor outside its scope");
+  const preview = calls.filter(c => c.command === "change_changes").at(-1);
+  assert.equal(preview.args.baseUrl, localUrl);
+  assert.equal(preview.args.sessionId, "worker");
+  assert.deepEqual(preview.args.expectedChange, expected);
+  click(button(tree, "Prepare selected Change")); await flush();
+  const request = reviewRequestText(tree);
+  assert.ok(request.value.includes(JSON.stringify(expected)));
+  click(button(request.parent, "Send to agent")); await flush();
+  const dispatched = calls.filter(c => c.command === "send_input").at(-1);
+  assert.equal(dispatched.args.id, "worker");
+  assert.equal(dispatched.args.changeId, id);
+  assert.deepEqual(dispatched.args.expectedChange, expected);
+  // A lost ancestor invalidates the selected output without broadening its preview.
+  emitFleet(bridge, [declared]); await flush();
+  assert.ok(textOf(tree).includes("no longer belongs"));
+  assert.equal(button(tree, "Edit file"), null);
+  assert.ok(button(tree, "Prepare selected Change").props.disabled);
+  assert.equal(find(tree, n => n.type === "textarea"), composer);
+  const count = calls.filter(c => c.command === "work_changes").length;
+  emitFleet(bridge, [track, declared]); await flush();
+  assert.equal(calls.filter(c => c.command === "work_changes").length, count, "recovery keeps the exact selected range");
+  assert.deepEqual(calls.filter(c => c.command === "change_changes").at(-1).args.expectedChange, expected);
+  click(button(tree, "Landing")); await flush();
+  const selectedRow = candidates(tree).at(-1);
+  assert.equal(button(selectedRow, "Land").props.disabled, false);
+  if (ids.length > 1) assert.equal(button(candidates(tree)[0], "Land").props.disabled, true);
+  click(button(selectedRow, "Land")); await flush();
+  const land = calls.find(c => c.command === "land_change");
+  assert.equal(land.args.baseUrl, localUrl);
+  assert.equal(land.args.sessionId, "worker");
+  assert.equal(land.args.changeId, id);
+  assert.deepEqual(land.args.expectedChange, expected);
+  assert.equal(find(tree, n => n.type === "textarea"), composer);
 });

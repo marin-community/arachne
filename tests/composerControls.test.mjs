@@ -172,7 +172,7 @@ async function mount(t, Component, initialProps, liveTurn = null, options = {}) 
       if (this.fetch && command === "fetch_chat") return this.fetch(args);
       if (command === "fetch_chat") return this.snapshot;
       if (command === "chat_older_cursor" || command === "work_summary") return null;
-      if (["interrupt", "send_input", "clear_attention"].includes(command)) return this.action(command, args);
+      if (["interrupt", "send_input", "clear_attention", "publish_track"].includes(command)) return this.action(command, args);
       throw new Error(`Unexpected native command: ${command}`);
     },
     async listen(_name, callback) { this.onFrame = callback; return () => {}; },
@@ -191,6 +191,47 @@ async function mount(t, Component, initialProps, liveTurn = null, options = {}) 
 function threadProps(current) {
   return { session: current, fleet: [current], topic: current, launchOptions: null, loomUrl: "http://127.0.0.1:7878", unarchiving: false };
 }
+
+test("Track publish history starts collapsed while current Publish feedback stays visible and routed", async (t) => {
+  const previous = "00b79edd72788dc38f6ae27274dd1266019c2cb5";
+  const tags = [{ key: "topic", value: "true" }, { key: "track_topic_branch", value: "weaver/workflow-2" },
+    { key: "publish_result", value: previous, note: "land-locally: published refs/heads/previous" }];
+  const current = session("running", tags);
+  const { tree, bridge, calls, errors } = await mount(t, ThreadView, threadProps(current), null, { expectedErrors: ["Selected backend unavailable"] });
+  const details = find(tree, node => node.type === "details" && textOf(node).includes("Publish details"));
+  assert.ok(details, "native details supplies keyboard-accessible disclosure semantics");
+  assert.ok(!details.props.open, "history must be collapsed by default");
+  assert.equal(textOf(find(details, node => node.type === "summary")), "Publish details");
+  assert.match(textOf(details), /Source branch: weaver\/workflow-2/);
+  assert.match(textOf(details), new RegExp(`Previous publish: ${previous}`));
+  assert.match(textOf(details), /land-locally: published refs\/heads\/previous/);
+  const visibleText = node => node.type === "details" ? textOf(find(node, child => child.type === "summary"))
+    : node.type === "#comment" ? "" : node.text + node.children.map(visibleText).join("");
+  assert.ok(!visibleText(tree).includes(previous));
+  assert.ok(!visibleText(tree).includes("weaver/workflow-2"));
+  assert.ok(!visibleText(tree).includes("published refs/heads/previous"));
+  let complete;
+  bridge.action = () => new Promise(resolve => { complete = resolve; });
+  click(button(tree, "Choose publish strategy"));
+  await flush();
+  click(button(tree, "Squash into local primary current branch"));
+  await flush();
+  assert.ok(button(tree, "…").props.disabled);
+  assert.match(visibleText(tree), /Publishing to local primary current branch…/);
+  assert.deepEqual(calls, [{ command: "publish_track", args: { sessionId: fixture.id, strategy: "land-locally", baseUrl: SERVER } }]);
+  complete({ local: true, landing: { landed: true, target_branch: "current-primary", commit: "c".repeat(40), commits_squashed: 1, primary_checkout: "/repo" } });
+  await flush();
+  assert.match(visibleText(tree), /Published locally: squash of 1 commit into current-primary/);
+  assert.ok(!details.props.open);
+  assert.deepEqual(current.branch.tags, tags, "display must not rewrite historical durable tags");
+  bridge.action = async () => { throw new Error("Selected backend unavailable"); };
+  click(button(tree, "Publish"));
+  await flush();
+  assert.deepEqual(errors, ["Selected backend unavailable"]);
+  assert.ok(!button(tree, "Publish").props.disabled);
+  assert.ok(!visibleText(tree).includes("Published locally"));
+  assert.ok(!visibleText(tree).includes(previous), "failure cannot promote historical metadata into current feedback");
+});
 
 test("working terminal composer stops once while pending, then follows live idle state", async (t) => {
   const current = session();

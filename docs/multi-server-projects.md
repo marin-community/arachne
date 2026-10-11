@@ -34,6 +34,31 @@ one entry retires only that entry's subscriptions and stale pages. Chat events
 carry `{server_url, session_id, event}`; listeners check both identities. Local
 OS and `gh` commands keep their local behavior.
 
+Explicit Change declarations, own-channel result bodies and stored acceptance
+receipts retain server-local identities. The frontend validates those exact wire
+values against the local portion of the qualified source session ID. A selected
+Change pairs a frozen declaration with its qualified UI source ID; queue and
+selection keys include backend, source and Change ID. Shared UI completion and
+receipt references use the source backend's namespace, including target session
+and completion message IDs, without changing stored evidence.
+
+`change_changes`, selected `review_session`, selected preparation and
+`land_change` route through that selected source's backend. The transport retains
+the exact declaration and strips only UI routing identifiers. Mixed-backend
+selections and canonical targets fail before dispatch. An unavailable backend
+invalidates its queue selections and cannot fall back to a healthy server with
+the same local IDs. Completed ranges can request coordinator acceptance even
+when the original source runtime is archived; they never resume it.
+
+Selected operations retain the owning client's availability and retirement lease
+through each preflight read, route update and dispatch. An outage or client
+replacement invalidates existing leases even if the URL immediately recovers;
+healthy fleet refreshes preserve them. A selected Prepare carries paired
+`changeId` and `expectedChange` into `send_input`, which independently rechecks
+its exact declaration and snapshot on one leased client before source delivery.
+Cancellation after a task or reviewer request may have reached Loom is reported
+as uncertain delivery and requires reconciliation before retrying.
+
 Connection attempts reserve a generation before network verification. Only the
 latest attempt for that URL can install a client. Fleet publication is fenced
 against client retirement and availability changes, so delayed mutation reads

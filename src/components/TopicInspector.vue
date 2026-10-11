@@ -10,7 +10,8 @@ import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import TrackActivity from "./TrackActivity.vue";
 import AutolandControl from "./AutolandControl.vue";
-import { canonicalTopicBranch, isTrackCoordinator, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
+import { canonicalTopicBranch, isTrackCoordinator, resolveTrack, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
+import { selectionKey, changeRegistry, pinSelection, sameChange, selectedChangePayload, selectionProblem, type ChangeSelection } from "../durableChange.ts";
 import { landStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import SplitButton from "./SplitButton.vue";
 import {
@@ -37,6 +38,7 @@ const props = defineProps<{
   reviewRequest?: { sessionId: string } | null;
   expanded?: boolean;
   canExpand?: boolean;
+  landingRequest?: number;
 }>();
 
 const emit = defineEmits<{
@@ -50,7 +52,7 @@ const emit = defineEmits<{
   (e: "policy-updated", session: SessionView): void;
 }>();
 
-const candidateLabels = { working: "Working", waiting: "Waiting", ready: "Reported ready", stale: "Needs recheck", conflicted: "Conflict", landed: "Landed" };
+const candidateLabels = { working: "Working output", waiting: "Declared output", blocked: "Needs reconciliation", landed: "Landed" };
 const tab = ref<"threads" | "review" | "resources" | "landing" | "todos" | "activity" | "handoffs">("threads");
 watch(() => props.artifactRequest, target => { if (target) tab.value = "resources"; }, { immediate: true });
 watch(() => props.reviewRequest, request => {
@@ -66,7 +68,23 @@ const canEdit = computed(() => {
   try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(backendOf(reviewSession.value.id) ?? "").hostname); }
   catch { return false; }
 });
-function reviewCandidate(id: string) { emit("select", id); tab.value = "review"; }
+const selectedChange = ref<ChangeSelection | null>(null);
+const selectedProblem = computed(() => {
+  const selected = selectedChange.value;
+  if (!selected) return "";
+  if (resolveTrack(props.fleet, selected.sourceId)?.id !== props.topic.id) return "The selected source no longer belongs to this same-repository Track.";
+  const candidate = candidates.value.find(candidate => candidate.key === selectionKey(selected));
+  return selectionProblem(selected, candidate?.session ?? props.fleet.find(session => session.id === selected.sourceId));
+});
+function selectCandidate(candidate: LandingCandidate) {
+  selectedChange.value = pinSelection(candidate.session.id, candidate.change);
+  emit("select", candidate.session.id);
+}
+function reviewCandidate(candidate: LandingCandidate) { selectCandidate(candidate); tab.value = "review"; }
+watch(() => props.selectedId, id => {
+  if (selectedChange.value && selectedChange.value.sourceId !== id) selectedChange.value = null;
+});
+watch(() => props.landingRequest, () => { tab.value = "landing"; }, { immediate: !!props.landingRequest });
 
 // --- Threads tab -----------------------------------------------------------
 //
@@ -91,7 +109,9 @@ function toggle(id: string) {
 }
 
 // Queue membership does not depend on the Threads tree's collapse state.
-const candidates = computed(() => topicScope.value ? landingCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id) : []);
+const candidates = computed(() => topicScope.value ? landingCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id, props.fleet) : []);
+const registryErrors = computed(() => props.fleet.filter(session => session.id !== props.topic.id && resolveTrack(props.fleet, session.id)?.id === props.topic.id)
+  .flatMap(session => changeRegistry(session).errors));
 const landOptions = landStrategies();
 
 const sessionRepo = (s: SessionSummary) => s.github_repo || s.branch.repo_root;
@@ -101,13 +121,15 @@ const integrationNote = ref("");
 // Land requests wrap-up and acceptance; only a reported outcome means completion.
 async function onLand(candidate: LandingCandidate, strategy: string) {
   if (integratingId.value) return;
-  integratingId.value = candidate.session.id;
+  const selected = selectedChange.value;
+  if (!selected || selectionKey(selected) !== candidate.key || !sameChange(selected.change, candidate.change) || selectedProblem.value || candidate.state === "blocked" || candidate.state === "landed") return;
+  integratingId.value = candidate.key;
   const topicId = props.topic.id;
   integrationNote.value = "";
   try {
     const target = await invoke<IntegrationTarget>(
-      "land_thread",
-      { sessionId: candidate.session.id, strategy },
+      "land_change",
+      { ...selectedChangePayload(selected), strategy },
     );
     try { localStorage.setItem(strategyMemoryKey("land", sessionRepo(candidate.session)), strategy); } catch { /* unavailable storage */ }
     if (props.topic.id === topicId) integrationNote.value = threadLandFeedback(target);
@@ -238,6 +260,7 @@ watch(() => topicScope.value?.id, () => {
   collapsed.value = new Set();
   void refreshTodos();
 }, { immediate: true });
+watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null; });
 </script>
 
 <template>
@@ -302,6 +325,9 @@ watch(() => topicScope.value?.id, () => {
             <span v-if="row.childCount > 0" class="badge dim" :title="`${row.childCount} delegated children`">{{ row.childCount }}</span>
           </div>
           <div class="title">{{ subtitle(row.session) }}</div>
+          <div v-if="row.session.id !== topic.id && resolveTrack(fleet, row.session.id)?.id === topic.id" @click.stop @keydown.stop>
+            <AutolandControl :session="row.session" :track="topic" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
+          </div>
         </div>
         <div v-if="!topicRows.length" class="inspector-empty">No threads in this track yet.</div>
       </div>
@@ -314,8 +340,8 @@ watch(() => topicScope.value?.id, () => {
     <!-- Resources: the topic's attached resources and refs (ResourcePanel's
          content embedded here as the tab body). -->
     <div v-else-if="tab === 'review'" class="inspector-body inspector-body-flush">
-      <div class="inspector-review-context">{{ reviewSession.branch.title || reviewSession.branch.name }}</div>
-      <ChangeReview :session-id="reviewSession.id" :is-topic="reviewSummary ? isTrackCoordinator(reviewSummary) : null" :integration-target="reviewIntegrationTarget(fleet, reviewSession.id)" :can-edit="canEdit" embedded @saved="emit('checkout-saved', reviewSession.id)" />
+      <div class="inspector-review-context">{{ selectedChange?.change.title || reviewSession.branch.title || reviewSession.branch.name }}</div>
+      <ChangeReview :session-id="selectedChange?.sourceId || reviewSession.id" :selected-change="selectedChange" :selection-error="selectedProblem" :is-topic="selectedChange ? false : reviewSummary ? isTrackCoordinator(reviewSummary) : null" :integration-target="reviewIntegrationTarget(fleet, selectedChange?.sourceId || reviewSession.id)" :can-edit="canEdit" embedded @saved="emit('checkout-saved', reviewSession.id)" />
     </div>
     <div v-else-if="tab === 'activity' && topicScope" class="inspector-body inspector-body-flush"><TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topicScope" @select="emit('select', $event)" /></div>
     <div v-else-if="tab === 'resources' && topicScope" class="inspector-body inspector-body-flush">
@@ -325,31 +351,35 @@ watch(() => topicScope.value?.id, () => {
     <!-- Landing includes active work, advisory readiness, and accepted outcomes. -->
     <div v-else-if="tab === 'landing' && topicScope" class="inspector-body">
       <div v-if="integrationNote" class="inspector-note">{{ integrationNote }}</div>
+      <div v-if="selectedProblem" class="inspector-note inspector-note-error" role="alert">{{ selectedProblem }}</div>
+      <div v-for="message in registryErrors" :key="message" class="inspector-note inspector-note-error" role="alert">{{ message }}</div>
       <div v-if="!candidates.length" class="inspector-empty">
-        No landing candidates yet.<br />
-        <small>Working and waiting threads appear here. Readiness is reported explicitly.</small>
+        No declared Changes.<br />
+        <small>Threads with no explicit outputs require no Land.</small>
       </div>
-      <div v-for="candidate in candidates" :key="candidate.session.id" class="inspector-candidate" :class="{ selected: candidate.session.id === selectedId }">
+      <div v-for="candidate in candidates" :key="candidate.key" class="inspector-candidate" :class="{ selected: selectedChange && candidate.key === selectionKey(selectedChange) }">
         <div class="inspector-candidate-head">
-          <button class="link name" :aria-pressed="candidate.session.id === selectedId" @click="emit('select', candidate.session.id)">{{ candidate.session.branch.title || candidate.session.branch.name }}</button>
+          <button class="link name" :aria-pressed="!!selectedChange && candidate.key === selectionKey(selectedChange)" @click="selectCandidate(candidate)">{{ candidate.change.title }}</button>
           <span class="badge" :class="candidate.state === 'landed' ? 'done' : 'dim'">
             {{ candidateLabels[candidate.state] }}
           </span>
         </div>
         <div class="inspector-candidate-sub">
+          {{ candidate.key }} · {{ candidate.change.scope.kind }}<br />
+          {{ candidate.change.scope.base_oid.slice(0, 10) }} → {{ candidate.change.scope.head_oid.slice(0, 10) }} · {{ candidate.change.scope.paths.length ? candidate.change.scope.paths.join(', ') : 'entire pinned range' }}<br />
           {{ candidate.note || candidate.session.branch.branch }}
         </div>
         <AutolandControl :session="candidate.session" :track="topicScope" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
         <div class="inspector-candidate-actions">
-          <button class="link" @click="reviewCandidate(candidate.session.id)">{{ candidate.state === 'stale' || candidate.state === 'conflicted' ? "Reconcile / review" : "Review" }}</button>
+          <button v-if="candidate.state !== 'landed'" class="link" :disabled="candidate.state === 'blocked'" @click="reviewCandidate(candidate)">Select / review</button>
           <SplitButton
-            v-if="candidate.state !== 'landed'"
+            v-if="candidate.state !== 'landed' && candidate.state !== 'blocked'"
             kind="land"
             :repo="sessionRepo(candidate.session)"
             :options="landOptions"
             label="Land"
-            :busy="integratingId === candidate.session.id"
-            :disabled="!!integratingId || candidate.session.status === 'archived'"
+            :busy="integratingId === candidate.key"
+            :disabled="!!integratingId || !selectedChange || candidate.key !== selectionKey(selectedChange) || !sameChange(selectedChange.change, candidate.change) || !!selectedProblem"
             @run="(strategy: string) => onLand(candidate, strategy)"
           />
         </div>

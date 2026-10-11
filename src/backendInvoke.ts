@@ -1,6 +1,7 @@
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { computed, hasInjectionContext, inject, toValue, type MaybeRefOrGetter } from "vue";
 import { scopedId, splitScopedId, scopeSession, scopeLayout } from "./backendIdentity.ts";
+import { parseChange } from "./durableChange.ts";
 import { normalizeServerUrl } from "./serverProfiles.ts";
 import type { SessionLayout, SessionView } from "./App.vue";
 
@@ -24,6 +25,9 @@ export type BackendTransport = <T>(command: string, args: Record<string, unknown
 export function resolveBackendArgs(args: Record<string, unknown>, baseUrl?: string | null): { baseUrl: string; args: Record<string, unknown> } {
   const servers = new Set<string>();
   function strip(value: unknown, key = ""): unknown {
+    // This exact declaration is authenticated by the owning server. Its local
+    // IDs must never be interpreted as shared UI references.
+    if (key === "expectedChange") return value;
     if (typeof value === "string") {
       const identity = argumentIdentityKeys.has(key) ? splitScopedId(value) : null;
       if (identity) { servers.add(identity.baseUrl); return identity.id; }
@@ -58,13 +62,16 @@ export function scopeBackendResult<T>(command: string, baseUrl: string, result: 
     return { ...reply, session: scopeSession(baseUrl, reply.session) } as T;
   }
   const scopeIds = resourceCommands.has(command) || todoCommands.has(command) || command === "track_activity";
-  if (!scopeIds && !["integrate_session", "land_thread", "land_topic", "publish_track", "send_to_thread"].includes(command)) return result;
+  if (!scopeIds && !["integrate_session", "land_thread", "land_change", "land_topic", "publish_track", "send_to_thread"].includes(command)) return result;
   const identityRows = new Set(["resources", "hidden_resources", "resource", "project", "bindings", "todos", "channels", "messages", "handoffs", "watches"]);
   function scope(value: unknown, key = "", parent?: Record<string, unknown>, identityRow = false): unknown {
     if (typeof value === "string" && value && (referenceKeys.has(key) || (scopeIds && identityRow && key === "id") || (key === "author_id" && parent?.author_kind === "session"))) return scopedId(baseUrl, value);
     if (Array.isArray(value)) return value.map(item => scope(item, key));
     if (value && typeof value === "object") {
       const record = value as Record<string, unknown>;
+      // Inline declarations and wire receipts inside activity payloads are
+      // durable evidence, not navigation references.
+      if (record.version === 1 && typeof record.source_session === "string" && record.scope && ("completion" in record)) return value;
       return Object.fromEntries(Object.entries(record).map(([k, v]) => [k, scope(v, k, record, identityRows.has(key))]));
     }
     return value;
@@ -74,6 +81,14 @@ export function scopeBackendResult<T>(command: string, baseUrl: string, result: 
 export function createBackendInvoke(transport: BackendTransport) {
   return async function invoke<T>(command: string, args: Record<string, unknown> = {}, baseUrl?: string | null): Promise<T> {
     const resolved = resolveBackendArgs(args, baseUrl);
+    if (["change_changes", "land_change", "review_session", "send_input"].includes(command)
+      && (!["review_session", "send_input"].includes(command) || args.changeId != null || args.expectedChange != null)) {
+      const selected = parseChange(args.expectedChange);
+      const sourceId = command === "review_session" ? resolved.args.sourceId : command === "send_input" ? resolved.args.id : resolved.args.sessionId;
+      if (!selected || selected.id !== args.changeId || selected.source_session !== sourceId) {
+        throw new Error("The selected Change does not match its owning source and exact wire declaration.");
+      }
+    }
     return scopeBackendResult(command, resolved.baseUrl, await transport<T>(command, resolved.args));
   };
 }

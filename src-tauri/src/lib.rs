@@ -13,6 +13,8 @@
 
 pub mod activity;
 pub mod blocks;
+pub mod change;
+pub mod change_commands;
 pub mod client;
 pub mod commands;
 pub mod coordination;
@@ -73,6 +75,8 @@ pub fn run() {
             commands::delete_group,
             commands::integrate_session,
             commands::land_thread,
+            change_commands::land_change,
+            change_commands::change_changes,
             commands::set_autoland,
             commands::land_topic,
             publishing::publish_track,

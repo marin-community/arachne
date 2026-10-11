@@ -1,3 +1,5 @@
+import { backendOf } from "./backendIdentity.ts";
+
 /** Durable Loom policy and canonical accepted refs, shared by all Track UI. */
 export interface PolicySession {
   id: string;
@@ -42,9 +44,10 @@ export function canonicalTopicBranch(session: Pick<PolicySession, "branch">): st
 export function resolveTrack<T extends PolicySession>(fleet: readonly T[], sourceId: string): T | null {
   let current = fleet.find(session => session.id === sourceId);
   const repo = current?.branch.repo_root;
+  const backend = backendOf(sourceId);
   if (!repo) return null;
   const seen = new Set<string>();
-  while (current && !seen.has(current.id)) {
+  while (current && backendOf(current.id) === backend && !seen.has(current.id)) {
     seen.add(current.id);
     if (current.branch.repo_root === repo && current.status !== "archived" && isTrackCoordinator(current)) return current;
     const parentId = current.parent_session_id;
@@ -63,7 +66,7 @@ export function threadAutoland(session: PolicySession): AutolandPolicy {
   return value === "on" || value === "off" ? value : "inherit";
 }
 export function effectiveAutoland(source: PolicySession, track: PolicySession | null): "on" | "off" {
-  if (!track || source.branch.repo_root !== track.branch.repo_root) return "off";
+  if (!track || backendOf(source.id) !== backendOf(track.id) || source.branch.repo_root !== track.branch.repo_root) return "off";
   if (source.id === track.id) return trackAutoland(track);
   const policy = threadAutoland(source);
   return policy === "inherit" ? trackAutoland(track) : policy;

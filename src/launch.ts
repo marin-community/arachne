@@ -10,7 +10,7 @@
 // default", matching loom's omitted-vs-blank distinction; the Rust command
 // filters empty strings to `None` before they reach loom.
 
-import { computed, ref, watch } from "vue";
+import { computed, ref, watch, toValue, type MaybeRefOrGetter } from "vue";
 import { backendInvoke, useBackendUrl } from "./backendInvoke.ts";
 import { normalizeServerUrl } from "./serverProfiles.ts";
 
@@ -145,8 +145,9 @@ export function saveLaunchSelection(baseUrl: string, selection: LaunchSelection)
   selections.value[url] = { ...selection };
   try { localStorage.setItem(`${SELECTION_KEY}@${url}`, JSON.stringify(selection)); } catch { /* Memory remains usable. */ }
 }
-export function useLaunchSelection() {
-  const baseUrl = useBackendUrl();
+export function useLaunchSelection(owner?: MaybeRefOrGetter<string | null | undefined>) {
+  const injectedUrl = useBackendUrl();
+  const baseUrl = computed(() => owner === undefined ? injectedUrl.value : toValue(owner));
   return computed({
     get: () => launchSelectionFor(baseUrl.value),
     set: (selection: LaunchSelection) => { if (baseUrl.value) saveLaunchSelection(baseUrl.value, selection); },

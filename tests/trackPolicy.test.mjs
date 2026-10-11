@@ -3,6 +3,7 @@ import test from "node:test";
 import { readFileSync } from "node:fs";
 import { canonicalTopicBranch, resolveTrack, effectiveAutoland, trackAutoland, threadAutoland, inferTopicBranch, topicBranchError, isValidTopicBranch, threadLandFeedback, launchTopicBranch } from "../src/trackPolicy.ts";
 import { independentReviewRequest, preparationRequest } from "../src/reviewRequest.ts";
+import { declaration } from "./fixtures/durable-change.mjs";
 
 const session = (id, parent = null, tags = [], repo = "/repo") => ({
   id, status: "running", parent_session_id: parent, parent_id: null,
@@ -31,7 +32,7 @@ test("untagged new Track resolves its durable initialization destination before 
   const track = session("new-track");
   track.branch.goal = "Implement the task.\r\nArachne canonical Track initialization required: arachne/tracks/task\r\nInitialize from the launch seed before accepting changes.";
   assert.equal(canonicalTopicBranch(track), "arachne/tracks/task");
-  for (const prompt of [independentReviewRequest("HEAD source", track), preparationRequest(false, "HEAD source", track)]) {
+  for (const prompt of [independentReviewRequest("HEAD source", track, false, declaration()), preparationRequest(false, "HEAD source", track, [], declaration())]) {
     assert.match(prompt, /arachne\/tracks\/task/);
     assert.doesNotMatch(prompt, /weaver\/new-track/);
   }
