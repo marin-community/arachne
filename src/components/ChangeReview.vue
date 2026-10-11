@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+
 import CheckoutEditor from "./CheckoutEditor.vue";
 import type { SessionSummary } from "../App.vue";
-import { launchSelection } from "../launch";
+import { useLaunchSelection } from "../launch";
 import { preparationRequest, independentReviewRequest, reviewPreviewEvidence } from "../reviewRequest";
+
+const invoke = useBackendInvoke();
 
 interface ChangeLine {
   kind: "context" | "addition" | "deletion";
@@ -38,6 +41,8 @@ interface ChangeSet {
   files: ChangeFile[];
   truncated: boolean;
 }
+
+const launchSelection = useLaunchSelection();
 
 const props = withDefaults(defineProps<{ sessionId: string; canEdit?: boolean; isTopic?: boolean; integrationTarget?: SessionSummary | null; embedded?: boolean }>(), { canEdit: false, isTopic: false, embedded: false });
 const reviewingTrack = computed(() => changes.value?.accepted_source ?? props.isTopic);

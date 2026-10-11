@@ -108,6 +108,7 @@ fn review_error(message: &str) -> UiError {
     UiError {
         message: message.into(),
         unreachable: false,
+        server_url: None,
     }
 }
 
@@ -148,6 +149,7 @@ pub struct ReviewLaunch {
 pub async fn review_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     source_id: String,
     brief: String,
     profile: Option<String>,
@@ -155,56 +157,62 @@ pub async fn review_session(
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<ReviewLaunch, UiError> {
-    if brief.trim().is_empty() {
-        return Err(UiError {
-            message: "A bounded review brief is required.".into(),
-            unreachable: false,
-        });
-    }
-    let client = state.client.read().await.clone().ok_or_else(|| UiError {
-        message: "Connect to Loom to launch a reviewer.".into(),
-        unreachable: true,
-    })?;
-    let source = client.get_session(&source_id).await?;
-    if source.id != source_id {
-        return Err(review_error(
-            "The server returned a different source; refresh before reviewing.",
-        ));
-    }
-    if source.branch.branch.is_empty() || source.branch.repo_root.is_empty() {
-        return Err(UiError {
-            message: "The candidate needs a repository and branch to review.".into(),
-            unreachable: false,
-        });
-    }
-    let comparison = resolve_review_comparison(&client, &source).await?;
-    let mut input = review_launch_input(&source, &comparison, &brief);
-    input.profile = profile.filter(|v| !v.is_empty());
-    input.agent = agent.filter(|v| !v.is_empty());
-    input.model = model.filter(|v| !v.is_empty());
-    input.effort = effort.filter(|v| !v.is_empty());
-    let mut session = client.launch(&input).await?;
-    let mut warnings = Vec::new();
-    // A tag failure cannot turn a completed launch into a retry/duplicate launch.
-    for (key, value) in [("role", "reviewer"), ("review_source", source_id.as_str())] {
-        match client
-            .set_tag(&session.id, key, value, "Independent candidate review")
-            .await
-        {
-            Ok(()) => session.branch.tags.push(crate::loom::TagView {
-                key: key.into(),
-                value: value.into(),
-                note: "Independent candidate review".into(),
-                set_at: String::new(),
-                set_by: "arachne".into(),
-            }),
-            Err(error) => warnings.push(format!(
-                "Reviewer launched, but {key} could not be recorded: {error}"
-            )),
+    async {
+        if brief.trim().is_empty() {
+            return Err(UiError {
+                message: "A bounded review brief is required.".into(),
+                unreachable: false,
+                server_url: None,
+            });
         }
+        let client = crate::commands::state_client(&state, &base_url).await?;
+        let source = client.get_session(&source_id).await?;
+        if source.id != source_id {
+            return Err(review_error(
+                "The server returned a different source; refresh before reviewing.",
+            ));
+        }
+        if source.branch.branch.is_empty() || source.branch.repo_root.is_empty() {
+            return Err(UiError {
+                message: "The candidate needs a repository and branch to review.".into(),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        let comparison = resolve_review_comparison(&client, &source).await?;
+        let mut input = review_launch_input(&source, &comparison, &brief);
+        input.profile = profile.filter(|v| !v.is_empty());
+        input.agent = agent.filter(|v| !v.is_empty());
+        input.model = model.filter(|v| !v.is_empty());
+        input.effort = effort.filter(|v| !v.is_empty());
+        let mut session = client.launch(&input).await?;
+        let mut warnings = Vec::new();
+        // A tag failure cannot turn a completed launch into a retry/duplicate launch.
+        for (key, value) in [("role", "reviewer"), ("review_source", source_id.as_str())] {
+            match client
+                .set_tag(&session.id, key, value, "Independent candidate review")
+                .await
+            {
+                Ok(()) => session.branch.tags.push(crate::loom::TagView {
+                    key: key.into(),
+                    value: value.into(),
+                    note: "Independent candidate review".into(),
+                    set_at: String::new(),
+                    set_by: "arachne".into(),
+                }),
+                Err(error) => warnings.push(format!(
+                    "Reviewer launched, but {key} could not be recorded: {error}"
+                )),
+            }
+        }
+        let _ = app.emit(
+            "loom://review-launched",
+            serde_json::json!({"server_url": client.server_url(), "session_id": session.id}),
+        );
+        Ok(ReviewLaunch { session, warnings })
     }
-    let _ = app.emit("loom://review-launched", &session.id);
-    Ok(ReviewLaunch { session, warnings })
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[cfg(test)]

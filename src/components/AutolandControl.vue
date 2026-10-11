@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+const invoke = useBackendInvoke();
 import type { SessionView } from "../App.vue";
 import { effectiveAutoland, threadAutoland, trackAutoland, type AutolandPolicy, type PolicySession } from "../trackPolicy.ts";
 

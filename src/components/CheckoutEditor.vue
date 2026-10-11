@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, nextTick, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+
 import { editorDrafts } from "../editorDrafts";
+
+const invoke = useBackendInvoke();
 
 const props = defineProps<{ sessionId: string; path: string }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "saved"): void }>();
@@ -46,6 +49,7 @@ async function load(discard = false, restore = false) {
 }
 async function save() {
   if (!dirty.value || saving.value || loading.value || !checkout.value) return;
+  const current = generation;
   saving.value = true;
   error.value = "";
   // The textarea is disabled during saving so the saved snapshot is unambiguous.
@@ -53,12 +57,13 @@ async function save() {
     ? content.value.replace(/\r?\n/g, "\r\n") : content.value;
   try {
     await invoke("save_checkout_file", { sessionId: props.sessionId, path: props.path, checkout: checkout.value, original: original.value, content: saved });
+    if (current !== generation) return;
     original.value = saved;
     content.value = saved;
     notice.value = "Saved to this checkout. Ask the agent to validate before landing or publishing.";
     remember();
     emit("saved");
-  } catch (e) { error.value = errorMessage(e); }
+  } catch (e) { if (current === generation) error.value = errorMessage(e); }
   finally { saving.value = false; await nextTick(); textarea.value?.focus(); }
 }
 function close() { remember(); emit("close"); }

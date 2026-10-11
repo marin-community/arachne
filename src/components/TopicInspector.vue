@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { backendOf } from "../backendIdentity";
+import { useBackendInvoke } from "../backendInvoke";
+
 import type { SessionSummary, SessionView } from "../App.vue";
 import ResourcePanel from "./ResourcePanel.vue";
 import type { ArtifactTarget } from "../artifactLinks";
@@ -19,6 +21,8 @@ import {
   topicThreadRows,
   threadStatus,
 } from "../topicInspector";
+
+const invoke = useBackendInvoke();
 
 // Track inspector: workers, review, and the canonical Landing queue.
 
@@ -45,7 +49,7 @@ const tab = ref<"threads" | "review" | "resources" | "landing" | "todos" | "acti
 watch(() => props.artifactRequest, target => { if (target) tab.value = "resources"; }, { immediate: true });
 const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId) ?? props.topic);
 const canEdit = computed(() => {
-  try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(props.loomUrl ?? "").hostname); }
+  try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(backendOf(reviewSession.value.id) ?? "").hostname); }
   catch { return false; }
 });
 function reviewCandidate(id: string) { emit("select", id); tab.value = "review"; }
@@ -94,6 +98,7 @@ async function onLand(candidate: LandingCandidate, strategy: string) {
     try { localStorage.setItem(strategyMemoryKey("land", sessionRepo(candidate.session)), strategy); } catch { /* unavailable storage */ }
     if (props.topic.id === topicId) integrationNote.value = threadLandFeedback(target);
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     emit("error", error?.message ?? String(error));
   } finally {
     integratingId.value = null;
@@ -134,7 +139,7 @@ async function refreshTodos() {
     if (!next || !Array.isArray(next.todos)) throw new Error("Loom returned an invalid todo list");
     todos.value = next;
   } catch (error: any) {
-    todoError.value = error?.message ?? String(error);
+    if (topicId === props.topic.id) todoError.value = error?.message ?? String(error);
   } finally {
     todosLoading.value = false;
   }
@@ -145,15 +150,18 @@ async function addTodo() {
   if (!text || todoBusy.value) return;
   todoBusy.value = true;
   todoError.value = "";
+  const topicId = props.topic.id;
   try {
     const next = await invoke<TodoTopicView>("add_todo", {
-      topicId: props.topic.id,
+      topicId,
       text,
       expectedRevision: todos.value.revision,
     });
+    if (topicId !== props.topic.id) return;
     todos.value = next;
     todoDraft.value = "";
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refreshTodos();
     todoError.value = error?.message ?? String(error);
   } finally {
@@ -165,13 +173,17 @@ async function toggleTodo(todo: TodoItem) {
   if (todoBusy.value) return;
   todoBusy.value = true;
   todoError.value = "";
+  const topicId = props.topic.id;
   try {
-    todos.value = await invoke<TodoTopicView>("toggle_todo", {
-      topicId: props.topic.id,
+    const next = await invoke<TodoTopicView>("toggle_todo", {
+      topicId,
       todoId: todo.id,
       expectedRevision: todos.value.revision,
     });
+    if (topicId !== props.topic.id) return;
+    todos.value = next;
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refreshTodos();
     todoError.value = error?.message ?? String(error);
   } finally {
@@ -183,13 +195,17 @@ async function removeTodo(todo: TodoItem) {
   if (todoBusy.value) return;
   todoBusy.value = true;
   todoError.value = "";
+  const topicId = props.topic.id;
   try {
-    todos.value = await invoke<TodoTopicView>("remove_todo", {
-      topicId: props.topic.id,
+    const next = await invoke<TodoTopicView>("remove_todo", {
+      topicId,
       todoId: todo.id,
       expectedRevision: todos.value.revision,
     });
+    if (topicId !== props.topic.id) return;
+    todos.value = next;
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refreshTodos();
     todoError.value = error?.message ?? String(error);
   } finally {

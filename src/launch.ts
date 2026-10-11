@@ -10,8 +10,9 @@
 // default", matching loom's omitted-vs-blank distinction; the Rust command
 // filters empty strings to `None` before they reach loom.
 
-import { ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { computed, ref, watch } from "vue";
+import { backendInvoke, useBackendUrl } from "./backendInvoke.ts";
+import { normalizeServerUrl } from "./serverProfiles.ts";
 
 export interface AgentChoice {
   id: string;
@@ -104,11 +105,53 @@ function loadPresets(): LaunchPreset[] {
 
 // --- Store (module singleton: app-lifetime, shared by every picker) --------
 
-export const launchAgents = ref<AgentMetadata[]>([]);
-export const launchProfiles = ref<ProfileLite[]>([]);
-export const launchDefaultAgent = ref("");
+interface LaunchConfig { agents: AgentMetadata[]; profiles: ProfileLite[]; default_agent: string }
+const catalogs = ref<Record<string, LaunchConfig>>({});
+const pending = new Map<string, Promise<void>>();
+export function launchConfigFor(baseUrl: string | null | undefined): LaunchConfig | undefined {
+  return baseUrl ? catalogs.value[normalizeServerUrl(baseUrl)] : undefined;
+}
+export function useLaunchConfig() {
+  const baseUrl = useBackendUrl();
+  const config = computed(() => launchConfigFor(baseUrl.value));
+  return {
+    launchAgents: computed(() => config.value?.agents ?? []),
+    launchProfiles: computed(() => config.value?.profiles ?? []),
+    launchDefaultAgent: computed(() => config.value?.default_agent ?? ""),
+    ensureLaunchConfig: () => ensureLaunchConfig(baseUrl.value),
+  };
+}
 export const launchSelection = ref<LaunchSelection>(loadSelection());
 export const launchPresets = ref<LaunchPreset[]>(loadPresets());
+
+const selections = ref<Record<string, LaunchSelection>>({});
+let legacySelectionUrl = "http://127.0.0.1:7878";
+try { legacySelectionUrl = normalizeServerUrl(localStorage.getItem("loomUrl") || legacySelectionUrl); } catch { /* Browser tests/storage. */ }
+export function launchSelectionFor(baseUrl: string | null | undefined): LaunchSelection {
+  if (!baseUrl) return { agent: "", model: "", effort: "" };
+  const url = normalizeServerUrl(baseUrl);
+  if (!selections.value[url]) {
+    let saved: LaunchSelection | undefined;
+    try {
+      const value = JSON.parse(localStorage.getItem(`${SELECTION_KEY}@${url}`) || "null");
+      if (value && [value.agent, value.model, value.effort].every(field => typeof field === "string")) saved = value;
+    } catch { /* Use server defaults. */ }
+    selections.value[url] = saved ?? (url === legacySelectionUrl ? { ...launchSelection.value } : { agent: "", model: "", effort: "" });
+  }
+  return selections.value[url];
+}
+export function saveLaunchSelection(baseUrl: string, selection: LaunchSelection): void {
+  const url = normalizeServerUrl(baseUrl);
+  selections.value[url] = { ...selection };
+  try { localStorage.setItem(`${SELECTION_KEY}@${url}`, JSON.stringify(selection)); } catch { /* Memory remains usable. */ }
+}
+export function useLaunchSelection() {
+  const baseUrl = useBackendUrl();
+  return computed({
+    get: () => launchSelectionFor(baseUrl.value),
+    set: (selection: LaunchSelection) => { if (baseUrl.value) saveLaunchSelection(baseUrl.value, selection); },
+  });
+}
 
 // Persist on change — this is what makes the last chosen config the default.
 watch(
@@ -126,15 +169,17 @@ watch(
 // `launch_options` command already aggregates agents.list + profiles.list).
 // Safe to call on every connect; failures (not connected yet) leave the
 // last-known list and the persisted selection in place.
-export async function ensureLaunchConfig() {
-  const cfg = await invoke<{
-    agents: AgentMetadata[];
-    profiles: ProfileLite[];
-    default_agent: string;
-  }>("launch_options");
-  launchAgents.value = cfg.agents ?? [];
-  launchProfiles.value = cfg.profiles ?? [];
-  launchDefaultAgent.value = cfg.default_agent ?? "";
+export async function ensureLaunchConfig(baseUrl?: string | null, fetchOptions = backendInvoke) {
+  if (!baseUrl) throw new Error("An explicit Loom backend URL is required for launch options.");
+  const url = normalizeServerUrl(baseUrl);
+  if (pending.has(url)) return pending.get(url);
+  const request = fetchOptions<LaunchConfig>("launch_options", {}, url).then(cfg => {
+    catalogs.value = { ...catalogs.value, [url]: {
+      agents: cfg.agents ?? [], profiles: cfg.profiles ?? [], default_agent: cfg.default_agent ?? "",
+    } };
+  }).finally(() => { pending.delete(url); });
+  pending.set(url, request);
+  return request;
 }
 
 // Save (or overwrite) a preset by name.

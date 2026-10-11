@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { scopeSession, scopedId, splitScopedId } from "../src/backendIdentity.ts";
+const SERVER = "http://127.0.0.1:7878";
 import { after, before, test } from "node:test";
 import { readFile, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -154,7 +156,7 @@ async function typeDraft(tree, value) {
   await flush();
 }
 function session(status = "running", tags = [], protocol = "terminal") {
-  return { ...fixture, status, protocol, branch: { ...fixture.branch, tags } };
+  return scopeSession(SERVER, { ...fixture, status, protocol, branch: { ...fixture.branch, tags } });
 }
 
 async function mount(t, Component, initialProps, liveTurn = null, options = {}) {
@@ -204,7 +206,7 @@ test("working terminal composer stops once while pending, then follows live idle
   assert.equal(button(tree, "Stop").props.title, "Stopping…");
   // Call the handler again to verify the in-flight guard as well as disabled UI.
   button(tree, "Stop").props.onClick();
-  assert.deepEqual(calls, [{ command: "interrupt", args: { id: current.id } }]);
+  assert.deepEqual(calls, [{ command: "interrupt", args: { id: splitScopedId(current.id).id, baseUrl: SERVER } }]);
   props.fleet = [session("running", [{ key: "idle", value: "true" }])];
   complete();
   await flush();
@@ -222,7 +224,7 @@ test("typing while working restores Send and preserves its native message wiring
   await flush();
   assert.deepEqual(calls.find(({ command }) => command === "send_input"), {
     command: "send_input",
-    args: { id: current.id, text: "Continue with the next step", topicId: current.id, resourceIds: [], attachments: [] },
+    args: { id: splitScopedId(current.id).id, text: "Continue with the next step", topicId: splitScopedId(current.id).id, resourceIds: [], attachments: [], baseUrl: SERVER },
   });
   assert.equal(calls.some(({ command }) => command === "interrupt"), false);
   assert.ok(button(tree, "Stop"), "sending clears the draft, exposing Stop while work remains active");
@@ -239,7 +241,7 @@ test("idle attention composer switches Dismiss to Send for content and tracks li
   await typeDraft(tree, "   ");
   click(button(tree, "Dismiss attention"));
   await flush();
-  assert.deepEqual(calls, [{ command: "clear_attention", args: { session: fixture.id } }]);
+  assert.deepEqual(calls, [{ command: "clear_attention", args: { session: fixture.id, baseUrl: SERVER } }]);
   props.fleet = [session("running", tags.slice(0, 1))];
   await flush();
   assert.equal(button(tree, "Dismiss attention"), null);
@@ -253,7 +255,7 @@ test("ACP composer uses live chat snapshots for Stop and returns to Send after i
   bridge.action = async () => { bridge.snapshot = { ...bridge.snapshot, live_turn: null }; };
   click(button(tree, "Stop"));
   await flush();
-  assert.deepEqual(calls[0], { command: "interrupt", args: { id: current.id } });
+  assert.deepEqual(calls[0], { command: "interrupt", args: { id: splitScopedId(current.id).id, baseUrl: SERVER } });
   assert.equal(button(tree, "Stop"), null);
   assert.equal(button(tree, "Send message").props.disabled, true);
 });
@@ -349,7 +351,7 @@ test("near-top upward scroll prefetches once with the snapshot cursor and preser
   scroll(tree, 200);
   button(tree, "load older").props.onClick(); // bypass the disabled button
   assert.equal(pageCalls(calls).length, 1);
-  assert.deepEqual(pageCalls(calls)[0].args, { id: fixture.id, beforeTurn: 9, beforeSeq: 0 });
+  assert.deepEqual(pageCalls(calls)[0].args, { id: fixture.id, beforeTurn: 9, beforeSeq: 0, baseUrl: SERVER });
   assert.equal(calls.some(({ command }) => command === "chat_older_cursor"), false, "cursor lookup cannot race or overlap paging");
   const beforeHeight = el.scrollHeight;
   pending.resolve({ ...bridge.snapshot, ...historyPage(8, cursor(7)) });
@@ -434,7 +436,7 @@ test("thread switches discard stale pages and old completion cannot unlock the n
     ? { ...bridge.snapshot, ...historyPage(20, cursor(19)) }
     : args.id === fixture.id ? old.promise : current.promise;
   scroll(tree, 200);
-  props.session = { ...props.session, id: "new-thread" };
+  props.session = { ...props.session, id: scopedId(SERVER, "new-thread") };
   await flush();
   scroll(tree, 200);
   await flush();
@@ -472,7 +474,7 @@ test("stale page failures after server changes or unmount do not emit errors or 
 });
 
 async function resync(bridge) {
-  bridge.onFrame({ payload: { topic: "connection", event: "resync" } });
+  bridge.onFrame({ payload: { server_url: SERVER, session_id: fixture.id, event: { topic: "connection", event: "resync" } } });
   await new Promise((resolve) => setTimeout(resolve, 320));
   await flush();
 }
@@ -519,7 +521,7 @@ test("latest reloads discard stale thread replies and respect scrolling during a
   bridge.fetch = () => stale.promise;
   await resync(bridge);
   bridge.fetch = () => ({ ...bridge.snapshot, ...historyPage(20) });
-  props.session = { ...props.session, id: "new-thread" };
+  props.session = { ...props.session, id: scopedId(SERVER, "new-thread") };
   await flush();
   stale.resolve({ ...bridge.snapshot, ...historyPage(12) });
   await flush();

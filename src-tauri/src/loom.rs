@@ -696,15 +696,19 @@ mod integration_prompt_tests {
             assert!(prompt.contains("authenticated actor provenance"));
             assert!(prompt.contains("user interruption"));
             assert!(prompt.contains("resumption"));
-            assert!(prompt.contains("Session-authored interruptions")
-                || prompt.contains("session-authored interruption"));
+            assert!(
+                prompt.contains("Session-authored interruptions")
+                    || prompt.contains("session-authored interruption")
+            );
         }
         let guard = super::autoland_guard();
         assert!(guard.contains("ordinary system-authored messages, never typed completion results"));
         assert!(guard.contains("do not automatically resume that child or accept its work"));
         assert!(guard.contains("older queued request or prior complete result"));
         assert!(guard.contains("appropriate authorization and fresh completion/review evidence"));
-        assert!(include_str!("../../skills/coordinator.md").contains("authenticated actor provenance"));
+        assert!(
+            include_str!("../../skills/coordinator.md").contains("authenticated actor provenance")
+        );
         assert!(include_str!("../../skills/worker.md").contains("explicit user interruption"));
     }
 

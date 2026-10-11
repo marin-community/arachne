@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as localInvoke } from "@tauri-apps/api/core";
+import { matchesChatEnvelope } from "../backendInvoke";
+import { backendOf } from "../backendIdentity";
+import { useBackendInvoke } from "../backendInvoke";
+
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-shell";
 import type { LaunchOptions, SessionSummary, SessionView } from "../App.vue";
@@ -26,6 +30,8 @@ import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
 import { isStandalone } from "../threadKind";
 import { dismissibleAttention, composerSendAsDismiss, composerSendAsStop } from "../topicInspector";
+
+const invoke = useBackendInvoke(computed(() => backendOf(props.session.id)));
 
 interface Cursor {
   turn: number;
@@ -226,7 +232,7 @@ const matchingResources = computed(() => {
 
 async function loadMentionResources() {
   const topicId = props.topic?.id;
-  if (!topicId) return;
+  if (!topicId || backendOf(topicId) !== backendOf(props.session.id)) return;
   mentionLoading.value = true;
   mentionError.value = "";
   try {
@@ -446,7 +452,7 @@ const sendingToThread = ref(false);
 const deliveryKey = ref(crypto.randomUUID());
 const destinations = computed(() =>
   props.fleet
-    .filter((s) => s.id !== props.session.id && s.status !== "archived")
+    .filter((s) => s.id !== props.session.id && s.status !== "archived" && backendOf(s.id) === backendOf(props.session.id))
     .sort((a, b) => b.last_activity_at.localeCompare(a.last_activity_at)),
 );
 
@@ -516,16 +522,18 @@ function chooseHandoffAgent() {
 async function handoff() {
   if (!handoffAllowed.value || handingOff.value) return;
   handingOff.value = true;
+  const id = props.session.id;
   try {
     await invoke("handoff_session", {
-      id: props.session.id,
+      id,
       profile: handoffProfile.value || "default",
       agent: handoffAgent.value || null,
       model: handoffModel.value.trim() || null,
       effort: handoffEffort.value || null,
     });
+    if (id !== props.session.id) return;
     showHandoff.value = false;
-    emit("handoff", props.session.id);
+    emit("handoff", id);
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   } finally {
@@ -541,13 +549,15 @@ async function sendThreadNote() {
   const note = sendNote.value.trim();
   if (!note || !sendDestination.value || sendingToThread.value) return;
   sendingToThread.value = true;
+  const id = props.session.id;
   try {
     await invoke("send_to_thread", {
-      sourceId: props.session.id,
+      sourceId: id,
       destinationId: sendDestination.value,
       note,
       idempotencyKey: deliveryKey.value,
     });
+    if (id !== props.session.id) return;
     sendNote.value = "";
     sendDestination.value = "";
     showSendToThread.value = false;
@@ -771,8 +781,11 @@ onMounted(async () => {
   if (await reload()) scrollToBottom();
   if (disposed) return;
   recomputeCorners();
+  if (disposed) return;
   const unlisten = await listen("loom://chat-event", (event) => {
-    const frame = event.payload as ChatEventFrame;
+    const envelope = event.payload as { server_url: string; session_id: string; event: ChatEventFrame };
+    if (!matchesChatEnvelope(props.session.id, envelope)) return;
+    const frame = envelope.event;
     if (frame.topic === "connection" && frame.event === "resync") { scheduleReload(); return; }
     if (
       frame.topic.startsWith("chat:") ||
@@ -958,6 +971,7 @@ const recoveredPath = ref<string | null>(null);
 async function recover() {
   if (recovering.value) return;
   recovering.value = true;
+  const id = props.session.id;
   try {
     const wt = await invoke<{ path: string; created: boolean }>(
       "recover_worktree",
@@ -966,8 +980,9 @@ async function recover() {
         branch: props.session.branch.branch,
       },
     );
+    if (id !== props.session.id) return;
     recoveredPath.value = wt.path;
-    await invoke("open_in_zed", { id: props.session.id, workDir: wt.path });
+    await invoke("open_in_zed", { id, workDir: wt.path });
   } catch (e: any) {
     emit("error", e?.message ?? String(e));
   } finally {
@@ -984,7 +999,7 @@ function openTerminal() {
   // The terminal action: shell out to macOS Terminal on the same checkout.
   // A no-op when the checkout is gone — recover first.
   if (!zedTarget.value) return;
-  invoke("open_in_terminal", { path: zedTarget.value }).catch((e: any) =>
+  localInvoke("open_in_terminal", { path: zedTarget.value }).catch((e: any) =>
     emit("error", e?.message ?? String(e)),
   );
 }
@@ -1121,7 +1136,7 @@ const landOptions = computed(() => landStrategies(workSummary.value?.has_commits
 // Local primary publishing is available only for a loopback Loom server.
 const loomIsLocal = computed(() => {
   try {
-    const host = new URL(props.loomUrl).hostname;
+    const host = new URL(backendOf(props.session.id) ?? "").hostname;
     return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(host);
   } catch {
     return false;

@@ -545,10 +545,7 @@ mod tests {
             url: None,
         };
         let resource = draft.clone().validated("/repo", "topic").unwrap();
-        assert_eq!(
-            resource.id,
-            "file:/repo:topic:scratch/notes.md"
-        );
+        assert_eq!(resource.id, "file:/repo:topic:scratch/notes.md");
         // Re-attaching the same object is idempotent — the manifest write
         // dedupes on id.
         let again = draft.clone().validated("/repo", "topic").unwrap();
@@ -859,7 +856,10 @@ mod project_tests {
         );
         assert_eq!(rows.len(), 2);
         // And the merge does not retarget anything (no file reference).
-        assert_eq!(rows[0].resource.data.repository, "/repos/marin-community/loom");
+        assert_eq!(
+            rows[0].resource.data.repository,
+            "/repos/marin-community/loom"
+        );
     }
 
     #[test]
@@ -878,7 +878,11 @@ mod project_tests {
         .unwrap();
         assert_eq!(attached.id, loom.as_topic_resource("topic").id);
         // A hide keyed by the binding key covers the inherited row.
-        let rows = merge_effective(&[loom], &topic_with(vec![], vec![&attached.binding_key()]), "topic");
+        let rows = merge_effective(
+            &[loom],
+            &topic_with(vec![], vec![&attached.binding_key()]),
+            "topic",
+        );
         assert_eq!(rows[0].hidden, true);
     }
 

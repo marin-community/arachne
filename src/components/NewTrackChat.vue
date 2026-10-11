@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, nextTick, reactive } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { resolveBackendArgs, useBackendInvoke } from "../backendInvoke";
+import { backendOf, scopedId } from "../backendIdentity";
+import type { BackendFleet } from "../backendFleet";
 import type { LaunchOptions, ResourceMention, SessionLayout, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
@@ -37,6 +39,9 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 
 const props = defineProps<{
   fleet: SessionSummary[];
+  backendUrl: string;
+  backends: BackendFleet[];
+  available: boolean;
   launching?: boolean;
   error?: string | null;
   launchOptions: LaunchOptions | null;
@@ -46,6 +51,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  (e: "backend", url: string): void;
   (e: "close"): void;
   (
     e: "launch",
@@ -54,6 +60,8 @@ const emit = defineEmits<{
     meta?: { topicBranch?: string; title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
   ): void;
 }>();
+
+const invoke = useBackendInvoke();
 
 // --- Draft state ---------------------------------------------------------------
 //
@@ -67,7 +75,7 @@ const emit = defineEmits<{
 
 // Pin persistence to the server that opened this chat, including unmount
 // during a server switch. Draft resource IDs must never move to another server.
-const draftServer = localStorage.getItem("loomUrl");
+const draftServer = props.backendUrl;
 const draftStorage = {
   getItem: (key: string) => key === "loomUrl" ? draftServer : localStorage.getItem(key),
   setItem: (key: string, value: string) => localStorage.setItem(key, value),
@@ -77,6 +85,14 @@ const draft: NewTopicDraft = reactive(readDraft(draftStorage));
 const branchError = computed(() => topicBranchError(draft.topicBranch));
 const inferredBranch = computed(() => inferTopicBranch(draft.title, draft.body || (draft.attachments[0] ? `Review ${draft.attachments[0].name}` : "")));
 defineExpose({ draftSnapshot: () => JSON.stringify(draft) });
+// Single-server drafts used raw layout/resource IDs. Qualify them once
+// using the backend whose storage namespace contained the draft.
+if (draft.project && !backendOf(draft.project.id)) draft.project.id = scopedId(draftServer, draft.project.id);
+if (draft.project && backendOf(draft.project.id) !== draftServer) draft.project = null;
+for (const mention of draft.mentions) {
+  if (!backendOf(mention.topicId)) mention.topicId = scopedId(draftServer, mention.topicId);
+}
+draft.mentions = draft.mentions.filter(mention => backendOf(mention.topicId) === draftServer);
 const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
 
 // The project picker: the layout's non-system groups, "No project" first.
@@ -92,7 +108,7 @@ watch(() => props.project, (preseed) => {
   // A preseed arriving (or changing) after the chat is open retargets the
   // picker — the sidebar's + is the user's explicit choice (App's
   // openNewTopic passes null, which correctly does nothing here).
-  if (preseed?.id) draft.project = { id: preseed.id, name: preseed.name };
+  if (preseed) draft.project = preseed.id ? { id: preseed.id, name: preseed.name } : null;
 }, { immediate: true });
 
 // The project whose id exists in the current layout — a stale draft project
@@ -104,7 +120,7 @@ const liveProject = computed(() => {
   // Unknown layout (still loading): trust the selection — the sidebar's
   // preseed came from the live layout, and the picker reconciles the name
   // once the layout arrives.
-  if (!projectChoices.value.length) return project.value;
+  if (!props.layout) return project.value;
   return projectChoices.value.some((choice) => choice.id === project.value!.id) ? project.value : null;
 });
 
@@ -120,7 +136,7 @@ if (!draft.title && !draft.topicBranch && !draft.body && !draft.attachments.leng
     const inherited = readProjectDefaults(localStorage, draft.project.id);
     if (inherited) { draft.repo = draft.repo || inherited.repo; draft.base = draft.base || inherited.base; }
   }
-  if (!draft.repo) draft.repo = recentRepositories(localStorage)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : "");
+  if (!draft.repo) draft.repo = recentRepositories(draftStorage)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : "");
 }
 // A fresh empty draft switching projects retargets repo/base to the
 // project's saved defaults; an empty project (No project) keeps them.
@@ -366,14 +382,20 @@ const projectBindingsError = ref("");
 const uncheckedBindings = ref<Set<string>>(new Set());
 
 let bindingsRequest = 0;
+let bindingsIdentity = "";
 async function loadProjectBindings() {
   const request = ++bindingsRequest;
   const projectId = project.value?.id;
   const repoInput = repo.value.trim();
-  if (!projectId || !repoInput) {
+  const identity = JSON.stringify([draftServer, projectId, repoInput]);
+  if (identity !== bindingsIdentity) {
+    bindingsIdentity = identity;
+    uncheckedBindings.value = new Set();
+  }
+  if (!props.available || !projectId || !repoInput) {
     projectBindings.value = [];
     projectBindingsLoading.value = false;
-    uncheckedBindings.value = new Set();
+    projectBindingsError.value = "";
     return;
   }
   projectBindingsLoading.value = true;
@@ -383,13 +405,15 @@ async function loadProjectBindings() {
       projectId,
       repo: repoInput,
     });
-    if (request !== bindingsRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
+    if (!props.available || request !== bindingsRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
     projectBindings.value = view.bindings ?? [];
     projectRevision.value = view.revision ?? 0;
-    // Fresh fetch, fresh defaults: everything checked (inherited).
-    uncheckedBindings.value = new Set();
+    // Recovery/retry keeps this draft's choices for surviving bindings. New
+    // resources inherit by default; only changing project/repo resets choices.
+    const bindingIds = new Set(projectBindings.value.map(binding => binding.id));
+    uncheckedBindings.value = new Set([...uncheckedBindings.value].filter(id => bindingIds.has(id)));
   } catch (error: any) {
-    if (request !== bindingsRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
+    if (!props.available || request !== bindingsRequest || projectId !== project.value?.id || repoInput !== repo.value.trim()) return;
     projectBindings.value = [];
     projectBindingsError.value = error?.message ?? String(error);
   } finally {
@@ -433,7 +457,7 @@ async function attachToProject() {
   const title = projectFormTitle.value.trim();
   const path = projectFormPath.value.trim();
   const url = projectFormUrl.value.trim();
-  if (!projectId || !repoInput || projectSaving.value || !projectAttachValid.value) return;
+  if (!props.available || !projectId || !repoInput || projectSaving.value || !projectAttachValid.value) return;
   projectSaving.value = true;
   projectBindingsError.value = "";
   try {
@@ -463,7 +487,7 @@ async function attachToProject() {
 async function removeFromProject(binding: ProjectBinding) {
   const projectId = project.value?.id;
   const repoInput = repo.value.trim();
-  if (!projectId || !repoInput || projectSaving.value) return;
+  if (!props.available || !projectId || !repoInput || projectSaving.value) return;
   projectSaving.value = true;
   projectBindingsError.value = "";
   try {
@@ -483,12 +507,12 @@ async function removeFromProject(binding: ProjectBinding) {
   }
 }
 
-// The checklist reloads when the selected project or the repo changes —
-// bindings are per-repo, so "arachne" vs "loom" carry different lists.
+// Availability is part of the read identity: an outage retires pending reads,
+// and recovery reloads even when the saved project/repository stayed the same.
 watch(
-  () => [project.value?.id, repo.value.trim()] as const,
+  () => [project.value?.id, repo.value.trim(), props.available] as const,
   () => void loadProjectBindings(),
-  { immediate: true },
+  { immediate: true, flush: "sync" },
 );
 
 // --- Chat lifecycle ---------------------------------------------------------------
@@ -506,18 +530,33 @@ onMounted(async () => {
 // loses work. App clears the snapshot after a successful launch, once
 // this hook has flushed.
 onUnmounted(() => {
+  ++bindingsRequest;
   saveDraft(draftStorage, draft);
 });
 
 function send() {
   const t = title.value.trim();
   const b = body.value.trim();
-  if ((!t && !b && !attachments.value.length) || props.launching || attachmentLoading.value || branchError.value) return;
+  if (!props.available || projectBindingsLoading.value || projectBindingsError.value || (!t && !b && !attachments.value.length) || props.launching || attachmentLoading.value || branchError.value) return;
   // The message is both the agent's initial goal and the durable branch
   // description; either alone can seed a track. The draft is not cleared
   // here: App clears it on successful launch (this view unmounts), and
   // every other exit (failure, Esc, navigation) keeps it for reopening.
-  rememberRepository(localStorage, repo.value);
+  // Binding rows use qualified UI IDs; initial hides persist as server-local keys.
+  // Validate their owners before removing the UI qualification.
+  let hiddenBindingKeys: string[] | undefined;
+  try {
+    hiddenBindingKeys = liveProject.value?.id && uncheckedBindings.value.size
+      ? resolveBackendArgs({ hiddenBindingKeys: [...uncheckedBindings.value] }, draftServer).args.hiddenBindingKeys as string[]
+      : undefined;
+  } catch (error: any) {
+    projectBindingsError.value = error?.message ?? String(error);
+    return;
+  }
+  rememberRepository(draftStorage, repo.value);
+  // Publish the exact submitted snapshot before App captures its cleanup token.
+  // Navigation can unmount this composer while the launch remains pending.
+  saveDraft(draftStorage, draft);
   emit("launch", b || t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     topicBranch: draft.topicBranch || undefined,
     title: t || undefined,
@@ -532,9 +571,7 @@ function send() {
     project: liveProject.value ?? undefined,
     // Unchecked bindings become the track's initial hides — the project's
     // binding stays attached for every other track (design.md).
-    hiddenBindingKeys: liveProject.value?.id && uncheckedBindings.value.size
-      ? [...uncheckedBindings.value]
-      : undefined,
+    hiddenBindingKeys,
   });
 }
 
@@ -583,7 +620,7 @@ function onComposerKeydown(event: KeyboardEvent) {
           <span class="ntc-title-edit" aria-hidden="true">✎</span>
         </label>
         <div class="sub">
-          {{ project ? `project ${project.name} · ` : "" }}first send launches the track
+          {{ project ? `project ${project.name} · ` : "" }}{{ backends.find(backend => backend.url === backendUrl)?.name }} · first send launches the track
         </div>
       </div>
       <button
@@ -612,6 +649,14 @@ function onComposerKeydown(event: KeyboardEvent) {
                was the ONLY way in with no project at all; the sidebar's
                per-project + preseeds it. Changing the picker swaps the
                inherited-bindings checklist below. -->
+          <label class="nts-field">
+            <span class="nts-field-name">Backend</span>
+            <select :value="backendUrl" :disabled="launching" @change="emit('backend', ($event.target as HTMLSelectElement).value)">
+              <option v-for="backend in backends" :key="backend.url" :value="backend.url">{{ backend.name }} · {{ backend.url }}{{ backend.available ? '' : ' — Unavailable' }}</option>
+            </select>
+            <span class="nts-hint">This backend owns the project, repositories and track. Each backend keeps its own draft.</span>
+            <span v-if="!available" class="nts-hint" role="status">Backend unavailable. Reconnect from the sidebar before launching.</span>
+          </label>
           <label class="nts-field ntc-project-field">
             <span class="nts-field-name">Project <em class="nts-opt">optional</em></span>
             <select :value="project?.id ?? ''" @change="project = projectChoices.find((p) => p.id === ($event.target as HTMLSelectElement).value) ?? null">
@@ -650,21 +695,25 @@ function onComposerKeydown(event: KeyboardEvent) {
                   type="button"
                   class="nts-binding-remove"
                   :aria-label="`Remove ${binding.title} from project ${project?.name}`"
-                  :disabled="projectSaving"
+                  :disabled="!available || projectSaving"
                   title="Remove from the project (existing tracks keep their own bindings)"
                   @click="removeFromProject(binding)"
                 >×</button>
               </label>
             </template>
+            <div v-else-if="!available" class="nts-project-hint">Project resources unavailable until this backend reconnects.</div>
             <div v-else-if="!projectBindingsError" class="nts-project-hint">
               No resources bound to {{ project?.name }} yet — new tracks inherit what you bind here.
             </div>
-            <div v-if="projectBindingsError" class="nts-project-hint">{{ projectBindingsError }}</div>
+            <div v-if="projectBindingsError" class="nts-project-hint">
+              {{ projectBindingsError }}
+              <button type="button" class="link" :disabled="!available || projectBindingsLoading" @click="loadProjectBindings">Retry project resources</button>
+            </div>
             <div class="nts-binding-actions">
               <button
                 type="button"
                 class="link"
-                :disabled="projectSaving"
+                :disabled="!available || projectSaving"
                 @click="showProjectAttach = !showProjectAttach"
               >{{ showProjectAttach ? "Cancel" : "+ Bind a resource to this project" }}</button>
             </div>
@@ -684,7 +733,7 @@ function onComposerKeydown(event: KeyboardEvent) {
               <label>Title <input v-model="projectFormTitle" placeholder="Design document" /></label>
               <label v-if="projectIsUrlKind">GitHub URL <input v-model="projectFormUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
               <label v-else>Path in repo <input v-model="projectFormPath" placeholder="docs/design.md" spellcheck="false" /></label>
-              <button type="button" class="primary" :disabled="projectSaving || !projectAttachValid" @click="attachToProject">Bind to project</button>
+              <button type="button" class="primary" :disabled="!available || projectSaving || !projectAttachValid" @click="attachToProject">Bind to project</button>
             </div>
           </div>
         </div>
@@ -794,7 +843,7 @@ function onComposerKeydown(event: KeyboardEvent) {
           <button
             class="composer-send"
             type="button"
-            :disabled="(!title.trim() && !body.trim() && !attachments.length) || props.launching || attachmentLoading || !!branchError"
+            :disabled="!available || projectBindingsLoading || !!projectBindingsError || (!title.trim() && !body.trim() && !attachments.length) || props.launching || attachmentLoading || !!branchError"
             :title="props.launching ? 'Launching…' : 'Send — launches the track (⌘/Ctrl + Enter)'"
             aria-label="Send and launch track"
             @click="send"

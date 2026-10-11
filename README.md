@@ -9,7 +9,7 @@ npm install
 npx tauri dev
 ```
 
-The app initially targets `http://127.0.0.1:7878`. Open the connection indicator to set a different Loom URL. A remote Loom needs a bearer token; Arachne stores it in macOS Keychain. The web preview at Vite's port 5173 does not include Tauri commands and cannot connect to Loom by itself.
+The app initially registers `http://127.0.0.1:7878`. Open the connection indicator to register other Loom backends and choose the default for new projects and ungrouped tracks. All registered backends appear together; each project belongs to the backend where it was created. A remote Loom needs a bearer token; Arachne stores a separate credential for each backend in macOS Keychain. The web preview at Vite's port 5173 does not include Tauri commands and cannot connect to Loom by itself.
 
 To run both Loom and the native app locally, clone Loom into `../loom`, install
 Node 22+, Rust, and the platform's Tauri prerequisites, then run:
@@ -31,7 +31,7 @@ On Ubuntu, the native app needs `build-essential`, `pkg-config`,
 desktop Secret Service on Linux. The launcher also recognizes project-local
 Node and WebKit prerequisites under `.local/`.
 
-For the intended DGX Spark control plane, point Arachne at `http://100.121.8.110:7878` over Tailscale after Loom is deployed there. `scripts/deploy-loom-dgx.sh` describes the manual systemd installation. The Mac connects to that one control plane rather than maintaining a second Loom database.
+For the intended DGX Spark control plane, point Arachne at `http://100.121.8.110:7878` over Tailscale after Loom is deployed there. `scripts/deploy-loom-dgx.sh` describes the manual systemd installation. Register that backend alongside a local Loom to see both fleets together.
 
 ## Launch and work on a task
 
@@ -40,7 +40,7 @@ repository/base defaults, and resource bindings. Add the resources that new
 tracks should inherit, then choose **Create project**. The pane stays open as
 Project settings for further edits; each project's **⚙** button opens it later.
 
-Use **New thread** for a one-off, or **New track** for a durable effort led by a coordinator. New track opens a chat immediately: the setup choices (title, repository, seed base, editable topic branch, inherited project resources) sit in a setup card above the chat box and disappear once the model starts — the first send delivers the message and launches the track. The chat box keeps message text, attachments, @-mentions, and the launch-config pills (profile, agent, model, effort). **Convert to track** preserves a thread's conversation and checkout. Choose a managed repository or local checkout path, base branch, agent, inference profile, model, and reasoning effort before launch. The available profiles and model names come from the connected Loom server. Loom creates the session and checkout; Arachne streams the conversation and attention state. An idle ACP thread can switch its model through Loom's handoff operation. **Send to thread** delivers a note with source provenance into another thread's durable Loom channel.
+Use **New thread** for a one-off, or **New track** for a durable effort led by a coordinator. New track opens a chat immediately: the setup choices (title, repository, seed base, editable topic branch, inherited project resources) sit in a setup card above the chat box and disappear once the model starts — the first send delivers the message and launches the track. The chat box keeps message text, attachments, @-mentions, and the launch-config pills (profile, agent, model, effort). **Convert to track** preserves a thread's conversation and checkout. Choose a managed repository or local checkout path, base branch, agent, inference profile, model, and reasoning effort before launch. Choose the backend in the new-project or new-track setup card. Its repository, profile and model choices come from that backend. Creating a track from a project heading selects the project’s backend automatically. Loom creates the session and checkout; Arachne streams the conversation and attention state. An idle ACP thread can switch its model through Loom's handoff operation. **Send to thread** delivers a note with source provenance into another thread's durable Loom channel.
 
 Type **@** in a chat to complete repository file paths, including untracked files outside the ignore rules. Before launching a track, completion uses the selected repository; for a remote Loom server it needs an existing session checkout in that repository. Use **@{** to browse attached resources instead. Pick a file with **Tab** or **Enter**; **⌘/Ctrl+Enter** sends the message and **Shift+Enter** adds a newline.
 
@@ -62,7 +62,7 @@ The **Threads** inspector shows advisory working, reviewing, ready, conflict/sta
 
 The **Activity** inspector displays Loom's existing watches, delivery subscriptions, durable messages/results, and delivery errors. It refreshes on fleet events and explicitly on demand; channel/watch-only changes need Refresh until Loom exposes those events to this client. No agent polling loop is added. Attention banners show concrete requests and link directly to the affected worker or coordinator. Hiding a banner leaves its request in Needs You.
 
-**⌘K** searches titles, descriptions, branches, repository names, and PR metadata, including archived work. **⌘N** opens a one-off thread; **⌘⇧N** a track; **⌘⇧D** delegates; **⌘⇧E** toggles the inspector; **⌘⇧H** goes home; **⌘,** opens saved Loom servers. Ctrl works in place of Cmd. Repository/base defaults and drafts are scoped by server; each server's bearer token lives in its own Keychain entry.
+**⌘K** searches titles, descriptions, branches, repository names, and PR metadata, including archived work. **⌘N** opens a one-off thread; **⌘⇧N** a track; **⌘⇧D** delegates; **⌘⇧E** toggles the inspector; **⌘⇧H** goes home; **⌘,** opens saved Loom servers. Ctrl works in place of Cmd. Repository/base defaults and drafts are scoped by backend; each backend’s bearer token lives in its own Keychain entry. A disconnected backend retains dimmed project headings with an **Unavailable** label and reconnect action, including after restart when project metadata was cached. Its tracks are omitted from actionable fleet views until recovery; other backends remain usable. Reconnecting refreshes only that backend.
 
 Codex can use an existing ChatGPT subscription login on the runner. Run `codex login` as the same OS user that runs Loom, then verify with `codex login status`. API-key routes remain available when a key is configured. Arachne's bearer token authenticates to Loom; it is separate from Codex's inference login.
 

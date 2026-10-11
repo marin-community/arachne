@@ -160,13 +160,13 @@ test('standalone artifact inspector visibility reserves the same grid column as 
   assert.match(app, /<TopicInspector v-if="inspectorVisible && inspectorTopic"/);
   const expression = app.match(/const inspectorVisible = computed\(\(\) => ([\s\S]*?)\);/)?.[1];
   assert.ok(expression);
-  const evaluate = new Function('showNewThread', 'showNewTopic', 'showProjectSheet', 'viewMode', 'inspectorTopic', 'showResources', `return (${expression});`);
+  const evaluate = new Function('showNewThread', 'showNewTopic', 'showProjectSheet', 'viewMode', 'inspectorTopic', 'showResources', 'currentAvailable', `return (${expression});`);
   const visible = (overrides: Record<string, unknown> = {}) => {
-    const state = { showNewThread: false, showNewTopic: false, showProjectSheet: false, viewMode: 'thread', inspectorTopic: { id: 'standalone' }, showResources: true, ...overrides };
+    const state = { showNewThread: false, showNewTopic: false, showProjectSheet: false, viewMode: 'thread', inspectorTopic: { id: 'standalone' }, showResources: true, currentAvailable: true, ...overrides };
     return evaluate(...Object.values(state).map(value => ({ value })));
   };
   assert.equal(visible(), true);
-  for (const override of [{ showNewThread: true }, { showNewTopic: true }, { showProjectSheet: true }, { viewMode: 'home' }, { inspectorTopic: null }, { showResources: false }]) {
+  for (const override of [{ showNewThread: true }, { showNewTopic: true }, { showProjectSheet: true }, { viewMode: 'home' }, { inspectorTopic: null }, { showResources: false }, { currentAvailable: false }]) {
     assert.equal(visible(override), false);
   }
 });

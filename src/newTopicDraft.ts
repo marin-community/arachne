@@ -188,6 +188,15 @@ export function clearDraftOnLaunch(storage: DraftStorage): void {
   clearDraft(storage);
 }
 
+/** A background launch may remove only the unchanged snapshot it submitted. */
+export function clearSubmittedDraft(storage: DraftStorage, submitted: string | null): void {
+  if (submitted === null) return;
+  try {
+    const key = draftStorageKey(storage);
+    if (storage.getItem(key) === submitted) storage.removeItem(key);
+  } catch { /* Storage unavailable; preserve the draft. */ }
+}
+
 /**
  * Whether a draft carries anything worth restoring — text, mentions, or
  * attachments. A blank draft reopening blank is indistinguishable from a

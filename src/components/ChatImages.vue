@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+
 import type { ChatDisplayBlock } from "../chatRows";
+
+const invoke = useBackendInvoke();
 
 const props = defineProps<{ block: ChatDisplayBlock; sessionId: string }>();
 

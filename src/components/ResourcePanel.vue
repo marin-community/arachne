@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+
+import { backendOf } from "../backendIdentity";
 import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
@@ -9,6 +11,8 @@ import type { ArtifactTarget } from "../artifactLinks";
 import { createArtifactPreview, type ArtifactContent } from "../artifactPreview";
 import type { SessionSummary } from "../App.vue";
 import { liveRows, mentionableRows, originLabel, prLight, prNumberFromUrl, type AttachedPrStatus, type EffectiveRow, type PanelIssue, type PanelPr } from "../resourcePanel";
+
+const invoke = useBackendInvoke(computed(() => backendOf(props.topic.id)));
 
 interface TopicResource {
   id: string;
@@ -124,9 +128,10 @@ const topicWorktree = ref(props.topic.worktree_present ? props.topic.work_dir : 
 const recoveringWorktree = ref(false);
 
 async function openTopicCheckout() {
+  const id = props.topic.id;
   try {
     if (topicWorktree.value) {
-      await invoke("open_in_zed", { id: props.topic.id });
+      await invoke("open_in_zed", { id });
       return;
     }
     recoveringWorktree.value = true;
@@ -134,8 +139,9 @@ async function openTopicCheckout() {
       repoRoot: props.topic.branch.repo_root,
       branch: props.topic.branch.branch,
     });
+    if (id !== props.topic.id) return;
     topicWorktree.value = wt.path;
-    await invoke("open_in_zed", { id: props.topic.id, workDir: wt.path });
+    await invoke("open_in_zed", { id, workDir: wt.path });
   } catch (error: any) {
     emit("error", error?.message ?? String(error));
   } finally {
@@ -214,6 +220,7 @@ async function runGhSearch() {
     ghResults.value = [];
     return;
   }
+  const topicId = props.topic.id;
   const seq = ++ghSearchSeq;
   ghSearching.value = true;
   ghError.value = "";
@@ -221,14 +228,14 @@ async function runGhSearch() {
     // Unified search: GitHub treats PRs and issues as searchable either way,
     // so one fetch covers both. The kind rides each result's URL.
     const rows = await invoke<GhSearchRow[]>("gh_search", { repo, kind: "pull_request", query });
-    if (seq === ghSearchSeq) ghResults.value = rows;
+    if (seq === ghSearchSeq && topicId === props.topic.id) ghResults.value = rows;
   } catch (error: any) {
-    if (seq === ghSearchSeq) {
+    if (seq === ghSearchSeq && topicId === props.topic.id) {
       ghResults.value = [];
       ghError.value = error?.message ?? String(error);
     }
   } finally {
-    if (seq === ghSearchSeq) ghSearching.value = false;
+    if (seq === ghSearchSeq && topicId === props.topic.id) ghSearching.value = false;
   }
 }
 
@@ -238,10 +245,11 @@ async function attachGhResult(row: GhSearchRow) {
   if (saving.value) return;
   saving.value = true;
   message.value = "";
+  const topicId = props.topic.id;
   try {
     const kind = row.url.includes("/pull/") ? "pull_request" : "issue";
     const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
-      topicId: props.topic.id,
+      topicId,
       resource: {
         kind,
         title: row.title,
@@ -252,6 +260,7 @@ async function attachGhResult(row: GhSearchRow) {
       },
       expectedRevision: snapshot.value.revision,
     });
+    if (topicId !== props.topic.id) return;
     applyEffective(next);
     const attached = next.resources.find((resource: EffectiveRow) => resource.url === row.url);
     selectedId.value = attached?.id ?? selectedId.value;
@@ -260,6 +269,7 @@ async function attachGhResult(row: GhSearchRow) {
     ghQuery.value = "";
     message.value = "Resource attached to this track.";
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     message.value = error?.message ?? String(error);
   } finally {
     saving.value = false;
@@ -283,7 +293,10 @@ function applyEffective(next: TopicEffectiveView) {
 // Failure leaves the row unlit, exactly like an unknown live state — it
 // must never block the panel.
 const attachedStatuses = ref<Record<string, AttachedPrStatus>>({});
+let statusRequest = 0;
 async function refreshAttachedStatuses(resources: TopicResource[]) {
+  const topicId = props.topic.id;
+  const request = ++statusRequest;
   const prUrls = resources
     .filter((resource) => resource.kind === "pull_request" && resource.url)
     .map((resource) => resource.url!);
@@ -298,7 +311,7 @@ async function refreshAttachedStatuses(resources: TopicResource[]) {
   );
   const next: Record<string, AttachedPrStatus> = {};
   for (const reply of replies) if (reply) next[reply[0]] = reply[1];
-  attachedStatuses.value = next;
+  if (topicId === props.topic.id && request === statusRequest) attachedStatuses.value = next;
 }
 
 /** An attached PR resource as a `PanelPr`, for `prLight`/`prTooltip`. */
@@ -381,6 +394,8 @@ watch(() => props.topic.id, () => {
   selectedId.value = null;
   editPath.value = null;
   content.value = "";
+  ghSearchSeq++; statusRequest++;
+  attachedStatuses.value = {};
   ghResults.value = [];
   ghQuery.value = "";
   ghError.value = "";
@@ -427,15 +442,21 @@ watch(repoOptions, (options) => {
   if (!formRepo.value || !options.includes(formRepo.value)) formRepo.value = options[0] ?? "";
 }, { immediate: true });
 
+let managedReposRequest = 0;
 async function loadManagedRepos() {
+  const request = ++managedReposRequest;
+  const baseUrl = backendOf(props.topic.id);
+  const current = () => request === managedReposRequest && baseUrl === backendOf(props.topic.id);
+  managedRepos.value = [];
   try {
-    const repos = await invoke<{ slug: string }[] | null>("managed_repos");
+    const repos = await invoke<{ slug: string }[] | null>("managed_repos", {}, baseUrl);
+    if (!current()) return;
     managedRepos.value = Array.isArray(repos) ? repos.map((r) => r.slug) : [];
   } catch {
-    managedRepos.value = [];
+    if (current()) managedRepos.value = [];
   }
 }
-loadManagedRepos();
+watch(() => backendOf(props.topic.id), loadManagedRepos, { immediate: true });
 
 async function attach() {
   // The GitHub picker attaches straight from a search result (attachGhResult);
@@ -447,12 +468,13 @@ async function attach() {
   saving.value = true;
   message.value = "";
   const before = new Set(snapshot.value.resources.map((resource) => resource.id));
+  const topicId = props.topic.id;
   try {
     // The draft's repository field carries the binding's own target: the
     // topic repo for files (pinned by validation) or the picked repo for
     // repository bindings (resolved to its canonical root command-side).
     const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
-      topicId: props.topic.id,
+      topicId,
       resource: formKind.value === "repository"
         ? {
             // The slug doubles as the title — the row is its repo.
@@ -473,6 +495,7 @@ async function attach() {
           },
       expectedRevision: snapshot.value.revision,
     });
+    if (topicId !== props.topic.id) return;
     applyEffective(next);
     // The attached row is the new one (upsert by id; a repository binding's
     // canonical root is resolved command-side, so diff, don't guess).
@@ -482,6 +505,7 @@ async function attach() {
     showAttach.value = false;
     message.value = "Resource attached to this track.";
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refresh();
     message.value = error?.message ?? String(error);
   } finally {
@@ -493,15 +517,19 @@ async function detach(resource: EffectiveRow) {
   if (saving.value) return;
   saving.value = true;
   message.value = "";
+  const topicId = props.topic.id;
   try {
-    applyEffective(await invoke<TopicEffectiveView>("detach_topic_resource", {
-      topicId: props.topic.id,
+    const next = await invoke<TopicEffectiveView>("detach_topic_resource", {
+      topicId,
       resourceId: resource.id,
       expectedRevision: snapshot.value.revision,
-    }));
+    });
+    if (topicId !== props.topic.id) return;
+    applyEffective(next);
     if (selectedId.value === resource.id) selectedId.value = null;
     message.value = "Attachment removed; the file was not changed.";
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refresh();
     message.value = error?.message ?? String(error);
   } finally {
@@ -515,15 +543,19 @@ async function hide(resource: EffectiveRow) {
   if (saving.value) return;
   saving.value = true;
   message.value = "";
+  const topicId = props.topic.id;
   try {
-    applyEffective(await invoke<TopicEffectiveView>("hide_topic_resource", {
-      topicId: props.topic.id,
+    const next = await invoke<TopicEffectiveView>("hide_topic_resource", {
+      topicId,
       resourceId: resource.id,
       expectedRevision: snapshot.value.revision,
-    }));
+    });
+    if (topicId !== props.topic.id) return;
+    applyEffective(next);
     if (selectedId.value === resource.id) selectedId.value = null;
     message.value = "Hidden for this track; the project binding is unchanged.";
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refresh();
     message.value = error?.message ?? String(error);
   } finally {
@@ -536,14 +568,18 @@ async function unhide(resource: EffectiveRow) {
   if (saving.value) return;
   saving.value = true;
   message.value = "";
+  const topicId = props.topic.id;
   try {
-    applyEffective(await invoke<TopicEffectiveView>("unhide_topic_resource", {
-      topicId: props.topic.id,
+    const next = await invoke<TopicEffectiveView>("unhide_topic_resource", {
+      topicId,
       resourceId: resource.id,
       expectedRevision: snapshot.value.revision,
-    }));
+    });
+    if (topicId !== props.topic.id) return;
+    applyEffective(next);
     message.value = "Restored from the project binding.";
   } catch (error: any) {
+    if (topicId !== props.topic.id) return;
     await refresh();
     message.value = error?.message ?? String(error);
   } finally {

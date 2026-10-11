@@ -19,6 +19,7 @@ fn error(message: impl Into<String>) -> UiError {
     UiError {
         message: message.into(),
         unreachable: false,
+        server_url: None,
     }
 }
 
@@ -99,15 +100,17 @@ fn canonical_source(view: &SessionView) -> Result<(String, bool), UiError> {
 #[tauri::command]
 pub async fn publish_track(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     strategy: String,
     upstream: Option<String>,
 ) -> Result<LandResult, UiError> {
-    let client = state.client.read().await.clone().ok_or_else(|| UiError {
-        message: "not connected to loom".into(),
-        unreachable: true,
-    })?;
-    publish(&client, &session_id, &strategy, upstream).await
+    async {
+        let client = crate::commands::state_client(&state, &base_url).await?;
+        publish(&client, &session_id, &strategy, upstream).await
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 async fn publish(

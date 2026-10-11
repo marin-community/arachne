@@ -1,12 +1,21 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from "vue";
+import { useBackendUrl } from "../backendInvoke";
+import { backendOf } from "../backendIdentity";
+
+import { useBackendInvoke } from "../backendInvoke";
+
 import type { LaunchOptions, ResourceMention, SessionSummary } from "../App.vue";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_BYTES, type FileAttachment } from "../attachments";
 import { pasteAsPlainText } from "../composerPaste";
 import { recentRepositories, rememberRepository } from "../launchDefaults";
-import { launchSelection } from "../launch";
+import { useLaunchSelection } from "../launch";
 import RepoBaseFields from "./RepoBaseFields.vue";
+
+const backendUrl = useBackendUrl();
+const invoke = useBackendInvoke();
+
+const launchSelection = useLaunchSelection();
 
 // The new-thread sheet: composing a thread happens in the main display
 // panel — the thread home — not in a cramped sidebar composer or a
@@ -26,6 +35,7 @@ import RepoBaseFields from "./RepoBaseFields.vue";
 const props = defineProps<{
   fleet: SessionSummary[];
   launching?: boolean;
+  available?: boolean;
   error?: string | null;
   launchOptions: LaunchOptions | null;
 }>();
@@ -41,8 +51,8 @@ const emit = defineEmits<{
 }>();
 
 const task = ref("");
-const repositorySuggestions = computed(() => [...new Set(props.fleet.map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
-const repo = ref(recentRepositories(localStorage)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : ""));
+const repositorySuggestions = computed(() => [...new Set(props.fleet.filter(s => backendOf(s.id) === backendUrl.value).map((s) => s.github_repo || s.branch.repo_root).filter(Boolean))]);
+const repo = ref(recentRepositories(localStorage, backendUrl.value)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : ""));
 const base = ref("");
 const taskEl = ref<HTMLTextAreaElement | null>(null);
 const attachments = ref<FileAttachment[]>([]);
@@ -132,12 +142,13 @@ interface TopicMentionResource {
 
 // Every top-level session is a topic whose resources can be mentioned.
 const topics = computed(() => {
-  const byId = new Map(props.fleet.map((s) => [s.id, s]));
-  const byBranch = new Map(props.fleet.map((s) => [s.branch.id, s]));
+  const byId = new Map(props.fleet.filter(s => backendOf(s.id) === backendUrl.value).map((s) => [s.id, s]));
+  const byBranch = new Map(props.fleet.filter(s => backendOf(s.id) === backendUrl.value).map((s) => [s.branch.id, s]));
   const parentOf = (s: SessionSummary) =>
     (s.parent_session_id ? byId.get(s.parent_session_id) : undefined) ??
     (s.parent_id ? byBranch.get(s.parent_id) : undefined);
   return props.fleet.filter((s) => {
+    if (backendOf(s.id) !== backendUrl.value) return false;
     const p = parentOf(s);
     return !p || p.id === s.id;
   });
@@ -157,7 +168,13 @@ const matchingResources = computed(() => {
   ).slice(0, 8);
 });
 
+let mentionRequest = 0;
+watch(backendUrl, () => {
+  mentionRequest++; mentionResources.value = []; mentions.value = [];
+  repo.value = recentRepositories(localStorage, backendUrl.value)[0] || ""; base.value = "";
+});
 async function loadMentionResources() {
+  const request = ++mentionRequest;
   mentionLoading.value = true;
   mentionError.value = "";
   try {
@@ -166,12 +183,13 @@ async function loadMentionResources() {
       // Effective rows only: hidden inherited bindings never resolve.
       return (view.resources ?? []).filter((resource) => !resource.hidden).map((resource) => ({ ...resource, topicId: id }));
     }));
+    if (request !== mentionRequest) return;
     mentionResources.value = views.flatMap((result) => result.status === "fulfilled" ? result.value : []);
     if (views.length && views.every((result) => result.status === "rejected")) {
       mentionError.value = "Could not load track resources";
     }
   } finally {
-    mentionLoading.value = false;
+    if (request === mentionRequest) mentionLoading.value = false;
   }
 }
 
@@ -219,10 +237,10 @@ function submit() {
     chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
   const t = task.value.trim();
-  if ((!t && !attachments.value.length) || props.launching || attachmentLoading.value) return;
+  if (props.available === false || (!t && !attachments.value.length) || props.launching || attachmentLoading.value) return;
   // The draft is deliberately not cleared: success unmounts the sheet
   // (App closes it), while failure keeps the text for a retry.
-  rememberRepository(localStorage, repo.value);
+  rememberRepository(localStorage, repo.value, backendUrl.value);
   emit("launch", t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     ...launchConfig(),
     base: base.value.trim() || undefined,
@@ -270,6 +288,8 @@ function onGoalKeydown(event: KeyboardEvent) {
         </button>
       </header>
 
+      <p class="nts-hint">Backend: {{ backendUrl }} · default for new threads</p>
+      <p v-if="available === false" class="nts-hint" role="status">Backend unavailable. Reconnect from the sidebar before launching.</p>
       <label class="nts-field">
         <span class="nts-field-name">Goal</span>
         <div class="nts-body-wrap">
@@ -354,7 +374,7 @@ function onGoalKeydown(event: KeyboardEvent) {
         <button @click="emit('close')">Cancel</button>
         <button
           class="primary"
-          :disabled="(!task.trim() && !attachments.length) || props.launching || attachmentLoading"
+          :disabled="available === false || (!task.trim() && !attachments.length) || props.launching || attachmentLoading"
           @click="submit"
         >
           {{ props.launching ? "Launching…" : "Launch thread" }}

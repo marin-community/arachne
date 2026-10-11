@@ -5,6 +5,7 @@ import {
   draftStorageKey,
   initializeDraftStorage,
   clearDraft,
+  clearSubmittedDraft,
   draftHasContent,
   emptyDraft,
   mergeLaunchConfig,
@@ -156,6 +157,20 @@ test("clearDraft wipes the stored payload", () => {
   saveDraft(s, { ...emptyDraft(), title: "x" });
   clearDraft(s);
   assert.deepEqual(readDraft(s), emptyDraft());
+});
+
+test("submitted draft cleanup compares exact contents and preserves newer snapshots", () => {
+  const s = store();
+  saveDraft(s, { ...emptyDraft(), body: "Submitted work" });
+  const submitted = s.getItem(DRAFT_STORAGE_KEY);
+  clearSubmittedDraft(s, null);
+  assert.equal(s.getItem(DRAFT_STORAGE_KEY), submitted);
+  saveDraft(s, { ...emptyDraft(), body: "Newer work" });
+  clearSubmittedDraft(s, submitted);
+  assert.equal(readDraft(s).body, "Newer work");
+  s.setItem(DRAFT_STORAGE_KEY, submitted);
+  clearSubmittedDraft(s, submitted);
+  assert.equal(s.getItem(DRAFT_STORAGE_KEY), null);
 });
 
 

@@ -1,7 +1,13 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted, useId } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendUrl } from "../backendInvoke";
+
+import { useBackendInvoke } from "../backendInvoke";
+
 import { recentRepositories, rememberRepository } from "../launchDefaults";
+
+const backendUrl = useBackendUrl();
+const invoke = useBackendInvoke();
 
 // The launch sheets' Repository + Base pair. Repository is half the row;
 // Base is the other half — a combobox populated with the chosen repo's
@@ -32,19 +38,24 @@ interface RepoBranch {
 }
 
 const pickerId = useId();
-const recentRepos = ref(recentRepositories(localStorage));
+const recentRepos = ref(recentRepositories(localStorage, backendUrl.value));
 const managedRepos = ref<string[]>([]);
-onMounted(async () => {
+let repoRequest = 0;
+watch(backendUrl, async () => {
+  const request = ++repoRequest;
+  managedRepos.value = [];
+  recentRepos.value = recentRepositories(localStorage, backendUrl.value);
   try {
     const rows = await invoke<{ slug: string; path: string }[]>("list_repos");
+    if (request !== repoRequest) return;
     managedRepos.value = (rows ?? []).flatMap((row) => [row.slug, row.path]).filter(Boolean);
     if (!props.repo && rows?.length === 1) emit("update:repo", rows[0].slug || rows[0].path);
   } catch { /* Typed paths and fleet suggestions still work offline. */ }
-});
+}, { immediate: true });
 const repoSuggestions = computed(() => [...new Set([...managedRepos.value, ...(props.repositories ?? []), ...recentRepos.value])].filter(Boolean));
 function rememberRepo() {
-  rememberRepository(localStorage, props.repo);
-  recentRepos.value = recentRepositories(localStorage);
+  rememberRepository(localStorage, props.repo, backendUrl.value);
+  recentRepos.value = recentRepositories(localStorage, backendUrl.value);
 }
 function editRepo(event: Event) {
   emit("update:base", "");
@@ -95,7 +106,7 @@ async function loadBranches() {
 // open so a fast typist doesn't fire a request per character.
 let loadTimer: ReturnType<typeof setTimeout> | null = null;
 watch(
-  () => props.repo,
+  () => [props.repo, backendUrl.value] as const,
   () => {
     branchRequest++;
     branches.value = [];
@@ -162,7 +173,7 @@ function setBase(name: string) {
   const repo = props.repo.trim();
   if (repo) {
     try {
-      localStorage.setItem(`arachne.base.${repo}`, name);
+      localStorage.setItem(`arachne.base.${repo}@${backendUrl.value}`, name);
     } catch {
       // Private mode / storage disabled — a default is a nicety, not a gate.
     }
@@ -180,11 +191,11 @@ function choose(entry: { branch: RepoBranch }) {
 // set (or on mount: a freshly opened sheet picks up the last branch
 // chosen for its repo).
 watch(
-  () => props.repo,
-  (repo) => {
+  () => [props.repo, backendUrl.value] as const,
+  ([repo]) => {
     if (!props.base && repo) {
       try {
-        const remembered = localStorage.getItem(`arachne.base.${repo.trim()}`);
+        const remembered = localStorage.getItem(`arachne.base.${repo.trim()}@${backendUrl.value}`);
         if (remembered) emit("update:base", remembered);
       } catch {
         /* storage unavailable */

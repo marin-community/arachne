@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { scopedId } from '../src/backendIdentity.ts';
+const SERVER = 'http://127.0.0.1:7878';
 import { readFile, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -73,18 +75,18 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const session = (id, project = 'alpha') => ({
-  id, status: 'idle', parent_id: null, parent_session_id: null,
-  last_activity_at: '2026-10-10T00:00:00Z', placement: { group_id: project },
-  branch: { id: `branch-${id}`, title: `Track ${id}`, name: id, tags: [] },
+  id: scopedId(SERVER, id), status: 'idle', parent_id: null, parent_session_id: null,
+  last_activity_at: '2026-10-10T00:00:00Z', placement: { group_id: scopedId(SERVER, project) },
+  branch: { id: scopedId(SERVER, `branch-${id}`), title: `Track ${id}`, name: id, tags: [] },
 });
 const todo = (id, topic_id = 'a') => ({ id, topic_id, text: `Todo ${id}`, revision: 1 });
 const empty = () => ({ todos: [], warnings: [] });
 const layout = { spaces: [{ rank: 0, groups: [
-  { id: 'alpha', name: 'Alpha', rank: 0 },
-  { id: 'beta', name: 'Beta', rank: 1 },
+  { id: scopedId(SERVER, 'alpha'), name: 'Alpha', rank: 0 },
+  { id: scopedId(SERVER, 'beta'), name: 'Beta', rank: 1 },
 ] }] };
 
-function mount(t, overrides = {}) {
+async function mount(t, overrides = {}) {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const requests = [];
   globalThis.homeTodosListeners = new Map();
@@ -94,13 +96,15 @@ function mount(t, overrides = {}) {
     requests.push({ ...request, args });
     return request.promise;
   };
-  const props = reactive({ fleet: [session('a')], layout, project: { id: 'alpha', name: 'Alpha' }, ...overrides });
+  const props = reactive({ fleet: [session('a')], layout, project: { id: scopedId(SERVER, 'alpha'), name: 'Alpha' }, ...overrides });
   const root = { children: [] };
   const app = renderer.createApp({ render: () => h(HomeView, props) });
+  app.provide("backendUrl", SERVER);
   app.mount(root);
   t.after(() => app.unmount());
   const fleetEvent = () => globalThis.homeTodosListeners.get('loom://fleet')({ payload: {} });
   const tick = async () => { t.mock.timers.tick(600); await flush(); };
+  await flush();
   return { root, app, props, requests, fleetEvent, tick };
 }
 
@@ -115,7 +119,7 @@ function assertUnsettled(root) {
 }
 
 test('settled empty inbox nodes survive repeated fleet refreshes and queued pending requests', async t => {
-  const { root, props, requests, fleetEvent, tick } = mount(t);
+  const { root, props, requests, fleetEvent, tick } = await mount(t);
   await flush();
   assert.equal(requests.length, 1);
   assertUnsettled(root);
@@ -151,16 +155,16 @@ test('settled empty inbox nodes survive repeated fleet refreshes and queued pend
 });
 
 test('background results show added and removed Todos, retain rows while pending, and surface failures', async t => {
-  const { root, props, requests, fleetEvent, tick } = mount(t);
+  const { root, props, requests, fleetEvent, tick } = await mount(t);
   requests[0].resolve(empty());
   await flush();
   fleetEvent();
   await tick();
   assertEmpty(root);
-  requests[1].resolve({ todos: [todo('review')], warnings: ['Partial Todo results'] });
+  requests[1].resolve({ todos: [todo('review')], warnings: ["Partial Todo results"] });
   await flush();
   assert.ok(textNode(root, 'Todo review'));
-  assert.equal(textNode(root, 'Partial Todo results').props.role, 'alert');
+  assert.equal(textNode(root, `${SERVER}: Partial Todo results`).props.role, 'alert');
   assert.equal(textNode(root, 'Nothing needs you.'), undefined);
   assert.equal(textNode(root, 'No open user Todos.'), undefined);
   fleetEvent();
@@ -169,15 +173,15 @@ test('background results show added and removed Todos, retain rows while pending
   requests[2].reject(new Error('Loom unavailable'));
   await flush();
   assert.ok(textNode(root, 'Todo review'));
-  assert.equal(textNode(root, 'Could not load user Todos: Loom unavailable').props.role, 'alert');
+  assert.equal(textNode(root, `${SERVER}: Could not load user Todos: Loom unavailable`).props.role, 'alert');
   textNode(root, 'Refresh').props.onClick();
   await flush();
-  assert.ok(textNode(root, 'Could not load user Todos: Loom unavailable'));
+  assert.ok(textNode(root, `${SERVER}: Could not load user Todos: Loom unavailable`));
   requests[3].resolve(empty());
   await flush();
   assertEmpty(root);
   assert.equal(textNode(root, 'Todo review'), undefined);
-  assert.equal(textNode(root, 'Could not load user Todos: Loom unavailable'), undefined);
+  assert.equal(textNode(root, `${SERVER}: Could not load user Todos: Loom unavailable`), undefined);
   props.fleet = [{ ...session('a'), branch: { ...session('a').branch, tags: [{ key: 'attention', value: 'attention', note: 'Please decide' }] } }];
   await flush();
   assert.ok(textNode(root, 'Please decide'));
@@ -186,15 +190,15 @@ test('background results show added and removed Todos, retain rows while pending
 });
 
 test('an initial failure is visible and a manual retry can settle empty', async t => {
-  const { root, requests } = mount(t);
+  const { root, requests } = await mount(t);
   requests[0].reject(new Error('Initial load failed'));
   await flush();
-  assert.equal(textNode(root, 'Could not load user Todos: Initial load failed').props.role, 'alert');
+  assert.equal(textNode(root, `${SERVER}: Could not load user Todos: Initial load failed`).props.role, 'alert');
   assert.equal(textNode(root, 'Nothing needs you.'), undefined);
   assert.equal(textNode(root, 'No open user Todos.'), undefined);
   textNode(root, 'Refresh').props.onClick();
   await flush();
-  assert.ok(textNode(root, 'Could not load user Todos: Initial load failed'));
+  assert.ok(textNode(root, `${SERVER}: Could not load user Todos: Initial load failed`));
   requests[1].resolve(empty());
   await flush();
   assertEmpty(root);
@@ -202,12 +206,12 @@ test('an initial failure is visible and a manual retry can settle empty', async 
 
 for (const staleResult of ['success', 'failure']) {
   test(`scope change clears previous data and ignores a late ${staleResult}`, async t => {
-    const { root, props, requests, fleetEvent, tick } = mount(t, { fleet: [session('a'), session('b', 'beta')] });
+    const { root, props, requests, fleetEvent, tick } = await mount(t, { fleet: [session('a'), session('b', 'beta')] });
     requests[0].resolve({ todos: [todo('old')], warnings: ['Old scope warning'] });
     await flush();
     fleetEvent();
     await tick();
-    props.project = { id: 'beta', name: 'Beta' };
+    props.project = { id: scopedId(SERVER, 'beta'), name: 'Beta' };
     await flush();
     assertUnsettled(root);
     assert.equal(textNode(root, 'Todo old'), undefined);
@@ -229,11 +233,11 @@ for (const staleResult of ['success', 'failure']) {
 }
 
 test('scope identity changes reload even when both projects have no topics', async t => {
-  const { root, props, requests, tick } = mount(t, { fleet: [] });
+  const { root, props, requests, tick } = await mount(t, { fleet: [] });
   requests[0].resolve(empty());
   await flush();
   assertEmpty(root);
-  props.project = { id: 'beta', name: 'Beta' };
+  props.project = { id: scopedId(SERVER, 'beta'), name: 'Beta' };
   await flush();
   assertUnsettled(root);
   await tick();
@@ -244,7 +248,7 @@ test('scope identity changes reload even when both projects have no topics', asy
 });
 
 test('new topic membership unsettles the current project until its Todos load', async t => {
-  const { root, props, requests, tick } = mount(t);
+  const { root, props, requests, tick } = await mount(t);
   requests[0].resolve(empty());
   await flush();
   props.fleet = [session('a'), session('new')];

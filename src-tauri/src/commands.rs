@@ -1,14 +1,14 @@
 //! Arachne's Tauri commands: the bridge between the Vue UI and the Loom client.
 //!
-//! All state lives in `tauri::State<LoomState>` — the client, the SSE
-//! subscriptions, and the open-session id. The UI drives everything through
+//! `tauri::State<LoomState>` holds a normalized server URL registry. Each
+//! server owns its client, SSE subscriptions, and selected-session lifecycle. The UI drives everything through
 //! these commands plus the `loom://*` emits for pushed frames.
 //!
 //! Subscription lifecycle is the part worth being careful with: each open
 //! session owns a chat forwarder, and a connect owns the fleet poller. Both
 //! run in spawned tasks that watch a cancellation token; `open_session`
 //! cancels the previous forwarder before starting the new one, and
-//! `connect` cancels the old poller. Without that, every session switch or
+//! `connect` cancels only that server's old poller. Without that, every session switch or
 //! reconnect leaks another SSE connection (and another duplicate event
 //! stream into the webview) — the browser's connection cap is exactly why
 //! loom multiplexes, and Arachne must not undo it from the other end.
@@ -33,24 +33,26 @@ use crate::resources::{
 
 #[derive(Default)]
 pub struct LoomState {
-    pub client: tokio::sync::RwLock<Option<Arc<LoomClient>>>,
-    open_generation: std::sync::atomic::AtomicU64,
-    /// Cancels the current fleet poller so a reconnect can replace it.
-    fleet_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
-    /// Cancels the open session's chat forwarder so a switch can replace it.
-    chat_cancel: tokio::sync::RwLock<Option<CancellationToken>>,
-    /// The open session's next-older cursor from the last fetch_chat —
-    /// `None` once history is exhausted.
-    older_cursor: tokio::sync::RwLock<Option<crate::loom::ChatCursorView>>,
+    pub servers: crate::routing::ServerRegistry,
 }
 
-/// The open session's older cursor, for the UI's "load older" button.
-/// `None` means history is exhausted (or no session open).
+/// Read the cursor for this server's selected session. Raw IDs never cross servers.
 #[tauri::command]
 pub async fn chat_older_cursor(
     state: State<'_, LoomState>,
+    base_url: String,
+    id: String,
 ) -> Result<Option<crate::loom::ChatCursorView>, UiError> {
-    Ok(state.older_cursor.read().await.clone())
+    async {
+        state
+            .servers
+            .resolve(&base_url)
+            .await?
+            .older_cursor(&id)
+            .map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// `fetch_chat`'s reply: the journal page plus the live-turn signals the
@@ -108,6 +110,18 @@ pub struct FleetSnapshot {
 pub struct UiError {
     pub message: String,
     pub unreachable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+}
+
+impl UiError {
+    pub(crate) fn for_server(mut self, base_url: &str) -> Self {
+        self.server_url = Some(
+            crate::routing::normalize_server_url(base_url)
+                .unwrap_or_else(|_| base_url.trim().to_owned()),
+        );
+        self
+    }
 }
 
 impl From<LoomError> for UiError {
@@ -116,15 +130,16 @@ impl From<LoomError> for UiError {
         UiError {
             message: e.to_string(),
             unreachable,
+            server_url: None,
         }
     }
 }
 
-async fn state_client(state: &LoomState) -> Result<Arc<LoomClient>, UiError> {
-    state.client.read().await.clone().ok_or_else(|| UiError {
-        message: "not connected to loom".into(),
-        unreachable: true,
-    })
+pub(crate) async fn state_client(
+    state: &LoomState,
+    base_url: &str,
+) -> Result<Arc<LoomClient>, UiError> {
+    Ok(state.servers.resolve(base_url).await?.client.clone())
 }
 
 /// Persist the loom bearer token to the macOS Keychain. An empty token
@@ -136,10 +151,12 @@ pub async fn save_token(base_url: String, token: String) -> Result<(), UiError> 
         .map_err(|e| UiError {
             message: format!("saving token: {e}"),
             unreachable: false,
+            server_url: None,
         })?
         .map_err(|e| UiError {
             message: e,
             unreachable: false,
+            server_url: None,
         })
 }
 
@@ -156,10 +173,12 @@ pub async fn load_token(
     .map_err(|e| UiError {
         message: format!("loading token: {e}"),
         unreachable: false,
+        server_url: None,
     })?
     .map_err(|e| UiError {
         message: e,
         unreachable: false,
+        server_url: None,
     })
 }
 
@@ -173,49 +192,58 @@ pub async fn connect(
     base_url: String,
     token: Option<String>,
 ) -> Result<(), UiError> {
-    let client = Arc::new(LoomClient::new(&base_url, token)?);
+    async {
+        let (entry, initial) = prepare_connection(&state.servers, &base_url, token).await?;
+        spawn_fleet_poller(app, entry, initial);
+        Ok(())
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
+}
+
+/// The reservation precedes all I/O, including public health verification.
+async fn prepare_connection(
+    registry: &crate::routing::ServerRegistry,
+    base_url: &str,
+    token: Option<String>,
+) -> Result<(Arc<crate::routing::ServerEntry>, FleetSnapshot), LoomError> {
+    let reservation = registry.reserve_connect(base_url).await?;
+    let client = Arc::new(LoomClient::new(base_url, token)?);
     client.health().await?;
-    // Health is public; prove the supplied credential can read the fleet
-    // before showing a green connection indicator.
-    client.list_sessions().await?;
-    client.session_layout().await?;
-
-    state
-        .open_generation
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    // Replace any previous fleet poller (reconnect to a different loom).
-    if let Some(old) = state.fleet_cancel.write().await.take() {
-        old.cancel();
-    }
-    // A reconnect invalidates the open session's chat forwarder too — its
-    // subscriptions belong to the old client.
-    if let Some(old) = state.chat_cancel.write().await.take() {
-        old.cancel();
-    }
-    *state.client.write().await = Some(client.clone());
-
-    let cancel = CancellationToken::new();
-    *state.fleet_cancel.write().await = Some(cancel.clone());
-    spawn_fleet_poller(app, client, cancel);
-    Ok(())
+    // Health is public; prove the supplied credential can read the fleet.
+    let initial = fetch_fleet_snapshot(&client).await?;
+    let entry = registry.install(reservation, client).await?;
+    Ok((entry, initial))
 }
 
 #[tauri::command]
-pub async fn launch_options(state: State<'_, LoomState>) -> Result<LaunchOptionsView, UiError> {
-    let client = state_client(&state).await?;
-    client.launch_options().await.map_err(Into::into)
+pub async fn launch_options(
+    state: State<'_, LoomState>,
+    base_url: String,
+) -> Result<LaunchOptionsView, UiError> {
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client.launch_options().await.map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Managed repositories on the currently connected Loom server.
 #[tauri::command]
 pub async fn list_repos(
     state: State<'_, LoomState>,
+    base_url: String,
 ) -> Result<Vec<crate::loom::RepoView>, UiError> {
-    state_client(&state)
-        .await?
-        .list_repos()
-        .await
-        .map_err(Into::into)
+    async {
+        state_client(&state, &base_url)
+            .await?
+            .list_repos()
+            .await
+            .map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// `repos.branches` for the launch sheet's Base picker: the local git
@@ -226,21 +254,26 @@ pub async fn list_repos(
 #[tauri::command]
 pub async fn repo_branches(
     state: State<'_, LoomState>,
+    base_url: String,
     repo: String,
 ) -> Result<Vec<crate::loom::RepoBranchView>, UiError> {
-    let client = state_client(&state).await?;
-    let slug = repo.trim();
-    let cwd = match client.list_repos().await {
-        Ok(repos) => match repos.iter().find(|r| r.slug == slug) {
-            Some(managed) => managed.path.clone(),
-            None => slug.to_string(),
-        },
-        // The allowlist lookup is a convenience, not a gate: a path (or an
-        // unlisted slug) still gets handed to loom, which reports the real
-        // error if nothing resolves.
-        Err(_) => slug.to_string(),
-    };
-    client.repo_branches(&cwd).await.map_err(Into::into)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let slug = repo.trim();
+        let cwd = match client.list_repos().await {
+            Ok(repos) => match repos.iter().find(|r| r.slug == slug) {
+                Some(managed) => managed.path.clone(),
+                None => slug.to_string(),
+            },
+            // The allowlist lookup is a convenience, not a gate: a path (or an
+            // unlisted slug) still gets handed to loom, which reports the real
+            // error if nothing resolves.
+            Err(_) => slug.to_string(),
+        };
+        client.repo_branches(&cwd).await.map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Change the runtime selection of an idle ACP session. The Loom server
@@ -248,144 +281,321 @@ pub async fn repo_branches(
 #[tauri::command]
 pub async fn handoff_session(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     profile: String,
     agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<SessionView, UiError> {
-    let client = state_client(&state).await?;
-    client
-        .handoff_session(
-            &id,
-            &profile,
-            agent.as_deref(),
-            model.as_deref(),
-            effort.as_deref(),
-        )
-        .await
-        .map_err(Into::into)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client
+            .handoff_session(
+                &id,
+                &profile,
+                agent.as_deref(),
+                model.as_deref(),
+                effort.as_deref(),
+            )
+            .await
+            .map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
-fn emit_connection_error(
-    app: &AppHandle,
-    client: &LoomClient,
-    error: LoomError,
-) -> Result<(), tauri::Error> {
-    let error = UiError::from(error);
-    app.emit("loom://error", serde_json::json!({"message": error.message, "unreachable": error.unreachable, "server_url": client.server_url()}))
+fn fleet_error_payload(client: &LoomClient, error: UiError) -> serde_json::Value {
+    serde_json::json!({
+        "message": error.message,
+        "unreachable": error.unreachable,
+        "server_url": client.server_url(),
+        "unavailable": true,
+    })
 }
 
-/// Fetch summaries + layout together and push them as a fleet snapshot.
-async fn emit_fleet(
-    app: &AppHandle,
+fn transport_error(frame: &crate::loom::EventFrame) -> Option<UiError> {
+    (frame.topic == "connection" && frame.event == "unavailable").then(|| UiError {
+        message: frame.data["message"]
+            .as_str()
+            .unwrap_or("event stream unavailable")
+            .to_owned(),
+        unreachable: frame.data["unreachable"].as_bool().unwrap_or(true),
+        server_url: None,
+    })
+}
+
+/// Best-effort mutation refreshes use the captured client's entry, never a
+/// replacement client. Retirement cancels I/O and serializes the final emit.
+async fn refresh_mutated_fleet(
+    registry: &crate::routing::ServerRegistry,
     client: &Arc<LoomClient>,
-    mut sessions: Vec<SessionSummaryView>,
+    emit: impl FnOnce(FleetUpdate),
 ) {
-    let layout = match client.session_layout().await {
-        Ok(l) => l,
-        Err(e) => {
-            let _ = emit_connection_error(&app, &client, e);
-            return;
-        }
+    let Some(entry) = registry.entry_for_client(client).await else {
+        return;
     };
-    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-    let _ = app.emit(
-        "loom://fleet",
-        &FleetSnapshot {
-            server_url: client.server_url(),
-            sessions,
-            layout,
-        },
-    );
-}
-
-/// `emit_fleet` with a caller-supplied layout (a mutation command already
-/// holds the fresh one) and a best-effort session list fetch. Pushing a
-/// snapshot for the mutation's own effect must never fail the command that
-/// produced it — loom's `layout` event also publishes it.
-async fn emit_fleet_with(
-    app: &AppHandle,
-    client: &Arc<LoomClient>,
-    layout: crate::loom::SessionLayoutView,
-) {
-    let mut sessions = match client.list_sessions().await {
-        Ok(s) => s,
-        Err(_) => return,
+    let Some(ticket) = entry.begin_mutation_refresh() else {
+        return;
     };
-    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-    let _ = app.emit(
-        "loom://fleet",
-        &FleetSnapshot {
-            server_url: client.server_url(),
-            sessions,
-            layout,
-        },
-    );
-}
-
-fn spawn_fleet_poller(app: AppHandle, client: Arc<LoomClient>, cancel: CancellationToken) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            if cancel.is_cancelled() {
+    // Read BOTH halves only after acquiring the lifecycle lease. Data
+    // returned by the earlier mutation may predate an outage/recovery.
+    let sessions = tokio::select! {
+        biased;
+        _ = entry.fleet_cancel.cancelled() => return,
+        result = client.list_sessions() => result,
+    };
+    let result = match sessions {
+        Ok(mut sessions) => {
+            if entry.mutation_ticket() != Some(ticket) {
+                entry.request_fleet_reconcile();
                 return;
             }
-            let mut sessions = match client.list_sessions().await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = emit_connection_error(&app, &client, e);
-                    tokio::select! {
-                        _ = cancel.cancelled() => return,
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
-                    }
-                    continue;
-                }
+            let layout = tokio::select! {
+                biased;
+                _ = entry.fleet_cancel.cancelled() => return,
+                result = client.session_layout() => result,
             };
-            // Every live session gets an event subscription. Loom caps each stream at
-            // 64 topics, so shard instead of silently losing older workers' attention.
-            use futures_util::StreamExt;
-            let topics = fleet_topics(&sessions);
-            sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-            emit_fleet(&app, &client, sessions).await;
-            let mut streams = futures_util::stream::SelectAll::new();
-            for chunk in topics.chunks(64) {
-                match client.subscribe(chunk).await {
-                    Ok(rx) => streams.push(tokio_stream::wrappers::ReceiverStream::new(rx)),
-                    Err(e) => {
-                        let _ = emit_connection_error(&app, &client, e);
-                    }
+            layout.map(|layout| {
+                sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+                FleetSnapshot {
+                    server_url: client.server_url(),
+                    sessions,
+                    layout,
                 }
-            }
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    frame = streams.next() => {
-                        if frame.is_none() { break; }
-                        // Coalesce a burst into one authoritative snapshot; no periodic polling.
-                        tokio::select! {
-                            _ = cancel.cancelled() => return,
-                            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
-                        }
-                        while streams.next().now_or_never().flatten().is_some() {}
-                        match client.list_sessions().await {
-                            Ok(list) => {
-                                let changed_topics = fleet_topics(&list) != topics;
-                                if cancel.is_cancelled() { return; }
-                                emit_fleet(&app, &client, list).await;
-                                if changed_topics { break; }
-                            }
-                            Err(e) => { let _ = emit_connection_error(&app, &client, e); }
-                        }
-                    }
+            })
+        }
+        Err(error) => Err(error),
+    };
+    let update = match result {
+        Ok(snapshot) => FleetUpdate::Snapshot(snapshot),
+        Err(error) => FleetUpdate::Unavailable(error.into()),
+    };
+    if !entry.publish_mutation(ticket, matches!(&update, FleetUpdate::Snapshot(_)), || {
+        emit(update)
+    }) {
+        entry.request_fleet_reconcile();
+    }
+}
+
+fn emit_fleet_update(app: &AppHandle, client: &LoomClient, update: FleetUpdate) {
+    match update {
+        FleetUpdate::Snapshot(snapshot) => {
+            let _ = app.emit("loom://fleet", snapshot);
+        }
+        FleetUpdate::Unavailable(error) => {
+            let _ = app.emit("loom://error", fleet_error_payload(client, error));
+        }
+    }
+}
+
+/// Refetch the whole snapshot under one lease, including after layout mutations.
+async fn emit_fleet(app: &AppHandle, state: &LoomState, client: &Arc<LoomClient>) {
+    refresh_mutated_fleet(&state.servers, client, |update| {
+        emit_fleet_update(app, client, update)
+    })
+    .await;
+}
+
+enum FleetUpdate {
+    Snapshot(FleetSnapshot),
+    Unavailable(UiError),
+}
+
+async fn fetch_fleet_snapshot(client: &LoomClient) -> Result<FleetSnapshot, LoomError> {
+    let mut sessions = client.list_sessions().await?;
+    let layout = client.session_layout().await?;
+    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+    Ok(FleetSnapshot {
+        server_url: client.server_url(),
+        sessions,
+        layout,
+    })
+}
+
+fn spawn_fleet_poller(
+    app: AppHandle,
+    entry: Arc<crate::routing::ServerEntry>,
+    initial: FleetSnapshot,
+) {
+    tauri::async_runtime::spawn(async move {
+        let client = entry.client.clone();
+        run_fleet_poller(entry, initial, |update| {
+            emit_fleet_update(&app, &client, update)
+        })
+        .await;
+    });
+}
+
+type FleetRead = futures_util::future::BoxFuture<'static, (u64, Result<FleetSnapshot, LoomError>)>;
+
+fn start_fleet_read(entry: &crate::routing::ServerEntry) -> Option<FleetRead> {
+    let ticket = entry.fleet_ticket()?;
+    let client = entry.client.clone();
+    Some(async move { (ticket, fetch_fleet_snapshot(&client).await) }.boxed())
+}
+
+/// Keep consuming transport transitions while REST reconciliation is in flight.
+/// An outage drops the pending read immediately; a resync starts a fresh read.
+/// Failed REST reads retry with a capped backoff while every stream stays live.
+/// Successful reconciliation returns to event-driven reads, with no idle polling.
+async fn run_fleet_poller(
+    entry: Arc<crate::routing::ServerEntry>,
+    initial: FleetSnapshot,
+    mut emit: impl FnMut(FleetUpdate) + Send,
+) {
+    use futures_util::StreamExt;
+    let client = entry.client.clone();
+    let cancel = entry.fleet_cancel.clone();
+    let reconcile = entry.fleet_reconcile.clone();
+    let mut sessions = initial.sessions.clone();
+    if cancel.is_cancelled() {
+        return;
+    }
+    if !entry.publish_initial(|| emit(FleetUpdate::Snapshot(initial))) {
+        // A mutation/outage after connect invalidated its pre-install read.
+        // Subscribe provisionally, then reconcile after all shards resync.
+        entry.request_fleet_reconcile();
+    }
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let topics = fleet_topics(&sessions);
+        let mut streams = futures_util::stream::SelectAll::new();
+        let mut unavailable = std::collections::HashSet::new();
+        for (shard, chunk) in topics.chunks(64).enumerate() {
+            // A shard must report resync before it can participate in a
+            // healthy fleet snapshot; a later failure blocks all shards.
+            unavailable.insert(shard);
+            match client.subscribe(chunk).await {
+                Ok(rx) => streams.push(
+                    tokio_stream::wrappers::ReceiverStream::new(rx)
+                        .map(move |frame| (shard, frame)),
+                ),
+                Err(error) => {
+                    entry.publish_fleet(false, || emit(FleetUpdate::Unavailable(error.into())))
                 }
-            }
-            // Subscription dropped (loom restarted): pause, retry, unless cancelled.
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
             }
         }
-    });
+        let mut refresh: Option<FleetRead> = None;
+        let mut debounce: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut refresh_pending = false;
+        let mut retry: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+        let mut retry_delay = std::time::Duration::from_millis(250);
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                frame = streams.next() => {
+                    let Some((shard, frame)) = frame else { break; };
+                    if let Some(error) = transport_error(&frame) {
+                        unavailable.insert(shard);
+                        refresh = None;
+                        debounce = None;
+                        retry = None;
+                        retry_delay = std::time::Duration::from_millis(250);
+                        refresh_pending = false;
+                        entry.publish_fleet(false, || emit(FleetUpdate::Unavailable(error)));
+                    } else {
+                        if frame.topic == "connection" && frame.event == "resync" {
+                            unavailable.remove(&shard);
+                        }
+                        if !unavailable.is_empty() { continue; }
+                        if retry.is_none() && debounce.is_none() {
+                        // Includes synthetic connection/resync, even with no
+                        // session/layout frame after the server recovers.
+                        debounce = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100))));
+                        }
+                    }
+                }
+                _ = reconcile.notified() => {
+                    // A mutation refresh failed or was invalidated. Retire
+                    // any earlier read and recover through this actor's same
+                    // bounded retry path; a transport outage waits for resync.
+                    refresh = None;
+                    debounce = None;
+                    refresh_pending = false;
+                    if unavailable.is_empty() && retry.is_none() {
+                        retry = Some(Box::pin(tokio::time::sleep(retry_delay)));
+                        retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+                    }
+                }
+                _ = async {
+                    match debounce.as_mut() {
+                        Some(timer) => timer.await,
+                        None => futures_util::future::pending().await,
+                    }
+                } => {
+                    debounce = None;
+                    if refresh.is_some() {
+                        refresh_pending = true;
+                    } else {
+                        refresh = start_fleet_read(&entry);
+                    }
+                }
+                _ = async {
+                    match retry.as_mut() {
+                        Some(timer) => timer.await,
+                        None => futures_util::future::pending().await,
+                    }
+                } => {
+                    retry = None;
+                    if unavailable.is_empty() {
+                        refresh = start_fleet_read(&entry);
+                    }
+                }
+                (ticket, result) = async {
+                    match refresh.as_mut() {
+                        Some(request) => request.await,
+                        None => futures_util::future::pending().await,
+                    }
+                } => {
+                    refresh = None;
+                    if cancel.is_cancelled() { return; }
+                    if !unavailable.is_empty() { continue; }
+                    let available = result.is_ok();
+                    let snapshot = result.as_ref().ok().cloned();
+                    let update = match result {
+                        Ok(snapshot) => FleetUpdate::Snapshot(snapshot),
+                        Err(error) => FleetUpdate::Unavailable(error.into()),
+                    };
+                    if !entry.publish_read(ticket, available, || emit(update)) {
+                        if cancel.is_cancelled() { return; }
+                        // A newer mutation/availability publication won. Never
+                        // apply this old result to topics or the UI, and never
+                        // lose the only quiet-fleet update: fetch again soon.
+                        refresh_pending = false;
+                        retry = None;
+                        debounce = Some(Box::pin(tokio::time::sleep(std::time::Duration::from_millis(100))));
+                        continue;
+                    }
+                    match snapshot {
+                        Some(snapshot) => {
+                            retry_delay = std::time::Duration::from_millis(250);
+                            let changed_topics = fleet_topics(&snapshot.sessions) != topics;
+                            sessions = snapshot.sessions;
+                            if changed_topics { break; }
+                        }
+                        None => {
+                            debounce = None;
+                            refresh_pending = false;
+                            retry = Some(Box::pin(tokio::time::sleep(retry_delay)));
+                            retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(5));
+                        }
+                    }
+                    if refresh_pending {
+                        refresh_pending = false;
+                        refresh = start_fleet_read(&entry);
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
+        }
+    }
 }
 
 fn fleet_topics(sessions: &[SessionSummaryView]) -> Vec<String> {
@@ -407,27 +617,30 @@ fn fleet_topics(sessions: &[SessionSummaryView]) -> Vec<String> {
 pub async fn convert_to_track(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    let view = client.get_session(&id).await?;
-    if view.status == "archived" {
-        return Err(resource_error(
-            "Reopen the thread before converting it to a track.",
-        ));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let view = client.get_session(&id).await?;
+        if view.status == "archived" {
+            return Err(resource_error(
+                "Reopen the thread before converting it to a track.",
+            ));
+        }
+        client
+            .set_tag(
+                &id,
+                "topic",
+                "true",
+                "Converted to a track; this conversation is its coordinator",
+            )
+            .await?;
+        emit_fleet(&app, &state, &client).await;
+        Ok(())
     }
-    client
-        .set_tag(
-            &id,
-            "topic",
-            "true",
-            "Converted to a track; this conversation is its coordinator",
-        )
-        .await?;
-    if let Ok(list) = client.list_sessions().await {
-        emit_fleet(&app, &client, list).await;
-    }
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Open a session and start its chat forwarder. A queued prompt in a lost ACP
@@ -436,47 +649,37 @@ pub async fn convert_to_track(
 pub async fn open_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
 ) -> Result<SessionView, UiError> {
-    let generation = state
-        .open_generation
-        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        + 1;
-    let client = state_client(&state).await?;
-    let original = client.get_session(&id).await?;
-    let view = match resume_queued_on_open(&client, &id, original.clone()).await {
-        Ok(view) => view,
-        Err(error) => {
-            let _ = app.emit(
-                "loom://error",
-                UiError {
-                    message: "Could not resume the queued message. Sending a message will retry."
-                        .into(),
-                    unreachable: error.is_unreachable(),
-                },
-            );
-            client.get_session(&id).await.unwrap_or(original)
-        }
-    };
+    async {
+        let entry = state.servers.resolve(&base_url).await?;
+        let generation = entry.begin_open(&id)?;
+        let client = entry.client.clone();
+        let original = client.get_session(&id).await?;
+        let view = match resume_queued_on_open(&client, &id, original.clone()).await {
+            Ok(view) => view,
+            Err(error) => {
+                let _ = app.emit(
+                    "loom://error",
+                    UiError {
+                        message:
+                            "Could not resume the queued message. Sending a message will retry."
+                                .into(),
+                        unreachable: error.is_unreachable(),
+                        server_url: Some(client.server_url()),
+                    },
+                );
+                client.get_session(&id).await.unwrap_or(original)
+            }
+        };
 
-    // Cancel the previous session's forwarder: its frames would interleave
-    // with the new session's otherwise.
-    let mut chat_cancel = state.chat_cancel.write().await;
-    if state
-        .open_generation
-        .load(std::sync::atomic::Ordering::SeqCst)
-        != generation
-    {
-        return Ok(view);
+        let cancel = entry.activate_chat(&id, generation)?;
+        spawn_chat_forwarder(app, client, id, cancel);
+        Ok(view)
     }
-    if let Some(old) = chat_cancel.take() {
-        old.cancel();
-    }
-    let cancel = CancellationToken::new();
-    *chat_cancel = Some(cancel.clone());
-    spawn_chat_forwarder(app, client.clone(), id.clone(), cancel);
-    state.older_cursor.write().await.take();
-    Ok(view)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 async fn resume_queued_on_open(
@@ -591,10 +794,15 @@ fn spawn_chat_forwarder(
             if let Ok(mut rx) = client.subscribe(&topics).await {
                 loop {
                     tokio::select! {
+                        biased;
                         _ = cancel.cancelled() => return,
                         frame = rx.recv() => {
                             let Some(frame) = frame else { break };
-                            let _ = app.emit("loom://chat-event", &frame);
+                            if cancel.is_cancelled() { return; }
+                            if let Some(error) = transport_error(&frame) {
+                                let _ = app.emit("loom://error", error.for_server(&client.server_url()));
+                            }
+                            let _ = app.emit("loom://chat-event", serde_json::json!({"server_url": client.server_url(), "session_id": id, "event": frame}));
                         }
                     }
                 }
@@ -613,31 +821,37 @@ fn spawn_chat_forwarder(
 #[tauri::command]
 pub async fn fetch_chat(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     before_turn: Option<i64>,
     before_seq: Option<i64>,
 ) -> Result<ChatSnapshot, UiError> {
-    let client = state_client(&state).await?;
-    let before = match (before_turn, before_seq) {
-        (Some(turn), Some(seq)) => Some(crate::loom::ChatCursorView { turn, seq }),
-        _ => None,
-    };
-    let chat = client.session_chat(&id, before.as_ref()).await?;
-    let (live_started_at, live_progress_at) = ChatSnapshot::live_timing(&chat);
-    *state.older_cursor.write().await = chat.older_cursor.clone();
-    Ok(ChatSnapshot {
-        older_cursor: chat.older_cursor,
-        blocks: chat
-            .blocks
-            .iter()
-            .map(crate::blocks::DisplayBlock::from_view)
-            .collect(),
-        live_turn: chat.live_turn,
-        pending_prompt: chat.pending_prompt,
-        live_started_at,
-        live_progress_at,
-        metadata: chat.metadata,
-    })
+    async {
+        let before = match (before_turn, before_seq) {
+            (Some(turn), Some(seq)) => Some(crate::loom::ChatCursorView { turn, seq }),
+            _ => None,
+        };
+        let entry = state.servers.resolve(&base_url).await?;
+        let page = entry.begin_page(&id)?;
+        let chat = entry.client.session_chat(&id, before.as_ref()).await?;
+        let (live_started_at, live_progress_at) = ChatSnapshot::live_timing(&chat);
+        entry.finish_page(&id, page, chat.older_cursor.clone())?;
+        Ok(ChatSnapshot {
+            older_cursor: chat.older_cursor.clone(),
+            blocks: chat
+                .blocks
+                .iter()
+                .map(crate::blocks::DisplayBlock::from_view)
+                .collect(),
+            live_turn: chat.live_turn,
+            pending_prompt: chat.pending_prompt,
+            live_started_at,
+            live_progress_at,
+            metadata: chat.metadata,
+        })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Set one live ACP selector (model, thinking level, mode, etc.). Its IDs and
@@ -645,15 +859,20 @@ pub async fn fetch_chat(
 #[tauri::command]
 pub async fn set_session_config(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     config_id: String,
     value: serde_json::Value,
 ) -> Result<crate::loom::AcpMetadataView, UiError> {
-    let client = state_client(&state).await?;
-    client
-        .set_session_config(&id, &config_id, value)
-        .await
-        .map_err(Into::into)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client
+            .set_session_config(&id, &config_id, value)
+            .await
+            .map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Complete file mentions from a session checkout, or the repository selected
@@ -661,44 +880,50 @@ pub async fn set_session_config(
 #[tauri::command]
 pub async fn complete_files(
     state: State<'_, LoomState>,
+    base_url: String,
     id: Option<String>,
     repo: Option<String>,
     query: String,
 ) -> Result<Vec<String>, UiError> {
-    let client = state_client(&state).await?;
-    if let Some(id) = id.filter(|id| !id.is_empty()) {
-        return client.session_files(&id, &query).await.map_err(Into::into);
-    }
-    let repo = repo.unwrap_or_default();
-    let repo = repo.trim();
-    if repo.is_empty() {
-        return Ok(Vec::new());
-    }
-    let managed = client.list_repos().await.unwrap_or_default();
-    let root = managed
-        .iter()
-        .find(|r| r.slug == repo || r.path == repo)
-        .map(|r| r.path.as_str())
-        .unwrap_or(repo);
-    if client.server_host().is_some_and(host_is_loopback) {
-        return crate::file_completion::repository_files(std::path::Path::new(root), &query)
-            .await
-            .map_err(resource_error);
-    }
-    // Remote repositories use Loom's existing checkout listing; never treat
-    // their paths as paths on the Mac running Arachne.
-    let sessions = client.list_sessions().await?;
-    for session in sessions.iter().filter(|session| {
-        session.worktree_present
-            && (session.branch.repo_root == root || session.github_repo.as_deref() == Some(repo))
-    }) {
-        if let Ok(files) = client.session_files(&session.id, &query).await {
-            return Ok(files);
+    async {
+        let client = state_client(&state, &base_url).await?;
+        if let Some(id) = id.filter(|id| !id.is_empty()) {
+            return client.session_files(&id, &query).await.map_err(Into::into);
         }
+        let repo = repo.unwrap_or_default();
+        let repo = repo.trim();
+        if repo.is_empty() {
+            return Ok(Vec::new());
+        }
+        let managed = client.list_repos().await.unwrap_or_default();
+        let root = managed
+            .iter()
+            .find(|r| r.slug == repo || r.path == repo)
+            .map(|r| r.path.as_str())
+            .unwrap_or(repo);
+        if client.server_host().is_some_and(host_is_loopback) {
+            return crate::file_completion::repository_files(std::path::Path::new(root), &query)
+                .await
+                .map_err(resource_error);
+        }
+        // Remote repositories use Loom's existing checkout listing; never treat
+        // their paths as paths on the Mac running Arachne.
+        let sessions = client.list_sessions().await?;
+        for session in sessions.iter().filter(|session| {
+            session.worktree_present
+                && (session.branch.repo_root == root
+                    || session.github_repo.as_deref() == Some(repo))
+        }) {
+            if let Ok(files) = client.session_files(&session.id, &query).await {
+                return Ok(files);
+            }
+        }
+        Err(resource_error(
+            "no available checkout for repository file completion",
+        ))
     }
-    Err(resource_error(
-        "no available checkout for repository file completion",
-    ))
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Return a bounded raster image attached to a session as a data URL. Loom
@@ -706,71 +931,86 @@ pub async fn complete_files(
 #[tauri::command]
 pub async fn load_session_image(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     name: String,
 ) -> Result<String, UiError> {
-    let client = state_client(&state).await?;
-    client.session_image(&id, &name).await.map_err(Into::into)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client.session_image(&id, &name).await.map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Send input to a session: ACP prompt (agents) or terminal text (raw).
 #[tauri::command]
 pub async fn send_input(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     text: String,
     topic_id: Option<String>,
     resource_ids: Option<Vec<String>>,
     attachments: Option<Vec<crate::loom::ScratchUpload>>,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    let mut prompt = text;
-    let ids = resource_ids.unwrap_or_default();
-    if !ids.is_empty() {
-        let topic_id =
-            topic_id.ok_or_else(|| resource_error("resource mentions require a topic"))?;
-        let mentions = ids
-            .into_iter()
-            .map(|resource_id| ResourceMention {
-                topic_id: topic_id.clone(),
-                resource_id,
-            })
-            .collect();
-        prompt.push_str(&resource_context(&client, mentions).await?);
-    }
-    // An orphan is a recoverable runtime gap, not a different kind of user
-    // conversation. Resume before uploading attachments or sending input.
-    let view = client.resume_if_orphaned(&id).await?;
-    let mut files = Vec::new();
-    for (name, bytes) in decode_attachments(attachments.unwrap_or_default())? {
-        files.push(client.upload_scratch(&id, &name, bytes).await?);
-    }
-    if !files.is_empty() {
-        prompt.push_str("\n\nAttached files in this session's Scratch directory:\n");
-        for path in &files {
-            prompt.push_str(&format!("- {path}\n"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let mut prompt = text;
+        let ids = resource_ids.unwrap_or_default();
+        if !ids.is_empty() {
+            let topic_id =
+                topic_id.ok_or_else(|| resource_error("resource mentions require a topic"))?;
+            let mentions = ids
+                .into_iter()
+                .map(|resource_id| ResourceMention {
+                    topic_id: topic_id.clone(),
+                    resource_id,
+                })
+                .collect();
+            prompt.push_str(&resource_context(&client, mentions).await?);
         }
+        // An orphan is a recoverable runtime gap, not a different kind of user
+        // conversation. Resume before uploading attachments or sending input.
+        let view = client.resume_if_orphaned(&id).await?;
+        let mut files = Vec::new();
+        for (name, bytes) in decode_attachments(attachments.unwrap_or_default())? {
+            files.push(client.upload_scratch(&id, &name, bytes).await?);
+        }
+        if !files.is_empty() {
+            prompt.push_str("\n\nAttached files in this session's Scratch directory:\n");
+            for path in &files {
+                prompt.push_str(&format!("- {path}\n"));
+            }
+        }
+        if view.protocol == "terminal" {
+            client.send_text(&id, &prompt, true).await?;
+        } else {
+            client.send_prompt(&id, &prompt, &files).await?;
+        }
+        Ok(())
     }
-    if view.protocol == "terminal" {
-        client.send_text(&id, &prompt, true).await?;
-    } else {
-        client.send_prompt(&id, &prompt, &files).await?;
-    }
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[tauri::command]
 pub async fn answer_permission(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     request_id: String,
     option_id: String,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    client
-        .answer_permission(&id, &request_id, &option_id)
-        .await?;
-    Ok(())
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client
+            .answer_permission(&id, &request_id, &option_id)
+            .await?;
+        Ok(())
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 fn decode_attachments(
@@ -855,61 +1095,77 @@ fn thread_note_body(source_title: &str, source_id: &str, note: &str) -> String {
 #[tauri::command]
 pub async fn send_to_thread(
     state: State<'_, LoomState>,
+    base_url: String,
     source_id: String,
     destination_id: String,
     note: String,
     idempotency_key: String,
 ) -> Result<(), UiError> {
-    if source_id == destination_id {
-        return Err(UiError {
-            message: "choose a different destination thread".into(),
-            unreachable: false,
-        });
+    async {
+        if source_id == destination_id {
+            return Err(UiError {
+                message: "choose a different destination thread".into(),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        if note.trim().is_empty() || idempotency_key.trim().is_empty() {
+            return Err(UiError {
+                message: "note and delivery key are required".into(),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        let client = state_client(&state, &base_url).await?;
+        let source = client.get_session(&source_id).await?;
+        let destination = client.get_session(&destination_id).await?;
+        if destination.status == "archived" {
+            return Err(UiError {
+                message: "the destination thread is archived".into(),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        let title = if source.branch.title.trim().is_empty() {
+            source.branch.name.as_str()
+        } else {
+            source.branch.title.as_str()
+        };
+        let body = thread_note_body(title, &source.id, &note);
+        client
+            .send_to_thread(
+                &destination.id,
+                &body,
+                serde_json::json!({
+                    "arachne": {
+                        "kind": "thread_note",
+                        "source_session_id": source.id,
+                        "source_branch_id": source.branch.id,
+                        "source_title": title,
+                    }
+                }),
+                &idempotency_key,
+            )
+            .await?;
+        Ok(())
     }
-    if note.trim().is_empty() || idempotency_key.trim().is_empty() {
-        return Err(UiError {
-            message: "note and delivery key are required".into(),
-            unreachable: false,
-        });
-    }
-    let client = state_client(&state).await?;
-    let source = client.get_session(&source_id).await?;
-    let destination = client.get_session(&destination_id).await?;
-    if destination.status == "archived" {
-        return Err(UiError {
-            message: "the destination thread is archived".into(),
-            unreachable: false,
-        });
-    }
-    let title = if source.branch.title.trim().is_empty() {
-        source.branch.name.as_str()
-    } else {
-        source.branch.title.as_str()
-    };
-    let body = thread_note_body(title, &source.id, &note);
-    client
-        .send_to_thread(
-            &destination.id,
-            &body,
-            serde_json::json!({
-                "arachne": {
-                    "kind": "thread_note",
-                    "source_session_id": source.id,
-                    "source_branch_id": source.branch.id,
-                    "source_title": title,
-                }
-            }),
-            &idempotency_key,
-        )
-        .await?;
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Interrupt the current turn.
 #[tauri::command]
-pub async fn interrupt(state: State<'_, LoomState>, id: String) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    client.interrupt(&id).await.map_err(Into::into)
+pub async fn interrupt(
+    state: State<'_, LoomState>,
+    base_url: String,
+    id: String,
+) -> Result<(), UiError> {
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client.interrupt(&id).await.map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 fn launch_repository(repository: &str) -> (Option<String>, String) {
@@ -943,6 +1199,7 @@ mod launch_repository_tests {
 pub async fn launch_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     repo: String,
     task: String,
     parent_id: Option<String>,
@@ -966,194 +1223,200 @@ pub async fn launch_session(
     as_track: Option<bool>,
     topic_branch: Option<String>,
 ) -> Result<SessionView, UiError> {
-    let client = state_client(&state).await?;
-    let (managed_repo, cwd) = launch_repository(&repo);
-    let parent = match parent_id.as_deref().filter(|s| !s.is_empty()) {
-        Some(id) => Some(client.get_session(id).await?),
-        None => None,
-    };
-    let parent_branch = parent.as_ref().map(|p| p.branch.id.clone());
-    if let Some(parent) = &parent {
-        let fleet = client.list_sessions().await?;
-        prepare_child_autoland(&client, parent, &fleet).await?;
-    }
-    // A bare prompt (the New thread sheet with no explicit title) sends
-    // only `task`, so the title falls back to it like the CLI; the expanded
-    // topic card sends an explicit short title and longer body.
-    let label = title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(String::from)
-        .unwrap_or_else(|| task.chars().take(80).collect());
-    let canonical = if parent_branch.is_none() && as_track.unwrap_or(true) {
-        let branch_label = title
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let (managed_repo, cwd) = launch_repository(&repo);
+        let parent = match parent_id.as_deref().filter(|s| !s.is_empty()) {
+            Some(id) => Some(client.get_session(id).await?),
+            None => None,
+        };
+        let parent_branch = parent.as_ref().map(|p| p.branch.id.clone());
+        if let Some(parent) = &parent {
+            let fleet = client.list_sessions().await?;
+            prepare_child_autoland(&client, parent, &fleet).await?;
+        }
+        // A bare prompt (the New thread sheet with no explicit title) sends
+        // only `task`, so the title falls back to it like the CLI; the expanded
+        // topic card sends an explicit short title and longer body.
+        let label = title
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(task.trim());
-        Some(allocate_track_branch(&client, &repo, branch_label, topic_branch.as_deref()).await?)
-    } else {
-        None
-    };
-    let description = description
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty())
-        .map(String::from);
-    let attachments = attachments.unwrap_or_default();
-    // Reject malformed uploads before Loom creates a branch/session. Loom
-    // validates the same limits again when it writes Scratch on its host.
-    let launch_bytes: usize = decode_attachments(attachments.clone())?
-        .iter()
-        .map(|(_, bytes)| bytes.len())
-        .sum();
-    if launch_bytes > 45 * 1024 * 1024 {
-        return Err(resource_error(
-            "launch attachments exceed the 45 MiB JSON request limit",
-        ));
-    }
-    let mut goal = task;
-    if let Some(mentions) = mentions {
-        goal.push_str(&resource_context(&client, mentions).await?);
-    }
-    if !attachments.is_empty() {
-        goal.push_str("\n\nAttached files in Scratch:\n");
-        for file in &attachments {
-            goal.push_str(&format!("- scratch/{}\n", file.name));
-        }
-    }
-    // The launch consumes `attachments` (scratch seeding); the names are
-    // needed after it, to record the files as the topic's resources.
-    let attachment_names: Vec<String> = attachments.iter().map(|file| file.name.clone()).collect();
-    let mut view = client
-        .launch(&crate::loom::SessionsLaunchInput {
-            repo: managed_repo,
-            cwd,
-            base: base
+            .filter(|t| !t.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| task.chars().take(80).collect());
+        let canonical = if parent_branch.is_none() && as_track.unwrap_or(true) {
+            let branch_label = title
                 .as_deref()
                 .map(str::trim)
-                .filter(|b| !b.is_empty())
-                .map(String::from),
-            title: Some(label),
-            goal: Some(goal),
-            initialization_prompt: canonical
-                .as_deref()
-                .map(crate::track_policy::initialization_prompt),
-            parent_branch: parent_branch.clone(),
-            // Empty strings mean "inherit the server default" — filter to
-            // None so loom sees omitted-vs-blank as intended.
-            profile: profile.filter(|s| !s.is_empty()),
-            launch_guidance: Some(if parent_branch.is_some() {
-                crate::loom::worker_launch_guidance()
-            } else if as_track.unwrap_or(true) {
-                crate::loom::topic_launch_guidance()
-            } else {
-                crate::loom::thread_launch_guidance()
-            }),
-            agent: agent.filter(|s| !s.is_empty()),
-            model: model.filter(|s| !s.is_empty()),
-            effort: effort.filter(|s| !s.is_empty()),
-            scratch: attachments,
-            ..Default::default()
-        })
-        .await?;
-    // Launch attachments are a resource too: the files land at
-    // `scratch/<name>` in the fresh worktree (loom seeds them at launch),
-    // so they are recorded as File resources of the new branch — the
-    // track starts with what you attached, visible in the Resources panel
-    // from the first moment (design.md: the effective view). Names are
-    // captured before `scratch` consumes the list.
-    //
-    // Both post-launch manifest edits (these rows, and the initial hides
-    // below) go through ONE write so a failure in one cannot strand the
-    // other. The branch is brand new — loom keys artifacts by branch id,
-    // which `sessions.launch` just created — so the manifest cannot exist
-    // yet and revision 0 creates it (base_rev == latest == 0).
-    let mut initial_manifest = TopicResourcesView::default();
-    for name in &attachment_names {
-        let draft = ResourceDraft {
-            kind: ResourceKind::File,
-            title: name.clone(),
-            repository: view.branch.repo_root.clone(),
-            // The scratch file is uncommitted worktree content, not a
-            // commit: the "ref" that pins it is the branch the launch
-            // just created.
-            reference: Some(view.branch.branch.clone()),
-            path: Some(format!("scratch/{name}")),
-            url: None,
+                .filter(|s| !s.is_empty())
+                .unwrap_or(task.trim());
+            Some(
+                allocate_track_branch(&client, &repo, branch_label, topic_branch.as_deref())
+                    .await?,
+            )
+        } else {
+            None
         };
-        if let Ok(resource) = draft.validated(&view.branch.repo_root, &view.branch.branch) {
-            if !initial_manifest
-                .resources
-                .iter()
-                .any(|r| r.id == resource.id)
-            {
-                initial_manifest.resources.push(resource);
+        let description = description
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(String::from);
+        let attachments = attachments.unwrap_or_default();
+        // Reject malformed uploads before Loom creates a branch/session. Loom
+        // validates the same limits again when it writes Scratch on its host.
+        let launch_bytes: usize = decode_attachments(attachments.clone())?
+            .iter()
+            .map(|(_, bytes)| bytes.len())
+            .sum();
+        if launch_bytes > 45 * 1024 * 1024 {
+            return Err(resource_error(
+                "launch attachments exceed the 45 MiB JSON request limit",
+            ));
+        }
+        let mut goal = task;
+        if let Some(mentions) = mentions {
+            goal.push_str(&resource_context(&client, mentions).await?);
+        }
+        if !attachments.is_empty() {
+            goal.push_str("\n\nAttached files in Scratch:\n");
+            for file in &attachments {
+                goal.push_str(&format!("- scratch/{}\n", file.name));
             }
         }
-    }
-    // The creation form's unchecked project bindings are recorded as the
-    // topic's initial hides, matched by reference-free binding key — the
-    // binding stays attached to the project and keeps supplying other
-    // topics (design.md).
-    let hidden_keys = hidden_binding_keys.unwrap_or_default();
-    if !hidden_keys.is_empty() {
-        initial_manifest.hidden.extend(hidden_keys);
-        initial_manifest.hidden.sort();
-        initial_manifest.hidden.dedup();
-    }
-    if !initial_manifest.resources.is_empty() || !initial_manifest.hidden.is_empty() {
-        // Best-effort: a failed manifest write must not fail the launch —
-        // the attachments are still in Scratch and the goal text; the
-        // topic simply inherits everything until the user hides from the
-        // panel.
-        let _ = save_topic_resources(&client, &view.branch.id, &initial_manifest, 0).await;
-    }
-    // `sessions.launch` has no description field (only GitHub issues seed
-    // one server-side), so the topic card's description is stamped right
-    // after launch via `sessions.update`. Best-effort: an empty description
-    // means "none was typed" — nothing to stamp.
-    if let Some(desc) = description {
-        let _ = client
-            .update_session(&crate::loom::SessionsUpdateInput {
-                description: Some(desc),
-                session: Some(view.id.clone()),
+        // The launch consumes `attachments` (scratch seeding); the names are
+        // needed after it, to record the files as the topic's resources.
+        let attachment_names: Vec<String> =
+            attachments.iter().map(|file| file.name.clone()).collect();
+        let mut view = client
+            .launch(&crate::loom::SessionsLaunchInput {
+                repo: managed_repo,
+                cwd,
+                base: base
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(String::from),
+                title: Some(label),
+                goal: Some(goal),
+                initialization_prompt: canonical
+                    .as_deref()
+                    .map(crate::track_policy::initialization_prompt),
+                parent_branch: parent_branch.clone(),
+                // Empty strings mean "inherit the server default" — filter to
+                // None so loom sees omitted-vs-blank as intended.
+                profile: profile.filter(|s| !s.is_empty()),
+                launch_guidance: Some(if parent_branch.is_some() {
+                    crate::loom::worker_launch_guidance()
+                } else if as_track.unwrap_or(true) {
+                    crate::loom::topic_launch_guidance()
+                } else {
+                    crate::loom::thread_launch_guidance()
+                }),
+                agent: agent.filter(|s| !s.is_empty()),
+                model: model.filter(|s| !s.is_empty()),
+                effort: effort.filter(|s| !s.is_empty()),
+                scratch: attachments,
                 ..Default::default()
             })
-            .await;
+            .await?;
+        // Launch attachments are a resource too: the files land at
+        // `scratch/<name>` in the fresh worktree (loom seeds them at launch),
+        // so they are recorded as File resources of the new branch — the
+        // track starts with what you attached, visible in the Resources panel
+        // from the first moment (design.md: the effective view). Names are
+        // captured before `scratch` consumes the list.
+        //
+        // Both post-launch manifest edits (these rows, and the initial hides
+        // below) go through ONE write so a failure in one cannot strand the
+        // other. The branch is brand new — loom keys artifacts by branch id,
+        // which `sessions.launch` just created — so the manifest cannot exist
+        // yet and revision 0 creates it (base_rev == latest == 0).
+        let mut initial_manifest = TopicResourcesView::default();
+        for name in &attachment_names {
+            let draft = ResourceDraft {
+                kind: ResourceKind::File,
+                title: name.clone(),
+                repository: view.branch.repo_root.clone(),
+                // The scratch file is uncommitted worktree content, not a
+                // commit: the "ref" that pins it is the branch the launch
+                // just created.
+                reference: Some(view.branch.branch.clone()),
+                path: Some(format!("scratch/{name}")),
+                url: None,
+            };
+            if let Ok(resource) = draft.validated(&view.branch.repo_root, &view.branch.branch) {
+                if !initial_manifest
+                    .resources
+                    .iter()
+                    .any(|r| r.id == resource.id)
+                {
+                    initial_manifest.resources.push(resource);
+                }
+            }
+        }
+        // The creation form's unchecked project bindings are recorded as the
+        // topic's initial hides, matched by reference-free binding key — the
+        // binding stays attached to the project and keeps supplying other
+        // topics (design.md).
+        let hidden_keys = hidden_binding_keys.unwrap_or_default();
+        if !hidden_keys.is_empty() {
+            initial_manifest.hidden.extend(hidden_keys);
+            initial_manifest.hidden.sort();
+            initial_manifest.hidden.dedup();
+        }
+        if !initial_manifest.resources.is_empty() || !initial_manifest.hidden.is_empty() {
+            // Best-effort: a failed manifest write must not fail the launch —
+            // the attachments are still in Scratch and the goal text; the
+            // topic simply inherits everything until the user hides from the
+            // panel.
+            let _ = save_topic_resources(&client, &view.branch.id, &initial_manifest, 0).await;
+        }
+        // `sessions.launch` has no description field (only GitHub issues seed
+        // one server-side), so the topic card's description is stamped right
+        // after launch via `sessions.update`. Best-effort: an empty description
+        // means "none was typed" — nothing to stamp.
+        if let Some(desc) = description {
+            let _ = client
+                .update_session(&crate::loom::SessionsUpdateInput {
+                    description: Some(desc),
+                    session: Some(view.id.clone()),
+                    ..Default::default()
+                })
+                .await;
+        }
+        if let Some(canonical) = &canonical {
+            stamp_new_track_metadata(&client, &mut view, canonical).await;
+        } else if parent_branch.is_none() {
+            let _ = client
+                .set_tag(&view.id, "topic", "false", "Standalone thread")
+                .await;
+        }
+        // File the new topic into its project when one was preselected (a
+        // project is a placement group — filing only, never execution state).
+        if let Some(group_id) = project
+            .as_ref()
+            .and_then(|p| p.id.as_deref())
+            .filter(|id| !id.is_empty())
+        {
+            let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
+            // Project bindings keep supplying the topic live (design.md:
+            // "Project resource bindings may continue to supply shared
+            // references to existing Topics") — nothing is copied at creation;
+            // the initial hides were folded into the manifest write above.
+        }
+        // Loom does not publish a fleet event for description updates. Publish
+        // the final launch state so the new topic card has its body immediately.
+        emit_fleet(&app, &state, &client).await;
+        let view = client.get_session(&view.id).await.unwrap_or(view);
+        // Selection/activation is the frontend's job: it routes the new
+        // session through open_session (chat forwarder + live streaming) via
+        // the returned view. Delegations stay on the parent thread — the child
+        // just appears nested in the sidebar.
+        Ok(view)
     }
-    if let Some(canonical) = &canonical {
-        stamp_new_track_metadata(&client, &mut view, canonical).await;
-    } else if parent_branch.is_none() {
-        let _ = client
-            .set_tag(&view.id, "topic", "false", "Standalone thread")
-            .await;
-    }
-    // File the new topic into its project when one was preselected (a
-    // project is a placement group — filing only, never execution state).
-    if let Some(group_id) = project
-        .as_ref()
-        .and_then(|p| p.id.as_deref())
-        .filter(|id| !id.is_empty())
-    {
-        let _ = client.move_sessions(&[view.id.as_str()], group_id).await;
-        // Project bindings keep supplying the topic live (design.md:
-        // "Project resource bindings may continue to supply shared
-        // references to existing Topics") — nothing is copied at creation;
-        // the initial hides were folded into the manifest write above.
-    }
-    // Loom does not publish a fleet event for description updates. Publish
-    // the final launch state so the new topic card has its body immediately.
-    if let Ok(list) = client.list_sessions().await {
-        emit_fleet(&app, &client, list).await;
-    }
-    let view = client.get_session(&view.id).await.unwrap_or(view);
-    // Selection/activation is the frontend's job: it routes the new
-    // session through open_session (chat forwarder + live streaming) via
-    // the returned view. Delegations stay on the parent thread — the child
-    // just appears nested in the sidebar.
-    Ok(view)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Open the macOS file picker at the local checkout of the selected repo.
@@ -1162,9 +1425,11 @@ pub async fn launch_session(
 #[tauri::command]
 pub async fn pick_topic_files(
     state: State<'_, LoomState>,
+    base_url: String,
     repo: String,
 ) -> Result<Vec<String>, UiError> {
-    let client = state_client(&state).await?;
+    async {
+    let client = state_client(&state, &base_url).await?;
     let sessions = client.list_sessions().await?;
     let checkout = sessions
         .iter()
@@ -1179,6 +1444,7 @@ pub async fn pick_topic_files(
         .ok_or_else(|| UiError {
             message: format!("no local checkout found for {repo}"),
             unreachable: false,
+            server_url: None,
         })?;
 
     // Pass the path as an argv item so names containing quotes or other
@@ -1203,6 +1469,7 @@ end run
         .map_err(|e| UiError {
             message: format!("opening file picker: {e}"),
             unreachable: false,
+            server_url: None,
         })?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1212,6 +1479,7 @@ end run
         return Err(UiError {
             message: format!("file picker failed: {}", stderr.trim()),
             unreachable: false,
+            server_url: None,
         });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1221,6 +1489,7 @@ end run
         .filter(|path| !path.is_empty())
         .map(str::to_owned)
         .collect())
+    }.await.map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Post-launch failures are recoverable setup blockers, never a failed launch
@@ -1328,57 +1597,62 @@ pub(crate) async fn allocate_track_branch(
 #[tauri::command]
 pub async fn delegate_task(
     state: State<'_, LoomState>,
+    base_url: String,
     parent_id: String,
     task: String,
     agent: Option<String>,
     model: Option<String>,
     effort: Option<String>,
 ) -> Result<SessionView, UiError> {
-    let client = state_client(&state).await?;
-    let parent = client.get_session(&parent_id).await?;
-    let fleet = client.list_sessions().await?;
-    // Conversation ancestry is independent of git ancestry. A child of a
-    // worker starts from the topic's accepted branch when one exists.
-    let base = if fleet
-        .iter()
-        .find(|s| s.id == parent.id)
-        .is_some_and(crate::track_policy::owns_track)
-    {
-        crate::track_policy::canonical_topic_branch(&parent.branch)
-            .ok_or_else(|| resource_error("Invalid canonical Track ref."))?
-            .to_owned()
-    } else {
-        resolve_integration_target(&fleet, &parent_id)
-            .map(|target| target.target_branch)
-            .unwrap_or_else(|| parent.branch.branch.clone())
-    };
-    prepare_child_autoland(&client, &parent, &fleet).await?;
-    let view = client
-        .launch(&crate::loom::SessionsLaunchInput {
-            repo: parent.github_repo.clone(),
-            cwd: parent.work_dir.clone(),
-            base: Some(base),
-            title: Some(task.chars().take(80).collect()),
-            goal: Some(task),
-            parent_branch: Some(parent.branch.id),
-            launch_guidance: Some(crate::loom::worker_launch_guidance()),
-            // Launch overrides from the picker: empty strings mean "inherit
-            // the server default", so filter them to None (loom's
-            // omitted-vs-blank distinction).
-            agent: agent.filter(|s| !s.is_empty()),
-            model: model.filter(|s| !s.is_empty()),
-            effort: effort.filter(|s| !s.is_empty()),
-            ..Default::default()
-        })
-        .await?;
-    // Self-heal the parent's topic marker: leaders launched from the CLI (or
-    // before this marker existed) should still hold their shape.
-    if should_mark_track(&fleet, &parent_id) {
-        let _ = client
-            .set_tag(&parent_id, "topic", "true", "joined by child session")
-            .await;
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let parent = client.get_session(&parent_id).await?;
+        let fleet = client.list_sessions().await?;
+        // Conversation ancestry is independent of git ancestry. A child of a
+        // worker starts from the topic's accepted branch when one exists.
+        let base = if fleet
+            .iter()
+            .find(|s| s.id == parent.id)
+            .is_some_and(crate::track_policy::owns_track)
+        {
+            crate::track_policy::canonical_topic_branch(&parent.branch)
+                .ok_or_else(|| resource_error("Invalid canonical Track ref."))?
+                .to_owned()
+        } else {
+            resolve_integration_target(&fleet, &parent_id)
+                .map(|target| target.target_branch)
+                .unwrap_or_else(|| parent.branch.branch.clone())
+        };
+        prepare_child_autoland(&client, &parent, &fleet).await?;
+        let view = client
+            .launch(&crate::loom::SessionsLaunchInput {
+                repo: parent.github_repo.clone(),
+                cwd: parent.work_dir.clone(),
+                base: Some(base),
+                title: Some(task.chars().take(80).collect()),
+                goal: Some(task),
+                parent_branch: Some(parent.branch.id),
+                launch_guidance: Some(crate::loom::worker_launch_guidance()),
+                // Launch overrides from the picker: empty strings mean "inherit
+                // the server default", so filter them to None (loom's
+                // omitted-vs-blank distinction).
+                agent: agent.filter(|s| !s.is_empty()),
+                model: model.filter(|s| !s.is_empty()),
+                effort: effort.filter(|s| !s.is_empty()),
+                ..Default::default()
+            })
+            .await?;
+        // Self-heal the parent's topic marker: leaders launched from the CLI (or
+        // before this marker existed) should still hold their shape.
+        if should_mark_track(&fleet, &parent_id) {
+            let _ = client
+                .set_tag(&parent_id, "topic", "true", "joined by child session")
+                .await;
+        }
+        Ok(view)
     }
-    Ok(view)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Archive a session: tear down its terminal + worktree, keep the branch.
@@ -1386,14 +1660,22 @@ pub async fn delegate_task(
 pub async fn archive_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    client.archive(&id).await?;
-    // The fleet poller's layout event will refresh the list; give the UI an
-    // immediate signal that this specific session is gone.
-    let _ = app.emit("loom://archived", &id);
-    Ok(())
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client.archive(&id).await?;
+        // The fleet poller's layout event will refresh the list; give the UI an
+        // immediate signal that this specific session is gone.
+        let _ = app.emit(
+            "loom://archived",
+            serde_json::json!({"server_url": client.server_url(), "session_id": id}),
+        );
+        Ok(())
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Unarchive a session, restoring its checkout and agent through Loom.
@@ -1401,14 +1683,17 @@ pub async fn archive_session(
 pub async fn unarchive_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
 ) -> Result<SessionView, UiError> {
-    let client = state_client(&state).await?;
-    let view = client.unarchive(&id).await?;
-    if let Ok(list) = client.list_sessions().await {
-        emit_fleet(&app, &client, list).await;
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let view = client.unarchive(&id).await?;
+        emit_fleet(&app, &state, &client).await;
+        Ok(view)
     }
-    Ok(view)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Edit a topic's metadata: title (compare-and-swap fenced), goal, and
@@ -1419,6 +1704,7 @@ pub async fn unarchive_session(
 pub async fn update_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     session: String,
     title: Option<String>,
     expected_title: Option<String>,
@@ -1426,23 +1712,25 @@ pub async fn update_session(
     goal: Option<String>,
     description: Option<String>,
 ) -> Result<SessionView, UiError> {
-    let client = state_client(&state).await?;
-    let view = client
-        .update_session(&crate::loom::SessionsUpdateInput {
-            title,
-            expected_title,
-            expected_title_provenance,
-            goal,
-            description,
-            session: Some(session),
-        })
-        .await?;
-    // Fresh summary + layout, pushed as a fleet snapshot so every sidebar
-    // surface (inbox lanes and the topic card) sees the edit at once.
-    if let Ok(list) = client.list_sessions().await {
-        emit_fleet(&app, &client, list).await;
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let view = client
+            .update_session(&crate::loom::SessionsUpdateInput {
+                title,
+                expected_title,
+                expected_title_provenance,
+                goal,
+                description,
+                session: Some(session),
+            })
+            .await?;
+        // Fresh summary + layout, pushed as a fleet snapshot so every sidebar
+        // surface (inbox lanes and the topic card) sees the edit at once.
+        emit_fleet(&app, &state, &client).await;
+        Ok(view)
     }
-    Ok(view)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Dismiss a session's attention flag without opening the thread: clear
@@ -1458,20 +1746,23 @@ pub async fn update_session(
 pub async fn clear_attention(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     session: String,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    for key in ["attention", "triage"] {
-        client.clear_tag(&session, key).await?;
+    async {
+        let client = state_client(&state, &base_url).await?;
+        for key in ["attention", "triage"] {
+            client.clear_tag(&session, key).await?;
+        }
+        // Fresh fleet snapshot, pushed so every surface (sidebar badges, Needs
+        // You buckets, inspector rows) drops the loud state at once. Tag
+        // changes also publish on the session's own SSE topic, but the push
+        // here keeps the UI instant even when that stream lags or is capped.
+        emit_fleet(&app, &state, &client).await;
+        Ok(())
     }
-    // Fresh fleet snapshot, pushed so every surface (sidebar badges, Needs
-    // You buckets, inspector rows) drops the loud state at once. Tag
-    // changes also publish on the session's own SSE topic, but the push
-    // here keeps the UI instant even when that stream lags or is capped.
-    if let Ok(list) = client.list_sessions().await {
-        emit_fleet(&app, &client, list).await;
-    }
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Build a Zed target from the authoritative Loom host and the session's
@@ -1483,6 +1774,7 @@ fn zed_target(host: &str, work_dir: &str) -> Result<String, UiError> {
         return Err(UiError {
             message: "session has no absolute checkout path to open".into(),
             unreachable: false,
+            server_url: None,
         });
     }
     if host == "localhost" || host == "127.0.0.1" || host == "::1" {
@@ -1493,6 +1785,7 @@ fn zed_target(host: &str, work_dir: &str) -> Result<String, UiError> {
     let mut url = reqwest::Url::parse(&format!("ssh://{host}")).map_err(|e| UiError {
         message: format!("invalid Loom host for Zed: {e}"),
         unreachable: false,
+        server_url: None,
     })?;
     url.set_path(work_dir);
     Ok(url.to_string())
@@ -1502,46 +1795,55 @@ fn zed_target(host: &str, work_dir: &str) -> Result<String, UiError> {
 #[tauri::command]
 pub async fn open_in_zed(
     state: State<'_, LoomState>,
+    base_url: String,
     id: String,
     work_dir: Option<String>,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    let view = client.get_session(&id).await?;
-    if view.status == "archived" {
-        return Err(UiError {
-            message: "this session is archived and its checkout is no longer active".into(),
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let view = client.get_session(&id).await?;
+        if view.status == "archived" {
+            return Err(UiError {
+                message: "this session is archived and its checkout is no longer active".into(),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        let host = client.server_host().ok_or_else(|| UiError {
+            message: "Loom URL has no host".into(),
             unreachable: false,
-        });
-    }
-    let host = client.server_host().ok_or_else(|| UiError {
-        message: "Loom URL has no host".into(),
-        unreachable: false,
-    })?;
-    // A caller-supplied path (post `recover_worktree`) wins over the stale
-    // session view: the recovery just materialized this checkout server-side.
-    let target = zed_target(host, work_dir.as_deref().unwrap_or(&view.work_dir))?;
-    // GUI apps often inherit a minimal PATH without /usr/local/bin, where
-    // Zed installs its CLI symlink. Prefer the app-bundled CLI on macOS.
-    let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
-        "/Applications/Zed.app/Contents/MacOS/cli"
-    } else {
-        "zed"
-    };
-    let status = tokio::process::Command::new(cli)
-        .arg(&target)
-        .status()
-        .await
-        .map_err(|e| UiError {
-            message: format!("launching zed: {e} (is zed installed and on PATH?)"),
-            unreachable: false,
+            server_url: None,
         })?;
-    if !status.success() {
-        return Err(UiError {
-            message: format!("zed exited with {status}"),
-            unreachable: false,
-        });
+        // A caller-supplied path (post `recover_worktree`) wins over the stale
+        // session view: the recovery just materialized this checkout server-side.
+        let target = zed_target(host, work_dir.as_deref().unwrap_or(&view.work_dir))?;
+        // GUI apps often inherit a minimal PATH without /usr/local/bin, where
+        // Zed installs its CLI symlink. Prefer the app-bundled CLI on macOS.
+        let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
+            "/Applications/Zed.app/Contents/MacOS/cli"
+        } else {
+            "zed"
+        };
+        let status = tokio::process::Command::new(cli)
+            .arg(&target)
+            .status()
+            .await
+            .map_err(|e| UiError {
+                message: format!("launching zed: {e} (is zed installed and on PATH?)"),
+                unreachable: false,
+                server_url: None,
+            })?;
+        if !status.success() {
+            return Err(UiError {
+                message: format!("zed exited with {status}"),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        Ok(())
     }
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Open a macOS Terminal window at the checkout path.
@@ -1556,11 +1858,13 @@ pub async fn open_in_terminal(path: String) -> Result<(), UiError> {
         .map_err(|e| UiError {
             message: format!("launching Terminal: {e}"),
             unreachable: false,
+            server_url: None,
         })?;
     if !status.success() {
         return Err(UiError {
             message: format!("open exited with {status}"),
             unreachable: false,
+            server_url: None,
         });
     }
     Ok(())
@@ -1574,14 +1878,19 @@ pub async fn open_in_terminal(path: String) -> Result<(), UiError> {
 #[tauri::command]
 pub async fn recover_worktree(
     state: State<'_, LoomState>,
+    base_url: String,
     repo_root: String,
     branch: String,
 ) -> Result<crate::loom::RepoWorktreeView, UiError> {
-    let client = state_client(&state).await?;
-    client
-        .ensure_worktree(&repo_root, &branch)
-        .await
-        .map_err(Into::into)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client
+            .ensure_worktree(&repo_root, &branch)
+            .await
+            .map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// The status a PR row needs to show its light, fetched straight from GitHub
@@ -1986,16 +2295,23 @@ mod zed_tests_more {
 
 /// Manual fleet refresh.
 #[tauri::command]
-pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot, UiError> {
-    let client = state_client(&state).await?;
-    let mut sessions = client.list_sessions().await?;
-    sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
-    let layout = client.session_layout().await?;
-    Ok(FleetSnapshot {
-        server_url: client.server_url(),
-        sessions,
-        layout,
-    })
+pub async fn refresh_fleet(
+    state: State<'_, LoomState>,
+    base_url: String,
+) -> Result<FleetSnapshot, UiError> {
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let mut sessions = client.list_sessions().await?;
+        sessions.sort_by(|a, b| a.last_activity_at.cmp(&b.last_activity_at));
+        let layout = client.session_layout().await?;
+        Ok(FleetSnapshot {
+            server_url: client.server_url(),
+            sessions,
+            layout,
+        })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Create a project (a placement group in a space). Projects are filing
@@ -2004,25 +2320,31 @@ pub async fn refresh_fleet(state: State<'_, LoomState>) -> Result<FleetSnapshot,
 pub async fn create_group(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     space_id: String,
     name: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
-    let name = name.trim().to_string();
-    if name.is_empty() {
-        return Err(UiError {
-            message: "project name cannot be empty".into(),
-            unreachable: false,
-        });
+    async {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(UiError {
+                message: "project name cannot be empty".into(),
+                unreachable: false,
+                server_url: None,
+            });
+        }
+        let client = state_client(&state, &base_url).await?;
+        let layout = client
+            .create_group(&space_id, &name)
+            .await
+            .map_err(Into::<UiError>::into)?;
+        // The fleet poller's `layout` subscription pushes the snapshot, but the
+        // new group should appear immediately — refetch under the publication lease.
+        emit_fleet(&app, &state, &client).await;
+        Ok(layout)
     }
-    let client = state_client(&state).await?;
-    let layout = client
-        .create_group(&space_id, &name)
-        .await
-        .map_err(Into::<UiError>::into)?;
-    // The fleet poller's `layout` subscription pushes the snapshot, but the
-    // new group should appear immediately — push it from the fresh layout.
-    emit_fleet_with(&app, &client, layout.clone()).await;
-    Ok(layout)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Delete a lane (placement group); its sessions move to the destination
@@ -2030,14 +2352,19 @@ pub async fn create_group(
 #[tauri::command]
 pub async fn delete_group(
     state: State<'_, LoomState>,
+    base_url: String,
     group_id: String,
     destination_group_id: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
-    let client = state_client(&state).await?;
-    client
-        .delete_group(&group_id, &destination_group_id)
-        .await
-        .map_err(Into::into)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client
+            .delete_group(&group_id, &destination_group_id)
+            .await
+            .map_err(Into::into)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Move sessions into a lane (placement group).
@@ -2045,16 +2372,21 @@ pub async fn delete_group(
 pub async fn move_to_group(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     session_ids: Vec<String>,
     group_id: String,
 ) -> Result<crate::loom::SessionLayoutView, UiError> {
-    let client = state_client(&state).await?;
-    let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
-    let layout = client.move_sessions(&refs, &group_id).await?;
-    // Loom publishes a layout SSE event, but push the fresh snapshot now so
-    // the topic visibly files under its new project heading immediately.
-    emit_fleet_with(&app, &client, layout.clone()).await;
-    Ok(layout)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let refs: Vec<&str> = session_ids.iter().map(|s| s.as_str()).collect();
+        let layout = client.move_sessions(&refs, &group_id).await?;
+        // Loom publishes a layout SSE event, but refetch the full snapshot now so
+        // the topic visibly files under its new project heading immediately.
+        emit_fleet(&app, &state, &client).await;
+        Ok(layout)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// A child acquiring children is a local coordinator, not a new canonical Track.
@@ -2070,24 +2402,29 @@ pub fn should_mark_track(fleet: &[SessionSummaryView], parent_id: &str) -> bool 
 #[tauri::command]
 pub async fn reparent_session(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     parent_id: Option<String>,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    client
-        .reparent_session(&session_id, parent_id.as_deref().filter(|p| !p.is_empty()))
-        .await?;
-    // Only a root is promoted; recursive delegation does not change Track ownership.
-    if let Some(parent) = parent_id.as_deref().filter(|p| !p.is_empty()) {
-        if let Ok(fleet) = client.list_sessions().await {
-            if should_mark_track(&fleet, parent) {
-                let _ = client
-                    .set_tag(parent, "topic", "true", "joined by child session")
-                    .await;
+    async {
+        let client = state_client(&state, &base_url).await?;
+        client
+            .reparent_session(&session_id, parent_id.as_deref().filter(|p| !p.is_empty()))
+            .await?;
+        // Only a root is promoted; recursive delegation does not change Track ownership.
+        if let Some(parent) = parent_id.as_deref().filter(|p| !p.is_empty()) {
+            if let Ok(fleet) = client.list_sessions().await {
+                if should_mark_track(&fleet, parent) {
+                    let _ = client
+                        .set_tag(parent, "topic", "true", "joined by child session")
+                        .await;
+                }
             }
         }
+        Ok(())
     }
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 // ---------------------------------------------------------------------------
@@ -2242,13 +2579,24 @@ pub(crate) async fn land_thread_with_client(
 pub async fn land_thread(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     strategy: Option<String>,
 ) -> Result<IntegrationTarget, UiError> {
-    let client = state_client(&state).await?;
-    let target = land_thread_with_client(&client, &session_id, strategy.as_deref()).await?;
-    let _ = app.emit("loom://integration-sent", &target);
-    Ok(target)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let target = land_thread_with_client(&client, &session_id, strategy.as_deref()).await?;
+        let _ = app.emit(
+            "loom://integration-sent",
+            serde_json::json!({
+                "server_url": client.server_url(), "coordinator_id": target.coordinator_id,
+                "coordinator_name": target.coordinator_name, "target_branch": target.target_branch,
+            }),
+        );
+        Ok(target)
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Compatibility alias with identical Thread Land acceptance semantics.
@@ -2256,10 +2604,13 @@ pub async fn land_thread(
 pub async fn integrate_session(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     strategy: Option<String>,
 ) -> Result<IntegrationTarget, UiError> {
-    land_thread(app, state, session_id, strategy).await
+    async { land_thread(app, state, base_url.clone(), session_id, strategy).await }
+        .await
+        .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2405,15 +2756,18 @@ async fn setup_autoland_policy(
 pub async fn set_autoland(
     app: AppHandle,
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     policy: String,
 ) -> Result<AutolandPolicyResult, UiError> {
-    let client = state_client(&state).await?;
-    let view = set_autoland_with_client(&client, &session_id, &policy).await?;
-    if let Ok(fleet) = client.list_sessions().await {
-        emit_fleet(&app, &client, fleet).await;
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let view = set_autoland_with_client(&client, &session_id, &policy).await?;
+        emit_fleet(&app, &state, &client).await;
+        Ok(view)
     }
-    Ok(view)
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Establish routes and notify the Track BEFORE a future child can report a
@@ -2538,13 +2892,19 @@ pub struct LandResult {
 #[tauri::command]
 pub async fn land_topic(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     strategy: String,
     upstream: Option<String>,
 ) -> Result<LandResult, UiError> {
-    // Compatibility for older callers; publishing always resolves the canonical
-    // accepted Track ref through the same path as the current Publish UI.
-    crate::publishing::publish_track(state, session_id, strategy, upstream).await
+    async {
+        // Compatibility for older callers; publishing always resolves the canonical
+        // accepted Track ref through the same path as the current Publish UI.
+        crate::publishing::publish_track(state, base_url.clone(), session_id, strategy, upstream)
+            .await
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[cfg(test)]
@@ -2623,12 +2983,14 @@ async fn land_topic_locally(
                 "land-locally needs the Loom server on this machine; {host} runs sessions remotely —\n\nuse one of the agent-mediated strategies instead"
             ),
             unreachable: false,
+        server_url: None,
         });
     }
     if view.branch.branch.trim().is_empty() {
         return Err(UiError {
             message: "this topic has no branch to land".into(),
             unreachable: false,
+            server_url: None,
         });
     }
     let source = crate::landing::inspect_source_checkout(
@@ -2777,27 +3139,37 @@ pub struct WorkSummary {
 #[tauri::command]
 pub async fn work_summary(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
 ) -> Result<WorkSummary, UiError> {
-    let client = state_client(&state).await?;
-    let changes = client.session_changes(&session_id).await?;
-    Ok(WorkSummary {
-        additions: changes.totals.additions,
-        deletions: changes.totals.deletions,
-        files: changes.totals.files,
-        has_commits: changes.head_oid.as_deref()
-            != changes.base.get("oid").and_then(|value| value.as_str()),
-    })
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let changes = client.session_changes(&session_id).await?;
+        Ok(WorkSummary {
+            additions: changes.totals.additions,
+            deletions: changes.totals.deletions,
+            files: changes.totals.files,
+            has_commits: changes.head_oid.as_deref()
+                != changes.base.get("oid").and_then(|value| value.as_str()),
+        })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Actual canonical comparison for loopback repositories, with explicit remote limits.
 #[tauri::command]
 pub async fn work_changes(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
 ) -> Result<ReviewChanges, UiError> {
-    let client = state_client(&state).await?;
-    load_review_changes(&client, &session_id).await
+    async {
+        let client = state_client(&state, &base_url).await?;
+        load_review_changes(&client, &session_id).await
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// A canonical preview identifies its actual source and comparison, rather than
@@ -3222,6 +3594,7 @@ fn resource_error(message: impl Into<String>) -> UiError {
     UiError {
         message: message.into(),
         unreachable: false,
+        server_url: None,
     }
 }
 
@@ -3644,34 +4017,39 @@ fn topic_prs(subtree: &[&SessionSummaryView]) -> Vec<TopicPrRow> {
 #[tauri::command]
 pub async fn topic_resources(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
 ) -> Result<TopicResourcesPanel, UiError> {
-    let client = state_client(&state).await?;
-    let context = load_topic_context(&client, &topic_id).await?;
-    // The live slice rides the same fetch: the fleet snapshot for the
-    // subtree's PRs and branches, plus the issue board. A failed board fetch
-    // must not take the manifest down with it — the panel degrades to the
-    // durable bindings only.
-    let fleet = client.list_sessions().await.map(|mut fleet| {
-        fleet.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
-        fleet
-    });
-    let (issues, prs) = match fleet {
-        Ok(fleet) => {
-            let subtree = topic_subtree(&fleet, &topic_id);
-            let issues = match client.list_issues().await {
-                Ok(board) => topic_issues(board, &context.topic, &subtree),
-                Err(_) => Vec::new(),
-            };
-            (issues, topic_prs(&subtree))
-        }
-        Err(_) => (Vec::new(), Vec::new()),
-    };
-    Ok(TopicResourcesPanel {
-        effective: context.effective_view(),
-        issues,
-        prs,
-    })
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = load_topic_context(&client, &topic_id).await?;
+        // The live slice rides the same fetch: the fleet snapshot for the
+        // subtree's PRs and branches, plus the issue board. A failed board fetch
+        // must not take the manifest down with it — the panel degrades to the
+        // durable bindings only.
+        let fleet = client.list_sessions().await.map(|mut fleet| {
+            fleet.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+            fleet
+        });
+        let (issues, prs) = match fleet {
+            Ok(fleet) => {
+                let subtree = topic_subtree(&fleet, &topic_id);
+                let issues = match client.list_issues().await {
+                    Ok(board) => topic_issues(board, &context.topic, &subtree),
+                    Err(_) => Vec::new(),
+                };
+                (issues, topic_prs(&subtree))
+            }
+            Err(_) => (Vec::new(), Vec::new()),
+        };
+        Ok(TopicResourcesPanel {
+            effective: context.effective_view(),
+            issues,
+            prs,
+        })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Attach a resource to a topic (an explicit Topic addition — design.md's
@@ -3742,35 +4120,47 @@ pub struct ProjectBindingsView {
 #[tauri::command]
 pub async fn project_bindings(
     state: State<'_, LoomState>,
+    base_url: String,
     project_id: String,
     repo: String,
 ) -> Result<ProjectBindingsView, UiError> {
-    let client = state_client(&state).await?;
-    let context = repo_branch_context(&client, &repo)
-        .await?
-        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
-    let store = load_projects_store(&client, &context).await?;
-    Ok(ProjectBindingsView {
-        bindings: store.projects.get(&project_id).cloned().unwrap_or_default(),
-        revision: store.revision,
-    })
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = repo_branch_context(&client, &repo)
+            .await?
+            .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+        let store = load_projects_store(&client, &context).await?;
+        Ok(ProjectBindingsView {
+            bindings: store.projects.get(&project_id).cloned().unwrap_or_default(),
+            revision: store.revision,
+        })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// The managed repositories, for pickers that bind a repository by slug
 /// (project bindings, topic attachments). Slug + path so the frontend can
 /// offer the human-readable name while commands key by either.
 #[tauri::command]
-pub async fn managed_repos(state: State<'_, LoomState>) -> Result<Vec<ManagedRepoView>, UiError> {
-    let client = state_client(&state).await?;
-    let mut repos = client.list_repos().await?;
-    repos.sort_by(|a, b| a.slug.cmp(&b.slug));
-    Ok(repos
-        .into_iter()
-        .map(|r| ManagedRepoView {
-            slug: r.slug,
-            path: r.path,
-        })
-        .collect())
+pub async fn managed_repos(
+    state: State<'_, LoomState>,
+    base_url: String,
+) -> Result<Vec<ManagedRepoView>, UiError> {
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let mut repos = client.list_repos().await?;
+        repos.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(repos
+            .into_iter()
+            .map(|r| ManagedRepoView {
+                slug: r.slug,
+                path: r.path,
+            })
+            .collect())
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Resolve `repo` to the canonical repo root by finding a branch of it —
@@ -3813,52 +4203,57 @@ async fn repo_root_of(client: &LoomClient, repo: &str) -> Result<Option<String>,
 #[tauri::command]
 pub async fn add_project_binding(
     state: State<'_, LoomState>,
+    base_url: String,
     project_id: String,
     repo: String,
     resource: ResourceDraft,
     expected_revision: i64,
 ) -> Result<ProjectBindingsView, UiError> {
-    let client = state_client(&state).await?;
-    let context = repo_branch_context(&client, &repo)
-        .await?
-        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
-    let repo_root = repo_root_of(&client, &repo)
-        .await?
-        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
-    let mut draft = resource;
-    if draft.kind == ResourceKind::Repository {
-        // A repository binding points at its own repo: the picker sends a
-        // slug (or path), resolved to the canonical root the same way the
-        // host repo is, so identity matches what a topic attach produces.
-        draft.repository = repo_root_of(&client, &draft.repository)
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = repo_branch_context(&client, &repo)
             .await?
-            .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
-    } else {
-        draft.repository = repo_root.clone();
+            .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+        let repo_root = repo_root_of(&client, &repo)
+            .await?
+            .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+        let mut draft = resource;
+        if draft.kind == ResourceKind::Repository {
+            // A repository binding points at its own repo: the picker sends a
+            // slug (or path), resolved to the canonical root the same way the
+            // host repo is, so identity matches what a topic attach produces.
+            draft.repository = repo_root_of(&client, &draft.repository)
+                .await?
+                .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
+        } else {
+            draft.repository = repo_root.clone();
+        }
+        let binding =
+            ProjectBinding::validated_for_project(draft, &repo_root).map_err(resource_error)?;
+        let mut store = load_projects_store(&client, &context).await?;
+        if store.revision != expected_revision {
+            return Err(resource_error(
+                "project bindings changed; reload before editing",
+            ));
+        }
+        let bindings = store.projects.entry(project_id.clone()).or_default();
+        let binding = ProjectBinding {
+            created_at: chrono_iso_now(),
+            ..binding
+        };
+        if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
+            *existing = binding;
+        } else {
+            bindings.push(binding);
+        }
+        let saved = save_projects_store(&client, &context, &store, expected_revision).await?;
+        Ok(ProjectBindingsView {
+            bindings: saved.projects.get(&project_id).cloned().unwrap_or_default(),
+            revision: saved.revision,
+        })
     }
-    let binding =
-        ProjectBinding::validated_for_project(draft, &repo_root).map_err(resource_error)?;
-    let mut store = load_projects_store(&client, &context).await?;
-    if store.revision != expected_revision {
-        return Err(resource_error(
-            "project bindings changed; reload before editing",
-        ));
-    }
-    let bindings = store.projects.entry(project_id.clone()).or_default();
-    let binding = ProjectBinding {
-        created_at: chrono_iso_now(),
-        ..binding
-    };
-    if let Some(existing) = bindings.iter_mut().find(|b| b.id == binding.id) {
-        *existing = binding;
-    } else {
-        bindings.push(binding);
-    }
-    let saved = save_projects_store(&client, &context, &store, expected_revision).await?;
-    Ok(ProjectBindingsView {
-        bindings: saved.projects.get(&project_id).cloned().unwrap_or_default(),
-        revision: saved.revision,
-    })
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Remove a binding from a project. Existing topics keep their own additions
@@ -3867,35 +4262,40 @@ pub async fn add_project_binding(
 #[tauri::command]
 pub async fn remove_project_binding(
     state: State<'_, LoomState>,
+    base_url: String,
     project_id: String,
     repo: String,
     binding_id: String,
     expected_revision: i64,
 ) -> Result<ProjectBindingsView, UiError> {
-    let client = state_client(&state).await?;
-    let context = repo_branch_context(&client, &repo)
-        .await?
-        .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
-    let mut store = load_projects_store(&client, &context).await?;
-    if store.revision != expected_revision {
-        return Err(resource_error(
-            "project bindings changed; reload before editing",
-        ));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = repo_branch_context(&client, &repo)
+            .await?
+            .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
+        let mut store = load_projects_store(&client, &context).await?;
+        if store.revision != expected_revision {
+            return Err(resource_error(
+                "project bindings changed; reload before editing",
+            ));
+        }
+        let bindings = store
+            .projects
+            .get_mut(&project_id)
+            .ok_or_else(|| resource_error("project has no bindings"))?;
+        let before = bindings.len();
+        bindings.retain(|b| b.id != binding_id);
+        if bindings.len() == before {
+            return Err(resource_error("binding not found"));
+        }
+        let saved = save_projects_store(&client, &context, &store, expected_revision).await?;
+        Ok(ProjectBindingsView {
+            bindings: saved.projects.get(&project_id).cloned().unwrap_or_default(),
+            revision: saved.revision,
+        })
     }
-    let bindings = store
-        .projects
-        .get_mut(&project_id)
-        .ok_or_else(|| resource_error("project has no bindings"))?;
-    let before = bindings.len();
-    bindings.retain(|b| b.id != binding_id);
-    if bindings.len() == before {
-        return Err(resource_error("binding not found"));
-    }
-    let saved = save_projects_store(&client, &context, &store, expected_revision).await?;
-    Ok(ProjectBindingsView {
-        bindings: saved.projects.get(&project_id).cloned().unwrap_or_default(),
-        revision: saved.revision,
-    })
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Attach a resource to a topic (an explicit Topic addition — design.md's
@@ -3906,46 +4306,51 @@ pub async fn remove_project_binding(
 #[tauri::command]
 pub async fn attach_topic_resource(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     resource: ResourceDraft,
     expected_revision: i64,
 ) -> Result<TopicEffectiveView, UiError> {
-    let client = state_client(&state).await?;
-    let context = load_topic_context(&client, &topic_id).await?;
-    let topic = &context.topic;
-    if context.manifest.revision != expected_revision {
-        return Err(resource_error("resources changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = load_topic_context(&client, &topic_id).await?;
+        let topic = &context.topic;
+        if context.manifest.revision != expected_revision {
+            return Err(resource_error("resources changed; reload before editing"));
+        }
+        let mut draft = resource;
+        if draft.kind == ResourceKind::Repository {
+            // A repository attachment names its own repo (a slug or path);
+            // canonicalize to the repo root a project binding would record so
+            // override/hide matching works across scopes.
+            draft.repository = repo_root_of(&client, &draft.repository)
+                .await?
+                .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
+        }
+        let resource = draft
+            .validated(&topic.branch.repo_root, &topic.branch.branch)
+            .map_err(resource_error)?;
+        let mut manifest = context.manifest.clone();
+        let key = resource.binding_key();
+        if let Some(existing) = manifest.resources.iter_mut().find(|r| r.id == resource.id) {
+            *existing = resource;
+        } else {
+            manifest.resources.push(resource);
+        }
+        // An explicit attach beats a recorded hide of the same backing object.
+        manifest.hidden.retain(|hidden| hidden != &key);
+        let saved =
+            save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await?;
+        Ok(TopicContext {
+            topic: topic.clone(),
+            manifest: saved,
+            project: context.project,
+            bindings: context.bindings,
+        }
+        .effective_view())
     }
-    let mut draft = resource;
-    if draft.kind == ResourceKind::Repository {
-        // A repository attachment names its own repo (a slug or path);
-        // canonicalize to the repo root a project binding would record so
-        // override/hide matching works across scopes.
-        draft.repository = repo_root_of(&client, &draft.repository)
-            .await?
-            .ok_or_else(|| resource_error("no loom branch exists for that repository yet"))?;
-    }
-    let resource = draft
-        .validated(&topic.branch.repo_root, &topic.branch.branch)
-        .map_err(resource_error)?;
-    let mut manifest = context.manifest.clone();
-    let key = resource.binding_key();
-    if let Some(existing) = manifest.resources.iter_mut().find(|r| r.id == resource.id) {
-        *existing = resource;
-    } else {
-        manifest.resources.push(resource);
-    }
-    // An explicit attach beats a recorded hide of the same backing object.
-    manifest.hidden.retain(|hidden| hidden != &key);
-    let saved =
-        save_topic_resources(&client, &topic.branch.id, &manifest, expected_revision).await?;
-    Ok(TopicContext {
-        topic: topic.clone(),
-        manifest: saved,
-        project: context.project,
-        bindings: context.bindings,
-    }
-    .effective_view())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Detach a topic's own binding. Inherited (project) bindings cannot be
@@ -3954,39 +4359,44 @@ pub async fn attach_topic_resource(
 #[tauri::command]
 pub async fn detach_topic_resource(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     resource_id: String,
     expected_revision: i64,
 ) -> Result<TopicEffectiveView, UiError> {
-    let client = state_client(&state).await?;
-    let context = load_topic_context(&client, &topic_id).await?;
-    if context.manifest.revision != expected_revision {
-        return Err(resource_error("resources changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = load_topic_context(&client, &topic_id).await?;
+        if context.manifest.revision != expected_revision {
+            return Err(resource_error("resources changed; reload before editing"));
+        }
+        let before = context.manifest.resources.len();
+        let mut manifest = context.manifest.clone();
+        manifest.resources.retain(|r| r.id != resource_id);
+        if manifest.resources.len() == before {
+            // Not a topic row: either an inherited binding (hide it instead) or
+            // nothing — both report the same error to the panel.
+            return Err(resource_error(
+                "resource not found on this topic; inherited bindings are hidden, not detached",
+            ));
+        }
+        let saved = save_topic_resources(
+            &client,
+            &context.topic.branch.id,
+            &manifest,
+            expected_revision,
+        )
+        .await?;
+        Ok(TopicContext {
+            topic: context.topic,
+            manifest: saved,
+            project: context.project,
+            bindings: context.bindings,
+        }
+        .effective_view())
     }
-    let before = context.manifest.resources.len();
-    let mut manifest = context.manifest.clone();
-    manifest.resources.retain(|r| r.id != resource_id);
-    if manifest.resources.len() == before {
-        // Not a topic row: either an inherited binding (hide it instead) or
-        // nothing — both report the same error to the panel.
-        return Err(resource_error(
-            "resource not found on this topic; inherited bindings are hidden, not detached",
-        ));
-    }
-    let saved = save_topic_resources(
-        &client,
-        &context.topic.branch.id,
-        &manifest,
-        expected_revision,
-    )
-    .await?;
-    Ok(TopicContext {
-        topic: context.topic,
-        manifest: saved,
-        project: context.project,
-        bindings: context.bindings,
-    }
-    .effective_view())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Hide an inherited project binding for this topic (design.md: allow a
@@ -3996,87 +4406,97 @@ pub async fn detach_topic_resource(
 #[tauri::command]
 pub async fn hide_topic_resource(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     resource_id: String,
     expected_revision: i64,
 ) -> Result<TopicEffectiveView, UiError> {
-    let client = state_client(&state).await?;
-    let context = load_topic_context(&client, &topic_id).await?;
-    if context.manifest.revision != expected_revision {
-        return Err(resource_error("resources changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = load_topic_context(&client, &topic_id).await?;
+        if context.manifest.revision != expected_revision {
+            return Err(resource_error("resources changed; reload before editing"));
+        }
+        let row = context
+            .find_effective(&resource_id)
+            .ok_or_else(|| resource_error("resource not found"))?;
+        if row.origin != ResourceOrigin::Project {
+            return Err(resource_error(
+                "only inherited resources can be hidden; detach your own bindings instead",
+            ));
+        }
+        let key = binding_key(&row.resource.data);
+        let mut manifest = context.manifest.clone();
+        if !manifest.hidden.iter().any(|hidden| hidden == &key) {
+            manifest.hidden.push(key);
+        }
+        let saved = save_topic_resources(
+            &client,
+            &context.topic.branch.id,
+            &manifest,
+            expected_revision,
+        )
+        .await?;
+        Ok(TopicContext {
+            topic: context.topic,
+            manifest: saved,
+            project: context.project,
+            bindings: context.bindings,
+        }
+        .effective_view())
     }
-    let row = context
-        .find_effective(&resource_id)
-        .ok_or_else(|| resource_error("resource not found"))?;
-    if row.origin != ResourceOrigin::Project {
-        return Err(resource_error(
-            "only inherited resources can be hidden; detach your own bindings instead",
-        ));
-    }
-    let key = binding_key(&row.resource.data);
-    let mut manifest = context.manifest.clone();
-    if !manifest.hidden.iter().any(|hidden| hidden == &key) {
-        manifest.hidden.push(key);
-    }
-    let saved = save_topic_resources(
-        &client,
-        &context.topic.branch.id,
-        &manifest,
-        expected_revision,
-    )
-    .await?;
-    Ok(TopicContext {
-        topic: context.topic,
-        manifest: saved,
-        project: context.project,
-        bindings: context.bindings,
-    }
-    .effective_view())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Restore a hidden inherited binding.
 #[tauri::command]
 pub async fn unhide_topic_resource(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     resource_id: String,
     expected_revision: i64,
 ) -> Result<TopicEffectiveView, UiError> {
-    let client = state_client(&state).await?;
-    let context = load_topic_context(&client, &topic_id).await?;
-    if context.manifest.revision != expected_revision {
-        return Err(resource_error("resources changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let context = load_topic_context(&client, &topic_id).await?;
+        if context.manifest.revision != expected_revision {
+            return Err(resource_error("resources changed; reload before editing"));
+        }
+        // Hidden rows are kept in the view exactly so this can resolve them.
+        let row = context
+            .merged()
+            .into_iter()
+            .find(|row| row.resource.id == resource_id)
+            .ok_or_else(|| resource_error("resource not found"))?;
+        if !row.hidden {
+            return Ok(context.effective_view());
+        }
+        let key = binding_key(&row.resource.data);
+        let mut manifest = context.manifest.clone();
+        let before = manifest.hidden.len();
+        manifest.hidden.retain(|hidden| hidden != &key);
+        if manifest.hidden.len() == before {
+            return Ok(context.effective_view());
+        }
+        let saved = save_topic_resources(
+            &client,
+            &context.topic.branch.id,
+            &manifest,
+            expected_revision,
+        )
+        .await?;
+        Ok(TopicContext {
+            topic: context.topic,
+            manifest: saved,
+            project: context.project,
+            bindings: context.bindings,
+        }
+        .effective_view())
     }
-    // Hidden rows are kept in the view exactly so this can resolve them.
-    let row = context
-        .merged()
-        .into_iter()
-        .find(|row| row.resource.id == resource_id)
-        .ok_or_else(|| resource_error("resource not found"))?;
-    if !row.hidden {
-        return Ok(context.effective_view());
-    }
-    let key = binding_key(&row.resource.data);
-    let mut manifest = context.manifest.clone();
-    let before = manifest.hidden.len();
-    manifest.hidden.retain(|hidden| hidden != &key);
-    if manifest.hidden.len() == before {
-        return Ok(context.effective_view());
-    }
-    let saved = save_topic_resources(
-        &client,
-        &context.topic.branch.id,
-        &manifest,
-        expected_revision,
-    )
-    .await?;
-    Ok(TopicContext {
-        topic: context.topic,
-        manifest: saved,
-        project: context.project,
-        bindings: context.bindings,
-    }
-    .effective_view())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 async fn resolve_topic_resource(
@@ -4105,121 +4525,136 @@ pub struct LinkedArtifactContent {
 #[tauri::command]
 pub async fn read_linked_artifact(
     state: State<'_, LoomState>,
+    base_url: String,
     key: String,
     name: String,
 ) -> Result<LinkedArtifactContent, UiError> {
-    let client = state_client(&state).await?;
-    let artifact = client.linked_artifact(&key, &name).await?;
-    let content = artifact
-        .get("content")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| resource_error("artifact has no text content"))?
-        .to_owned();
-    let title = artifact
-        .get("meta")
-        .and_then(|meta| meta.get("title"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(&name)
-        .to_owned();
-    Ok(LinkedArtifactContent { title, content })
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let artifact = client.linked_artifact(&key, &name).await?;
+        let content = artifact
+            .get("content")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| resource_error("artifact has no text content"))?
+            .to_owned();
+        let title = artifact
+            .get("meta")
+            .and_then(|meta| meta.get("title"))
+            .and_then(|value| value.as_str())
+            .unwrap_or(&name)
+            .to_owned();
+        Ok(LinkedArtifactContent { title, content })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[tauri::command]
 pub async fn read_topic_resource(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     resource_id: String,
 ) -> Result<TopicResourceContent, UiError> {
-    let client = state_client(&state).await?;
-    let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
-    let content = match resource.data.kind {
-        ResourceKind::File | ResourceKind::DesignDocument => {
-            if topic.status == "archived" {
-                return Err(resource_error(
-                    "topic checkout is archived; recover it to preview this file",
-                ));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
+        let content = match resource.data.kind {
+            ResourceKind::File | ResourceKind::DesignDocument => {
+                if topic.status == "archived" {
+                    return Err(resource_error(
+                        "topic checkout is archived; recover it to preview this file",
+                    ));
+                }
+                if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
+                    return Err(resource_error(
+                        "file reference no longer matches the topic branch",
+                    ));
+                }
+                let path = resource
+                    .data
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| resource_error("resource has no file path"))?;
+                crate::resources::validate_relative_path(path).map_err(resource_error)?;
+                client.worktree_text(&topic_id, path).await?
             }
-            if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
-                return Err(resource_error(
-                    "file reference no longer matches the topic branch",
-                ));
+            ResourceKind::Artifact => {
+                let name = resource
+                    .data
+                    .path
+                    .as_deref()
+                    .ok_or_else(|| resource_error("resource has no artifact name"))?;
+                client
+                    .branch_artifact(&topic.branch.id, name)
+                    .await?
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| resource_error("artifact has no content"))?
+                    .to_owned()
             }
-            let path = resource
-                .data
-                .path
-                .as_deref()
-                .ok_or_else(|| resource_error("resource has no file path"))?;
-            crate::resources::validate_relative_path(path).map_err(resource_error)?;
-            client.worktree_text(&topic_id, path).await?
-        }
-        ResourceKind::Artifact => {
-            let name = resource
-                .data
-                .path
-                .as_deref()
-                .ok_or_else(|| resource_error("resource has no artifact name"))?;
-            client
-                .branch_artifact(&topic.branch.id, name)
-                .await?
-                .get("content")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| resource_error("artifact has no content"))?
-                .to_owned()
-        }
-        _ => return Err(resource_error("this resource has no text preview")),
-    };
-    Ok(TopicResourceContent { resource, content })
+            _ => return Err(resource_error("this resource has no text preview")),
+        };
+        Ok(TopicResourceContent { resource, content })
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[tauri::command]
 pub async fn open_topic_resource_in_zed(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     resource_id: String,
 ) -> Result<(), UiError> {
-    let client = state_client(&state).await?;
-    let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
-    if !matches!(
-        resource.data.kind,
-        ResourceKind::File | ResourceKind::DesignDocument
-    ) {
-        return Err(resource_error("only repository files can open in Zed"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let (topic, resource) = resolve_topic_resource(&client, &topic_id, &resource_id).await?;
+        if !matches!(
+            resource.data.kind,
+            ResourceKind::File | ResourceKind::DesignDocument
+        ) {
+            return Err(resource_error("only repository files can open in Zed"));
+        }
+        if topic.status == "archived" {
+            return Err(resource_error(
+                "topic checkout is archived; recover it before opening a file",
+            ));
+        }
+        if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
+            return Err(resource_error(
+                "file reference no longer matches the topic branch",
+            ));
+        }
+        let path = resource
+            .data
+            .path
+            .as_deref()
+            .ok_or_else(|| resource_error("resource has no file path"))?;
+        crate::resources::validate_relative_path(path).map_err(resource_error)?;
+        let host = client
+            .server_host()
+            .ok_or_else(|| resource_error("Loom URL has no host"))?;
+        let file = std::path::Path::new(&topic.work_dir).join(path);
+        let target = zed_target(host, &file.to_string_lossy())?;
+        let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
+            "/Applications/Zed.app/Contents/MacOS/cli"
+        } else {
+            "zed"
+        };
+        let status = tokio::process::Command::new(cli)
+            .arg(&target)
+            .status()
+            .await
+            .map_err(|e| resource_error(format!("launching zed: {e}")))?;
+        if !status.success() {
+            return Err(resource_error(format!("zed exited with {status}")));
+        }
+        Ok(())
     }
-    if topic.status == "archived" {
-        return Err(resource_error(
-            "topic checkout is archived; recover it before opening a file",
-        ));
-    }
-    if resource.data.reference.as_deref() != Some(&topic.branch.branch) {
-        return Err(resource_error(
-            "file reference no longer matches the topic branch",
-        ));
-    }
-    let path = resource
-        .data
-        .path
-        .as_deref()
-        .ok_or_else(|| resource_error("resource has no file path"))?;
-    crate::resources::validate_relative_path(path).map_err(resource_error)?;
-    let host = client
-        .server_host()
-        .ok_or_else(|| resource_error("Loom URL has no host"))?;
-    let file = std::path::Path::new(&topic.work_dir).join(path);
-    let target = zed_target(host, &file.to_string_lossy())?;
-    let cli = if std::path::Path::new("/Applications/Zed.app/Contents/MacOS/cli").exists() {
-        "/Applications/Zed.app/Contents/MacOS/cli"
-    } else {
-        "zed"
-    };
-    let status = tokio::process::Command::new(cli)
-        .arg(&target)
-        .status()
-        .await
-        .map_err(|e| resource_error(format!("launching zed: {e}")))?;
-    if !status.success() {
-        return Err(resource_error(format!("zed exited with {status}")));
-    }
-    Ok(())
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 // --- Todos -----------------------------------------------------------------
@@ -4300,6 +4735,7 @@ fn todo_error(message: impl Into<String>) -> UiError {
     UiError {
         message: message.into(),
         unreachable: false,
+        server_url: None,
     }
 }
 
@@ -4335,13 +4771,18 @@ fn todo_id(text: &str, topic_id: &str) -> String {
 #[tauri::command]
 pub async fn topic_todos(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
 ) -> Result<TodoTopicView, UiError> {
-    let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
-    Ok(load_todo_list(&client, &topic.branch.id)
-        .await?
-        .topic_view(&topic_id))
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let topic = client.get_session(&topic_id).await?;
+        Ok(load_todo_list(&client, &topic.branch.id)
+            .await?
+            .topic_view(&topic_id))
+    }
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Open user Todos across visible Tracks. Discover existing manifests once
@@ -4400,80 +4841,85 @@ mod user_todos_tests {
 #[tauri::command]
 pub async fn user_todos(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_ids: Vec<String>,
 ) -> Result<UserTodosView, UiError> {
-    use futures_util::{stream, StreamExt};
-    use std::collections::{HashMap, HashSet};
-    let client = state_client(&state).await?;
-    let wanted: HashSet<String> = topic_ids.into_iter().collect();
-    let sessions = client.list_sessions().await?;
-    let topics: Vec<_> = sessions
-        .into_iter()
-        .filter(|s| wanted.contains(&s.id) && s.status != "archived")
-        .collect();
-    let mut repositories = HashMap::new();
-    let by_branch: HashMap<_, _> = topics
-        .iter()
-        .map(|s| (s.branch.id.clone(), s.id.clone()))
-        .collect();
-    for topic in &topics {
-        repositories
-            .entry(topic.branch.repo_root.clone())
-            .or_insert(topic.branch.id.clone());
-    }
-    let mut warnings = Vec::new();
-    let mut existing = HashSet::new();
-    for (repo, branch) in repositories {
-        match client
-            .op::<Vec<serde_json::Value>>(
-                "/api/artifacts/list",
-                &serde_json::json!({ "branch": branch, "repo": true }),
-            )
-            .await
-        {
-            Ok(artifacts) => {
-                for artifact in artifacts {
-                    if artifact["name"] == TODOS_NAME {
-                        if let Some(branch) = artifact["branch_id"]
-                            .as_str()
-                            .filter(|id| by_branch.contains_key(*id))
-                        {
-                            existing.insert(branch.to_owned());
+    async {
+        use futures_util::{stream, StreamExt};
+        use std::collections::{HashMap, HashSet};
+        let client = state_client(&state, &base_url).await?;
+        let wanted: HashSet<String> = topic_ids.into_iter().collect();
+        let sessions = client.list_sessions().await?;
+        let topics: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| wanted.contains(&s.id) && s.status != "archived")
+            .collect();
+        let mut repositories = HashMap::new();
+        let by_branch: HashMap<_, _> = topics
+            .iter()
+            .map(|s| (s.branch.id.clone(), s.id.clone()))
+            .collect();
+        for topic in &topics {
+            repositories
+                .entry(topic.branch.repo_root.clone())
+                .or_insert(topic.branch.id.clone());
+        }
+        let mut warnings = Vec::new();
+        let mut existing = HashSet::new();
+        for (repo, branch) in repositories {
+            match client
+                .op::<Vec<serde_json::Value>>(
+                    "/api/artifacts/list",
+                    &serde_json::json!({ "branch": branch, "repo": true }),
+                )
+                .await
+            {
+                Ok(artifacts) => {
+                    for artifact in artifacts {
+                        if artifact["name"] == TODOS_NAME {
+                            if let Some(branch) = artifact["branch_id"]
+                                .as_str()
+                                .filter(|id| by_branch.contains_key(*id))
+                            {
+                                existing.insert(branch.to_owned());
+                            }
                         }
                     }
                 }
+                Err(error) => warnings.push(format!("Todos unavailable for {repo}: {error}")),
             }
-            Err(error) => warnings.push(format!("Todos unavailable for {repo}: {error}")),
         }
-    }
-    let pages = stream::iter(existing.into_iter().map(|branch| {
-        let client = client.clone();
-        async move {
-            let result = load_todo_list(&client, &branch).await;
-            (branch, result)
-        }
-    }))
-    .buffer_unordered(4)
-    .collect::<Vec<_>>()
-    .await;
-    let mut todos = Vec::new();
-    for (branch, result) in pages {
-        match result {
-            Ok(list) => {
-                if let Some(topic_id) = by_branch.get(&branch) {
-                    todos.extend(open_user_todos(list, topic_id));
+        let pages = stream::iter(existing.into_iter().map(|branch| {
+            let client = client.clone();
+            async move {
+                let result = load_todo_list(&client, &branch).await;
+                (branch, result)
+            }
+        }))
+        .buffer_unordered(4)
+        .collect::<Vec<_>>()
+        .await;
+        let mut todos = Vec::new();
+        for (branch, result) in pages {
+            match result {
+                Ok(list) => {
+                    if let Some(topic_id) = by_branch.get(&branch) {
+                        todos.extend(open_user_todos(list, topic_id));
+                    }
                 }
+                Err(error) => warnings.push(format!("Todos unavailable: {}", error.message)),
             }
-            Err(error) => warnings.push(format!("Todos unavailable: {}", error.message)),
         }
+        todos.sort_by(|a, b| {
+            a.todo
+                .created_at
+                .cmp(&b.todo.created_at)
+                .then_with(|| a.todo.id.cmp(&b.todo.id))
+        });
+        Ok(UserTodosView { todos, warnings })
     }
-    todos.sort_by(|a, b| {
-        a.todo
-            .created_at
-            .cmp(&b.todo.created_at)
-            .then_with(|| a.todo.id.cmp(&b.todo.id))
-    });
-    Ok(UserTodosView { todos, warnings })
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Toggle one todo's done state. Because the artifact is one list, the
@@ -4483,79 +4929,94 @@ pub async fn user_todos(
 #[tauri::command]
 pub async fn toggle_todo(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     todo_id: String,
     expected_revision: i64,
 ) -> Result<TodoTopicView, UiError> {
-    let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
-    let mut list = load_todo_list(&client, &topic.branch.id).await?;
-    if list.revision != expected_revision {
-        return Err(todo_error("todos changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let topic = client.get_session(&topic_id).await?;
+        let mut list = load_todo_list(&client, &topic.branch.id).await?;
+        if list.revision != expected_revision {
+            return Err(todo_error("todos changed; reload before editing"));
+        }
+        let todo = list
+            .todos
+            .iter_mut()
+            .find(|t| t.id == todo_id)
+            .ok_or_else(|| todo_error("todo not found"))?;
+        todo.done = !todo.done;
+        let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+        Ok(saved.topic_view(&topic_id))
     }
-    let todo = list
-        .todos
-        .iter_mut()
-        .find(|t| t.id == todo_id)
-        .ok_or_else(|| todo_error("todo not found"))?;
-    todo.done = !todo.done;
-    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
-    Ok(saved.topic_view(&topic_id))
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Add a todo to this topic's slice.
 #[tauri::command]
 pub async fn add_todo(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     text: String,
     expected_revision: i64,
 ) -> Result<TodoTopicView, UiError> {
-    let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
-    todo_text_ok(&text)?;
-    let mut list = load_todo_list(&client, &topic.branch.id).await?;
-    if list.revision != expected_revision {
-        return Err(todo_error("todos changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let topic = client.get_session(&topic_id).await?;
+        todo_text_ok(&text)?;
+        let mut list = load_todo_list(&client, &topic.branch.id).await?;
+        if list.revision != expected_revision {
+            return Err(todo_error("todos changed; reload before editing"));
+        }
+        let id = todo_id(&text, &topic_id);
+        if let Some(existing) = list.todos.iter_mut().find(|t| t.id == id) {
+            existing.text = text.trim().to_owned();
+            existing.topic_id = topic_id.clone();
+        } else {
+            list.todos.push(TodoItem {
+                id,
+                text: text.trim().to_owned(),
+                done: false,
+                topic_id: topic_id.clone(),
+                created_at: chrono_iso_now(),
+            });
+        }
+        let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+        Ok(saved.topic_view(&topic_id))
     }
-    let id = todo_id(&text, &topic_id);
-    if let Some(existing) = list.todos.iter_mut().find(|t| t.id == id) {
-        existing.text = text.trim().to_owned();
-        existing.topic_id = topic_id.clone();
-    } else {
-        list.todos.push(TodoItem {
-            id,
-            text: text.trim().to_owned(),
-            done: false,
-            topic_id: topic_id.clone(),
-            created_at: chrono_iso_now(),
-        });
-    }
-    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
-    Ok(saved.topic_view(&topic_id))
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// Remove a todo from the list.
 #[tauri::command]
 pub async fn remove_todo(
     state: State<'_, LoomState>,
+    base_url: String,
     topic_id: String,
     todo_id: String,
     expected_revision: i64,
 ) -> Result<TodoTopicView, UiError> {
-    let client = state_client(&state).await?;
-    let topic = client.get_session(&topic_id).await?;
-    let mut list = load_todo_list(&client, &topic.branch.id).await?;
-    if list.revision != expected_revision {
-        return Err(todo_error("todos changed; reload before editing"));
+    async {
+        let client = state_client(&state, &base_url).await?;
+        let topic = client.get_session(&topic_id).await?;
+        let mut list = load_todo_list(&client, &topic.branch.id).await?;
+        if list.revision != expected_revision {
+            return Err(todo_error("todos changed; reload before editing"));
+        }
+        let before = list.todos.len();
+        list.todos.retain(|t| t.id != todo_id);
+        if list.todos.len() == before {
+            return Err(todo_error("todo not found"));
+        }
+        let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
+        Ok(saved.topic_view(&topic_id))
     }
-    let before = list.todos.len();
-    list.todos.retain(|t| t.id != todo_id);
-    if list.todos.len() == before {
-        return Err(todo_error("todo not found"));
-    }
-    let saved = save_todo_list(&client, &topic.branch.id, &list, expected_revision).await?;
-    Ok(saved.topic_view(&topic_id))
+    .await
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 /// RFC3339 without pulling a chrono dependency: loom only needs a
@@ -4964,8 +5425,12 @@ pub struct CheckoutFile {
     checkout: String,
 }
 
-async fn local_editor_checkout(state: &LoomState, session_id: &str) -> Result<String, UiError> {
-    let client = state_client(state).await?;
+async fn local_editor_checkout(
+    state: &LoomState,
+    base_url: &str,
+    session_id: &str,
+) -> Result<String, UiError> {
+    let client = state_client(state, base_url).await?;
     if !host_is_loopback(client.server_host().unwrap_or("")) {
         return Err(resource_error(
             "In-app editing currently requires a local Loom server",
@@ -4983,40 +5448,1300 @@ async fn local_editor_checkout(state: &LoomState, session_id: &str) -> Result<St
 #[tauri::command]
 pub async fn read_checkout_file(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     path: String,
 ) -> Result<CheckoutFile, UiError> {
-    let checkout = local_editor_checkout(&state, &session_id).await?;
-    tokio::task::spawn_blocking(move || {
-        let content =
-            crate::editor::read(std::path::Path::new(&checkout), &path).map_err(resource_error)?;
-        Ok(CheckoutFile { content, checkout })
-    })
+    async {
+        let checkout = local_editor_checkout(&state, &base_url, &session_id).await?;
+        tokio::task::spawn_blocking(move || {
+            let content = crate::editor::read(std::path::Path::new(&checkout), &path)
+                .map_err(resource_error)?;
+            Ok(CheckoutFile { content, checkout })
+        })
+        .await
+        .map_err(|e| resource_error(e.to_string()))?
+    }
     .await
-    .map_err(|e| resource_error(e.to_string()))?
+    .map_err(|error: UiError| error.for_server(&base_url))
 }
 
 #[tauri::command]
 pub async fn save_checkout_file(
     state: State<'_, LoomState>,
+    base_url: String,
     session_id: String,
     path: String,
     checkout: String,
     original: String,
     content: String,
 ) -> Result<(), UiError> {
-    let current = local_editor_checkout(&state, &session_id).await?;
-    if current != checkout {
-        return Err(resource_error(
-            "The thread's checkout moved. Reopen the file before saving.",
-        ));
+    async {
+        let current = local_editor_checkout(&state, &base_url, &session_id).await?;
+        if current != checkout {
+            return Err(resource_error(
+                "The thread's checkout moved. Reopen the file before saving.",
+            ));
+        }
+        tokio::task::spawn_blocking(move || {
+            crate::editor::save(std::path::Path::new(&current), &path, &original, &content)
+                .map_err(resource_error)
+        })
+        .await
+        .map_err(|e| resource_error(e.to_string()))?
     }
-    tokio::task::spawn_blocking(move || {
-        crate::editor::save(std::path::Path::new(&current), &path, &original, &content)
-            .map_err(resource_error)
-    })
     .await
-    .map_err(|e| resource_error(e.to_string()))?
+    .map_err(|error: UiError| error.for_server(&base_url))
+}
+
+#[cfg(test)]
+mod fleet_transport_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn actor_entry(
+        client: Arc<LoomClient>,
+        cancel: CancellationToken,
+    ) -> Arc<crate::routing::ServerEntry> {
+        let mut entry = crate::routing::ServerEntry::new(client);
+        entry.fleet_cancel = cancel;
+        Arc::new(entry)
+    }
+
+    fn initial(client: &LoomClient) -> FleetSnapshot {
+        FleetSnapshot {
+            server_url: client.server_url(),
+            sessions: vec![],
+            layout: serde_json::from_value(serde_json::json!({"revision":0,"spaces":[]})).unwrap(),
+        }
+    }
+
+    async fn request(socket: &mut tokio::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        loop {
+            let mut buf = [0; 2048];
+            let n = socket.read(&mut buf).await.unwrap();
+            assert_ne!(n, 0);
+            bytes.extend_from_slice(&buf[..n]);
+            if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_lowercase();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .map(|value| value.parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if bytes.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    async fn json_response(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+        let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn next(rx: &mut tokio::sync::mpsc::UnboundedReceiver<FleetUpdate>) -> FleetUpdate {
+        tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn delayed_first_connect_cannot_replace_newer_client_or_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let held_tx = held_tx.clone();
+                tokio::spawn(async move {
+                    let header = request(&mut socket).await;
+                    let old = header
+                        .to_lowercase()
+                        .contains("authorization: bearer old-token");
+                    if header.starts_with("GET /api/health ") {
+                        if old {
+                            held_tx.send(socket).unwrap();
+                        } else {
+                            json_response(&mut socket, "200 OK", "{}").await;
+                        }
+                    } else if header.starts_with("POST /api/sessions/summary/list ") {
+                        json_response(&mut socket, "200 OK", "[]").await;
+                    } else if header.starts_with("POST /api/session_layout/get ") {
+                        let revision = if old { 1 } else { 9 };
+                        json_response(
+                            &mut socket,
+                            "200 OK",
+                            &format!(r#"{{"revision":{revision},"spaces":[]}}"#),
+                        )
+                        .await;
+                    } else {
+                        assert!(header.starts_with("POST /api/probe "));
+                        assert!(header
+                            .to_lowercase()
+                            .contains("authorization: bearer new-token"));
+                        json_response(&mut socket, "200 OK", r#"{"token":"new-token"}"#).await;
+                    }
+                });
+            }
+        });
+        let registry = Arc::new(crate::routing::ServerRegistry::default());
+        let other = registry
+            .install_for_test(Arc::new(
+                LoomClient::new("http://127.0.0.1:1", None).unwrap(),
+            ))
+            .await;
+        let first = tokio::spawn({
+            let registry = registry.clone();
+            let url = url.clone();
+            async move { prepare_connection(&registry, &url, Some("old-token".into())).await }
+        });
+        let mut delayed_health =
+            tokio::time::timeout(std::time::Duration::from_secs(3), held_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let (new_entry, snapshot) =
+            prepare_connection(&registry, &format!("{url}/"), Some("new-token".into()))
+                .await
+                .unwrap();
+        assert_eq!(snapshot.layout.revision, 9);
+        json_response(&mut delayed_health, "200 OK", "{}").await;
+        let old_result = tokio::time::timeout(std::time::Duration::from_secs(3), first)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            old_result,
+            Err(LoomError::Api { status: 409, .. })
+        ));
+        let current = registry.resolve(&url).await.unwrap();
+        assert!(Arc::ptr_eq(&current, &new_entry));
+        assert!(!new_entry.fleet_cancel.is_cancelled());
+        assert!(!other.fleet_cancel.is_cancelled());
+        let probe: serde_json::Value = current
+            .client
+            .op("/api/probe", &serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(probe["token"], "new-token");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn mutation_refresh_suppresses_retired_and_outage_generation_successes_and_errors() {
+        for retired in [false, true] {
+            for failure in [false, true] {
+                for hold_layout in [false, true] {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let client = Arc::new(
+                        LoomClient::new(
+                            &format!("http://{}", listener.local_addr().unwrap()),
+                            None,
+                        )
+                        .unwrap(),
+                    );
+                    let registry = Arc::new(crate::routing::ServerRegistry::default());
+                    let entry = registry.install_for_test(client.clone()).await;
+                    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+                    let server = tokio::spawn(async move {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        assert!(request(&mut socket)
+                            .await
+                            .starts_with("POST /api/sessions/summary/list "));
+                        if hold_layout {
+                            json_response(&mut socket, "200 OK", "[]").await;
+                            (socket, _) = listener.accept().await.unwrap();
+                            assert!(request(&mut socket)
+                                .await
+                                .starts_with("POST /api/session_layout/get "));
+                        }
+                        held_tx.send(socket).unwrap();
+                    });
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                    let refresh = tokio::spawn({
+                        let registry = registry.clone();
+                        let client = client.clone();
+                        let tx = tx.clone();
+                        async move {
+                            refresh_mutated_fleet(&registry, &client, |update| {
+                                let _ = tx.send(update);
+                            })
+                            .await;
+                        }
+                    });
+                    let mut held = tokio::time::timeout(std::time::Duration::from_secs(3), held_rx)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let current = if retired {
+                        registry
+                            .install_for_test(Arc::new(
+                                LoomClient::new(&client.server_url(), None).unwrap(),
+                            ))
+                            .await
+                    } else {
+                        entry.clone()
+                    };
+                    current.publish_fleet(false, || {
+                        let _ = tx.send(FleetUpdate::Unavailable(UiError::from(
+                            LoomError::Connection("stream lost".into()),
+                        )));
+                    });
+                    assert!(matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)));
+                    let (status, body) = if failure {
+                        ("503 Unavailable", r#"{"error":"late failure"}"#)
+                    } else if !hold_layout {
+                        ("200 OK", "[]")
+                    } else {
+                        ("200 OK", r#"{"revision":1,"spaces":[]}"#)
+                    };
+                    let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    // Retirement cancels the read, so the peer may already be closed.
+                    let _ = held.write_all(response.as_bytes()).await;
+                    tokio::time::timeout(std::time::Duration::from_secs(3), refresh)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        rx.try_recv().is_err(),
+                        "retired={retired}, failure={failure}, hold_layout={hold_layout}"
+                    );
+                    assert!(
+                        current.mutation_ticket().is_none(),
+                        "only actor reconciliation can restore availability"
+                    );
+                    current.publish_fleet(true, || {});
+                    assert!(current.mutation_ticket().is_some());
+                    server.await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_completion_after_outage_recovery_refetches_both_snapshot_halves() {
+        for old_layout_read in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+                    .unwrap(),
+            );
+            let registry = Arc::new(crate::routing::ServerRegistry::default());
+            let entry = registry.install_for_test(client.clone()).await;
+            let mut fresh: SessionSummaryView =
+                serde_json::from_str(include_str!("../tests/fixtures/launch-response.json"))
+                    .unwrap();
+            fresh.id = "after-recovery".into();
+            let summaries = serde_json::to_string(&vec![fresh]).unwrap();
+            let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (mut old_read, _) = listener.accept().await.unwrap();
+                let expected = if old_layout_read {
+                    "/api/session_layout/get"
+                } else {
+                    "/api/sessions/summary/list"
+                };
+                assert!(request(&mut old_read)
+                    .await
+                    .starts_with(&format!("POST {expected} ")));
+                held_tx.send(old_read).unwrap();
+                let (mut summaries_read, _) = listener.accept().await.unwrap();
+                assert!(request(&mut summaries_read)
+                    .await
+                    .starts_with("POST /api/sessions/summary/list "));
+                json_response(&mut summaries_read, "200 OK", &summaries).await;
+                let (mut layout_read, _) = listener.accept().await.unwrap();
+                assert!(request(&mut layout_read)
+                    .await
+                    .starts_with("POST /api/session_layout/get "));
+                json_response(&mut layout_read, "200 OK", r#"{"revision":9,"spaces":[]}"#).await;
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mutation = tokio::spawn({
+                let registry = registry.clone();
+                let client = client.clone();
+                async move {
+                    // Represents data awaited by the mutation before its push.
+                    // Neither old summaries nor a mutation's old layout seeds
+                    // the refresh: its full snapshot uses a new fenced read.
+                    if old_layout_read {
+                        let _ = client.session_layout().await.unwrap();
+                    } else {
+                        let _ = client.list_sessions().await.unwrap();
+                    }
+                    refresh_mutated_fleet(&registry, &client, |update| {
+                        let _ = tx.send(update);
+                    })
+                    .await;
+                }
+            });
+            let mut held = tokio::time::timeout(std::time::Duration::from_secs(3), held_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            entry.publish_fleet(false, || {});
+            entry.publish_fleet(true, || {});
+            let old_body = if old_layout_read {
+                r#"{"revision":1,"spaces":[]}"#
+            } else {
+                "[]"
+            };
+            json_response(&mut held, "200 OK", old_body).await;
+            let FleetUpdate::Snapshot(snapshot) = next(&mut rx).await else {
+                panic!("fresh fenced snapshot expected")
+            };
+            assert_eq!(snapshot.sessions.len(), 1);
+            assert_eq!(snapshot.sessions[0].id, "after-recovery");
+            assert_eq!(snapshot.layout.revision, 9);
+            tokio::time::timeout(std::time::Duration::from_secs(3), mutation)
+                .await
+                .unwrap()
+                .unwrap();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_failure_wakes_quiet_actor_and_retry_respects_outage_and_retirement() {
+        for fail_layout in [false, true] {
+            for action in ["recover", "outage", "retire"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = Arc::new(
+                    LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+                        .unwrap(),
+                );
+                let registry = crate::routing::ServerRegistry::default();
+                let entry = registry.install_for_test(client.clone()).await;
+                let failures = Arc::new(AtomicUsize::new(0));
+                let reads = Arc::new(AtomicUsize::new(0));
+                let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+                let server = tokio::spawn({
+                    let failures = failures.clone();
+                    let reads = reads.clone();
+                    async move {
+                        loop {
+                            let (mut socket, _) = listener.accept().await.unwrap();
+                            let failures = failures.clone();
+                            let reads = reads.clone();
+                            let stream_tx = stream_tx.clone();
+                            tokio::spawn(async move {
+                                let header = request(&mut socket).await;
+                                if header.starts_with("GET /api/events/stream") {
+                                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                                    stream_tx.send(socket).unwrap();
+                                } else {
+                                    let is_layout =
+                                        header.starts_with("POST /api/session_layout/get ");
+                                    assert!(
+                                        is_layout
+                                            || header
+                                                .starts_with("POST /api/sessions/summary/list ")
+                                    );
+                                    reads.fetch_add(1, Ordering::SeqCst);
+                                    let fail = is_layout == fail_layout
+                                        && failures
+                                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                                n.checked_sub(1)
+                                            })
+                                            .is_ok();
+                                    if fail {
+                                        json_response(&mut socket, "503 Unavailable", r#"{"error":"transient mutation reconciliation failure"}"#).await;
+                                    } else {
+                                        let body = if is_layout {
+                                            r#"{"revision":9,"spaces":[]}"#
+                                        } else {
+                                            "[]"
+                                        };
+                                        json_response(&mut socket, "200 OK", body).await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let poller = tokio::spawn({
+                    let entry = entry.clone();
+                    let tx = tx.clone();
+                    async move {
+                        run_fleet_poller(entry.clone(), initial(&entry.client), |update| {
+                            let _ = tx.send(update);
+                        })
+                        .await;
+                    }
+                });
+                assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+                let mut stream = Some(
+                    tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                );
+                assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+                // Fail the mutation refresh, then fail the actor's first retry
+                // too. No SSE frames arrive after the initial resync.
+                failures.store(if action == "recover" { 2 } else { 1 }, Ordering::SeqCst);
+                refresh_mutated_fleet(&registry, &client, |update| {
+                    let _ = tx.send(update);
+                })
+                .await;
+                assert!(matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)));
+                assert!(entry.mutation_ticket().is_none());
+                let failed_reads = reads.load(Ordering::SeqCst);
+                match action {
+                    "recover" => {
+                        assert!(
+                            matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)),
+                            "first actor retry must also see the transient failure"
+                        );
+                        let FleetUpdate::Snapshot(snapshot) = next(&mut rx).await else {
+                            panic!("quiet actor must recover mutation-owned REST failure")
+                        };
+                        assert_eq!(snapshot.layout.revision, 9);
+                        assert!(entry.mutation_ticket().is_some());
+                        let recovered_reads = reads.load(Ordering::SeqCst);
+                        assert!(recovered_reads > failed_reads);
+                        assert!(tokio::time::timeout(
+                            std::time::Duration::from_millis(600),
+                            rx.recv()
+                        )
+                        .await
+                        .is_err());
+                        assert_eq!(
+                            reads.load(Ordering::SeqCst),
+                            recovered_reads,
+                            "recovery must return to no idle polling"
+                        );
+                        entry.fleet_cancel.cancel();
+                    }
+                    "outage" => {
+                        server.abort();
+                        drop(stream.take());
+                        assert!(matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)));
+                        assert!(tokio::time::timeout(
+                            std::time::Duration::from_millis(600),
+                            rx.recv()
+                        )
+                        .await
+                        .is_err());
+                        assert_eq!(
+                            reads.load(Ordering::SeqCst),
+                            failed_reads,
+                            "outage must cancel mutation-triggered retry"
+                        );
+                        entry.fleet_cancel.cancel();
+                    }
+                    "retire" => {
+                        let replacement = registry
+                            .install_for_test(Arc::new(
+                                LoomClient::new(&client.server_url(), None).unwrap(),
+                            ))
+                            .await;
+                        assert!(!replacement.fleet_cancel.is_cancelled());
+                    }
+                    _ => unreachable!(),
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(3), poller)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if action == "retire" {
+                    assert_eq!(
+                        reads.load(Ordering::SeqCst),
+                        failed_reads,
+                        "retired actor must not process mutation-triggered retry"
+                    );
+                }
+                drop(stream);
+                server.abort();
+            }
+        }
+    }
+
+    fn summary_rows(title: &str, count: usize) -> Vec<SessionSummaryView> {
+        (0..count)
+            .map(|index| {
+                let mut row: SessionSummaryView =
+                    serde_json::from_str(include_str!("../tests/fixtures/launch-response.json"))
+                        .unwrap();
+                row.id = format!("session-{index:02}");
+                row.branch.title = title.into();
+                row.status = "running".into();
+                row
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn older_actor_success_or_error_cannot_overwrite_mutation_and_reconciles_quiet_fleet() {
+        for hold_layout in [false, true] {
+            for fail_old_read in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let client = Arc::new(
+                    LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+                        .unwrap(),
+                );
+                let registry = crate::routing::ServerRegistry::default();
+                let entry = registry.install_for_test(client.clone()).await;
+                let before = serde_json::to_string(&summary_rows("Before", 1)).unwrap();
+                let after = serde_json::to_string(&summary_rows("After", 1)).unwrap();
+                let summaries = Arc::new(AtomicUsize::new(0));
+                let layouts = Arc::new(AtomicUsize::new(0));
+                let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel();
+                let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+                let server = tokio::spawn({
+                    let summaries = summaries.clone();
+                    let layouts = layouts.clone();
+                    let before = before.clone();
+                    async move {
+                        loop {
+                            let (mut socket, _) = listener.accept().await.unwrap();
+                            let summaries = summaries.clone();
+                            let layouts = layouts.clone();
+                            let held_tx = held_tx.clone();
+                            let stream_tx = stream_tx.clone();
+                            let before = before.clone();
+                            let after = after.clone();
+                            tokio::spawn(async move {
+                                let header = request(&mut socket).await;
+                                if header.starts_with("GET /api/events/stream") {
+                                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                                    stream_tx.send(socket).unwrap();
+                                } else if header.starts_with("POST /api/sessions/summary/list ") {
+                                    let first = summaries.fetch_add(1, Ordering::SeqCst) == 0;
+                                    if first && !hold_layout {
+                                        held_tx.send(socket).unwrap();
+                                    } else {
+                                        json_response(
+                                            &mut socket,
+                                            "200 OK",
+                                            if first { &before } else { &after },
+                                        )
+                                        .await;
+                                    }
+                                } else {
+                                    assert!(header.starts_with("POST /api/session_layout/get "));
+                                    let first = layouts.fetch_add(1, Ordering::SeqCst) == 0;
+                                    if first && hold_layout {
+                                        held_tx.send(socket).unwrap();
+                                    } else {
+                                        json_response(
+                                            &mut socket,
+                                            "200 OK",
+                                            r#"{"revision":9,"spaces":[]}"#,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            });
+                        }
+                    }
+                });
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                let mut seed = initial(&client);
+                seed.sessions = summary_rows("Initial", 1);
+                let poller = tokio::spawn(run_fleet_poller(entry.clone(), seed, {
+                    let tx = tx.clone();
+                    move |update| {
+                        let _ = tx.send(update);
+                    }
+                }));
+                assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+                let stream =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut held =
+                    tokio::time::timeout(std::time::Duration::from_secs(3), held_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                refresh_mutated_fleet(&registry, &client, |update| {
+                    let _ = tx.send(update);
+                })
+                .await;
+                let FleetUpdate::Snapshot(mutation) = next(&mut rx).await else {
+                    panic!("mutation snapshot expected")
+                };
+                assert_eq!(mutation.sessions[0].branch.title, "After");
+                let body = if fail_old_read {
+                    r#"{"error":"retired read failure"}"#
+                } else if hold_layout {
+                    r#"{"revision":1,"spaces":[]}"#
+                } else {
+                    &before
+                };
+                json_response(
+                    &mut held,
+                    if fail_old_read {
+                        "503 Unavailable"
+                    } else {
+                        "200 OK"
+                    },
+                    body,
+                )
+                .await;
+                let FleetUpdate::Snapshot(reconciled) = next(&mut rx).await else {
+                    panic!("a stale actor error must not invalidate the newer mutation snapshot")
+                };
+                assert_eq!(
+                    reconciled.sessions[0].branch.title, "After",
+                    "old actor summary must not overwrite newer mutation publication"
+                );
+                assert_eq!(reconciled.layout.revision, 9);
+                assert!(
+                    summaries.load(Ordering::SeqCst) >= 3,
+                    "invalidated actor read must fetch fresh even with quiet SSE"
+                );
+                let reads = summaries.load(Ordering::SeqCst);
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv())
+                        .await
+                        .is_err()
+                );
+                assert_eq!(
+                    summaries.load(Ordering::SeqCst),
+                    reads,
+                    "fresh reconciliation must stop idle polling"
+                );
+                entry.fleet_cancel.cancel();
+                poller.await.unwrap();
+                drop((stream, held));
+                server.abort();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_connect_snapshot_cannot_overwrite_mutation_or_outage_and_subscribes_new_shards(
+    ) {
+        for action in ["mutation", "outage", "retire"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let registry = crate::routing::ServerRegistry::default();
+            let reads = Arc::new(AtomicUsize::new(0));
+            let streams = Arc::new(AtomicUsize::new(0));
+            let recovered = Arc::new(std::sync::atomic::AtomicBool::new(action != "outage"));
+            let before = serde_json::to_string(&summary_rows("Before", 1)).unwrap();
+            // layout +65 sessions needs two new subscriptions; initial data
+            // knew only session-00. A rejected initial snapshot must not
+            // leave this old topic list as the actor's permanent subscription.
+            let after = serde_json::to_string(&summary_rows("After", 65)).unwrap();
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn({
+                let reads = reads.clone();
+                let streams = streams.clone();
+                let recovered = recovered.clone();
+                async move {
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let reads = reads.clone();
+                        let streams = streams.clone();
+                        let recovered = recovered.clone();
+                        let stream_tx = stream_tx.clone();
+                        let before = before.clone();
+                        let after = after.clone();
+                        tokio::spawn(async move {
+                            let header = request(&mut socket).await;
+                            if header.starts_with("GET /api/health ") {
+                                json_response(&mut socket, "200 OK", "{}").await;
+                            } else if header.starts_with("GET /api/events/stream") {
+                                streams.fetch_add(1, Ordering::SeqCst);
+                                if !recovered.load(Ordering::SeqCst) {
+                                    json_response(
+                                        &mut socket,
+                                        "403 Forbidden",
+                                        r#"{"error":"offline subscription"}"#,
+                                    )
+                                    .await;
+                                } else {
+                                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                                    let path = header.split_whitespace().nth(1).unwrap();
+                                    let url =
+                                        reqwest::Url::parse(&format!("http://localhost{path}"))
+                                            .unwrap();
+                                    let topics = url
+                                        .query_pairs()
+                                        .find(|(name, _)| name == "topics")
+                                        .unwrap()
+                                        .1
+                                        .into_owned();
+                                    stream_tx.send((topics, socket)).unwrap();
+                                }
+                            } else if header.starts_with("POST /api/sessions/summary/list ") {
+                                let first = reads.fetch_add(1, Ordering::SeqCst) == 0;
+                                json_response(
+                                    &mut socket,
+                                    "200 OK",
+                                    if first { &before } else { &after },
+                                )
+                                .await;
+                            } else {
+                                assert!(header.starts_with("POST /api/session_layout/get "));
+                                json_response(
+                                    &mut socket,
+                                    "200 OK",
+                                    r#"{"revision":9,"spaces":[]}"#,
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                }
+            });
+            let (entry, seed) = prepare_connection(&registry, &url, None).await.unwrap();
+            assert_eq!(seed.sessions[0].branch.title, "Before");
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            match action {
+                "mutation" => {
+                    refresh_mutated_fleet(&registry, &entry.client, |update| {
+                        let _ = tx.send(update);
+                    })
+                    .await;
+                    let FleetUpdate::Snapshot(mutation) = next(&mut rx).await else {
+                        panic!("mutation snapshot expected")
+                    };
+                    assert_eq!(mutation.sessions.len(), 65);
+                    assert_eq!(mutation.sessions[0].branch.title, "After");
+                }
+                "outage" => entry.publish_fleet(false, || {}),
+                "retire" => {
+                    registry
+                        .install_for_test(Arc::new(LoomClient::new(&url, None).unwrap()))
+                        .await;
+                }
+                _ => unreachable!(),
+            }
+            // Start forwarding the prepared connect snapshot only after the
+            // newer mutation/outage/retirement became observable.
+            let poller = tokio::spawn(run_fleet_poller(entry.clone(), seed, move |update| {
+                let _ = tx.send(update);
+            }));
+            if action == "retire" {
+                poller.await.unwrap();
+                assert!(rx.recv().await.is_none());
+                assert_eq!(streams.load(Ordering::SeqCst), 0);
+            } else {
+                if action == "outage" {
+                    assert!(
+                        matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)),
+                        "old connect snapshot must not restore availability after outage"
+                    );
+                    assert!(
+                        tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv())
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(
+                        reads.load(Ordering::SeqCst),
+                        1,
+                        "outage must not reconcile REST until resync"
+                    );
+                    recovered.store(true, Ordering::SeqCst);
+                }
+                let FleetUpdate::Snapshot(fresh) = next(&mut rx).await else {
+                    panic!("initial invalidation must reconcile fresh")
+                };
+                assert_eq!(fresh.sessions.len(), 65);
+                assert!(fresh.sessions.iter().all(|row| row.branch.title == "After"));
+                let mut sockets = Vec::new();
+                let mut topics = std::collections::HashSet::new();
+                // First successful subscription uses the provisional initial
+                // topics; the next two must replace it using fresh65 sessions.
+                for index in 0..3 {
+                    let (subscribed, socket) =
+                        tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                    if index > 0 {
+                        topics.extend(subscribed.split(',').map(str::to_owned));
+                    }
+                    sockets.push(socket);
+                }
+                for index in 0..65 {
+                    assert!(
+                        topics.contains(&format!("session:session-{index:02}")),
+                        "new session shard must be subscribed"
+                    );
+                }
+                assert!(topics.contains("layout"));
+                let FleetUpdate::Snapshot(reconciled) = next(&mut rx).await else {
+                    panic!("all new shards must reconcile")
+                };
+                assert_eq!(reconciled.sessions.len(), 65);
+                assert!(reconciled
+                    .sessions
+                    .iter()
+                    .all(|row| row.branch.title == "After"));
+                entry.fleet_cancel.cancel();
+                poller.await.unwrap();
+                drop(sockets);
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn quiet_live_sse_retries_failed_rest_then_stops_after_recovery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap(),
+        );
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn({
+            let reads = reads.clone();
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let reads = reads.clone();
+                    let stream_tx = stream_tx.clone();
+                    tokio::spawn(async move {
+                        let header = request(&mut socket).await;
+                        if header.starts_with("GET /api/events/stream") {
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                            stream_tx.send(socket).unwrap();
+                        } else if header.starts_with("POST /api/sessions/summary/list ") {
+                            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                json_response(
+                                    &mut socket,
+                                    "503 Unavailable",
+                                    r#"{"error":"transient"}"#,
+                                )
+                                .await;
+                            } else {
+                                json_response(&mut socket, "200 OK", "[]").await;
+                            }
+                        } else {
+                            assert!(header.starts_with("POST /api/session_layout/get "));
+                            json_response(&mut socket, "200 OK", r#"{"revision":9,"spaces":[]}"#)
+                                .await;
+                        }
+                    });
+                }
+            }
+        });
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = tokio::spawn(run_fleet_poller(
+            actor_entry(client.clone(), cancel.clone()),
+            initial(&client),
+            move |update| {
+                let _ = tx.send(update);
+            },
+        ));
+        assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+        let stream = tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)));
+        let FleetUpdate::Snapshot(snapshot) = next(&mut rx).await else {
+            panic!("quiet live SSE must recover after transient REST failure")
+        };
+        assert_eq!(snapshot.layout.revision, 9);
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(600), rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "recovered quiet fleet must not keep polling"
+        );
+        cancel.cancel();
+        poller.await.unwrap();
+        drop(stream);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_rest_retry_is_cancelled_by_retirement_or_stream_outage() {
+        for retire in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+                    .unwrap(),
+            );
+            let registry = crate::routing::ServerRegistry::default();
+            let entry = registry.install_for_test(client.clone()).await;
+            let reads = Arc::new(AtomicUsize::new(0));
+            let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+            let server = tokio::spawn({
+                let reads = reads.clone();
+                async move {
+                    loop {
+                        let (mut socket, _) = listener.accept().await.unwrap();
+                        let reads = reads.clone();
+                        let stream_tx = stream_tx.clone();
+                        tokio::spawn(async move {
+                            let header = request(&mut socket).await;
+                            if header.starts_with("GET /api/events/stream") {
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                                stream_tx.send(socket).unwrap();
+                            } else {
+                                assert!(header.starts_with("POST /api/sessions/summary/list "));
+                                reads.fetch_add(1, Ordering::SeqCst);
+                                json_response(
+                                    &mut socket,
+                                    "503 Unavailable",
+                                    r#"{"error":"transient"}"#,
+                                )
+                                .await;
+                            }
+                        });
+                    }
+                }
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let poller = tokio::spawn(run_fleet_poller(
+                entry.clone(),
+                initial(&client),
+                move |update| {
+                    let _ = tx.send(update);
+                },
+            ));
+            assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+            let stream = tokio::time::timeout(std::time::Duration::from_secs(3), stream_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)));
+            if retire {
+                registry
+                    .install_for_test(Arc::new(
+                        LoomClient::new(&client.server_url(), None).unwrap(),
+                    ))
+                    .await;
+                poller.await.unwrap();
+            } else {
+                // Stop accepting reconnects, then close the live transport before its retry timer.
+                server.abort();
+                drop(stream);
+                assert!(matches!(next(&mut rx).await, FleetUpdate::Unavailable(_)));
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(600), rx.recv())
+                        .await
+                        .is_err()
+                );
+                entry.fleet_cancel.cancel();
+                poller.await.unwrap();
+            }
+            assert_eq!(
+                reads.load(Ordering::SeqCst),
+                1,
+                "outage/retirement must cancel pending REST retry"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn outage_interrupts_pending_rest_and_quiet_resync_reconciles_without_polling() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap(),
+        );
+        let reads = Arc::new(AtomicUsize::new(0));
+        let layouts = Arc::new(AtomicUsize::new(0));
+        let streams = Arc::new(AtomicUsize::new(0));
+        let recovery = Arc::new(tokio::sync::Notify::new());
+        let (sse_tx, mut sse_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (stalled_tx, mut stalled_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn({
+            let reads = reads.clone();
+            let layouts = layouts.clone();
+            let recovery = recovery.clone();
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let reads = reads.clone();
+                    let layouts = layouts.clone();
+                    let streams = streams.clone();
+                    let recovery = recovery.clone();
+                    let sse_tx = sse_tx.clone();
+                    let stalled_tx = stalled_tx.clone();
+                    tokio::spawn(async move {
+                        let header = request(&mut socket).await;
+                        if header.starts_with("GET /api/events/stream") {
+                            if streams.fetch_add(1, Ordering::SeqCst) > 0 {
+                                recovery.notified().await;
+                            }
+                            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                            sse_tx.send(socket).unwrap();
+                        } else if header.starts_with("POST /api/sessions/summary/list ") {
+                            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                                // Deliberately never answer this REST request.
+                                stalled_tx.send(socket).unwrap();
+                            } else {
+                                json_response(&mut socket, "200 OK", "[]").await;
+                            }
+                        } else {
+                            assert!(header.starts_with("POST /api/session_layout/get "));
+                            layouts.fetch_add(1, Ordering::SeqCst);
+                            json_response(&mut socket, "200 OK", r#"{"revision":0,"spaces":[]}"#)
+                                .await;
+                        }
+                    });
+                }
+            }
+        });
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = tokio::spawn(run_fleet_poller(
+            actor_entry(client.clone(), cancel.clone()),
+            initial(&client),
+            move |update| {
+                let _ = tx.send(update);
+            },
+        ));
+        assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+        let mut stream = tokio::time::timeout(std::time::Duration::from_secs(3), sse_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let stalled = tokio::time::timeout(std::time::Duration::from_secs(3), stalled_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        stream.write_all(b"0\r\n\r\n").await.unwrap();
+        drop(stream); // A real outage closes the TCP connection, including its keep-alive pool entry.
+        let FleetUpdate::Unavailable(error) = next(&mut rx).await else {
+            panic!("outage must signal before REST responds")
+        };
+        let payload = fleet_error_payload(&client, error);
+        assert_eq!(payload["server_url"], client.server_url());
+        assert_eq!(payload["unavailable"], true);
+        assert_eq!(payload["unreachable"], true);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "outage must not poll sessions"
+        );
+        recovery.notify_one();
+        let recovered_stream =
+            tokio::time::timeout(std::time::Duration::from_secs(3), sse_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let FleetUpdate::Snapshot(snapshot) = next(&mut rx).await else {
+            panic!("quiet resync must reconcile")
+        };
+        assert_eq!(snapshot.server_url, client.server_url());
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert_eq!(layouts.load(Ordering::SeqCst), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            2,
+            "healthy idle fleet must not poll sessions"
+        );
+        cancel.cancel();
+        poller.await.unwrap();
+        drop((stalled, recovered_stream));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn healthy_shard_cannot_restore_availability_until_failed_shard_resyncs() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(
+            LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None).unwrap(),
+        );
+        let mut seed = initial(&client);
+        // layout + 64 live sessions requires two subscriptions (64 topics each).
+        for index in 0..64 {
+            let mut row: SessionSummaryView =
+                serde_json::from_str(include_str!("../tests/fixtures/launch-response.json"))
+                    .unwrap();
+            row.id = format!("session-{index:02}");
+            row.status = "running".into();
+            seed.sessions.push(row);
+        }
+        let summaries = serde_json::to_string(&seed.sessions).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let recovered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (healthy_tx, mut healthy_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (recovered_tx, mut recovered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn({
+            let reads = reads.clone();
+            let recovered = recovered.clone();
+            async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let reads = reads.clone();
+                    let recovered = recovered.clone();
+                    let healthy_tx = healthy_tx.clone();
+                    let recovered_tx = recovered_tx.clone();
+                    let summaries = summaries.clone();
+                    tokio::spawn(async move {
+                        let header = request(&mut socket).await;
+                        if header.starts_with("GET /api/events/stream") {
+                            let path = header.split_whitespace().nth(1).unwrap();
+                            let url =
+                                reqwest::Url::parse(&format!("http://localhost{path}")).unwrap();
+                            let topics = url
+                                .query_pairs()
+                                .find(|(key, _)| key == "topics")
+                                .unwrap()
+                                .1
+                                .into_owned();
+                            let failed_shard =
+                                topics.split(',').any(|topic| topic == "session:session-63");
+                            if failed_shard && !recovered.load(Ordering::SeqCst) {
+                                json_response(
+                                    &mut socket,
+                                    "403 Forbidden",
+                                    r#"{"error":"shard denied"}"#,
+                                )
+                                .await;
+                            } else {
+                                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                                if failed_shard {
+                                    recovered_tx.send(socket).unwrap();
+                                } else {
+                                    healthy_tx.send(socket).unwrap();
+                                }
+                            }
+                        } else if header.starts_with("POST /api/sessions/summary/list ") {
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            json_response(&mut socket, "200 OK", &summaries).await;
+                        } else {
+                            assert!(header.starts_with("POST /api/session_layout/get "));
+                            json_response(&mut socket, "200 OK", r#"{"revision":1,"spaces":[]}"#)
+                                .await;
+                        }
+                    });
+                }
+            }
+        });
+        let cancel = CancellationToken::new();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = tokio::spawn(run_fleet_poller(
+            actor_entry(client.clone(), cancel.clone()),
+            seed,
+            move |update| {
+                let _ = tx.send(update);
+            },
+        ));
+        assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+        let FleetUpdate::Unavailable(error) = next(&mut rx).await else {
+            panic!("denied shard must invalidate availability")
+        };
+        assert_eq!(fleet_error_payload(&client, error)["unavailable"], true);
+        let mut healthy_stream =
+            tokio::time::timeout(std::time::Duration::from_secs(3), healthy_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let event = "data: {\"topic\":\"session:session-00\",\"event\":\"status\",\"data\":{}}\n\n";
+        let chunk = format!("{:x}\r\n{event}\r\n", event.len());
+        healthy_stream.write_all(chunk.as_bytes()).await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), rx.recv())
+                .await
+                .is_err(),
+            "a healthy shard must not emit available snapshots while another is unavailable"
+        );
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            0,
+            "blocked shards must not trigger REST reconciliation"
+        );
+        recovered.store(true, Ordering::SeqCst);
+        let recovered_stream =
+            tokio::time::timeout(std::time::Duration::from_secs(3), recovered_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let FleetUpdate::Snapshot(snapshot) = next(&mut rx).await else {
+            panic!("all-shard resync must restore the fleet")
+        };
+        assert_eq!(snapshot.server_url, client.server_url());
+        assert_eq!(snapshot.sessions.len(), 64);
+        assert_eq!(snapshot.layout.revision, 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+        cancel.cancel();
+        poller.await.unwrap();
+        drop((healthy_stream, recovered_stream));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn subscription_and_fleet_auth_failures_mark_availability_false() {
+        for fail_stream in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(
+                LoomClient::new(&format!("http://{}", listener.local_addr().unwrap()), None)
+                    .unwrap(),
+            );
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                assert!(request(&mut stream)
+                    .await
+                    .starts_with("GET /api/events/stream"));
+                if fail_stream {
+                    json_response(&mut stream, "403 Forbidden", r#"{"error":"denied"}"#).await;
+                } else {
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                    let (mut rest, _) = listener.accept().await.unwrap();
+                    assert!(request(&mut rest)
+                        .await
+                        .starts_with("POST /api/sessions/summary/list "));
+                    json_response(&mut rest, "401 Unauthorized", r#"{"error":"denied"}"#).await;
+                }
+                // Keep an accepted SSE stream alive until the poller is canceled.
+                futures_util::future::pending::<()>().await;
+            });
+            let cancel = CancellationToken::new();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let poller = tokio::spawn(run_fleet_poller(
+                actor_entry(client.clone(), cancel.clone()),
+                initial(&client),
+                move |update| {
+                    let _ = tx.send(update);
+                },
+            ));
+            assert!(matches!(next(&mut rx).await, FleetUpdate::Snapshot(_)));
+            let FleetUpdate::Unavailable(error) = next(&mut rx).await else {
+                panic!("access failure must invalidate availability")
+            };
+            let payload = fleet_error_payload(&client, error);
+            assert_eq!(payload["server_url"], client.server_url());
+            assert_eq!(payload["unavailable"], true);
+            assert_eq!(payload["unreachable"], false);
+            // Ordinary command/chat errors never gain the fleet availability flag.
+            let ordinary = serde_json::to_value(
+                UiError::from(LoomError::Connection("chat failed".into()))
+                    .for_server(&client.server_url()),
+            )
+            .unwrap();
+            assert!(ordinary.get("unavailable").is_none());
+            cancel.cancel();
+            poller.await.unwrap();
+            server.abort();
+        }
+    }
 }
 
 #[cfg(test)]

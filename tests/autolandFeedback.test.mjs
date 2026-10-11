@@ -19,7 +19,7 @@ function harness(props, invoke) {
   const events = [];
   const state = reactive(props);
   const context = { ref, computed, watch, trackAutoland, threadAutoland, effectiveAutoland,
-    defineProps: () => state, defineEmits: () => (...event) => events.push(event), invoke };
+    defineProps: () => state, defineEmits: () => (...event) => events.push(event), useBackendInvoke: () => invoke };
   vm.createContext(context);
   vm.runInContext(ts.transpileModule(`${source}\nglobalThis.control = { change, policy, effective, warning, busy };`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },

@@ -1,7 +1,9 @@
 <script setup lang="ts">
 import { ref, computed, watch } from "vue";
 import { isStandalone } from "../threadKind";
-import { invoke } from "@tauri-apps/api/core";
+import { backendInvoke as invoke } from "../backendInvoke";
+import { backendOf } from "../backendIdentity";
+import type { BackendFleet } from "../backendFleet";
 import type { SessionSummary, SessionLayout } from "../App.vue";
 import { buildProjectSections, layoutProjects, topicProjectId, type ProjectRef } from "../projects";
 import {
@@ -20,6 +22,7 @@ import { topicRootOf, threadAncestors } from "../topic-view";
 
 const props = defineProps<{
   fleet: SessionSummary[];
+  backends?: BackendFleet[];
   layout: SessionLayout | null;
   selectedId: string | null;
   showNewThread?: boolean;
@@ -29,6 +32,7 @@ const props = defineProps<{
 }>();
 
 const emit = defineEmits<{
+  (e: "retry-backend", url: string): void;
   (e: "select", id: string): void;
   (e: "select-topic", id: string): void;
   (
@@ -67,6 +71,7 @@ const emit = defineEmits<{
 // shows its full shape; only the root chevron collapses the folder.
 const collapsed = ref(new Set<string>());
 const expandedTopics = ref(new Set<string>());
+const actionError = ref<string | null>(null);
 const dragging = ref<string | null>(null);
 const dropTarget = ref<string | null>(null);
 
@@ -74,6 +79,14 @@ const dropTarget = ref<string | null>(null);
 // the Tracks list by default; this toggle shows them again. See the topic
 // list block below for the model.
 const showArchived = ref(false);
+
+function serverLabel(id: string | null): string {
+  const url = backendOf(id);
+  if (!url) return "";
+  const backend = props.backends?.find(backend => backend.url === url);
+  const name = backend?.name || new URL(url).host;
+  return props.backends?.some(other => other.url !== url && other.name === name) ? `${name} · ${new URL(url).host}` : name;
+}
 
 function subtitle(s: SessionSummary): string {
   return pendingPermissionSummary(s) || threadStatus(s).detail || s.branch.description || s.branch.title || "—";
@@ -296,15 +309,17 @@ watch(() => [props.selectedId, props.fleet] as const, ([id]) => {
 });
 
 // The user-space Inbox: where "unfile" drops and lane deletes send chats.
-const userInboxId = computed(() => {
+function inboxFor(id: string | null) {
+  const url = backendOf(id);
   for (const sp of props.layout?.spaces ?? []) {
+    if (url && backendOf(sp.id) !== url) continue;
     if (sp.system_key === "user" || sp.name === "User") {
       const g = sp.groups.find((g) => g.system_key === "inbox");
       if (g) return g.id;
     }
   }
   return undefined;
-});
+}
 
 // --- Tabs --------------------------------------------------------------------
 
@@ -357,7 +372,10 @@ const archivedCount = computed(() => countArchivedTopics(allTopics.value));
 // Ungrouped (and any empty section) starts collapsed by default; the user's
 // toggles override that default until the next visit.
 const projectOverrides = ref(new Map<string, boolean>());
-const projectSections = computed(() => buildProjectSections(topics.value, props.layout));
+const projectSections = computed(() => buildProjectSections(topics.value, props.layout).map(section => {
+  const backend = props.backends?.find(backend => backend.url === backendOf(section.id));
+  return { ...section, backend, unavailable: !!backend && !backend.available };
+}));
 function isProjectCollapsed(id: string | null): boolean {
   const key = id ?? "ungrouped";
   const override = projectOverrides.value.get(key);
@@ -459,18 +477,19 @@ function toggleMoveMenu(id: string) {
   moveMenuId.value = moveMenuId.value === id ? null : id;
 }
 const moveTargets = computed(() => {
-  const projects = layoutProjects(props.layout).map((p) => ({ id: p.id, name: p.name }));
-  if (userInboxId.value)
-    projects.push({ id: userInboxId.value, name: "Unfiled (Inbox)" });
+  const projects = layoutProjects(props.layout).filter(project => !moveMenuId.value || backendOf(project.id) === backendOf(moveMenuId.value)).map((p) => ({ id: p.id, name: p.name }));
+  const inbox = inboxFor(moveMenuId.value);
+  if (inbox) projects.push({ id: inbox, name: "Unfiled (Inbox)" });
   return projects;
 });
 const projectIds = computed(() => new Set(moveTargets.value.map((t) => t.id)));
 async function moveToProject(topicId: string, groupId: string) {
   moveMenuId.value = null;
+  if (backendOf(topicId) !== backendOf(groupId)) return;
   try {
     await invoke("move_to_group", { sessionIds: [topicId], groupId });
   } catch (e: any) {
-    console.error("move_to_group failed", e);
+    actionError.value = `${serverLabel(topicId)}: ${e?.message ?? String(e)}`;
   }
 }
 
@@ -497,6 +516,10 @@ function onDragEnd() {
 
 function onDragOver(key: string, e: DragEvent) {
   if (!dragging.value) return;
+  const targetId = key.includes("loom:") ? key.slice(key.indexOf("loom:")) : null;
+  if (targetId && backendOf(targetId) !== backendOf(dragging.value)) return;
+  const backend = props.backends?.find(backend => backend.url === backendOf(targetId));
+  if (backend && !backend.available) return;
   e.preventDefault();
   if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
   dropTarget.value = key;
@@ -515,12 +538,12 @@ function onDropProject(sectionId: string | null, key: string, e: DragEvent) {
   e.preventDefault();
   dropTarget.value = null;
   if (!dragging.value) return;
-  const groupId = sectionId ?? userInboxId.value;
-  if (groupId) {
+  const groupId = sectionId ?? inboxFor(dragging.value);
+  if (groupId && backendOf(groupId) === backendOf(dragging.value) && !props.backends?.some(backend => backend.url === backendOf(groupId) && !backend.available)) {
     const id = dragging.value;
     dragging.value = null;
     invoke("move_to_group", { sessionIds: [id], groupId }).catch((err) =>
-      console.error("move_to_group failed", err),
+      actionError.value = `${serverLabel(id)}: ${err?.message ?? String(err)}`,
     );
   } else {
     dragging.value = null;
@@ -545,7 +568,7 @@ function onDragLeaveProject(key: string, e: DragEvent) {
 function onDropLeader(parentId: string, key: string, e: DragEvent) {
   e.preventDefault();
   dropTarget.value = null;
-  if (dragging.value && dragging.value !== parentId) {
+  if (dragging.value && dragging.value !== parentId && backendOf(dragging.value) === backendOf(parentId)) {
     emit("reparent", dragging.value, parentId);
     dragging.value = null;
   }
@@ -555,8 +578,8 @@ function onDropLane(laneId: string, key: string, e: DragEvent) {
   e.preventDefault();
   dropTarget.value = null;
   if (dragging.value) {
-    const target = laneId === "unfiled" ? userInboxId.value : laneId;
-    emit("reparent", dragging.value, null, target);
+    const target = laneId === "unfiled" ? inboxFor(dragging.value) : laneId;
+    if (target && backendOf(target) === backendOf(dragging.value)) emit("reparent", dragging.value, null, target);
     dragging.value = null;
   }
 }
@@ -577,7 +600,7 @@ async function dismissAttention(id: string) {
   try {
     await invoke("clear_attention", { session: id });
   } catch (e: any) {
-    console.error("clear_attention failed", e);
+    actionError.value = `${serverLabel(id)}: ${e?.message ?? String(e)}`;
   } finally {
     dismissingId.value = null;
   }
@@ -599,6 +622,7 @@ async function archiveRow(id: string) {
 
 <template>
   <aside class="sidebar">
+    <div v-if="actionError" class="backend-status" role="alert">{{ actionError }} <button @click="actionError = null" aria-label="Dismiss filing error">×</button></div>
     <div class="tab-bar" role="tablist">
       <button
         class="tab"
@@ -641,6 +665,7 @@ async function archiveRow(id: string) {
             "
           >
             <span class="group-name">{{ lane.name }}</span>
+            <span class="project-server" :title="backendOf(lane.id) || undefined">{{ serverLabel(lane.id) }}</span>
             <span class="group-count">{{ lane.count }}</span>
             <button
               v-if="!lane.system && lane.id !== 'unfiled'"
@@ -694,6 +719,7 @@ async function archiveRow(id: string) {
               <span class="name">{{
                 row.session.branch.name || row.session.id
               }}</span>
+              <span class="project-server" :title="backendOf(row.session.id) || undefined">{{ serverLabel(row.session.id) }}</span>
               <!-- A genuinely-working thread (running, mid-turn) shows a
                    spinner; a resting one (finished turn → quiet idle mark) and
                    terminal rows stay quiet. Loud-tag threads keep their text
@@ -789,12 +815,19 @@ async function archiveRow(id: string) {
         </div>
       </div>
 
+      <div class="backend-status-list">
+        <div v-for="backend in backends?.filter(backend => !backend.available)" :key="backend.url" class="backend-status" role="status">
+          <strong>{{ backend.name }}</strong> · {{ backend.connecting ? 'Connecting…' : 'Unavailable' }}
+          <small :title="backend.error || backend.url">{{ backend.error || backend.url }}</small>
+          <button :disabled="backend.connecting" @click="emit('retry-backend', backend.url)">Reconnect</button>
+        </div>
+      </div>
       <div class="topic-list">
         <div
           v-for="section in projectSections"
           :key="section.id ?? 'ungrouped'"
           class="project-section"
-          :class="{ 'drop-hint': dropTarget === `project-${section.id ?? 'ungrouped'}` }"
+          :class="{ unavailable: section.unavailable, 'drop-hint': dropTarget === `project-${section.id ?? 'ungrouped'}` }"
           @dragover="onDragOver(`project-${section.id ?? 'ungrouped'}`, $event)"
           @dragleave="onDragLeaveProject(`project-${section.id ?? 'ungrouped'}`, $event)"
           @drop="onDropProject(section.id, `project-${section.id ?? 'ungrouped'}`, $event)"
@@ -832,8 +865,13 @@ async function archiveRow(id: string) {
               @click.stop="toggleProject(section.id)"
             >{{ isProjectCollapsed(section.id) ? "▸" : "▾" }}</button>
             <span class="project-name">{{ section.name }}</span>
-            <span class="project-count" :title="`${section.topics.length} tracks`">{{ section.topics.length }}</span>
+            <span v-if="section.backend" class="project-server" :title="section.backend.url">{{ serverLabel(section.id) }}</span>
+            <span v-if="section.unavailable" class="unavailable-label">Unavailable</span>
+            <button v-if="section.unavailable" class="link" :disabled="section.backend?.connecting" @click.stop="section.backend && emit('retry-backend', section.backend.url)">{{ section.backend?.connecting ? 'Connecting…' : 'Retry' }}</button>
+            <span v-if="!section.unavailable" class="project-count" :title="`${section.topics.length} tracks`">{{ section.topics.length }}</span>
             <button
+              v-if="section.id"
+              :disabled="section.unavailable"
               class="project-manage-resources"
               type="button"
               :title="`Manage resources inherited by new tracks in ${section.name}`"
@@ -841,6 +879,7 @@ async function archiveRow(id: string) {
               @click.stop="emit('manage-project-resources', { id: section.id, name: section.name })"
             >⚙</button>
             <button
+              :disabled="section.unavailable"
               class="project-new-topic"
               type="button"
               :title="`New track in ${section.name}`"
@@ -848,7 +887,8 @@ async function archiveRow(id: string) {
               @click.stop="emit('new-topic-in-project', { id: section.id, name: section.name })"
             >+</button>
           </div>
-          <template v-if="!isProjectCollapsed(section.id)">
+          <p v-if="section.unavailable" class="project-unavailable" role="status">Tracks unavailable while this backend is offline.</p>
+          <template v-if="!section.unavailable && !isProjectCollapsed(section.id)">
         <template v-for="t in section.topics" :key="t.session.id">
         <div
           class="topic-card"
@@ -902,6 +942,7 @@ async function archiveRow(id: string) {
               <span class="topic-title">{{
                 t.session.branch.title || t.session.branch.name
               }}</span>
+            <span class="project-server" :title="backendOf(t.session.id) || undefined">{{ serverLabel(t.session.id) }}</span>
               <!-- Same quiet-badge rules as inbox rows: working topic
                    spins, resting/terminal stay quiet, loud tags stay text. -->
               <span

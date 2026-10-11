@@ -1,6 +1,10 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, computed, watch, nextTick } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { ref, onMounted, onUnmounted, computed, watch, nextTick, provide } from "vue";
+import { invoke as rawInvoke } from "@tauri-apps/api/core";
+import { backendInvoke, useBackendInvoke } from "./backendInvoke";
+import { backendOf, splitScopedId } from "./backendIdentity";
+import { normalizeServerUrl, readServerProfiles } from "./serverProfiles";
+import { registeredBackends, registerBackend, combinedFleet, combinedLayout, acceptSnapshot, markUnavailable, cacheProjectLayout } from "./backendFleet";
 import { listen } from "@tauri-apps/api/event";
 import CommandPalette from "./components/CommandPalette.vue";
 import AttentionBanner from "./components/AttentionBanner.vue";
@@ -15,9 +19,9 @@ import ProjectSheet from "./components/ProjectSheet.vue";
 import TopicInspector from "./components/TopicInspector.vue";
 import type { ArtifactTarget } from "./artifactLinks";
 import type { FileAttachment } from "./attachments";
-import { launchSelection, ensureLaunchConfig, launchAgents, launchProfiles, launchDefaultAgent } from "./launch";
-import { launchTopicBranch } from "./trackPolicy.ts";
-import { clearDraftOnLaunch, initializeDraftStorage, readDraft } from "./newTopicDraft";
+import { launchSelectionFor } from "./launch";
+import { clearSubmittedDraft, draftStorageKey, initializeDraftStorage } from "./newTopicDraft";
+import { launchTopicBranch } from "./trackPolicy";
 import {
   resolveTopicThread,
   topicRootOf,
@@ -164,13 +168,14 @@ export interface LaunchOptions {
 initializeDraftStorage(localStorage);
 
 const DEFAULT_URL = "http://127.0.0.1:7878";
-const connected = ref(false);
+const connected = computed(() => backends.value.some(backend => backend.available));
 const connError = ref<string | null>(null);
-const launching = ref(false);
 const unarchivingIds = ref(new Set<string>());
-const fleet = ref<SessionSummary[]>([]);
-const layout = ref<SessionLayout | null>(null);
-const launchOptions = ref<LaunchOptions | null>(null);
+const pendingLaunches = ref(new Set<string>());
+const launching = computed(() => pendingLaunches.value.has(operationUrl.value));
+const fleet = computed(() => combinedFleet(backends.value));
+const layout = computed(() => combinedLayout(backends.value));
+const launchOptions = computed(() => backends.value.find(backend => backend.url === operationUrl.value)?.launchOptions ?? null);
 const selectedId = ref<string | null>(null);
 const selectedTopicId = ref<string | null>(null);
 const viewMode = ref<"home" | "topic" | "thread">("home");
@@ -198,8 +203,9 @@ const settingsSaving = ref(false);
 const threadView = ref<InstanceType<typeof ThreadView> | null>(null);
 const newTrackChat = ref<InstanceType<typeof NewTrackChat> | null>(null);
 let connectionGeneration = 0;
-let launcherGeneration = 0;
-function closeLaunchers() { showNewTopic.value = false; showNewThread.value = false; showNewProject.value = false; projectResourcesProject.value = null; }
+const composerGeneration = ref(0);
+const topicDraftOwners = new Map<string, number>();
+function closeLaunchers() { composerGeneration.value++; showNewTopic.value = false; showNewThread.value = false; showNewProject.value = false; projectResourcesProject.value = null; }
 async function openWorker() {
   if (!selectedView.value && selectedTopic.value) await selectSession(selectedTopic.value.id);
   await nextTick();
@@ -238,119 +244,132 @@ const settingsError = ref<string | null>(null);
 // it lives in the macOS Keychain behind Tauri commands, never here (spec:
 // "do not store sensitive credentials in frontend localStorage"). It's
 // read once at boot into memory for the settings sheet's prefilled value.
-const loomUrl = ref(localStorage.getItem("loomUrl") ?? DEFAULT_URL);
+let initialUrl = DEFAULT_URL;
+try { initialUrl = normalizeServerUrl(localStorage.getItem("loomUrl") ?? DEFAULT_URL); } catch { /* Invalid legacy URL. */ }
+const loomUrl = ref(initialUrl); // The default for new projects/unfiled tracks.
+const backends = ref(registeredBackends(localStorage, initialUrl));
+const composerUrl = ref(initialUrl);
 const loomToken = ref("");
-
-// --- Boot: connect to loom (URL from settings) ------------------------------
-
-onMounted(async () => {
-  // Prefill the in-memory token from the Keychain (migration note: an old
-  // build's localStorage token, if any, is stale and ignored).
-  try {
-    loomToken.value = (await invoke<string | null>("load_token", { baseUrl: loomUrl.value, migrateLegacy: true })) ?? "";
-  } catch {
-    // Keychain unavailable (rare); connect can still proceed tokenless.
-  }
-  // Register listeners BEFORE connecting, so the initial fleet snapshot
-  // emitted right after connect is never missed.
-  await listen<FleetSnapshot>("loom://fleet", (event) => {
-    if (event.payload.server_url.replace(/\/$/, "") !== loomUrl.value.replace(/\/$/, "")) return;
-    fleet.value = event.payload.sessions;
-    layout.value = event.payload.layout;
-    connected.value = true;
-    connError.value = null;
-  });
-  await listen("loom://error", (event) => {
-    const err = event.payload as { message: string; unreachable: boolean; server_url?: string };
-    if (err.server_url && err.server_url.replace(/\/+$/, "") !== loomUrl.value.replace(/\/+$/, "")) return;
-    if (err.unreachable) {
-      connected.value = false;
-      connError.value = err.message;
-    }
-  });
-
-  await connect(loomUrl.value, loomToken.value || null);
+const operationUrl = computed(() => {
+  if (showNewTopic.value || showNewThread.value || showNewProject.value) return composerUrl.value;
+  return backendOf(projectResourcesProject.value?.id) || backendOf(selectedId.value) || backendOf(selectedTopicId.value) || backendOf(selectedProject.value?.id) || loomUrl.value;
 });
-
-async function connect(url: string, token: string | null) {
-  try {
-    await invoke("connect", { baseUrl: url, token });
-    connected.value = true;
-    connError.value = null;
-    launchOptions.value = await invoke<LaunchOptions>("launch_options").catch(() => null);
-    // The launch-preset store shares this fetch's data (same command):
-    // mirror it into the store so the picker's lists hydrate on connect.
-    if (launchOptions.value) {
-      launchAgents.value = launchOptions.value.agents;
-      launchProfiles.value = launchOptions.value.profiles;
-      launchDefaultAgent.value = launchOptions.value.default_agent;
-    } else {
-      await ensureLaunchConfig().catch(() => {});
-    }
-  } catch (e: any) {
-    connected.value = false;
-    connError.value = e?.message ?? String(e);
-    launchOptions.value = null;
-  }
+provide("backendUrl", operationUrl);
+const currentBackend = computed(() => backends.value.find(backend => backend.url === operationUrl.value));
+const currentAvailable = computed(() => currentBackend.value?.available ?? false);
+const composerFleet = computed(() => currentBackend.value?.available ? currentBackend.value.sessions : []);
+const composerLayout = computed(() => currentBackend.value?.layout ?? null);
+const invoke = useBackendInvoke(operationUrl);
+function reportActionError(url: string | null, error: any, publish = true) {
+  const backend = backends.value.find(backend => backend.url === url);
+  const message = error?.message ?? String(error);
+  if (backend && error?.unreachable) markUnavailable(backend, message);
+  if (publish && (!url || operationUrl.value === url)) connError.value = backend ? `${backend.name}: ${message}` : message;
 }
 
+
+let appDisposed = false;
+const eventStops: (() => void)[] = [];
+onUnmounted(() => { appDisposed = true; eventStops.forEach(stop => stop()); });
+async function subscribe<T>(name: string, receive: (event: { payload: T }) => void) {
+  const stop = await listen<T>(name, receive);
+  if (appDisposed) stop(); else eventStops.push(stop);
+}
+onMounted(async () => {
+  await subscribe<FleetSnapshot>("loom://fleet", event => {
+    const url = normalizeServerUrl(event.payload.server_url);
+    const backend = backends.value.find(backend => backend.url === url);
+    if (!backend) return;
+    acceptSnapshot(backend, event.payload.sessions, event.payload.layout);
+    cacheProjectLayout(localStorage, url, event.payload.layout);
+  });
+  await subscribe("loom://error", event => {
+    const error = event.payload as { message: string; unreachable: boolean; unavailable?: boolean; server_url?: string };
+    if (!error.server_url) return;
+    const backend = backends.value.find(backend => backend.url === normalizeServerUrl(error.server_url!));
+    if (backend && (error.unavailable || error.unreachable)) markUnavailable(backend, error.message);
+    else if (backend && backend.url === operationUrl.value) connError.value = `${backend.name}: ${error.message}`;
+  });
+  await Promise.allSettled(backends.value.map(backend => connect(backend.url)));
+});
+
+const connectRequests = new Map<string, number>();
+async function connect(url: string, suppliedToken?: string | null) {
+  const backend = backends.value.find(backend => backend.url === url);
+  if (!backend) return;
+  const request = (connectRequests.get(url) ?? 0) + 1;
+  connectRequests.set(url, request);
+  backend.connecting = true;
+  try {
+    const token = suppliedToken !== undefined ? suppliedToken : await rawInvoke<string | null>("load_token", { baseUrl: url, migrateLegacy: url === initialUrl }).catch(() => null);
+    // Credential lookup can outlive a newer settings/retry request. Retire it
+    // before native connect reserves and installs a client with stale credentials.
+    if (appDisposed || request !== connectRequests.get(url)) return;
+    await rawInvoke("connect", { baseUrl: url, token });
+    if (request !== connectRequests.get(url)) return;
+    // The initial pushed snapshot may race the command reply. Request a
+    // confirmed snapshot so availability always carries a coherent fleet.
+    const snapshot = await rawInvoke<FleetSnapshot>("refresh_fleet", { baseUrl: url });
+    if (request !== connectRequests.get(url)) return;
+    acceptSnapshot(backend, snapshot.sessions, snapshot.layout);
+    cacheProjectLayout(localStorage, url, snapshot.layout);
+    const options = await rawInvoke<LaunchOptions>("launch_options", { baseUrl: url }).catch(() => null);
+    if (request === connectRequests.get(url)) backend.launchOptions = options;
+  } catch (error: any) {
+    if (request === connectRequests.get(url)) markUnavailable(backend, error?.message ?? String(error));
+  } finally {
+    if (request === connectRequests.get(url)) backend.connecting = false;
+  }
+}
+async function retryBackend(url: string) {
+  await connect(url);
+  if (backendOf(selectedId.value) === url && currentAvailable.value && selectedId.value) await selectSession(selectedId.value);
+}
+function changeComposerBackend(url: string) {
+  if (launching.value) return;
+  composerGeneration.value++;
+  connectionGeneration++;
+  composerUrl.value = url;
+  if (showNewTopic.value) topicDraftOwners.set(url, composerGeneration.value);
+  newTopicProject.value = null;
+  connError.value = null;
+}
+function onProjectLayout(next: SessionLayout) {
+  const backend = currentBackend.value;
+  if (!backend) return;
+  backend.layout = next;
+  // Persist the confirmed server layout by removing UI qualification.
+  const raw = JSON.parse(JSON.stringify(next), (_key, value) => typeof value === "string" ? splitScopedId(value)?.id ?? value : value);
+  cacheProjectLayout(localStorage, backend.url, raw);
+}
 async function saveSettings(url: string, token: string) {
   if (settingsSaving.value) return;
-  if (launching.value) {
-    settingsError.value = "Wait for the current launch or delegation to finish before switching servers.";
-    return;
-  }
   settingsSaving.value = true;
   settingsError.value = null;
-  const previous = { url: loomUrl.value, token: loomToken.value, fleet: fleet.value, layout: layout.value, connected: connected.value, selectedId: selectedId.value, launchOptions: launchOptions.value, agents: launchAgents.value, profiles: launchProfiles.value, defaultAgent: launchDefaultAgent.value };
   try {
-    const changed = url.replace(/\/+$/, "") !== loomUrl.value.replace(/\/+$/, "");
-    connectionGeneration++;
-    loomUrl.value = url;
-    loomToken.value = token;
-    if (changed) {
-      closeLaunchers(); showTopicsHome(); selectedProject.value = null;
-      fleet.value = []; layout.value = null; launchOptions.value = null;
-      launchAgents.value = []; launchProfiles.value = []; launchDefaultAgent.value = "";
-    }
-    connected.value = false;
+    url = normalizeServerUrl(url);
+    const name = readServerProfiles(localStorage).find(profile => profile.url === url)?.name || new URL(url).host;
+    const backend = registerBackend(localStorage, backends.value, { url, name });
     await connect(url, token || null);
-    if (!connected.value) {
-      settingsError.value = connError.value;
-      // A failed health/auth check leaves the backend's old client intact.
-      // Its known-good credential has not been overwritten in Keychain.
-      loomUrl.value = previous.url; loomToken.value = previous.token;
-      fleet.value = previous.fleet; layout.value = previous.layout; connected.value = previous.connected;
-      launchOptions.value = previous.launchOptions; launchAgents.value = previous.agents; launchProfiles.value = previous.profiles; launchDefaultAgent.value = previous.defaultAgent;
-      return;
-    }
+    if (!backend.available) { settingsError.value = backend.error; return; }
+    await rawInvoke("save_token", { baseUrl: url, token });
+    // Default changes affect only future creation. All existing projects,
+    // selections and requests keep their own backend association.
+    loomUrl.value = url;
     localStorage.setItem("loomUrl", url);
-    if (changed) {
-      // Runtime/model IDs belong to a server's catalog. A new server starts
-      // from its own defaults rather than inheriting hidden unsupported IDs.
-      launchSelection.value = { agent: "", model: "", effort: "" };
-    }
-    // Connecting cancels the chat stream even when only the token changed.
-    if (!changed && previous.selectedId) await selectSession(previous.selectedId);
-    try {
-      // Only a credential that passed Loom health/auth checks replaces the
-      // saved one. A Keychain failure leaves the established client usable.
-      await invoke("save_token", { baseUrl: url, token });
-    } catch (error: any) {
-      settingsError.value = `Connected, but could not save this server's token in Keychain: ${error?.message ?? String(error)}`;
-      return;
-    }
+    if (backendOf(selectedId.value) === url && selectedId.value) await selectSession(selectedId.value);
     showSettings.value = false;
-  } catch (e: any) {
-    settingsError.value = e?.message ?? String(e);
+  } catch (error: any) {
+    settingsError.value = error?.message ?? String(error);
   } finally { settingsSaving.value = false; }
 }
 
 // --- Actions ----------------------------------------------------------------
 
-async function selectSession(id: string, launchedView?: SessionView, launcher = launcherGeneration) {
+async function selectSession(id: string, launchedView?: SessionView, launcher = composerGeneration.value) {
+  if (!backends.value.find(backend => backend.url === backendOf(id))?.available) return;
   if (!launchedView) closeLaunchers();
-  const generation = connectionGeneration;
+  const generation = ++connectionGeneration;
   viewMode.value = "thread";
   selectedId.value = id;
   // Drop the stale view immediately: ThreadView is keyed by selectedId and
@@ -362,7 +381,7 @@ async function selectSession(id: string, launchedView?: SessionView, launcher = 
     const view = await invoke<SessionView>("open_session", { id });
     if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id) {
       selectedView.value = view;
-      if (launchedView && launcher === launcherGeneration) closeLaunchers();
+      if (launchedView && launcher === composerGeneration.value) closeLaunchers();
     }
   } catch (e: any) {
     if (generation === connectionGeneration && viewMode.value === "thread" && selectedId.value === id) {
@@ -371,7 +390,7 @@ async function selectSession(id: string, launchedView?: SessionView, launcher = 
         // Creation succeeded even if activating its stream failed. Show the
         // existing track with the error instead of a launch retry.
         selectedView.value = launchedView;
-        if (launcher === launcherGeneration) closeLaunchers();
+        if (launcher === composerGeneration.value) closeLaunchers();
       }
     }
   }
@@ -411,6 +430,7 @@ async function openTopicChat(id: string) {
 // the Overview action in the Topic/coordinator chat header — the main pane
 // stays a conversation whenever a Topic is open.
 function showTopicOverview(id: string) {
+  connectionGeneration++;
   closeLaunchers();
   selectedTopicId.value = id;
   selectedId.value = null;
@@ -429,6 +449,7 @@ async function openCoordinatorThread(topicId: string) {
 }
 
 function showTopicsHome() {
+  connectionGeneration++;
   closeLaunchers();
   selectedId.value = null;
   selectedTopicId.value = null;
@@ -440,14 +461,15 @@ async function openTopicInZed(id: string) {
   try {
     await invoke("open_in_zed", { id });
   } catch (e: any) {
-    connError.value = e?.message ?? String(e);
+    reportActionError(backendOf(id), e);
   }
 }
 
 const newTopicProject = ref<{ id: string | null; name: string } | null>(null);
 
 function openNewThread() {
-  launcherGeneration++;
+  connectionGeneration++;
+  composerUrl.value = loomUrl.value;
   // A stale connection error from an earlier flow shouldn't read as a
   // launch failure inside the fresh sheet.
   connError.value = null;
@@ -457,9 +479,11 @@ function openNewThread() {
 }
 
 function openNewTopic() {
-  launcherGeneration++;
+  connectionGeneration++;
+  composerUrl.value = loomUrl.value;
   connError.value = null;
   closeLaunchers();
+  topicDraftOwners.set(composerUrl.value, composerGeneration.value);
   newTopicProject.value = null;
   showNewTopic.value = true;
 }
@@ -468,17 +492,23 @@ function openNewTopic() {
 // sheet. Navigation itself (the project-filtered home) is a separate
 // minimal handler.
 function openNewTopicInProject(project: { id: string | null; name: string } | null) {
-  launcherGeneration++;
+  const url = backendOf(project?.id) || loomUrl.value;
+  if (!backends.value.find(backend => backend.url === url)?.available) return;
+  connectionGeneration++;
+  composerUrl.value = url;
   connError.value = null;
   closeLaunchers();
+  topicDraftOwners.set(url, composerGeneration.value);
   newTopicProject.value = project;
   showNewTopic.value = true;
 }
 function closeNewTopic() {
+  composerGeneration.value++;
   showNewTopic.value = false;
   newTopicProject.value = null;
 }
 function closeNewThreadSheet() {
+  composerGeneration.value++;
   showNewThread.value = false;
 }
 
@@ -486,7 +516,8 @@ function closeNewThreadSheet() {
 // (what new topics inherit) without creating a topic first.
 const projectResourcesProject = ref<{ id: string; name: string } | null>(null);
 function openNewProject() {
-  launcherGeneration++;
+  connectionGeneration++;
+  composerUrl.value = loomUrl.value;
   connError.value = null;
   closeLaunchers();
   newTopicProject.value = null;
@@ -500,14 +531,14 @@ function onProjectCreated(project: { id: string; name: string }) {
 function openProjectResources(project: { id: string | null; name: string }) {
   // Only real projects have bindings — Ungrouped (null id) never opens
   // this sheet; the sidebar only emits for named headings anyway.
-  if (!project.id) return;
-  launcherGeneration++;
+  if (!project.id || !backends.value.find(backend => backend.url === backendOf(project.id))?.available) return;
   connError.value = null;
   closeLaunchers();
   newTopicProject.value = null;
   projectResourcesProject.value = { id: project.id, name: project.name };
 }
 function closeProjectResources() {
+  composerGeneration.value++;
   showNewProject.value = false;
   projectResourcesProject.value = null;
 }
@@ -531,15 +562,16 @@ async function launchTask(
   task: string,
   repo: string,
   meta?: { topicBranch?: string; title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[]; asTrack?: boolean },
-  completed?: (success: boolean) => void,
+  completed?: (success: boolean, currentComposer: boolean) => void,
 ) {
-  // Vue batches prop updates, so the composer's disabled state alone cannot
-  // prevent two submissions in the same tick (keyboard + click, for example).
-  if (launching.value) return;
-  launching.value = true;
-  const launcher = launcherGeneration;
+  if (!currentAvailable.value) { connError.value = "This project’s backend is unavailable. Reconnect before launching."; completed?.(false, true); return; }
+  const launchUrl = operationUrl.value;
+  const navigation = connectionGeneration;
+  const composer = composerGeneration.value;
+  if (pendingLaunches.value.has(launchUrl)) return;
+  pendingLaunches.value.add(launchUrl);
   try {
-    const view = await invoke<SessionView>("launch_session", {
+    const view = await backendInvoke<SessionView>("launch_session", {
       repo,
       task,
       title: meta?.title ?? null,
@@ -557,20 +589,24 @@ async function launchTask(
       hiddenBindingKeys: meta?.hiddenBindingKeys ?? [],
       asTrack: meta?.asTrack ?? false,
       topicBranch: launchTopicBranch(meta?.topicBranch, meta?.asTrack ?? false),
-    });
-    // A new topic activates immediately: route through selectSession
-    // so open_session runs (chat forwarder + cursor reset + fresh view),
-    // not just the launch stub — otherwise the thread never streams live.
-    // Keep the launch composer painted until the live view is available.
-    await selectSession(view.id, view, launcher);
-    completed?.(true);
+    }, launchUrl);
+    // Keep the submitted composer painted until its live view is ready.
+    let currentComposer = composer === composerGeneration.value && navigation === connectionGeneration && operationUrl.value === launchUrl;
+    if (currentComposer) {
+      const selection = selectSession(view.id, view, composer);
+      const selectedNavigation = connectionGeneration;
+      await selection;
+      currentComposer = connectionGeneration === selectedNavigation && composerGeneration.value === composer + 1 && selectedId.value === view.id;
+    }
+    completed?.(true, currentComposer);
   } catch (e: any) {
     // Keep the sheet open with the draft intact: a failed launch
     // (bad repo, loom down) is one edit away from a retry, not a blank form.
-    connError.value = e?.message ?? String(e);
-    completed?.(false);
+    const currentComposer = composer === composerGeneration.value && navigation === connectionGeneration;
+    reportActionError(launchUrl, e, currentComposer);
+    completed?.(false, currentComposer);
   } finally {
-    launching.value = false;
+    pendingLaunches.value.delete(launchUrl);
   }
 }
 
@@ -588,18 +624,20 @@ function launchTopic(
   repo: string,
   meta?: { topicBranch?: string; title?: string; description?: string; base?: string; mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string; project?: { id: string | null; name: string }; hiddenBindingKeys?: string[] },
 ) {
-  const launcher = launcherGeneration;
-  const launchedDraft = newTrackChat.value?.draftSnapshot();
-  launchTask(task, repo, { ...meta, asTrack: true }, (success) => {
+  const draftUrl = composerUrl.value;
+  const draftOwner = topicDraftOwners.get(draftUrl);
+  const storage = { getItem: (key: string) => key === "loomUrl" ? draftUrl : localStorage.getItem(key),
+    setItem: (key: string, value: string) => localStorage.setItem(key, value), removeItem: (key: string) => localStorage.removeItem(key) };
+  let submitted: string | null = null;
+  try { submitted = newTrackChat.value?.draftSnapshot() ?? storage.getItem(draftStorageKey(storage)); } catch { /* Storage unavailable. */ }
+  return launchTask(task, repo, { ...meta, asTrack: true }, (success, currentComposer) => {
     if (success) {
-      if (launcher === launcherGeneration) closeNewTopic();
+      if (currentComposer) closeNewTopic();
       // Unmounting the sheet snapshots its draft (onUnmounted runs on
       // this same flush); drop it a microtask later, after that snapshot
       // has landed, so reopening the sheet starts fresh.
       nextTick(() => {
-        // Navigation may have saved a newer draft while creation was pending.
-        // Only remove the saved snapshot belonging to the launched composer.
-        if (JSON.stringify(readDraft(localStorage)) === launchedDraft) clearDraftOnLaunch(localStorage);
+        if (topicDraftOwners.get(draftUrl) === draftOwner) clearSubmittedDraft(storage, submitted);
       });
     }
   });
@@ -614,15 +652,16 @@ function launchThread(
   repo: string,
   meta?: { mentions?: ResourceMention[]; attachments?: FileAttachment[]; profile?: string; agent?: string; model?: string; effort?: string },
 ) {
-  const launcher = launcherGeneration;
-  launchTask(task, repo, meta, (success) => {
-    if (success && launcher === launcherGeneration) closeNewThreadSheet();
+  return launchTask(task, repo, meta, (success, currentComposer) => {
+    if (success && currentComposer) closeNewThreadSheet();
   });
 }
 
 // The durable command returns fresh tags. Reflect them across both panes immediately.
 function onPolicyUpdated(view: SessionView) {
-  fleet.value = fleet.value.map(session => session.id === view.id ? { ...session, branch: view.branch } : session);
+  for (const backend of backends.value) {
+    backend.sessions = backend.sessions.map(session => session.id === view.id ? { ...session, branch: view.branch } : session);
+  }
   if (selectedView.value?.id === view.id) selectedView.value = { ...selectedView.value, branch: view.branch };
 }
 
@@ -644,15 +683,17 @@ async function updateTopic(
       expectedTitleProvenance: expected?.provenance ?? null,
     });
   } catch (e: any) {
-    connError.value = e?.message ?? String(e);
+    reportActionError(backendOf(id), e);
   }
 }
 
 async function delegateFromThread(parentId: string, task: string, completed?: (success: boolean) => void) {
-  launching.value = true;
+  const launchUrl = backendOf(parentId);
+  if (!launchUrl || pendingLaunches.value.has(launchUrl)) return;
+  pendingLaunches.value.add(launchUrl);
   // The launch-preset picker's current selection rides along: the last
   // chosen harness/model/effort is the default for every delegation.
-  const sel = launchSelection.value;
+  const sel = launchSelectionFor(launchUrl);
   try {
     const view = await invoke<SessionView>("delegate_task", {
       parentId,
@@ -665,10 +706,10 @@ async function delegateFromThread(parentId: string, task: string, completed?: (s
     // Stay on the parent thread — the child appears nested under it in the
     // sidebar (and inherits the parent's topic) via the layout events.
   } catch (e: any) {
-    connError.value = e?.message ?? String(e);
+    reportActionError(launchUrl, e);
     completed?.(false);
   } finally {
-    launching.value = false;
+    pendingLaunches.value.delete(launchUrl);
   }
 }
 
@@ -688,14 +729,14 @@ async function reparentSession(
       });
     }
   } catch (e: any) {
-    connError.value = e?.message ?? String(e);
+    reportActionError(backendOf(sessionId), e);
   }
 }
 
 async function deleteLane(laneId: string) {
   try {
     // Delete a user lane; its chats move back to the user-space Inbox.
-    const inbox = userInboxId();
+    const inbox = userInboxId(backendOf(laneId));
     if (!inbox) {
       connError.value = "no Inbox lane found to move chats into";
       return;
@@ -705,12 +746,13 @@ async function deleteLane(laneId: string) {
       destinationGroupId: inbox,
     });
   } catch (e: any) {
-    connError.value = e?.message ?? String(e);
+    reportActionError(backendOf(laneId), e);
   }
 }
 
-function userInboxId(): string | undefined {
+function userInboxId(url: string | null): string | undefined {
   for (const sp of layout.value?.spaces ?? []) {
+    if (backendOf(sp.id) !== url) continue;
     if (sp.system_key === "user" || sp.name === "User") {
       const g = sp.groups.find((g) => g.system_key === "inbox");
       if (g) return g.id;
@@ -725,7 +767,7 @@ async function onArchived(id: string) {
   try {
     await invoke("archive_session", { id });
   } catch (e: any) {
-    connError.value = e?.message ?? String(e);
+    reportActionError(backendOf(id), e);
     return;
   }
   if (selectedId.value === id) {
@@ -757,9 +799,7 @@ async function onUnarchived(id: string) {
   }
 }
 
-const connClass = computed(() =>
-  connected.value ? "ok" : connError.value ? "bad" : "warn",
-);
+const connClass = computed(() => backends.value.every(backend => backend.available) ? "ok" : connected.value ? "warn" : "bad");
 
 const selectedTopic = computed(() => {
   let node = fleet.value.find((session) => session.id === (selectedId.value ?? selectedTopicId.value));
@@ -781,7 +821,7 @@ const inspectorTopic = computed(() => selectedTopic.value ?? (artifactRequest.va
 watch([loomUrl, selectedId, selectedTopicId], () => { artifactRequest.value = null; });
 const showProjectSheet = computed(() => showNewProject.value || !!projectResourcesProject.value);
 const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.value && !showProjectSheet.value
-  && viewMode.value !== "home" && !!inspectorTopic.value && showResources.value);
+  && viewMode.value !== "home" && !!inspectorTopic.value && showResources.value && currentAvailable.value);
 </script>
 
 <template>
@@ -800,17 +840,18 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
           connected
             ? connError
               ? connError
-              : `loom · ${loomUrl.replace("http://", "")}`
-            : (connError ?? "connecting…")
+              : `${backends.filter(backend => backend.available).length}/${backends.length} servers available`
+            : (connError ?? (backends.some(backend => backend.connecting) ? "connecting…" : "Backends unavailable"))
         }}
       </button>
       <button v-if="!showProjectSheet && viewMode !== 'home' && selectedTopic" class="header-resources" :aria-pressed="showResources"
         title="Track inspector (⌘⇧E)" @click="showResources = !showResources">Inspector</button>
     </header>
     <FleetSidebar
-      :key="loomUrl"
       :fleet="fleet"
       :layout="layout"
+      :backends="backends"
+      @retry-backend="retryBackend"
       :selected-id="selectedId ?? selectedTopicId"
       :show-new-thread="showNewThread"
       :show-new-topic="showNewTopic"
@@ -833,27 +874,38 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
     <NewTrackChat
       ref="newTrackChat"
       v-if="showNewTopic"
-      :fleet="fleet"
+      :key="`${composerUrl}:${composerGeneration}`"
+      :backend-url="composerUrl"
+      :backends="backends"
+      :available="currentAvailable"
+      @backend="changeComposerBackend"
+      :fleet="composerFleet"
       :launching="launching"
       :error="connError"
       :launch-options="launchOptions"
-      :layout="layout"
+      :layout="composerLayout"
       :project="newTopicProject"
       @close="closeNewTopic"
       @launch="launchTopic"
     />
     <ProjectSheet
       v-else-if="showProjectSheet"
-      :key="projectResourcesProject?.id ?? 'new-project'"
+      :key="projectResourcesProject?.id ?? composerUrl"
       :project="projectResourcesProject"
-      :layout="layout"
+      :layout="composerLayout"
+      :backend-url="operationUrl"
+      :backends="backends"
+      :available="currentAvailable"
+      @backend="changeComposerBackend"
       @close="closeProjectResources"
       @created="onProjectCreated"
-      @layout="layout = $event"
+      @layout="onProjectLayout"
     />
     <NewThreadSheet
       v-else-if="showNewThread"
-      :fleet="fleet"
+      :key="`${composerUrl}:${composerGeneration}`"
+      :available="currentAvailable"
+      :fleet="composerFleet"
       :launching="launching"
       :error="connError"
       :launch-options="launchOptions"
@@ -862,13 +914,13 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
     />
     <ThreadView
       ref="threadView"
-      v-else-if="viewMode === 'thread' && selectedId && selectedView"
+      v-else-if="currentAvailable && viewMode === 'thread' && selectedId && selectedView"
       :key="selectedId"
       :session="selectedView"
       :topic="selectedTopic"
       :fleet="fleet"
       :launch-options="launchOptions"
-      :loom-url="loomUrl"
+      :loom-url="backendOf(selectedView.id) || operationUrl"
       @open-artifact="openArtifact"
       @error="connError = $event"
       @archive="onArchived"
@@ -883,9 +935,14 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
       @open-coordinator="openCoordinatorThread"
       @home="onHome"
     />
+    <section v-else-if="(viewMode !== 'home' || !!selectedProject?.id) && !currentAvailable" class="backend-unavailable main-unavailable" role="status">
+      <h2>Backend unavailable</h2><p>{{ currentBackend?.name }} · {{ operationUrl }}</p>
+      <p>{{ currentBackend?.error || 'Reconnecting…' }}</p>
+      <button :disabled="currentBackend?.connecting" @click="retryBackend(operationUrl)">{{ currentBackend?.connecting ? 'Connecting…' : 'Reconnect' }}</button>
+    </section>
     <HomeView
       v-else
-      :key="`${loomUrl}:${viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'}`"
+      :key="`${viewMode === 'topic' ? selectedTopicId ?? 'topic' : 'home'}`"
       :fleet="fleet"
       :topic="viewMode === 'topic' ? selectedTopic : null"
       :project="selectedProject"
@@ -898,7 +955,7 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
       @manage-project-resources="openProjectResources"
       @error="connError = $event"
     />
-    <TopicInspector v-if="inspectorVisible && inspectorTopic" :topic="inspectorTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="loomUrl"
+    <TopicInspector v-if="inspectorVisible && inspectorTopic" :topic="inspectorTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="backendOf(inspectorTopic.id) || operationUrl"
       :artifact-request="artifactRequest" @open-artifact="openArtifact"
       @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" @policy-updated="onPolicyUpdated" />
     <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && !showProjectSheet && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
@@ -908,6 +965,7 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
       v-if="showSettings"
       :url="loomUrl"
       :token="loomToken"
+      :backends="backends"
       :connected="connected"
       :error="settingsError"
       :saving="settingsSaving"
@@ -916,3 +974,7 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
     />
   </div>
 </template>
+
+<style scoped>
+.main-unavailable { grid-area: main; padding: 36px; color: var(--muted); }
+</style>

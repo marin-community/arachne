@@ -1,11 +1,17 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
+import { backendOf } from "../backendIdentity";
+import { partitionBackendIds } from "../backendInvoke";
+import { useBackendInvoke, useBackendUrl } from "../backendInvoke";
+
 import type { SessionLayout, SessionSummary } from "../App.vue";
 import { homeRowTitle } from "../homeRows";
 import { layoutProjects, topicProjectId } from "../projects";
 import { attentionAction, attentionLevel, attentionReason, dismissibleAttention, isReadyCandidate, threadStatus } from "../topicInspector";
+
+const invoke = useBackendInvoke();
+const fallbackBackend = useBackendUrl();
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -92,10 +98,13 @@ const title = (s: SessionSummary) => s.branch.title || s.branch.name;
 // Project and parent Topic; scoped views drop the parts the heading or the
 // dashboard already names. Pure logic lives in src/homeRows.ts.
 function rowTitle(s: SessionSummary): string {
-  return homeRowTitle(s, rootOf(s), projectNameOf(s), {
+  const label = homeRowTitle(s, rootOf(s), projectNameOf(s), {
     topic: props.topic != null,
     project: props.project?.id != null,
   });
+  if (props.topic || props.project?.id) return label;
+  const server = backendOf(s.id);
+  return server ? `${label} · ${new URL(server).host}${new URL(server).pathname.replace(/\/$/, "")}` : label;
 }
 
 const level = attentionLevel;
@@ -133,13 +142,22 @@ const resting = computed(() => scoped.value.filter((s) =>
 interface UserTodo { id: string; text: string; topic_id: string; revision: number }
 const userTodos = ref<UserTodo[]>([]);
 const todoWarnings = ref<string[]>([]);
-const todoBusy = ref<string | null>(null);
+const todoBusy = ref(new Set<string>());
 const todosLoading = ref(false);
 let todoTimer: ReturnType<typeof setTimeout> | undefined;
 let todoUnlisten: UnlistenFn | undefined;
 let todosDisposed = false;
-let todoRequest = 0;
-let todosDirty = false;
+interface BackendTodos {
+  topicIds: string[];
+  scope: string;
+  todos: UserTodo[];
+  warnings: string[];
+  pending: Promise<void> | null;
+  dirty: boolean;
+  settled: boolean;
+}
+const backendTodos = new Map<string, BackendTodos>();
+const todoMutations = new Map<string, { url: string; state: BackendTodos }>();
 const todoTopicIds = computed(() => [...new Set(scoped.value.map((s) => rootOf(s).id))].sort());
 const todoScope = computed(() => JSON.stringify([
   props.topic?.id ?? null,
@@ -151,42 +169,89 @@ const settledTodoScope = ref<string | null>(null);
 // empty state. Background fleet refreshes retain the last result until changed.
 const todosPending = computed(() => settledTodoScope.value !== todoScope.value);
 const visibleTodos = computed(() => userTodos.value.filter((todo) => todoTopicIds.value.includes(todo.topic_id)));
-async function refreshUserTodos() {
+function publishTodos() {
   if (todosDisposed) return;
-  if (todosLoading.value) { todosDirty = true; return; }
-  const request = ++todoRequest;
-  const scope = todoScope.value;
-  todosLoading.value = true;
-  try {
-    const result = await invoke<{ todos: UserTodo[]; warnings: string[] }>("user_todos", { topicIds: todoTopicIds.value });
-    if (todosDisposed || request !== todoRequest || scope !== todoScope.value) return;
-    userTodos.value = result.todos;
-    todoWarnings.value = result.warnings;
-  } catch (error: any) {
-    if (!todosDisposed && request === todoRequest && scope === todoScope.value) {
-      todoWarnings.value = [`Could not load user Todos: ${error?.message ?? String(error)}`];
-    }
-  } finally {
-    if (!todosDisposed && request === todoRequest && scope === todoScope.value) settledTodoScope.value = scope;
-    todosLoading.value = false;
-    if (todosDirty && !todosDisposed) { todosDirty = false; scheduleTodos(); }
+  const states = [...backendTodos.values()];
+  userTodos.value = states.flatMap(state => state.todos);
+  todoWarnings.value = states.flatMap(state => state.warnings);
+  todosLoading.value = states.some(state => state.pending !== null);
+  settledTodoScope.value = states.every(state => state.settled) ? todoScope.value : null;
+}
+function syncTodoBackends() {
+  const groups = partitionBackendIds(todoTopicIds.value);
+  const emptyUrl = backendOf(props.project?.id || props.topic?.id) || fallbackBackend.value;
+  if (!groups.size && emptyUrl) groups.set(emptyUrl, []);
+  const scopeFor = (ids: string[]) => JSON.stringify(ids.length ? ids : [todoScope.value]);
+  for (const [url, state] of backendTodos) {
+    if (!groups.has(url) || scopeFor(groups.get(url)!) !== state.scope) backendTodos.delete(url);
   }
+  for (const [url, topicIds] of groups) {
+    if (!backendTodos.has(url)) backendTodos.set(url, { topicIds, scope: scopeFor(topicIds), todos: [], warnings: [], pending: null, dirty: false, settled: false });
+  }
+  for (const [id, ticket] of todoMutations) {
+    if (backendTodos.get(ticket.url) !== ticket.state) { todoMutations.delete(id); todoBusy.value.delete(id); }
+  }
+  publishTodos();
+}
+function refreshBackendTodos(baseUrl: string, state: BackendTodos): Promise<void> {
+  if (state.pending) { state.dirty = true; return state.pending; }
+  const current = () => !todosDisposed && backendTodos.get(baseUrl) === state;
+  state.pending = Promise.resolve().then(async () => {
+    try {
+      const reply = await invoke<{ todos: UserTodo[]; warnings: string[] }>("user_todos", { topicIds: state.topicIds }, baseUrl);
+      if (!current()) return;
+      state.todos = reply.todos;
+      state.warnings = reply.warnings.map(warning => `${baseUrl}: ${warning}`);
+    } catch (error: any) {
+      if (!current()) return;
+      state.warnings = [`${baseUrl}: Could not load user Todos: ${error?.message ?? String(error)}`];
+    } finally {
+      state.pending = null;
+      state.settled = true;
+      if (current()) {
+        publishTodos();
+        if (state.dirty) { state.dirty = false; void refreshBackendTodos(baseUrl, state); }
+      }
+    }
+  });
+  publishTodos();
+  return state.pending;
+}
+async function refreshUserTodos(baseUrl?: string) {
+  if (todosDisposed) return;
+  syncTodoBackends();
+  // Only the owning backend coalesces its in-flight requests. A stalled
+  // sibling never blocks healthy refreshes, completion, or publication.
+  await Promise.allSettled([...backendTodos].filter(([url]) => !baseUrl || url === baseUrl)
+    .map(([url, state]) => refreshBackendTodos(url, state)));
 }
 function scheduleTodos() {
   if (todoTimer || todosDisposed) return;
   todoTimer = setTimeout(() => { todoTimer = undefined; void refreshUserTodos(); }, 600);
 }
 async function completeTodo(todo: UserTodo) {
-  if (todoBusy.value) return;
-  todoBusy.value = todo.id;
+  const url = backendOf(todo.topic_id);
+  const state = url && backendTodos.get(url);
+  if (todosDisposed || !url || !state || todoBusy.value.has(todo.id)) return;
+  const ticket = { url, state };
+  todoMutations.set(todo.id, ticket);
+  todoBusy.value.add(todo.id);
+  const current = () => !todosDisposed && todoMutations.get(todo.id) === ticket
+    && backendTodos.get(url) === state && todoTopicIds.value.includes(todo.topic_id);
   try {
     await invoke("toggle_todo", { topicId: todo.topic_id, todoId: todo.id, expectedRevision: todo.revision });
-    userTodos.value = userTodos.value.filter((row) => row.id !== todo.id);
-    await refreshUserTodos();
+    if (!current()) return;
+    state.todos = state.todos.filter(row => row.id !== todo.id);
+    publishTodos();
+    await refreshUserTodos(url);
   } catch (error: any) {
-    await refreshUserTodos();
-    todoWarnings.value = [...todoWarnings.value, error?.message ?? String(error)];
-  } finally { todoBusy.value = null; }
+    if (!current()) return;
+    await refreshUserTodos(url);
+    if (current()) { state.warnings.push(`${url}: ${error?.message ?? String(error)}`); publishTodos(); }
+  } finally {
+    // A retired completion cannot unlock a newer mutation of the same Todo.
+    if (todoMutations.get(todo.id) === ticket) { todoMutations.delete(todo.id); todoBusy.value.delete(todo.id); }
+  }
 }
 onMounted(async () => {
   void refreshUserTodos();
@@ -195,15 +260,8 @@ onMounted(async () => {
     if (todosDisposed) stop(); else todoUnlisten = stop;
   } catch { /* Manual refresh remains available without the event bridge. */ }
 });
-onUnmounted(() => { todosDisposed = true; todoRequest++; todoUnlisten?.(); if (todoTimer) clearTimeout(todoTimer); });
-watch(todoScope, () => {
-  // Invalidate in-flight results (including failures) from the previous scope.
-  todoRequest++;
-  settledTodoScope.value = null;
-  userTodos.value = [];
-  todoWarnings.value = [];
-  scheduleTodos();
-});
+onUnmounted(() => { todosDisposed = true; backendTodos.clear(); todoMutations.clear(); todoBusy.value.clear(); todoUnlisten?.(); if (todoTimer) clearTimeout(todoTimer); });
+watch(todoScope, () => { settledTodoScope.value = null; syncTodoBackends(); scheduleTodos(); });
 
 const sections = computed(() => [
   { name: "Needs You", rows: needs.value, kind: "needs" },
@@ -217,6 +275,7 @@ const sections = computed(() => [
 // top of its section. When a specific project's home is open, every row
 // shares one project — the grouping only matters on the aggregate home.
 interface ProjectGroup {
+  key: string;
   name: string;
   /** The layout-group id when the group is a real project — the id the
    *   project-bindings store is keyed by; null for repo-derived groups. */
@@ -226,9 +285,9 @@ interface ProjectGroup {
 function groupByProject(rows: SessionSummary[]): ProjectGroup[] {
   const groups = new Map<string, ProjectGroup>();
   for (const row of rows) {
-    const key = projectNameOf(row);
+    const key = `${backendOf(row.id)}:${projectIdOf(row) || projectNameOf(row)}`;
     if (!groups.has(key)) {
-      groups.set(key, { name: key, id: projectIdOf(row), rows: [] });
+      groups.set(key, { key, name: projectNameOf(row), id: projectIdOf(row), rows: [] });
     }
     groups.get(key)!.rows.push(row);
   }
@@ -312,18 +371,18 @@ const readyGroups = computed(() => groupByProject(ready.value));
           </div>
           <section class="home-user-todos section" aria-label="Your Todos">
             <div class="home-todos-heading"><div class="section-title">Your Todos <span class="home-section-count">{{ visibleTodos.length }}</span></div>
-              <button type="button" :disabled="todosLoading || todosPending" @click="refreshUserTodos">{{ todosLoading || todosPending ? "Loading…" : "Refresh" }}</button></div>
+              <button type="button" :aria-busy="todosLoading" :disabled="(todosLoading || todosPending) && backendTodos.size <= 1" @click="refreshUserTodos()">{{ (todosLoading || todosPending) && backendTodos.size <= 1 ? "Loading…" : "Refresh" }}</button></div>
             <p v-for="warning in todoWarnings" :key="warning" class="home-todo-error" role="alert">{{ warning }}</p>
             <div v-if="!visibleTodos.length && !todosPending && !todoWarnings.length" class="home-section-empty">No open user Todos.</div>
             <div v-for="todo in visibleTodos" :key="todo.id" class="home-todo-row">
-              <button type="button" class="home-todo-complete" :disabled="todoBusy !== null" :aria-label="`Complete ${todo.text}`" title="Mark complete" @click="completeTodo(todo)">{{ todoBusy === todo.id ? "…" : "✓" }}</button>
+              <button type="button" class="home-todo-complete" :disabled="todoBusy.has(todo.id)" :aria-label="`Complete ${todo.text}`" title="Mark complete" @click="completeTodo(todo)">{{ todoBusy.has(todo.id) ? "…" : "✓" }}</button>
               <div class="row-main"><div>{{ todo.text }}</div><button class="home-todo-track" type="button" @click="emit('select', todo.topic_id)">{{ byId.get(todo.topic_id)?.branch.title || byId.get(todo.topic_id)?.branch.name || "Open Track" }}</button></div>
             </div>
           </section>
 
         </template>
         <template v-else>
-          <template v-for="group in section.kind === 'working' ? workingGroups : readyGroups" :key="group.name">
+          <template v-for="group in section.kind === 'working' ? workingGroups : readyGroups" :key="group.key">
             <!-- Aggregate home: each project group carries the same manage
                  affordance as the filtered project home — real projects
                  only (repo-derived groups have no binding store). -->

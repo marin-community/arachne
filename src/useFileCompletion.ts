@@ -1,5 +1,5 @@
 import { computed, nextTick, onScopeDispose, ref, watch, type Ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke, useBackendUrl } from "./backendInvoke.ts";
 
 export interface FileCompletionSource {
   id?: string;
@@ -12,9 +12,11 @@ export function useFileCompletion(
   draft: Ref<string>,
   source: Ref<FileCompletionSource | null>,
   input: Ref<HTMLTextAreaElement | HTMLInputElement | null>,
-  lookup = (source: FileCompletionSource, query: string) =>
-    invoke<string[]>("complete_files", { ...source, query }),
+  lookup?: (source: FileCompletionSource, query: string) => Promise<string[]>,
 ) {
+  const invoke = useBackendInvoke();
+  const backendUrl = useBackendUrl();
+  const lookupFiles = lookup ?? ((source: FileCompletionSource, query: string) => invoke<string[]>("complete_files", { ...source, query }));
   const caret = ref(0);
   const matches = ref<string[]>([]);
   const selected = ref(0);
@@ -32,7 +34,7 @@ export function useFileCompletion(
     !dismissed.value && mention.value !== null && matches.value.length > 0,
   );
 
-  watch([mention, source], ([current, target]) => {
+  watch([mention, source, backendUrl], ([current, target]) => {
     selected.value = 0;
     dismissed.value = false;
     const request = ++sequence;
@@ -42,7 +44,7 @@ export function useFileCompletion(
     timer = setTimeout(async () => {
       timer = null;
       try {
-        const files = await lookup(target, current.query);
+        const files = await lookupFiles(target, current.query);
         if (request === sequence) matches.value = files;
       } catch {
         // Completion is optional; a failed lookup must never block typing.

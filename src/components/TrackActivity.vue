@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { SessionSummary } from "../App.vue";
 import ChatMarkdown from "./ChatMarkdown.vue";
 import type { ArtifactTarget } from "../artifactLinks";
 import { deliverySummary, messageSource, watchTriggerKind, watchTriggerLabel, type TrackActivitySnapshot } from "../trackActivity";
+
+const invoke = useBackendInvoke();
 
 const props = defineProps<{ topic: SessionSummary; resultsOnly?: boolean; loomUrl?: string }>();
 const emit = defineEmits<{ (e: "open-artifact", target: ArtifactTarget): void; (e: "select", sessionId: string): void }>();

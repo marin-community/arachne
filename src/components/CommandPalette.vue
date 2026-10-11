@@ -2,6 +2,8 @@
 import { ref, computed, onMounted } from "vue";
 import type { SessionSummary } from "../App.vue";
 import { searchThreads } from "../navigation";
+import { backendOf } from "../backendIdentity";
+const serverLabel = (id: string) => { const url = backendOf(id); return url ? new URL(url).host + new URL(url).pathname.replace(/\/$/, "") : ""; };
 import { isStandalone } from "../threadKind";
 const props = defineProps<{ fleet: SessionSummary[] }>();
 const emit = defineEmits<{ (e: "close"): void; (e: "select", id: string): void; (e: "action", action: string): void }>();
@@ -19,7 +21,7 @@ const actions = [
 const results = computed(() => [
   ...actions.filter(a => `${a.title} ${a.detail}`.toLowerCase().includes(query.value.toLowerCase())).map(a => ({...a, kind: "action"})),
   ...searchThreads(props.fleet, query.value).slice(0, 40).map(s => ({ id: s.id, title: s.branch.title || s.branch.name,
-    detail: [s.placement?.group_name, s.parent_session_id || s.parent_id ? "Worker" : isStandalone(s) ? "Thread" : "Track", s.github_repo || s.branch.repo_root,
+    detail: [serverLabel(s.id), s.placement?.group_name, s.parent_session_id || s.parent_id ? "Worker" : isStandalone(s) ? "Thread" : "Track", s.github_repo || s.branch.repo_root,
       s.branch.github?.pr_number ? `PR #${s.branch.github.pr_number}` : "", s.status === "archived" ? "Archived" : ""].filter(Boolean).join(" · "), shortcut: "", kind: "session" })),
 ]);
 function choose(index: number) { const row = results.value[index]; if (!row) return; if (row.kind === "session") emit("select", row.id); else emit("action", row.id); emit("close"); }

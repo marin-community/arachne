@@ -159,7 +159,8 @@ impl LoomClient {
     }
 
     pub fn new(base_url: &str, token: Option<String>) -> Result<Self, LoomError> {
-        let base = reqwest::Url::parse(base_url)
+        let normalized = crate::routing::normalize_server_url(base_url)?;
+        let base = reqwest::Url::parse(&normalized)
             .map_err(|e| LoomError::Connection(format!("invalid base URL {base_url:?}: {e}")))?;
         // NOTE: no client-wide timeout. A `timeout()` applies per-request
         // including streaming bodies, which would kill the SSE connection
@@ -1181,6 +1182,8 @@ impl LoomClient {
     /// fixed for the subscription's life — SSE cannot change topics
     /// mid-connection, so callers drop and resubscribe when the topic set
     /// changes (exactly what the UI does when switching open sessions).
+    /// Synthetic connection/unavailable and connection/resync frames expose
+    /// transport transitions even when no server-side event is published.
     pub async fn subscribe(
         &self,
         topics: &[String],
@@ -1197,21 +1200,22 @@ impl LoomClient {
         let token = self.token.clone();
         tokio::spawn(async move {
             let mut backoff = Duration::from_millis(250);
+            let mut reported_unavailable = false;
             loop {
                 let mut req = http.get(url.clone());
                 if let Some(token) = &token {
                     req = req.bearer_auth(token);
                 }
-                let mut ok = false;
                 let response = tokio::select! {
                     _ = tx.closed() => return,
                     response = req.send() => response,
                 };
-                if let Ok(resp) = response {
-                    if resp.status().is_success() {
-                        ok = true;
+                let error = match response {
+                    Ok(resp) if resp.status().is_success() => {
                         backoff = Duration::from_millis(250);
-                        // A reconnect may have missed events: ask consumers to reconcile.
+                        reported_unavailable = false;
+                        // Reconcile even when no session/layout events were published
+                        // during the outage. Headers suffice; do not await a frame.
                         if tx
                             .send(EventFrame {
                                 topic: "connection".into(),
@@ -1223,28 +1227,18 @@ impl LoomClient {
                         {
                             return;
                         }
-                        // Read the body as bytes and decode SSE textually.
-                        use futures_util::StreamExt;
                         let mut stream = resp.bytes_stream();
                         let mut buf = String::new();
                         loop {
-                            match tokio::select! { _ = tx.closed() => return, frame = stream.next() => frame }
-                            {
+                            match tokio::select! {
+                                _ = tx.closed() => return,
+                                frame = stream.next() => frame,
+                            } {
                                 Some(Ok(chunk)) => {
                                     buf.push_str(&String::from_utf8_lossy(&chunk));
-                                    // Process complete SSE events: blank-line
-                                    // separated; each `data:` line carries one
-                                    // JSON frame. Anything left over is a
-                                    // partial event that stays buffered for
-                                    // the next chunk — never trim to the last
-                                    // newline, that would drop a complete
-                                    // `data:` line still waiting for its
-                                    // terminating blank line.
                                     while let Some(pos) = buf.find("\n\n") {
                                         let event: String = buf.drain(..pos + 2).collect();
                                         for line in event.lines() {
-                                            // Keep-alive comments (`:` prefix)
-                                            // and other fields are skipped.
                                             if let Some(data) = line.strip_prefix("data:") {
                                                 let data = data.strip_prefix(' ').unwrap_or(data);
                                                 if let Ok(frame) =
@@ -1258,16 +1252,41 @@ impl LoomClient {
                                         }
                                     }
                                 }
-                                _ => break,
+                                Some(Err(error)) => {
+                                    break LoomError::Connection(format!(
+                                        "event stream failed: {error}"
+                                    ))
+                                }
+                                None => {
+                                    break LoomError::Connection(
+                                        "event stream closed; reconnecting".into(),
+                                    )
+                                }
                             }
                         }
                     }
+                    Ok(resp) => LoomError::Api {
+                        status: resp.status().as_u16(),
+                        method: "GET",
+                        path: "/api/events/stream".into(),
+                        message: format!("event subscription rejected: {}", resp.status()),
+                    },
+                    Err(error) => LoomError::Connection(error.to_string()),
+                };
+                // ReceiverStream remains open across retries. Surface the first
+                // failure immediately rather than waiting for REST or a new event.
+                if !reported_unavailable {
+                    if tx.send(EventFrame {
+                        topic: "connection".into(),
+                        event: "unavailable".into(),
+                        data: serde_json::json!({"message": error.to_string(), "unreachable": error.is_unreachable()}),
+                    }).await.is_err() { return; }
+                    reported_unavailable = true;
                 }
-                let _ = ok;
-                if tx.is_closed() {
-                    return;
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = tokio::time::sleep(backoff) => {},
                 }
-                tokio::select! { _ = tx.closed() => return, _ = tokio::time::sleep(backoff) => {} }
                 backoff = (backoff * 2).min(Duration::from_secs(5));
             }
         });
@@ -1924,5 +1943,56 @@ mod launch_tests {
         assert_eq!(launched.id, "decode-probe-session");
         assert!(launched.branch.goal.contains(&guidance.root));
         assert!(opening_turn.contains(&guidance.root));
+    }
+}
+
+#[cfg(test)]
+mod stream_transport_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn next(rx: &mut mpsc::Receiver<EventFrame>) -> EventFrame {
+        tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_connect_and_stream_close_signal_unavailable_and_quiet_recovery_signals_resync()
+    {
+        let reserved = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = reserved.local_addr().unwrap();
+        drop(reserved);
+        let client = LoomClient::new(&format!("http://{addr}"), None).unwrap();
+        let mut rx = client.subscribe(&["layout".into()]).await.unwrap();
+        let failed = next(&mut rx).await;
+        assert_eq!(
+            (&*failed.topic, &*failed.event),
+            ("connection", "unavailable")
+        );
+        assert_eq!(failed.data["unreachable"], true);
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 1024];
+            let count = socket.read(&mut bytes).await.unwrap();
+            assert!(String::from_utf8_lossy(&bytes[..count])
+                .starts_with("GET /api/events/stream?topics=layout "));
+            // No session/layout data at all: transport headers alone signal recovery.
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            socket
+        });
+        let recovered = next(&mut rx).await;
+        assert_eq!(
+            (&*recovered.topic, &*recovered.event),
+            ("connection", "resync")
+        );
+        let mut socket = server.await.unwrap();
+        socket.write_all(b"0\r\n\r\n").await.unwrap();
+        let lost = next(&mut rx).await;
+        assert_eq!((&*lost.topic, &*lost.event), ("connection", "unavailable"));
+        assert_eq!(lost.data["unreachable"], true);
+        drop(rx);
     }
 }

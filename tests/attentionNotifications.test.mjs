@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { attentionNotices, retainActiveDismissals } from "../src/attentionNotifications.ts";
+import { scopedId } from "../src/backendIdentity.ts";
 
 const session = (id, tags = [], extra = {}) => ({
   id, status: "running", parent_session_id: null, parent_id: null,
@@ -46,6 +47,15 @@ test("a fresh permission request with the same title resurfaces", () => {
   const a = session("topic", [], { pending_permissions: [{ request_id: "a", title: "Write config?" }] });
   const b = session("topic", [], { pending_permissions: [{ request_id: "b", title: "Write config?" }] });
   assert.notEqual(attentionNotices([a])[0].key, attentionNotices([b])[0].key);
+});
+
+test("colliding backend session IDs create distinct notifications and show their server", () => {
+  const fleet = ["https://a.example", "https://b.example"].map(url => session(scopedId(url, "shared"), [tag("attention")], {
+    branch: { id: scopedId(url, "branch"), title: "Same title", name: "same", tags: [tag("attention")] },
+  }));
+  const notices = attentionNotices(fleet);
+  assert.equal(new Set(notices.map(notice => notice.key)).size, 2);
+  assert.deepEqual(notices.map(notice => notice.title).sort(), ["Same title · a.example", "Same title · b.example"]);
 });
 
 

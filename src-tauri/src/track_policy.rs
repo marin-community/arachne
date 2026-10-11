@@ -256,7 +256,11 @@ mod tests {
         tagged(&mut track, "track_topic_branch", "arachne/tracks/new");
         // Display tags stamped by launch cannot authorize a colliding ref.
         assert!(canonical_topic_branch(&track).is_none());
-        tagged(&mut track, "track_topic_initialized", "arachne/tracks/other");
+        tagged(
+            &mut track,
+            "track_topic_initialized",
+            "arachne/tracks/other",
+        );
         assert!(canonical_topic_branch(&track).is_none());
         tagged(&mut track, "track_topic_initialized", "arachne/tracks/new");
         assert_eq!(canonical_topic_branch(&track), Some("arachne/tracks/new"));

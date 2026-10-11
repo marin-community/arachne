@@ -1,6 +1,7 @@
 import type { SessionSummary } from "./App.vue";
 import { attentionAction, attentionLevel, attentionReason } from "./topicInspector.ts";
 import { topicRootOf } from "./topic-view.ts";
+import { backendOf } from "./backendIdentity.ts";
 
 export interface AttentionNotice {
   key: string;
@@ -27,6 +28,9 @@ export function attentionNotices(fleet: readonly SessionSummary[]): AttentionNot
       const topic = topicRootOf(fleet, s.id) ?? s;
       const title = s.branch.title || s.branch.name;
       const topicTitle = topic.branch.title || topic.branch.name;
+      const backend = backendOf(s.id);
+      const serverLabel = backend ? `${new URL(backend).host}${new URL(backend).pathname.replace(/\/$/, "")}` : "";
+      const displayTitle = topic.id === s.id ? title : `${topicTitle} · ${title}`;
       const requests = (s.pending_permissions ?? []).map((p) => p.request_id).sort();
       const tags = s.branch.tags.filter((t) =>
         (t.key === "attention" || t.key === "triage") &&
@@ -36,7 +40,7 @@ export function attentionNotices(fleet: readonly SessionSummary[]): AttentionNot
         key: JSON.stringify([s.id, level, reason, requests, tags]),
         sessionId: s.id,
         topicId: topic.id,
-        title: topic.id === s.id ? title : `${topicTitle} · ${title}`,
+        title: serverLabel ? `${displayTitle} · ${serverLabel}` : displayTitle,
         reason,
         action: attentionAction(s),
         level,

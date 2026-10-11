@@ -1,15 +1,20 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, nextTick, useId } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick, useId, watch } from "vue";
 import {
-  launchAgents,
-  launchDefaultAgent,
-  launchSelection,
+  useLaunchConfig,
+  useLaunchSelection,
   launchPresets,
-  ensureLaunchConfig,
   saveLaunchPreset,
   deleteLaunchPreset,
   type LaunchSelection,
 } from "../launch";
+
+import { useBackendUrl } from "../backendInvoke";
+
+const backendUrl = useBackendUrl();
+const launchSelection = useLaunchSelection();
+const { launchAgents, launchDefaultAgent, ensureLaunchConfig } = useLaunchConfig();
+
 
 // The launch-preset picker: harness / model family / model / effort, plus
 // named presets. Sits inline as a compact button showing the current
@@ -165,6 +170,7 @@ function saveCurrentAsPreset() {
 // Load the agent list lazily the first time the popover opens (and it's
 // cheap to refetch — a stale custom-agent list is the only drift risk).
 let loaded = false;
+watch(backendUrl, () => { loaded = false; open.value = false; });
 function toggleOpen() {
   open.value = !open.value;
   if (open.value && !loaded) {

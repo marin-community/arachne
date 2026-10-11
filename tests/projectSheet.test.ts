@@ -27,6 +27,7 @@ function mountSheet() {
   } });
   const module = { exports: {} as any };
   new Function("require", "module", "exports", compiled)((name: string) => {
+    if (name === "../backendInvoke") return { useBackendInvoke: () => async () => [] };
     if (name === "@tauri-apps/api/core") return { invoke: async () => [] };
     if (name.endsWith(".vue")) return {};
     if (name.startsWith("../")) return require(new URL(`${name.replace("../", "../src/")}.ts`, import.meta.url).pathname);
@@ -38,7 +39,7 @@ function mountSheet() {
     parentNode: () => null, nextSibling: () => null,
   });
   let closes = 0;
-  const app = renderer.createApp({ ...module.exports.default, render: () => null }, { onClose: () => closes++ });
+  const app = renderer.createApp({ ...module.exports.default, render: () => null }, { onClose: () => closes++, backendUrl: "http://127.0.0.1:7878", backends: [], available: true });
   const instance = app.mount({}) as any;
   return {
     document, state: instance.$.setupState, closes: () => closes,

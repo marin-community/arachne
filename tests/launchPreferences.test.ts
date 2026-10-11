@@ -34,3 +34,19 @@ test("saved server profiles contain only validated names and URLs", () => {
   s.setItem(SERVER_PROFILES_KEY, JSON.stringify([{ name: "Bad", url: "https://secret:token@host" }, { name: "Good", url: "https://host", token: "never copied" }]));
   assert.deepEqual(readServerProfiles(s), [{ name: "Good", url: "https://host" }]);
 });
+
+test("explicit backend preferences ignore the legacy selected server and decode old project keys", async () => {
+  const { scopedId } = await import("../src/backendIdentity.ts");
+  const s = storage();
+  s.setItem("loomUrl", "http://localhost:7878");
+  saveProjectDefaults(s, "old-project", { repo: "org/old", base: "main" });
+  const project = scopedId("http://localhost:7878", "old-project");
+  s.setItem("loomUrl", "http://localhost:7879");
+  assert.deepEqual(readProjectDefaults(s, project), { repo: "org/old", base: "main" });
+  saveProjectDefaults(s, project, { repo: "org/new", base: "dev" });
+  assert.deepEqual(readProjectDefaults(s, project), { repo: "org/new", base: "dev" });
+  assert.deepEqual(recentRepositories(s, "http://localhost:7878/"), ["org/new", "org/old"]);
+  assert.deepEqual(recentRepositories(s), []);
+  rememberRepository(s, "org/other", "http://localhost:7879");
+  assert.deepEqual(recentRepositories(s), ["org/other"]);
+});

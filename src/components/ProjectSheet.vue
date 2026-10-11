@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, onMounted, onUnmounted } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { useBackendInvoke } from "../backendInvoke";
+import type { BackendFleet } from "../backendFleet";
 import type { SessionLayout } from "../App.vue";
 import { saveNewProject, type ProjectBinding, type ProjectBindingsView, type ProjectCreationDraft } from "../projectCreation";
 import { readProjectDefaults, saveProjectDefaults, recentRepositories } from "../launchDefaults";
@@ -15,15 +16,26 @@ import { readDraft, DEFAULT_REPO } from "../newTopicDraft";
 // → the repo-shared `arachne-projects` store), never copied onto topics.
 
 const props = defineProps<{
+  backendUrl: string;
+  backends: BackendFleet[];
+  available: boolean;
   project?: { id: string; name: string } | null;
   layout?: SessionLayout | null;
 }>();
 
 const emit = defineEmits<{
+  (e: "backend", url: string): void;
   (e: "close"): void;
   (e: "created", project: { id: string; name: string }): void;
   (e: "layout", layout: SessionLayout): void;
 }>();
+
+const invoke = useBackendInvoke();
+const preferenceStorage = {
+  getItem: (key: string) => key === "loomUrl" ? props.backendUrl : localStorage.getItem(key),
+  setItem: (key: string, value: string) => localStorage.setItem(key, value),
+  removeItem: (key: string) => localStorage.removeItem(key),
+};
 
 const creation = reactive<ProjectCreationDraft>({ project: null, bindings: [] });
 const creating = computed(() => !props.project);
@@ -88,8 +100,8 @@ async function seedRepoDefault() {
   const saved = project.value ? readProjectDefaults(localStorage, project.value.id) : null;
   if (saved) { repo.value = saved.repo; base.value = saved.base; return; }
   try {
-    const parsed = readDraft(localStorage);
-    repo.value = parsed?.repo?.trim() || recentRepositories(localStorage)[0] || DEFAULT_REPO;
+    const parsed = readDraft(preferenceStorage);
+    repo.value = parsed?.repo?.trim() || recentRepositories(preferenceStorage)[0] || DEFAULT_REPO;
   } catch {
     repo.value = DEFAULT_REPO;
   }
@@ -173,7 +185,7 @@ async function attach() {
   const path = formPath.value.trim();
   const url = formUrl.value.trim();
   const targetRepo = formRepo.value.trim();
-  if (!repoInput || saving.value || loading.value || !attachValid.value) return;
+  if (!props.available || !repoInput || saving.value || loading.value || !attachValid.value) return;
   const resource = isUrlKind.value
     ? { kind: formKind.value, title, repository: "", reference: null, path: null, url }
     : formKind.value === "repository"
@@ -207,7 +219,7 @@ async function attach() {
 }
 
 async function remove(binding: ProjectBinding) {
-  if (saving.value || loading.value) return;
+  if (!props.available || saving.value || loading.value) return;
   const pendingIndex = creation.bindings.findIndex((b) => b.id === binding.id);
   if (pendingIndex !== -1) {
     creation.bindings.splice(pendingIndex, 1);
@@ -244,7 +256,7 @@ function resetAttach() {
 }
 
 async function create() {
-  if (saving.value || !name.value.trim() || showAttach.value) return;
+  if (!props.available || saving.value || !name.value.trim() || showAttach.value) return;
   saving.value = true;
   error.value = "";
   try {
@@ -289,12 +301,21 @@ function onKeydown(event: KeyboardEvent) {
         <button class="nts-close" :disabled="saving" title="Close (esc)" aria-label="Close project settings" @click="emit('close')">✕</button>
       </header>
 
+      <label class="nts-field">
+        <span class="nts-field-name">Backend</span>
+        <select v-if="creating" :value="backendUrl" :disabled="saving || !!creation.project || !!creation.bindings.length || showAttach" @change="emit('backend', ($event.target as HTMLSelectElement).value)">
+          <option v-for="backend in backends" :key="backend.url" :value="backend.url">{{ backend.name }} · {{ backend.url }}{{ backend.available ? '' : ' — Unavailable' }}</option>
+        </select>
+        <span v-else>{{ backends.find(backend => backend.url === backendUrl)?.name }} · {{ backendUrl }}</span>
+        <span class="nts-hint">The project and its resource bindings stay on this backend.</span>
+        <span v-if="!available" class="nts-hint" role="status">Backend unavailable. Reconnect from the sidebar to continue.</span>
+      </label>
       <label v-if="creating" class="nts-field">
         <span class="nts-field-name">Project name</span>
-        <input ref="nameInput" v-model="name" :disabled="saving || !!creation.project" placeholder="Project name" @keydown.enter.prevent="create" />
+        <input ref="nameInput" v-model="name" :disabled="!available || saving || !!creation.project" placeholder="Project name" @keydown.enter.prevent="create" />
       </label>
 
-      <RepoBaseFields v-model:repo="repo" v-model:base="base" :disabled="saving || (creating && !!creation.savedRepo)" @submit="creating ? create() : saveDefaults()" />
+      <RepoBaseFields v-model:repo="repo" v-model:base="base" :disabled="!available || saving || (creating && !!creation.savedRepo)" @submit="creating ? create() : saveDefaults()" />
       <div v-if="!creating" class="nts-binding-actions">
         <button type="button" :disabled="!repo.trim() || saving" @click="saveDefaults">{{ defaultsSaved ? 'Defaults saved' : 'Save launch defaults' }}</button>
         <span class="nts-hint">Repository and base for new tracks on this device. Existing work keeps its settings.</span>
@@ -315,7 +336,7 @@ function onKeydown(event: KeyboardEvent) {
               type="button"
               class="nts-binding-remove"
               :aria-label="`Remove ${binding.title} from project ${projectName}`"
-              :disabled="saving || loading"
+              :disabled="!available || saving || loading"
               title="Remove from the project (existing tracks keep their own bindings)"
               @click="remove(binding)"
             >×</button>
@@ -325,11 +346,11 @@ function onKeydown(event: KeyboardEvent) {
           Nothing bound yet — new tracks in {{ projectName }} inherit what you bind here.
         </div>
         <div class="nts-binding-actions">
-          <button type="button" class="link" :disabled="saving" @click="showAttach = !showAttach">
+          <button type="button" class="link" :disabled="saving || (!available && !showAttach)" @click="showAttach = !showAttach">
             {{ showAttach ? "Cancel" : "+ Bind a resource" }}
           </button>
         </div>
-        <fieldset v-if="showAttach" class="nts-binding-form" :disabled="saving">
+        <fieldset v-if="showAttach" class="nts-binding-form" :disabled="!available || saving">
           <label>Kind
             <select v-model="formKind" @change="chooseKind">
               <option value="design_document">Design document</option>
@@ -349,7 +370,7 @@ function onKeydown(event: KeyboardEvent) {
           </label>
           <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
           <label v-else-if="formKind !== 'repository'">Path in repo <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
-          <button type="button" class="primary" :disabled="saving || loading || !attachValid || !repo.trim()" @click="attach">{{ creating ? 'Add resource' : 'Bind to project' }}</button>
+          <button type="button" class="primary" :disabled="!available || saving || loading || !attachValid || !repo.trim()" @click="attach">{{ creating ? 'Add resource' : 'Bind to project' }}</button>
         </fieldset>
       </div>
 
@@ -362,7 +383,7 @@ function onKeydown(event: KeyboardEvent) {
       </span>
       <div v-if="creating" class="nts-actions">
         <button type="button" :disabled="saving" @click="emit('close')">{{ creation.project ? 'Close' : 'Cancel' }}</button>
-        <button type="button" class="primary" :disabled="saving || !name.trim() || showAttach || (!!creation.bindings.length && !repo.trim())" @click="create">
+        <button type="button" class="primary" :disabled="!available || saving || !name.trim() || showAttach || (!!creation.bindings.length && !repo.trim())" @click="create">
           {{ saving ? 'Saving…' : creation.project ? 'Save remaining resources' : 'Create project' }}
         </button>
       </div>

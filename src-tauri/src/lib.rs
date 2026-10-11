@@ -22,6 +22,7 @@ pub mod landing;
 pub mod loom;
 pub mod publishing;
 pub mod resources;
+pub mod routing;
 pub mod secret;
 pub mod track_policy;
 

@@ -1,3 +1,4 @@
+import { splitScopedId } from "./backendIdentity.ts";
 import type { SessionSummary } from "./App.vue";
 import { canonicalTopicBranch, resolveTrack } from "./trackPolicy.ts";
 
@@ -11,7 +12,7 @@ export function preparationRequest(isTrack: boolean, revision: string, target: S
   const destination = isTrack
     ? `Canonical publish source: ${target ? canonicalTopicBranch(target) : "resolve the Track canonical branch"}. A publishing strategy and destination have not been selected yet. Inspect repository policy and report the appropriate destination options; do not assume main.`
     : target
-      ? `Landing destination: coordinator ${target.branch.name} (session ${target.id}), branch ${canonicalTopicBranch(target)}, repository ${target.branch.repo_root}. Re-verify this exact target and its current revision; do not substitute main or the primary checkout's branch.`
+      ? `Landing destination: coordinator ${target.branch.name} (session ${splitScopedId(target.id)?.id ?? target.id}), branch ${canonicalTopicBranch(target)}, repository ${target.branch.repo_root}. Re-verify this exact target and its current revision; do not substitute main or the primary checkout's branch.`
       : "No landing target is resolved. Identify the same-repository track coordinator before claiming readiness; do not assume main.";
   const edits = !isTrack && editedPaths.length ? ` Files manually saved through this review: ${editedPaths.join(", ")}. Treat these as intentional user edits; inspect their relevance and explicitly report anything excluded.` : "";
   const sourceScope = isTrack
@@ -23,7 +24,7 @@ export function preparationRequest(isTrack: boolean, revision: string, target: S
 /** Independent reviews compare worker changes with the canonical accepted ref. */
 export function independentReviewRequest(revision: string, target: SessionSummary | null, isTrack = false): string {
   const destination = target
-    ? `${isTrack ? "Canonical accepted source" : "Compare against canonical accepted branch"}: ${canonicalTopicBranch(target)} in ${target.branch.repo_root} (Track ${target.id}). Re-read and verify this exact ref and revision; do not substitute its scratch branch or main.`
+    ? `${isTrack ? "Canonical accepted source" : "Compare against canonical accepted branch"}: ${canonicalTopicBranch(target)} in ${target.branch.repo_root} (Track ${splitScopedId(target.id)?.id ?? target.id}). Re-read and verify this exact ref and revision; do not substitute its scratch branch or main.`
     : "No same-repository Track is resolved. Resolve the canonical accepted ref before comparing changes; do not assume main.";
   const sourceScope = isTrack
     ? " Fork the committed canonical accepted ref and compare with its recorded publishing base. Coordinator scratch commits and checkout edits are outside this review; report the exact accepted source and publishing base revisions."
