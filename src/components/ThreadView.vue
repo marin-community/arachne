@@ -8,7 +8,6 @@ import ContextTelemetry from "./ContextTelemetry.vue";
 import { useSlashCommands, type SlashCommand } from "../useSlashCommands";
 import LaunchPreset from "./LaunchPreset.vue";
 import SplitButton from "./SplitButton.vue";
-import AutolandControl from "./AutolandControl.vue";
 import { canonicalTopicBranch, isTrackCoordinator, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
 import { landStrategies, publishStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import CodeActions from "./CodeActions.vue";
@@ -1255,8 +1254,6 @@ async function onPublish(strategy: string) {
     </div>
     <div v-if="isTopic || (isWorker && !isReviewer)" class="integrate-note">
       <span>{{ isTopic ? 'Publish source' : 'Land destination' }}: <code>{{ canonicalDestination || 'No same-repository Track resolved' }}</code></span>
-      <AutolandControl :session="currentSummary ?? session" :track="integrationTarget" :coordinator="isTopic" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
-      <span v-if="isTopic">Autoland accepts worker results; Publish is an explicit action.</span>
     </div>
     <div v-if="integrationNote" class="integrate-note">{{ integrationNote }}</div>
     <div v-if="isTopic && lastPublish" class="integrate-note" :title="lastPublish.note">Last publish result: {{ lastPublish.value }}<span v-if="lastPublish.note"> · {{ lastPublish.note }}</span></div>
