@@ -44,9 +44,9 @@ interface ChangeSet {
 
 const launchSelection = useLaunchSelection();
 
-const props = withDefaults(defineProps<{ sessionId: string; canEdit?: boolean; isTopic?: boolean; integrationTarget?: SessionSummary | null; embedded?: boolean }>(), { canEdit: false, isTopic: false, embedded: false });
+const props = withDefaults(defineProps<{ sessionId: string; canEdit?: boolean; isTopic?: boolean | null; integrationTarget?: SessionSummary | null; embedded?: boolean }>(), { canEdit: false, isTopic: false, embedded: false });
 const reviewingTrack = computed(() => changes.value?.accepted_source ?? props.isTopic);
-const checkoutEditable = computed(() => props.canEdit && !reviewingTrack.value);
+const checkoutEditable = computed(() => props.canEdit && reviewingTrack.value === false);
 const emit = defineEmits<{ (e: "requested"): void; (e: "saved"): void }>();
 const editPath = ref<string | null>(null);
 const editedPaths = ref<string[]>([]);
@@ -56,6 +56,16 @@ let completionGeneration = 0;
 const visibleFiles = computed(() => changes.value?.files.filter(file => file.path.display.toLowerCase().includes(fileQuery.value.toLowerCase())) ?? []);
 const requestMode = ref<"review" | "prepare" | null>(null);
 const requestText = ref("");
+const requestScope = ref("");
+// Keep editable requests through comparison refreshes, but never send a brief
+// prepared for a different canonical target or preview revision.
+const currentRequestScope = computed(() => JSON.stringify([
+  reviewingTrack.value, props.integrationTarget?.id,
+  props.integrationTarget?.branch.repo_root, props.integrationTarget?.branch.branch,
+  props.integrationTarget?.branch.tags.find(tag => tag.key === "track_topic_branch")?.value,
+  reviewPreviewEvidence(changes.value),
+]));
+const requestStale = computed(() => requestScope.value !== currentRequestScope.value);
 const requesting = ref(false);
 const requestNote = ref("");
 let requestGeneration = 0;
@@ -69,14 +79,16 @@ watch(fileQuery, async query => {
   } catch { /* The diff remains usable when completion is unavailable. */ }
 });
 function prepareRequest(mode: "review" | "prepare") {
+  if (reviewingTrack.value === null) return;
   requestMode.value = mode;
+  requestScope.value = currentRequestScope.value;
   const revision = reviewPreviewEvidence(changes.value);
   requestText.value = mode === "review"
-    ? independentReviewRequest(revision, props.integrationTarget ?? null, reviewingTrack.value)
-    : preparationRequest(reviewingTrack.value, revision, props.integrationTarget ?? null, editedPaths.value);
+    ? independentReviewRequest(revision, props.integrationTarget ?? null, reviewingTrack.value === true)
+    : preparationRequest(reviewingTrack.value === true, revision, props.integrationTarget ?? null, editedPaths.value);
 }
 async function sendRequest() {
-  if (requesting.value || !requestText.value.trim()) return;
+  if (loading.value || requestStale.value || requesting.value || !requestText.value.trim()) return;
   const id = props.sessionId;
   const request = ++requestGeneration;
   requesting.value = true;
@@ -145,7 +157,6 @@ watch(() => props.sessionId, () => {
 watch(() => [props.isTopic, props.integrationTarget?.id, props.integrationTarget?.branch.branch,
   props.integrationTarget?.branch.tags.find(tag => tag.key === "track_topic_branch")?.value], () => {
   changes.value = null;
-  requestMode.value = null;
   void refresh();
 });
 
@@ -164,13 +175,15 @@ function lineNumber(value: number | null): string {
       <button :disabled="loading" @click="refresh">{{ loading ? "Loading…" : "Refresh" }}</button>
     </div>
     <div class="review-toolbar">
-      <button :disabled="loading || requesting" @click="prepareRequest('review')">Launch reviewer</button>
-      <button :disabled="loading || requesting" @click="prepareRequest('prepare')">Prepare {{ reviewingTrack ? "publishing" : "landing" }}</button>
+      <button :disabled="loading || requesting || reviewingTrack === null" @click="prepareRequest('review')">Launch reviewer</button>
+      <button :disabled="loading || requesting || reviewingTrack === null" @click="prepareRequest('prepare')">Prepare {{ reviewingTrack === null ? "changes" : reviewingTrack ? "publishing" : "landing" }}</button>
     </div>
     <div v-if="requestMode" class="review-request">
       <label :for="`review-request-${sessionId}`">{{ requestMode === 'review' ? "Review request" : "Preparation request" }}</label>
       <textarea :id="`review-request-${sessionId}`" v-model="requestText" :disabled="requesting" rows="5" />
-      <div><button :disabled="requesting" @click="requestMode = null">Cancel</button><button class="primary" :disabled="requesting || !requestText.trim()" @click="sendRequest">{{ requesting ? "Sending…" : (requestMode === 'review' ? "Launch reviewer" : "Send to agent") }}</button></div>
+      <p v-if="requestStale && !loading" role="status">The comparison changed. Keep your draft or replace it with a request for the current comparison.</p>
+      <button v-if="requestStale" :disabled="loading || requesting || reviewingTrack === null" @click="prepareRequest(requestMode)">Replace with current comparison</button>
+      <div><button :disabled="requesting" @click="requestMode = null">Cancel</button><button class="primary" :disabled="loading || requestStale || requesting || !requestText.trim()" @click="sendRequest">{{ requesting ? "Sending…" : (requestMode === 'review' ? "Launch reviewer" : "Send to agent") }}</button></div>
     </div>
     <div v-if="requestNote" class="change-review-state" role="status">{{ requestNote }}</div>
     <div class="review-file-picker">
@@ -227,7 +240,7 @@ function lineNumber(value: number | null): string {
 </template>
 
 <style scoped>
-.change-review.embedded { max-height: none; height: 100%; border: 0; }
+.change-review.embedded { flex: 1; max-height: none; border: 0; }
 .review-toolbar, .review-file-picker, .review-file-actions { display: flex; gap: 6px; align-items: center; padding: 8px 12px; flex-wrap: wrap; }
 .review-toolbar button { flex: 1; white-space: nowrap; }
 .review-file-picker input { flex: 1; min-width: 100px; padding: 6px 8px; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 5px; font-size: 11px; }

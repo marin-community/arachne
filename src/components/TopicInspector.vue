@@ -27,16 +27,22 @@ const invoke = useBackendInvoke();
 // Track inspector: workers, review, and the canonical Landing queue.
 
 const props = defineProps<{
-  topic: SessionSummary;
+  topic: SessionSummary | SessionView;
+  selectedView?: SessionView | null;
+  scopeId?: string;
   fleet: SessionSummary[];
   selectedId: string | null;
   loomUrl?: string;
   artifactRequest?: ArtifactTarget | null;
+  reviewRequest?: { sessionId: string } | null;
+  expanded?: boolean;
+  canExpand?: boolean;
 }>();
 
 const emit = defineEmits<{
   (e: "open-artifact", target: ArtifactTarget): void;
   (e: "close"): void;
+  (e: "toggle-expanded"): void;
   (e: "error", message: string): void;
   (e: "select", id: string): void;
   (e: "new-thread"): void;
@@ -47,7 +53,15 @@ const emit = defineEmits<{
 const candidateLabels = { working: "Working", waiting: "Waiting", ready: "Reported ready", stale: "Needs recheck", conflicted: "Conflict", landed: "Landed" };
 const tab = ref<"threads" | "review" | "resources" | "landing" | "todos" | "activity" | "handoffs">("threads");
 watch(() => props.artifactRequest, target => { if (target) tab.value = "resources"; }, { immediate: true });
-const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId) ?? props.topic);
+watch(() => props.reviewRequest, request => {
+  if (request && request.sessionId === props.selectedId) tab.value = "review";
+}, { immediate: true });
+// A SessionView is enough to request the server comparison. Only fleet summaries
+// carry ancestry; never classify an absent summary as a root/coordinator.
+const topicScope = computed(() => props.fleet.find(session => session.id === (props.scopeId ?? props.topic.id)) ?? null);
+const reviewSession = computed(() => props.fleet.find(session => session.id === props.selectedId)
+  ?? (props.selectedView?.id === props.selectedId ? props.selectedView : null) ?? props.topic);
+const reviewSummary = computed(() => props.fleet.find(session => session.id === reviewSession.value.id) ?? null);
 const canEdit = computed(() => {
   try { return ["localhost", "127.0.0.1", "::1", "[::1]"].includes(new URL(backendOf(reviewSession.value.id) ?? "").hostname); }
   catch { return false; }
@@ -69,7 +83,7 @@ function subtitle(s: SessionSummary): string {
 
 const collapsed = ref(new Set<string>());
 
-const topicRows = computed(() => topicThreadRows(props.fleet, props.topic.id, collapsed.value));
+const topicRows = computed(() => topicScope.value ? topicThreadRows(props.fleet, props.topic.id, collapsed.value) : []);
 
 function toggle(id: string) {
   if (collapsed.value.has(id)) collapsed.value.delete(id);
@@ -77,7 +91,7 @@ function toggle(id: string) {
 }
 
 // Queue membership does not depend on the Threads tree's collapse state.
-const candidates = computed(() => landingCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id));
+const candidates = computed(() => topicScope.value ? landingCandidates(topicThreadRows(props.fleet, props.topic.id, new Set()), props.topic.id) : []);
 const landOptions = landStrategies();
 
 const sessionRepo = (s: SessionSummary) => s.github_repo || s.branch.repo_root;
@@ -130,6 +144,7 @@ const todoBusy = ref(false);
 const todoError = ref("");
 
 async function refreshTodos() {
+  if (!topicScope.value) return;
   const topicId = props.topic.id;
   todosLoading.value = true;
   todoError.value = "";
@@ -215,7 +230,7 @@ async function removeTodo(todo: TodoItem) {
 
 // Reset per-topic state when the inspected topic changes: the todo slice,
 // collapse state, and the integration note all belong to one topic.
-watch(() => props.topic.id, () => {
+watch(() => topicScope.value?.id, () => {
   todos.value = { todos: [], revision: 0 };
   todoDraft.value = "";
   todoError.value = "";
@@ -226,26 +241,32 @@ watch(() => props.topic.id, () => {
 </script>
 
 <template>
-  <aside class="topic-inspector" aria-label="Track inspector">
+  <aside id="topic-inspector" class="topic-inspector" aria-label="Track inspector">
     <header class="topic-inspector-head">
       <div class="topic-inspector-topic">
         <strong>{{ topic.branch.title || topic.branch.name }}</strong>
       </div>
+      <button v-if="canExpand" type="button" :aria-expanded="!!expanded" aria-controls="topic-inspector"
+        :aria-label="expanded ? 'Restore inspector' : 'Expand inspector'"
+        :title="expanded ? 'Restore inspector beside conversation' : 'Expand inspector across conversation'"
+        @click="emit('toggle-expanded')">{{ expanded ? 'Restore' : 'Expand' }}</button>
       <button title="Close inspector" aria-label="Close inspector" @click="emit('close')">×</button>
     </header>
-    <div v-if="isTrackCoordinator(topic)" class="canonical-policy">
-      <span>Canonical destination: <code>{{ canonicalTopicBranch(topic) }}</code></span>
-      <AutolandControl :session="topic" :track="topic" coordinator @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
+    <div v-if="topicScope && isTrackCoordinator(topicScope)" class="canonical-policy">
+      <span>Canonical destination: <code>{{ canonicalTopicBranch(topicScope) }}</code></span>
+      <AutolandControl :session="topicScope" :track="topicScope" coordinator @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
     </div>
     <div class="tab-bar inspector-tab-bar" role="tablist">
-      <button class="tab" :class="{ active: tab === 'threads' }" role="tab" :aria-selected="tab === 'threads'" @click="tab = 'threads'">Threads</button>
+      <button class="tab" :class="{ active: tab === 'threads' }" role="tab" :aria-selected="tab === 'threads'" :disabled="!topicScope" @click="tab = 'threads'">Threads</button>
       <button class="tab" :class="{ active: tab === 'review' }" role="tab" :aria-selected="tab === 'review'" @click="tab = 'review'">Review</button>
-      <button class="tab" :class="{ active: tab === 'handoffs' }" role="tab" :aria-selected="tab === 'handoffs'" @click="tab = 'handoffs'">Handoffs</button>
-      <button class="tab" :class="{ active: tab === 'activity' }" role="tab" :aria-selected="tab === 'activity'" @click="tab = 'activity'">Activity</button>
-      <button class="tab" :class="{ active: tab === 'resources' }" role="tab" :aria-selected="tab === 'resources'" @click="tab = 'resources'">Resources</button>
-      <button class="tab" :class="{ active: tab === 'landing' }" role="tab" :aria-selected="tab === 'landing'" @click="tab = 'landing'">Landing</button>
-      <button class="tab" :class="{ active: tab === 'todos' }" role="tab" :aria-selected="tab === 'todos'" @click="tab = 'todos'">Todos</button>
+      <button class="tab" :class="{ active: tab === 'handoffs' }" role="tab" :aria-selected="tab === 'handoffs'" :disabled="!topicScope" @click="tab = 'handoffs'">Handoffs</button>
+      <button class="tab" :class="{ active: tab === 'activity' }" role="tab" :aria-selected="tab === 'activity'" :disabled="!topicScope" @click="tab = 'activity'">Activity</button>
+      <button class="tab" :class="{ active: tab === 'resources' }" role="tab" :aria-selected="tab === 'resources'" :disabled="!topicScope" @click="tab = 'resources'">Resources</button>
+      <button class="tab" :class="{ active: tab === 'landing' }" role="tab" :aria-selected="tab === 'landing'" :disabled="!topicScope" @click="tab = 'landing'">Landing</button>
+      <button class="tab" :class="{ active: tab === 'todos' }" role="tab" :aria-selected="tab === 'todos'" :disabled="!topicScope" @click="tab = 'todos'">Todos</button>
     </div>
+
+    <div v-if="!topicScope" class="inspector-note" role="status">Session details are loading. Review uses this session’s server comparison.</div>
 
     <!-- Threads: the coordinator + worker fleet. Row click switches the
          main chat; New Thread lives here (design.md "Place New Thread
@@ -286,23 +307,23 @@ watch(() => props.topic.id, () => {
       </div>
     </div>
 
-    <div v-else-if="tab === 'handoffs'" class="inspector-body inspector-body-flush">
-      <TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topic" results-only @select="emit('select', $event)" />
+    <div v-else-if="tab === 'handoffs' && topicScope" class="inspector-body inspector-body-flush">
+      <TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topicScope" results-only @select="emit('select', $event)" />
     </div>
 
     <!-- Resources: the topic's attached resources and refs (ResourcePanel's
          content embedded here as the tab body). -->
     <div v-else-if="tab === 'review'" class="inspector-body inspector-body-flush">
       <div class="inspector-review-context">{{ reviewSession.branch.title || reviewSession.branch.name }}</div>
-      <ChangeReview :session-id="reviewSession.id" :is-topic="reviewSession.id === topic.id" :integration-target="reviewIntegrationTarget(fleet, reviewSession.id)" :can-edit="canEdit" embedded @saved="emit('checkout-saved', reviewSession.id)" />
+      <ChangeReview :session-id="reviewSession.id" :is-topic="reviewSummary ? isTrackCoordinator(reviewSummary) : null" :integration-target="reviewIntegrationTarget(fleet, reviewSession.id)" :can-edit="canEdit" embedded @saved="emit('checkout-saved', reviewSession.id)" />
     </div>
-    <div v-else-if="tab === 'activity'" class="inspector-body inspector-body-flush"><TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topic" @select="emit('select', $event)" /></div>
-    <div v-else-if="tab === 'resources'" class="inspector-body inspector-body-flush">
-      <ResourcePanel :key="loomUrl" :artifact-request="artifactRequest" :topic="topic" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
+    <div v-else-if="tab === 'activity' && topicScope" class="inspector-body inspector-body-flush"><TrackActivity :loom-url="loomUrl" @open-artifact="emit('open-artifact', $event)" :topic="topicScope" @select="emit('select', $event)" /></div>
+    <div v-else-if="tab === 'resources' && topicScope" class="inspector-body inspector-body-flush">
+      <ResourcePanel :key="loomUrl" :artifact-request="artifactRequest" :topic="topicScope" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
     </div>
 
     <!-- Landing includes active work, advisory readiness, and accepted outcomes. -->
-    <div v-else-if="tab === 'landing'" class="inspector-body">
+    <div v-else-if="tab === 'landing' && topicScope" class="inspector-body">
       <div v-if="integrationNote" class="inspector-note">{{ integrationNote }}</div>
       <div v-if="!candidates.length" class="inspector-empty">
         No landing candidates yet.<br />
@@ -318,7 +339,7 @@ watch(() => props.topic.id, () => {
         <div class="inspector-candidate-sub">
           {{ candidate.note || candidate.session.branch.branch }}
         </div>
-        <AutolandControl :session="candidate.session" :track="topic" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
+        <AutolandControl :session="candidate.session" :track="topicScope" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
         <div class="inspector-candidate-actions">
           <button class="link" @click="reviewCandidate(candidate.session.id)">{{ candidate.state === 'stale' || candidate.state === 'conflicted' ? "Reconcile / review" : "Review" }}</button>
           <SplitButton
@@ -337,7 +358,7 @@ watch(() => props.topic.id, () => {
 
     <!-- Todos: a topic-filtered view of the durable cross-topic user todo
          list. Topic plans and worker checklists stay separate. -->
-    <div v-else class="inspector-body">
+    <div v-else-if="topicScope" class="inspector-body">
       <div class="todo-form">
         <input
           v-model="todoDraft"

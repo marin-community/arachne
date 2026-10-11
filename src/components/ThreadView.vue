@@ -15,7 +15,6 @@ import SplitButton from "./SplitButton.vue";
 import { canonicalTopicBranch, isTrackCoordinator, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
 import { landStrategies, publishStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import CodeActions from "./CodeActions.vue";
-import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import { landResultFeedback, type LandResult } from "../landFeedback";
 import { addAttachments, filesFromClipboard, imagePreviewUrl, type FileAttachment } from "../attachments";
@@ -73,13 +72,14 @@ interface ChatEventFrame {
   data?: any;
 }
 
-const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string; unarchiving: boolean }>();
+const props = defineProps<{ session: SessionView; topic: SessionSummary | null; fleet: SessionSummary[]; launchOptions: LaunchOptions | null; loomUrl: string; unarchiving: boolean; inspectorExpanded?: boolean }>();
 const currentUsage = computed(() => {
   const summary = props.fleet.find((item) => item.id === props.session.id);
   return resolveContextUsage(blocks.value, summary?.usage ?? props.session.usage);
 });
 const emit = defineEmits<{
   (e: "open-artifact", target: ArtifactTarget): void;
+  (e: "review", sessionId: string): void;
   (e: "error", msg: string): void;
   (e: "archive", id: string): void;
   (e: "unarchive", id: string): void;
@@ -578,9 +578,17 @@ function submitDelegate() {
   });
 }
 
+// Remember the reading position while the inspector hides mounted history.
+let inspectorScrollTop = 0;
+watch(() => props.inspectorExpanded, expanded => {
+  if (expanded) inspectorScrollTop = convEl.value?.scrollTop ?? 0;
+  else nextTick(() => { if (convEl.value) convEl.value.scrollTop = inspectorScrollTop; });
+});
+
 // Auto-scroll only when the user is already at (or near) the bottom — never
 // yank someone who has scrolled up to read.
 function atBottom(): boolean {
+  if (props.inspectorExpanded) return false;
   if (!convEl.value) return true;
   const el = convEl.value;
   return el.scrollHeight - el.scrollTop - el.clientHeight < 60;
@@ -590,7 +598,7 @@ function scrollToBottom() {
   const id = props.session.id;
   const url = props.loomUrl;
   nextTick(() => {
-    if (convEl.value && chatIsCurrent(generation, id, url)) {
+    if (!props.inspectorExpanded && convEl.value && chatIsCurrent(generation, id, url)) {
       convEl.value.scrollTop = convEl.value.scrollHeight;
       lastConversationScrollTop = convEl.value.scrollTop;
     }
@@ -748,6 +756,7 @@ function recomputeCorners() {
 }
 
 function onConversationScroll() {
+  if (props.inspectorExpanded) return;
   const el = convEl.value;
   if (el) {
     const movingUp = el.scrollTop < lastConversationScrollTop;
@@ -1123,7 +1132,7 @@ const lastIntegration = computed(() => currentSummary.value?.branch.tags.find((t
 const integrationTarget = computed(() => reviewIntegrationTarget(props.fleet, props.session.id));
 // Every root conversation is a topic, including older single-prompt launches
 // that predate the durable marker.
-const isTopic = computed(() => !isWorker.value && !isStandalone(liveSummary.value));
+const isTopic = computed(() => !!currentSummary.value && isTrackCoordinator(currentSummary.value) && !isStandalone(liveSummary.value));
 const converting = ref(false);
 async function convertToTrack() {
   converting.value = true;
@@ -1147,7 +1156,6 @@ const canonicalDestination = computed(() => integrationTarget.value ? canonicalT
 const integrating = ref(false);
 const landing = ref(false);
 const integrationNote = ref("");
-const showChanges = ref(false);
 const workSummary = ref<{ files: number; additions: number; deletions: number; has_commits: boolean } | null>(null);
 let workSummaryGeneration = 0;
 async function refreshWorkSummary(id = props.session.id) {
@@ -1162,7 +1170,6 @@ async function refreshWorkSummary(id = props.session.id) {
   }
 }
 watch(() => props.session.id, (id) => {
-  showChanges.value = false;
   integrationNote.value = "";
   workSummary.value = null;
   void refreshWorkSummary(id);
@@ -1205,7 +1212,9 @@ async function onPublish(strategy: string) {
 </script>
 
 <template>
-  <section class="main">
+  <section class="main" :class="{ 'composer-only': inspectorExpanded }">
+    <!-- Hide history without remounting chat or its composer. -->
+    <div v-show="!inspectorExpanded" class="thread-history">
     <div v-if="topic" class="thread-breadcrumb">
       <button @click="emit('home')">Tracks home</button><span> → </span>
       <button @click="emit('open-topic', topic.id)">{{ topic.branch.title || topic.branch.name }}</button>
@@ -1239,6 +1248,7 @@ async function onPublish(strategy: string) {
         @click="dismissAttention"
       >{{ dismissing ? "Dismissing…" : "Dismiss" }}</button>
       <CodeActions
+        @review="emit('review', session.id)"
         :checkout-path="zedTarget"
         :recovering="recovering"
         :repo-label="repoLabel"
@@ -1256,10 +1266,10 @@ async function onPublish(strategy: string) {
         @open-terminal="openTerminal"
         @open-resource="openResource"
       />
-      <button :disabled="!session.work_dir" :aria-expanded="showChanges" @click="showChanges = !showChanges">{{ showChanges ? "Hide diff" : "Review diff" }}</button>
+      <button :disabled="!session.work_dir" aria-controls="topic-inspector" @click="emit('review', session.id)">Review diff</button>
       <SplitButton v-if="isWorker && !isReviewer" kind="land" :repo="sessionRepo" :options="landOptions" label="Land" :busy="integrating" :disabled="!integrationTarget || session.status === 'archived'" @run="onThreadLand" />
       <SplitButton v-if="isTopic" kind="publish" :repo="sessionRepo" :options="publishOptions" label="Publish" :busy="landing" :disabled="session.status === 'archived'" @run="onPublish" />
-      <button v-if="!isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
+      <button v-if="currentSummary && !isWorker && !isTopic" :disabled="converting || session.status === 'archived'" @click="convertToTrack">{{ converting ? 'Converting…' : 'Convert to track' }}</button>
       <button v-if="currentStatus === 'archived'" :disabled="unarchiving" @click="emit('unarchive', session.id)">{{ unarchiving ? 'Unarchiving…' : 'Unarchive' }}</button>
       <button v-else class="danger" @click="archive">Archive</button>
       <button class="accent" @click="showDelegate ? showDelegate = false : openDelegate()">
@@ -1293,7 +1303,6 @@ async function onPublish(strategy: string) {
         </button>
       </div>
     </div>
-    <ChangeReview v-if="showChanges" :session-id="session.id" :can-edit="loomIsLocal" :is-topic="isTopic" :integration-target="integrationTarget" @saved="refreshWorkSummary()" />
     <div v-if="showDelegate" class="delegate-box">
       <input
         ref="delegateInput"
@@ -1495,6 +1504,8 @@ async function onPublish(strategy: string) {
         No conversation yet.
       </div>
     </div>
+    </div>
+    <div v-if="inspectorExpanded" class="inspector-composer-context">Follow up with {{ session.branch.title || session.branch.name || session.id }}</div>
     <div class="composer-wrap" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
       <div v-if="showHandoff" class="handoff-box composer-handoff">
         <div class="handoff-heading">Switch this thread’s runtime</div>

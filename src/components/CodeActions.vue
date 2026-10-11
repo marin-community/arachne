@@ -26,6 +26,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: "open-checkout"): void;
+  (e: "review"): void;
   (e: "open-terminal"): void;
   (e: "open-resource", url: string): void;
 }>();
@@ -111,7 +112,7 @@ onUnmounted(() => document.removeEventListener("mousedown", onDocumentClick));
         </div>
         <div v-if="workSummary">
           <dt>Changes</dt>
-          <dd>{{ workSummary.files }} files <span class="additions">+{{ workSummary.additions }}</span> <span class="deletions">−{{ workSummary.deletions }}</span></dd>
+          <dd><button class="code-link" aria-controls="topic-inspector" @click="open = false; emit('review')">{{ workSummary.files }} files <span class="additions">+{{ workSummary.additions }}</span> <span class="deletions">−{{ workSummary.deletions }}</span></button></dd>
         </div>
       </dl>
       <button v-if="checkoutPath" class="terminal-action" @click="openTerminal">Open Terminal</button>

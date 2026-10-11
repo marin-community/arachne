@@ -21,7 +21,7 @@ import type { ArtifactTarget } from "./artifactLinks";
 import type { FileAttachment } from "./attachments";
 import { launchSelectionFor } from "./launch";
 import { clearSubmittedDraft, draftStorageKey, initializeDraftStorage } from "./newTopicDraft";
-import { launchTopicBranch } from "./trackPolicy";
+import { isTrackCoordinator, launchTopicBranch } from "./trackPolicy";
 import {
   resolveTopicThread,
   topicRootOf,
@@ -180,6 +180,7 @@ const selectedId = ref<string | null>(null);
 const selectedTopicId = ref<string | null>(null);
 const viewMode = ref<"home" | "topic" | "thread">("home");
 const selectedView = ref<SessionView | null>(null);
+const selectedSummarySnapshot = ref<SessionSummary | null>(null);
 // The new-thread composer: a sheet over the main panel, not a modal and
 // not the sidebar. Takes over while open; a launch closes it and opens
 // the live thread (launchTask → selectSession).
@@ -191,10 +192,18 @@ const showNewThread = ref(false);
 const showNewTopic = ref(false);
 const showNewProject = ref(false);
 const showSettings = ref(false);
+const inspectorExpanded = ref(false);
+const reviewRequest = ref<{ sessionId: string } | null>(null);
+function openReview(sessionId: string) {
+  reviewRequest.value = { sessionId };
+  artifactRequest.value = null;
+  showResources.value = true;
+}
 const artifactRequest = ref<ArtifactTarget | null>(null);
 function openArtifact(target: ArtifactTarget) {
   artifactRequest.value = { ...target };
   showResources.value = true;
+  reviewRequest.value = null;
 }
 const showResources = ref(localStorage.getItem("arachne.inspector") !== "false");
 watch(showResources, value => localStorage.setItem("arachne.inspector", String(value)));
@@ -208,8 +217,9 @@ const topicDraftOwners = new Map<string, number>();
 function closeLaunchers() { composerGeneration.value++; showNewTopic.value = false; showNewThread.value = false; showNewProject.value = false; projectResourcesProject.value = null; }
 async function openWorker() {
   if (!selectedView.value && selectedTopic.value) await selectSession(selectedTopic.value.id);
+  inspectorExpanded.value = false;
   await nextTick();
-  threadView.value?.openDelegate();
+  await threadView.value?.openDelegate();
 }
 function command(action: string) {
   if (action === "thread") openNewThread();
@@ -372,6 +382,8 @@ async function selectSession(id: string, launchedView?: SessionView, launcher = 
   const generation = ++connectionGeneration;
   viewMode.value = "thread";
   selectedId.value = id;
+  selectedSummarySnapshot.value = fleet.value.find(session => session.id === id)
+    ?? (selectedSummarySnapshot.value?.id === id ? selectedSummarySnapshot.value : null);
   // Drop the stale view immediately: ThreadView is keyed by selectedId and
   // remounts the moment it changes — if the old view were still here, its
   // onMounted would fetch the PREVIOUS session's chat, and nothing would
@@ -394,6 +406,12 @@ async function selectSession(id: string, launchedView?: SessionView, launcher = 
       }
     }
   }
+}
+
+// Inspector row/review clicks on the active thread must retain its composer.
+function selectInspectorSession(id: string) {
+  if (viewMode.value === "thread" && selectedId.value === id && selectedView.value) return;
+  void selectSession(id);
 }
 
 function selectTopic(id: string) {
@@ -801,8 +819,23 @@ async function onUnarchived(id: string) {
 
 const connClass = computed(() => backends.value.every(backend => backend.available) ? "ok" : connected.value ? "warn" : "bad");
 
+// Cached summaries belong to one server, even if another server reuses an ID.
+const inspectorServer = computed(() => backendOf(selectedId.value) || backendOf(selectedTopicId.value) || loomUrl.value);
+watch(inspectorServer, () => { selectedSummarySnapshot.value = null; }, { flush: "sync" });
+// Refresh known ancestry when the first summary arrives, and retain it across gaps.
+watch(() => fleet.value.find(session => session.id === selectedId.value), summary => {
+  if (summary) selectedSummarySnapshot.value = summary;
+});
+// Retain the latest summary if its fleet row is delayed. View-only fields stay
+// in selectedView; the initial view must never overwrite newer live metadata.
+const inspectorFleet = computed<SessionSummary[]>(() => {
+  const view = selectedView.value;
+  const summary = selectedSummarySnapshot.value;
+  return view && summary?.id === view.id && !fleet.value.some(session => session.id === view.id)
+    ? [...fleet.value, summary] : fleet.value;
+});
 const selectedTopic = computed(() => {
-  let node = fleet.value.find((session) => session.id === (selectedId.value ?? selectedTopicId.value));
+  let node = inspectorFleet.value.find((session) => session.id === (selectedId.value ?? selectedTopicId.value));
   if (!node) return null;
   const seen = new Set<string>();
   while (node && !seen.has(node.id)) {
@@ -813,19 +846,38 @@ const selectedTopic = computed(() => {
     if (!parent) break;
     node = parent;
   }
-  return node && !isStandalone(node) ? node : null;
+  return node && !isStandalone(node) && isTrackCoordinator(node) ? node : null;
 });
-// A standalone chat can also open an artifact in the Resources inspector.
-const inspectorTopic = computed(() => selectedTopic.value ?? (artifactRequest.value
-  ? fleet.value.find(session => session.id === selectedId.value) ?? null : null));
-watch([loomUrl, selectedId, selectedTopicId], () => { artifactRequest.value = null; });
+// Keep component identity across temporary ancestor gaps, separately from live
+// scope metadata. Missing ancestors must still disable Track policy/actions.
+const inspectorRoute = computed(() => JSON.stringify([inspectorServer.value, selectedId.value, selectedTopicId.value]));
+const inspectorAnchor = ref<{ route: string; id: string; server: string } | null>(null);
+// Ancestry enrichment changes scope, never the identity of an open inspector.
+// Verified navigation within one Track keeps its tab; ChangeReview resets its
+// source state on sessionId. Other navigation/connection changes reset the panel.
+const inspectorInstanceKey = ref(inspectorRoute.value);
+watch([inspectorRoute, selectedTopic], ([route, topic], [previousRoute]) => {
+  const sameTrack = topic && inspectorAnchor.value?.id === topic.id
+    && inspectorAnchor.value.server === inspectorServer.value;
+  if (route !== previousRoute && !sameTrack) inspectorInstanceKey.value = route;
+  if (topic) inspectorAnchor.value = { route, id: topic.id, server: inspectorServer.value };
+  else if (inspectorAnchor.value?.route !== route) inspectorAnchor.value = null;
+}, { immediate: true, flush: "sync" });
+// Standalone chats can open Resources and Review without becoming Tracks.
+const inspectorTopic = computed(() => selectedTopic.value ?? ((inspectorAnchor.value || artifactRequest.value || reviewRequest.value)
+  ? inspectorFleet.value.find(session => session.id === selectedId.value) ?? selectedView.value : null));
+watch([inspectorServer, selectedId, selectedTopicId], () => { artifactRequest.value = null; reviewRequest.value = null; });
 const showProjectSheet = computed(() => showNewProject.value || !!projectResourcesProject.value);
 const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.value && !showProjectSheet.value
   && viewMode.value !== "home" && !!inspectorTopic.value && showResources.value && currentAvailable.value);
+// Closing or leaving the inspector always restores the conversation layout.
+watch(inspectorVisible, visible => { if (!visible) inspectorExpanded.value = false; });
+const expandedInspectorVisible = computed(() => inspectorVisible.value && inspectorExpanded.value
+  && viewMode.value === "thread" && !!selectedView.value);
 </script>
 
 <template>
-  <div class="app" :class="{ 'with-resources': inspectorVisible }" data-tauri-drag-region>
+  <div class="app" :class="{ 'with-resources': inspectorVisible, 'inspector-expanded': expandedInspectorVisible }" data-tauri-drag-region>
     <header class="header" data-tauri-drag-region>
       <button class="title home-link" title="Show Tracks home" @click="onHome">🕸 Arachne</button>
       <button class="header-search" title="Search and commands (⌘K)" @click="showSearch = true">Search <kbd>⌘K</kbd></button>
@@ -916,9 +968,11 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
       ref="threadView"
       v-else-if="currentAvailable && viewMode === 'thread' && selectedId && selectedView"
       :key="selectedId"
+      :inspector-expanded="expandedInspectorVisible"
+      @review="openReview"
       :session="selectedView"
       :topic="selectedTopic"
-      :fleet="fleet"
+      :fleet="inspectorFleet"
       :launch-options="launchOptions"
       :loom-url="backendOf(selectedView.id) || operationUrl"
       @open-artifact="openArtifact"
@@ -955,9 +1009,12 @@ const inspectorVisible = computed(() => !showNewThread.value && !showNewTopic.va
       @manage-project-resources="openProjectResources"
       @error="connError = $event"
     />
-    <TopicInspector v-if="inspectorVisible && inspectorTopic" :topic="inspectorTopic" :fleet="fleet" :selected-id="selectedId" :loom-url="backendOf(inspectorTopic.id) || operationUrl"
+    <TopicInspector v-if="inspectorVisible && inspectorTopic" :key="inspectorInstanceKey"
+      :scope-id="inspectorAnchor?.id ?? inspectorTopic.id"
+      :expanded="expandedInspectorVisible" :can-expand="viewMode === 'thread' && !!selectedView"
+      :review-request="reviewRequest" @toggle-expanded="inspectorExpanded = !inspectorExpanded" :topic="inspectorTopic" :selected-view="selectedView" :fleet="inspectorFleet" :selected-id="selectedId" :loom-url="inspectorServer"
       :artifact-request="artifactRequest" @open-artifact="openArtifact"
-      @close="showResources = false" @error="connError = $event" @select="selectSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" @policy-updated="onPolicyUpdated" />
+      @close="showResources = false" @error="connError = $event" @select="selectInspectorSession" @new-thread="openWorker" @checkout-saved="threadView?.refreshWorkSummary($event)" @policy-updated="onPolicyUpdated" />
     <AttentionBanner v-show="connected && !showSettings && !showNewTopic && !showNewThread && !showProjectSheet && viewMode !== 'home'" :fleet="fleet" :selected-id="selectedId" :connection-key="loomUrl" @select="selectSession" @home="onHome" />
     <CommandPalette v-if="showSearch" :fleet="fleet" @close="showSearch = false" @select="selectSession" @action="command" />
     <div v-if="connError && !showSettings && !showNewThread && !showNewTopic" class="app-error" role="alert"><span>{{ connError }}</span><button @click="showSettings = true" v-if="!connected">Connection settings</button><button aria-label="Dismiss error" @click="connError = null">×</button></div>
