@@ -173,14 +173,11 @@ const selectedId = ref<string | null>(null);
 const selectedTopicId = ref<string | null>(null);
 const viewMode = ref<"home" | "topic" | "thread">("home");
 const selectedView = ref<SessionView | null>(null);
-// The new-thread composer: a sheet over the main panel, not a modal and
-// not the sidebar. Takes over while open; a launch closes it and opens
-// the live thread (launchTask → selectSession).
+// New thread opens a chat in the main panel. Its first send launches the
+// standalone thread and swaps this view for the live chat.
 const showNewThread = ref(false);
-// The new-track chat: same main-panel takeover as the thread sheet, but
-// chat-first — it looks like the thread it will become, with the setup
-// choices (title, repo/base, project bindings) in the conversation area
-// and the first send launching the track (launchTopic).
+// New track shares this chat layout, with a title and project bindings
+// alongside repository/base. Its first send launches the track (launchTopic).
 const showNewTopic = ref(false);
 const showNewProject = ref(false);
 const showSettings = ref(false);

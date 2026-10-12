@@ -103,11 +103,14 @@ unrelated second list. The aggregate Tracks home still shows Needs You even
 when Inbox exists. Ready to Integrate requires explicit verified candidate
 state from Loom; a stopped or sleeping worker is not sufficient evidence.
 
-**New thread** starts a standalone conversation for a one-off task (a form
-sheet). **New track** opens a chat immediately: the same shape as a live
-thread — header, conversation, composer — with the setup choices (title,
-repository and base, inherited project resources) in a setup card above
-the chat box, where the conversation will land. The setup disappears once
+**New thread** starts a standalone conversation for a one-off task. It opens
+with the same chat layout as **New track**: a header, a repository/base setup
+card in the conversation area, and a composer with attachments, @-mentions,
+launch-config pills, and a Send button. The first send launches the thread;
+setup fields do not launch on Enter. **New track** opens a chat immediately:
+the same shape as a live thread — header, conversation, composer — with the
+setup choices (title, repository and base, inherited project resources) in
+a setup card above the chat box, where the conversation will land. The setup disappears once
 the model starts. Loom's launch needs the first message, so the first
 send from the chat box both delivers that message and launches the Track;
 the chat box keeps what belongs to a chat — message text, attachments,

@@ -1411,7 +1411,7 @@ button.danger:hover { border-color: var(--blocked); }
 .header .conn.clickable { cursor: pointer; }
 .header .conn.clickable:hover { color: var(--text); }
 
-/* --- New-thread sheet ----------------------------------------------- */
+/* --- Project sheet and launch fields -------------------------------- */
 /* Takes over the main display panel (same grid area as the thread home):
    not a floating modal, a full takeover with room to compose. */
 .new-thread-sheet {
@@ -1459,10 +1459,6 @@ button.danger:hover { border-color: var(--blocked); }
   letter-spacing: normal;
   opacity: .7;
 }
-/* The topic body's wrap: anchor for the @-mention dropdown. */
-.nts-body-wrap { position: relative; }
-.nts-body-wrap textarea { display: block; width: 100%; }
-.mention-menu.nts-mention-menu { top: calc(100% + 3px); bottom: auto; left: 0; width: 100%; }
 /* Project context chip in the new-track header. */
 .nts-project {
   font-size: 11px;
@@ -1531,11 +1527,11 @@ button.danger:hover { border-color: var(--blocked); }
   gap: 8px;
 }
 
-/* --- New-track chat ----------------------------------------------- */
-/* The chat-first New track view (src/components/NewTrackChat.vue): the
-   same .main shape as a live thread (header, conversation, composer),
-   with a setup card standing in for the messages that aren't sent yet. */
-.new-track .conversation { gap: 14px; }
+/* --- New-track and new-thread chats -------------------------------- */
+/* Launch chats share the live thread's header, conversation, and composer,
+   with setup cards where the first messages will land. */
+.new-track .conversation,
+.new-thread .conversation { gap: 14px; }
 
 /* The header title is the track's title field: it renders with the
    header name's weight and size, sits on a transparent borderless field,
@@ -1574,14 +1570,16 @@ button.danger:hover { border-color: var(--blocked); }
 .ntc-title-field:hover .ntc-title-edit,
 .ntc-title-field:focus-within .ntc-title-edit,
 .ntc-title-field.has-title .ntc-title-edit { opacity: 1; }
-.new-track-setup .who em {
+.new-track-setup .who em,
+.new-thread-setup .who em {
   font-style: normal;
   font-weight: 400;
   text-transform: none;
   letter-spacing: normal;
   color: var(--text-dim);
 }
-.new-track-setup .body { padding: 14px; }
+.new-track-setup .body,
+.new-thread-setup .body { padding: 14px; }
 .new-track-setup-body {
   display: flex;
   flex-direction: column;
@@ -1601,7 +1599,8 @@ button.danger:hover { border-color: var(--blocked); }
   font: inherit;
   padding: 0;
 }
-.new-track-error { max-width: 860px; }
+.new-track-error,
+.new-thread-error { max-width: 860px; }
 
 /* --- Home (attention-first) ---------------------------------------- */
 
