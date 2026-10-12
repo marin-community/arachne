@@ -15,6 +15,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "close"): void;
   (e: "save", url: string, token: string): void;
+  (e: "rename", url: string, name: string): void;
 }>();
 
 const url = ref(props.url);
@@ -27,6 +28,19 @@ const urlInput = ref<HTMLInputElement | null>(null);
 const validUrl = computed(() => {
   try { return normalizeServerUrl(url.value); } catch { return ""; }
 });
+const savedProfile = computed(() => profiles.value.find(profile => profile.url === validUrl.value));
+const canRename = computed(() => !!savedProfile.value && name.value.trim() !== savedProfile.value.name);
+function rename() {
+  if (!canRename.value || props.saving) return;
+  try {
+    profiles.value = rememberServer(localStorage, { url: validUrl.value, name: name.value }, { requirePersistence: true });
+    name.value = profiles.value.find(profile => profile.url === validUrl.value)!.name;
+    localError.value = "";
+    emit("rename", validUrl.value, name.value);
+  } catch (error: any) {
+    localError.value = `Could not save server name: ${error?.message ?? String(error)}`;
+  }
+}
 const selectedStatus = computed(() => {
   const backend = props.backends?.find(backend => backend.url === validUrl.value);
   return backend ? (backend.connecting ? "Connecting…" : backend.available ? "Available" : "Unavailable") : "Not registered";
@@ -106,16 +120,20 @@ onUnmounted(() => { tokenRequest++; clearTimeout(tokenTimer); document.removeEve
         <input ref="urlInput" v-model="url" :disabled="saving" placeholder="http://127.0.0.1:7878" spellcheck="false" autocomplete="off" />
       </label>
       <label>
-        <span>Name <em>(optional)</em></span>
+        <span>Server name <em>(optional)</em></span>
         <input v-model="name" :disabled="saving" placeholder="Local Loom, laptop, experiments…" />
       </label>
+      <div class="server-rename">
+        <button type="button" :disabled="!canRename || saving" @click="rename">Rename server</button>
+        <span class="hint">Updates the name everywhere. Keeps this connection and default.</span>
+      </div>
       <label>
         <span>Bearer token <em>(optional on loopback)</em></span>
         <input v-model="token" :disabled="saving || tokenLoading" :placeholder="tokenLoading ? 'Loading from Keychain…' : 'Token for this server'" type="password" autocomplete="off" spellcheck="false" />
       </label>
       <div class="hint">All registered backends appear together. Save makes this the default for new projects and ungrouped tracks. Each project stays on its own backend. Tokens are stored per server in Keychain.</div>
       <div v-if="url.trim() && !validUrl" class="server-error" role="alert">Enter an HTTP(S) URL without credentials, query, or fragment.</div>
-      <div v-if="error || localError" class="server-error" role="alert">{{ error || localError }}</div>
+      <div v-if="error || localError" class="server-error" role="alert">{{ localError || error }}</div>
       <div class="modal-actions">
         <button type="button" :disabled="saving" @click="emit('close')">Cancel</button>
         <button class="primary" type="submit" :disabled="!validUrl || tokenLoading || saving">{{ saving ? 'Connecting…' : 'Save & set default' }}</button>
@@ -129,5 +147,6 @@ onUnmounted(() => { tokenRequest++; clearTimeout(tokenTimer); document.removeEve
 .server-heading h2 { margin: 0; }
 .server-status { color: var(--muted); font-size: 12px; }
 .server-settings select { width: 100%; min-width: 0; padding: 9px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); }
+.server-rename { display: flex; align-items: center; gap: 12px; }
 .server-error { color: var(--danger, #d76969); font-size: 12px; }
 </style>

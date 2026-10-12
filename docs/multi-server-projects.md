@@ -120,3 +120,29 @@ independent Todo publication. In `src-tauri`, run `cargo fmt --all -- --check`,
 dependencies are available. Rust TCP fixtures cover credential isolation,
 stalled reconciliation, disconnects, authentication failures, quiet recovery,
 and delayed actor or initial snapshots racing newer mutations.
+
+## Server names and navigation transport check
+
+Settings offers **Rename server** beside the server name. It persists the alias
+and updates project headings and backend choices immediately. Renaming keeps
+the URL identity, selected chat, default backend, Keychain entries and active
+connections. **Save & set default** remains the separate connection action.
+Track and chat rows omit the repeated backend label; project/lane headings keep
+it.
+
+The actual App/ThreadView HTTP regression uses two strict servers with colliding
+session and branch IDs, distinct conversations, raw fleet events and cached
+layout roundtrips. It also verifies that a deliberately leaked scoped UI ID
+returns 404 while App selections send raw session IDs and render the owning chat.
+To exercise the real Rust registry/client transport in that frontend regression:
+
+```sh
+cargo build --manifest-path src-tauri/Cargo.toml --locked --offline --example navigation_transport
+NATIVE_NAVIGATION_BRIDGE="$CARGO_TARGET_DIR/debug/examples/navigation_transport" npm test
+```
+
+Set `CARGO_TARGET_DIR` to an isolated build directory and use the platform's
+normal native dependency environment. The test-only bridge exercises the native
+registry, client, chat pagination state and display conversion for idle sessions;
+it excludes the desktop webview, OS credentials and live SSE forwarding. The
+plain frontend run uses the same strict HTTP fixture contract.

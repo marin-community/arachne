@@ -719,7 +719,6 @@ async function archiveRow(id: string) {
               <span class="name">{{
                 row.session.branch.name || row.session.id
               }}</span>
-              <span class="project-server" :title="backendOf(row.session.id) || undefined">{{ serverLabel(row.session.id) }}</span>
               <!-- A genuinely-working thread (running, mid-turn) shows a
                    spinner; a resting one (finished turn → quiet idle mark) and
                    terminal rows stay quiet. Loud-tag threads keep their text
@@ -942,7 +941,6 @@ async function archiveRow(id: string) {
               <span class="topic-title">{{
                 t.session.branch.title || t.session.branch.name
               }}</span>
-            <span class="project-server" :title="backendOf(t.session.id) || undefined">{{ serverLabel(t.session.id) }}</span>
               <!-- Same quiet-badge rules as inbox rows: working topic
                    spins, resting/terminal stay quiet, loud tags stay text. -->
               <span

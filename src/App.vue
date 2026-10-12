@@ -375,6 +375,12 @@ async function saveSettings(url: string, token: string) {
   } finally { settingsSaving.value = false; }
 }
 
+function renameServer(url: string, name: string) {
+  const backend = backends.value.find(backend => backend.url === normalizeServerUrl(url));
+  if (!backend) return;
+  registerBackend(localStorage, backends.value, { url: backend.url, name: name.trim() || new URL(backend.url).host });
+}
+
 // --- Actions ----------------------------------------------------------------
 
 async function selectSession(id: string, launchedView?: SessionView, launcher = composerGeneration.value) {
@@ -1031,6 +1037,7 @@ const expandedInspectorVisible = computed(() => inspectorVisible.value && inspec
       :saving="settingsSaving"
       @close="showSettings = false"
       @save="saveSettings"
+      @rename="renameServer"
     />
   </div>
 </template>

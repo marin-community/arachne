@@ -28,10 +28,10 @@ export function readServerProfiles(storage: PreferenceStorage): ServerProfile[] 
   } catch { return []; }
 }
 
-export function rememberServer(storage: PreferenceStorage, profile: ServerProfile): ServerProfile[] {
+export function rememberServer(storage: PreferenceStorage, profile: ServerProfile, options: { requirePersistence?: boolean } = {}): ServerProfile[] {
   const url = normalizeServerUrl(profile.url);
   const profiles = [{ name: profile.name.trim() || new URL(url).host, url }, ...readServerProfiles(storage).filter((p) => p.url !== url)];
   try { storage.setItem(SERVER_PROFILES_KEY, JSON.stringify(profiles)); }
-  catch { /* Credentials remain solely in Keychain. */ }
+  catch (error) { if (options.requirePersistence) throw error; /* Registration caches remain best effort. */ }
   return profiles;
 }

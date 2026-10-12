@@ -33,6 +33,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
       if (specifier === "@tauri-apps/plugin-shell") return { open: async () => {} };
       if (specifier === "dompurify") return { sanitize: (value: string) => value };
       if (specifier === "vue") return { ...vue, withDirectives: (vnode: any) => vnode };
+      if (specifier.endsWith("ChatMarkdown.vue")) return { props: ["text"], setup: (props: any) => () => vue.h("span", props.text) };
       if (specifier.endsWith(".vue")) return { render: () => null };
       if (specifier.startsWith(".")) {
         const next = resolve(dirname(file), specifier);
@@ -56,7 +57,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
     component.render = evaluate(template.code, file).render;
   } else component.render = () => null;
   const renderer = vue.createRenderer<Element, Element>({
-    createElement: type => ({ type, props: {}, children: [], focus() {} }),
+    createElement: type => ({ type, props: {}, children: [], focus() {}, querySelectorAll() { return []; }, getBoundingClientRect() { return { top: 0 }; }, scrollHeight: 0, scrollTop: 0, clientHeight: 0 }),
     createText: text => ({ type: "text", text, props: {}, children: [] }),
     createComment: text => ({ type: "comment", text, props: {}, children: [] }),
     insert(element, parent, anchor) {
@@ -74,7 +75,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
   });
   const props = vue.reactive(initial);
   const events: { name: string; args: any[] }[] = [];
-  const listeners = Object.fromEntries(["close", "backend", "launch", "created", "layout", "requested"].map(name => [`on${name[0].toUpperCase()}${name.slice(1)}`, (...args: any[]) => events.push({ name, args })]));
+  const listeners = Object.fromEntries(["close", "backend", "launch", "created", "layout", "requested", "rename", "save", "error"].map(name => [`on${name[0].toUpperCase()}${name.slice(1)}`, (...args: any[]) => events.push({ name, args })]));
   const app = renderer.createApp({ setup: () => () => vue.h(component, { ...props, ...listeners }) });
   app.provide("backendUrl", vue.computed(() => props.backendUrl));
   const container: Element = { type: "root", props: {}, children: [] };
@@ -84,7 +85,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
     return walk(container);
   }
   return {
-    props, events, state: instance.$.subTree.component.setupState, elements,
+    props, events, values, state: instance.$.subTree.component.setupState, elements,
     stop() { app.unmount(); if (previous) Object.defineProperty(globalThis, "localStorage", previous); else Reflect.deleteProperty(globalThis, "localStorage"); },
   };
 }
