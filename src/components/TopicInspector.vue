@@ -269,10 +269,15 @@ watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null
       <div class="topic-inspector-topic">
         <strong>{{ topic.branch.title || topic.branch.name }}</strong>
       </div>
-      <button v-if="canExpand" type="button" :aria-expanded="!!expanded" aria-controls="topic-inspector"
+      <button v-if="canExpand" class="inspector-expand-button" type="button" :aria-expanded="!!expanded" aria-controls="topic-inspector"
         :aria-label="expanded ? 'Restore inspector' : 'Expand inspector'"
         :title="expanded ? 'Restore inspector beside conversation' : 'Expand inspector across conversation'"
-        @click="emit('toggle-expanded')">{{ expanded ? 'Restore' : 'Expand' }}</button>
+        @click="emit('toggle-expanded')">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path :d="expanded ? 'M4 14h6v6 M10 14l-7 7 M20 10h-6V4 M14 10l7-7' : 'M15 3h6v6 M21 3l-7 7 M9 21H3v-6 M3 21l7-7'" />
+        </svg>
+      </button>
       <button title="Close inspector" aria-label="Close inspector" @click="emit('close')">×</button>
     </header>
     <div v-if="topicScope && isTrackCoordinator(topicScope)" class="canonical-policy">
@@ -416,6 +421,7 @@ watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null
 </template>
 
 <style scoped>
+.inspector-expand-button { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 28px; height: 28px; padding: 0; }
 .inspector-tab-bar { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .inspector-tab-bar .tab { padding: 7px 6px; }
 .inspector-review-context { padding: 8px 12px; font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
