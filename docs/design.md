@@ -105,11 +105,15 @@ when Inbox exists. Reported Ready is an advisory fact from explicit source
 state, not verified control-plane readiness. A stopped/sleeping worker is
 not sufficient evidence, and a ready tag is not required to request Land.
 
-**New thread** starts a standalone conversation for a one-off task (a form
-sheet). **New track** opens a chat immediately: the same shape as a live
-thread — header, conversation, composer — with the setup choices (title,
-repository, seed base and editable canonical topic branch, inherited project resources) in a setup card above
-the chat box, where the conversation will land. The setup disappears once
+**New thread** starts a standalone conversation for a one-off task. It opens
+with the same chat layout as **New track**: a header, a repository/base setup
+card in the conversation area, and a composer with attachments, @-mentions,
+launch-config pills, and a Send button. The first send launches the thread;
+setup fields do not launch on Enter. **New track** opens a chat immediately:
+the same shape as a live thread — header, conversation, composer — with the
+setup choices (title, repository, seed base and editable canonical topic
+branch, inherited project resources) in a setup card above the chat box,
+where the conversation will land. The setup disappears once
 the model starts. Loom's launch needs the first message, so the first
 send from the chat box both delivers that message and launches the Track;
 the chat box keeps what belongs to a chat — message text, attachments,

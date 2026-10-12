@@ -270,7 +270,7 @@ test('new thread submits once and stays visible until its live chat opens', asyn
     const goal = find(root, node => node.tag === 'textarea');
     goal.props['onUpdate:modelValue']('Fix the thread transition');
     await nextTick();
-    const launch = find(root, node => node.text === 'Launch thread');
+    const launch = find(root, node => node.props?.['aria-label'] === 'Send and launch thread');
     goal.props.onKeydown({ key: 'Enter', ctrlKey: true, preventDefault() {} });
     launch.props.onClick();
     assert.equal(calls.filter(call => call.command === 'launch_session').length, 1);

@@ -10,6 +10,7 @@ import { addAttachments, filesFromClipboard, imagePreviewUrl, MAX_LAUNCH_TOTAL_B
 import { pasteAsPlainText } from "../composerPaste";
 import { recentRepositories, rememberRepository } from "../launchDefaults";
 import { useLaunchSelection } from "../launch";
+import { useFileCompletion } from "../useFileCompletion";
 import RepoBaseFields from "./RepoBaseFields.vue";
 
 const backendUrl = useBackendUrl();
@@ -17,20 +18,10 @@ const invoke = useBackendInvoke();
 
 const launchSelection = useLaunchSelection();
 
-// The new-thread sheet: composing a thread happens in the main display
-// panel — the thread home — not in a cramped sidebar composer or a
-// floating modal. The sheet takes over grid-area `main` while open;
-// launching routes through App's launchTask → selectSession flow, which
-// swaps the sheet for the live thread. On failure the sheet stays and the
-// draft survives, so a retry is one edit away.
-//
-// The draft carries the same affordances the chat composer has: file
-// attachments (uploaded into the new session's Scratch directory) and
-// @-mentions of existing topic resources (the same `topic_resources`
-// menu the thread composer and the new-track chat use), plus the launch
-// config (profile/agent/model/effort). These moved here when the
-// sidebar's single-prompt composer was removed — this sheet is now the
-// only single-prompt launch surface.
+// New thread opens in the main pane with the same header, conversation,
+// and composer as New track. Repository/base sit in a setup card; the
+// first send launches the standalone thread through App's launchTask →
+// selectSession flow. Failed launches leave the draft here for retry.
 
 const props = defineProps<{
   fleet: SessionSummary[];
@@ -55,6 +46,7 @@ const repositorySuggestions = computed(() => [...new Set(props.fleet.filter(s =>
 const repo = ref(recentRepositories(localStorage, backendUrl.value)[0] || (repositorySuggestions.value.length === 1 ? repositorySuggestions.value[0] : ""));
 const base = ref("");
 const taskEl = ref<HTMLTextAreaElement | null>(null);
+const completion = useFileCompletion(task, computed(() => repo.value.trim() ? { repo: repo.value.trim() } : null), taskEl);
 const attachments = ref<FileAttachment[]>([]);
 const attachmentError = ref("");
 const attachmentLoading = ref(false);
@@ -194,10 +186,11 @@ async function loadMentionResources() {
 }
 
 function updateMention() {
+  completion.updateCaret();
   const caret = taskEl.value?.selectionStart ?? task.value.length;
-  const match = /(?:^|\s)@([^@{}\n]{0,64})$/.exec(task.value.slice(0, caret));
+  const match = /(?:^|\s)@\{?([^@{}\n]{0,64})$/.exec(task.value.slice(0, caret));
   const wasOpen = !!mentionRange.value;
-  mentionRange.value = match ? { start: caret - match[1].length - 1, end: caret, query: match[1] } : null;
+  mentionRange.value = match ? { start: task.value.slice(0, caret).lastIndexOf("@"), end: caret, query: match[1] } : null;
   mentionIndex.value = 0;
   if (mentionRange.value && !wasOpen) void loadMentionResources();
 }
@@ -218,7 +211,7 @@ function chooseMention(resource: TopicMentionResource) {
   });
 }
 
-// --- Sheet lifecycle ---------------------------------------------------------------
+// --- Chat lifecycle ---------------------------------------------------------------
 
 // Keyboard-first: focus the goal on open, and Esc always closes — unless
 // the mention menu is open (it owns Esc first).
@@ -233,13 +226,9 @@ onMounted(async () => {
 onUnmounted(() => document.removeEventListener("keydown", onKeydown));
 
 function submit() {
-  if (mentionRange.value && matchingResources.value.length) {
-    chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
-  }
   const t = task.value.trim();
   if (props.available === false || (!t && !attachments.value.length) || props.launching || attachmentLoading.value) return;
-  // The draft is deliberately not cleared: success unmounts the sheet
-  // (App closes it), while failure keeps the text for a retry.
+  // Success unmounts this chat; failure keeps the text for a retry.
   rememberRepository(localStorage, repo.value, backendUrl.value);
   emit("launch", t || `Review ${attachments.value[0].name}`, repo.value.trim(), {
     ...launchConfig(),
@@ -254,13 +243,10 @@ function submit() {
 // inserts a newline so a goal can be multi-line. The mention menu owns
 // the arrow keys and Escape while it's open.
 function onGoalKeydown(event: KeyboardEvent) {
+  if (completion.onKeydown(event)) { mentionRange.value = null; return; }
   if (event.key === "Enter" && !event.shiftKey && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();
-    if (mentionRange.value && matchingResources.value.length) {
-      chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
-    } else {
-      submit();
-    }
+    submit();
     return;
   }
   if (!mentionRange.value) return;
@@ -269,144 +255,151 @@ function onGoalKeydown(event: KeyboardEvent) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value + 1) % matchingResources.value.length;
   } else if (event.key === "ArrowUp" && matchingResources.value.length) {
     event.preventDefault(); mentionIndex.value = (mentionIndex.value - 1 + matchingResources.value.length) % matchingResources.value.length;
+  } else if ((event.key === "Tab" || (event.key === "Enter" && !event.shiftKey)) && matchingResources.value.length) {
+    event.preventDefault(); chooseMention(matchingResources.value[mentionIndex.value] || matchingResources.value[0]);
   }
 }
 </script>
 
 <template>
-  <section class="new-thread-sheet" aria-label="New thread">
-    <div class="nts-inner">
-      <header class="nts-head">
-        <h1>New thread</h1>
-        <button
-          class="nts-close"
-          title="Close (esc)"
-          aria-label="Close new thread"
-          @click="emit('close')"
-        >
-          ✕
-        </button>
-      </header>
+  <section class="main new-thread" aria-label="New thread">
+    <div class="thread-header">
+      <div class="meta">
+        <div class="name">New thread</div>
+        <div class="sub">first send launches the thread</div>
+      </div>
+      <button
+        class="nts-close"
+        title="Close (esc)"
+        aria-label="Close new thread"
+        @click="emit('close')"
+      >
+        ✕
+      </button>
+    </div>
 
-      <p class="nts-hint">Backend: {{ backendUrl }} · default for new threads</p>
-      <p v-if="available === false" class="nts-hint" role="status">Backend unavailable. Reconnect from the sidebar before launching.</p>
-      <label class="nts-field">
-        <span class="nts-field-name">Goal</span>
-        <div class="nts-body-wrap">
+    <div class="conversation">
+      <div class="block new-thread-setup">
+        <div class="who">Thread setup <em>· goes away at launch</em></div>
+        <div class="body new-thread-setup-body">
+          <span class="nts-hint">Backend: {{ backendUrl }} · default for new threads</span>
+          <span v-if="available === false" class="nts-hint" role="status">Backend unavailable. Reconnect from the sidebar before launching.</span>
+          <RepoBaseFields v-model:repo="repo" v-model:base="base" :repositories="repositorySuggestions" />
+        </div>
+      </div>
+      <div v-if="props.error" class="nts-error new-thread-error" role="alert">{{ props.error }}</div>
+    </div>
+
+    <div class="composer-wrap" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
+      <div v-if="completion.visible.value" class="mention-menu" role="listbox" aria-label="Repository files">
+        <button v-for="(path, index) in completion.matches.value" :key="path" type="button" role="option"
+          :aria-selected="index === completion.selected.value" :class="{ selected: index === completion.selected.value }"
+          @mousedown.prevent="completion.choose(path); mentionRange = null">
+          <strong>@{{ path }}</strong>
+        </button>
+      </div>
+      <div v-else-if="mentionRange" class="mention-menu" role="listbox" aria-label="Existing track resources">
+        <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
+        <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
+        <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
+        <button
+          v-for="(resource, index) in matchingResources"
+          :key="`${resource.topicId}:${resource.id}`"
+          role="option"
+          :aria-selected="index === mentionIndex"
+          :class="{ selected: index === mentionIndex }"
+          @mousedown.prevent="chooseMention(resource)"
+        >
+          <strong>{{ resource.title }}</strong>
+          <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
+        </button>
+      </div>
+      <div class="composer-card">
+        <div v-if="attachments.length || attachmentError || attachmentLoading" class="attachment-row composer-attachments">
+          <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
+            <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
+            {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments = attachments.filter((_, i) => i !== index)">×</button>
+          </span>
+          <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
+          <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
+        </div>
+        <div class="composer">
           <textarea
             ref="taskEl"
             v-model="task"
-            rows="6"
-            placeholder="Describe the goal — it becomes the agent's first message… Use @ to mention an existing resource."
+            aria-label="First message"
+            placeholder="Describe the goal, context, and what a good result looks like… Use @ to mention a repository file or resource."
             @input="updateMention"
             @click="updateMention"
+            @keyup="completion.updateCaret"
             @keydown="onGoalKeydown"
             @paste="onPaste"
           ></textarea>
-          <div v-if="mentionRange" class="mention-menu nts-mention-menu" role="listbox" aria-label="Existing track resources">
-            <div v-if="mentionLoading" class="mention-hint">Loading resources…</div>
-            <div v-else-if="mentionError" class="mention-hint">{{ mentionError }}</div>
-            <div v-else-if="!matchingResources.length" class="mention-hint">No matching attached resources</div>
-            <button
-              v-for="(resource, index) in matchingResources"
-              :key="`${resource.topicId}:${resource.id}`"
-              role="option"
-              :aria-selected="index === mentionIndex"
-              :class="{ selected: index === mentionIndex }"
-              @mousedown.prevent="chooseMention(resource)"
-            >
-              <strong>{{ resource.title }}</strong>
-              <small>{{ resource.repository }} · {{ resource.path || resource.url || resource.kind }}</small>
-            </button>
-          </div>
         </div>
-        <span class="nts-hint">⌘/Ctrl+Enter to launch · Enter for a new line</span>
-      </label>
-
-      <div class="attachment-row" @dragover.prevent @drop.prevent="($event) => $event.dataTransfer?.files && addFiles($event.dataTransfer.files)">
-        <label class="attachment-pick">+ Attach files or images<input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files or images to new thread" @change="onFileInput" /></label>
-        <span v-for="(file, index) in attachments" :key="file.name" class="attachment-chip">
-          <img v-if="imagePreviewUrl(file)" :src="imagePreviewUrl(file)!" class="attachment-preview" alt="" />
-          {{ file.name }} <button type="button" :aria-label="`Remove ${file.name}`" @click="attachments.splice(index, 1)">×</button>
-        </span>
-        <span v-if="attachmentError" class="attachment-error">{{ attachmentError }}</span>
-        <span v-if="attachmentLoading" class="attachment-hint">Reading files…</span>
-      </div>
-
-      <RepoBaseFields v-model:repo="repo" v-model:base="base" :repositories="repositorySuggestions" @submit="submit" />
-
-      <div class="nts-field">
-        <span class="nts-field-name">Launch config <em class="nts-opt">optional</em></span>
-        <div class="launch-controls">
-          <select v-model="profile" aria-label="Inference profile" @change="onProfileChange">
-            <option v-if="!profiles.some((p) => p.name === 'default')" value="default">Default route</option>
-            <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.name }} · {{ p.agent_kind }}</option>
-          </select>
-          <select v-model="agent" aria-label="Agent runtime" @change="onAgentChange">
-            <option value="">{{ selectedProfile?.agent_kind || launchOptions?.default_agent || 'Default agent' }}</option>
-            <option v-for="choice in launchOptions?.agents ?? []" :key="choice.kind" :value="choice.kind">{{ choice.label }}</option>
-          </select>
-          <select v-if="modelChoices.length && !selectedAgent?.accepts_raw_model" v-model="model" aria-label="Model">
-            <option value="">{{ agent ? 'Runtime default model' : (selectedProfile?.model || 'Runtime default model') }}</option>
-            <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-          </select>
-          <input
-            v-else
-            v-model="model"
-            list="nts-thread-models"
-            :placeholder="agent ? 'Model · runtime default' : (selectedProfile?.model || 'Model · runtime default')"
-            aria-label="Model override"
-            spellcheck="false"
-          />
-          <datalist id="nts-thread-models">
-            <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-          </datalist>
-          <select v-model="effort" aria-label="Reasoning effort">
-            <option value="">{{ agent ? 'Default effort' : (selectedProfile?.effort || 'Default effort') }}</option>
-            <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
-          </select>
+        <div class="composer-utility-row">
+          <label class="attachment-pick composer-attach" title="Attach files or images" aria-label="Attach files or images">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 12.5 14.5 6a3 3 0 0 1 4.25 4.25l-8.5 8.5a5 5 0 0 1-7.07-7.07l8.5-8.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <input type="file" multiple :disabled="attachmentLoading" aria-label="Attach files or images to the thread's first message" @change="onFileInput" />
+          </label>
+          <label class="composer-pill" title="Inference profile">
+            <span aria-hidden="true">⚡</span>
+            <select v-model="profile" aria-label="Inference profile" @change="onProfileChange">
+              <option v-if="!profiles.some((p) => p.name === 'default')" value="default">Default route</option>
+              <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.name }}</option>
+            </select>
+            <span aria-hidden="true">⌄</span>
+          </label>
+          <label class="composer-pill" title="Agent runtime">
+            <span aria-hidden="true">⚙</span>
+            <select v-model="agent" aria-label="Agent runtime" @change="onAgentChange">
+              <option value="">{{ selectedProfile?.agent_kind || launchOptions?.default_agent || 'Default agent' }}</option>
+              <option v-for="choice in launchOptions?.agents ?? []" :key="choice.kind" :value="choice.kind">{{ choice.label }}</option>
+            </select>
+            <span aria-hidden="true">⌄</span>
+          </label>
+          <label v-if="modelChoices.length && !selectedAgent?.accepts_raw_model" class="composer-pill" title="Model">
+            <span aria-hidden="true">▣</span>
+            <select v-model="model" aria-label="Model">
+              <option value="">{{ agent ? 'Runtime default model' : (selectedProfile?.model || 'Runtime default model') }}</option>
+              <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+            </select>
+            <span aria-hidden="true">⌄</span>
+          </label>
+          <label v-else class="composer-pill" title="Model override">
+            <span aria-hidden="true">▣</span>
+            <input
+              v-model="model"
+              list="nts-thread-models"
+              :placeholder="agent ? 'Model' : (selectedProfile?.model || 'Model')"
+              aria-label="Model override"
+              spellcheck="false"
+            />
+            <datalist id="nts-thread-models">
+              <option v-for="choice in modelChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+            </datalist>
+            <span aria-hidden="true">⌄</span>
+          </label>
+          <label class="composer-pill" title="Reasoning effort">
+            <span aria-hidden="true">◉</span>
+            <select v-model="effort" aria-label="Reasoning effort">
+              <option value="">{{ agent ? 'Default effort' : (selectedProfile?.effort || 'Default effort') }}</option>
+              <option v-for="choice in effortChoices" :key="choice.id" :value="choice.id">{{ choice.label }}</option>
+            </select>
+            <span aria-hidden="true">⌄</span>
+          </label>
+          <button
+            class="composer-send"
+            type="button"
+            :disabled="available === false || (!task.trim() && !attachments.length) || props.launching || attachmentLoading"
+            :title="props.launching ? 'Launching…' : 'Send — launches the thread (⌘/Ctrl + Enter)'"
+            aria-label="Send and launch thread"
+            @click="submit"
+          >
+            <span v-if="props.launching">…</span><span v-else aria-hidden="true">↑</span>
+          </button>
         </div>
       </div>
-
-      <div v-if="props.error" class="nts-error">{{ props.error }}</div>
-
-      <div class="nts-actions">
-        <button @click="emit('close')">Cancel</button>
-        <button
-          class="primary"
-          :disabled="available === false || (!task.trim() && !attachments.length) || props.launching || attachmentLoading"
-          @click="submit"
-        >
-          {{ props.launching ? "Launching…" : "Launch thread" }}
-        </button>
-      </div>
+      <div class="composer-hint">⌘/Ctrl + Enter to send and launch · Enter for a new line</div>
     </div>
   </section>
 </template>
-
-<style scoped>
-/* Launch config row (profile/agent/model/effort) — same look as the
-   new-track chat's controls. */
-.launch-controls {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.launch-controls select,
-.launch-controls input {
-  box-sizing: border-box;
-  flex: 1 1 118px;
-  min-width: 0;
-  max-width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--bg);
-  color: var(--text);
-  padding: 6px 8px;
-  font: 11px var(--mono);
-}
-.launch-controls select:focus,
-.launch-controls input:focus {
-  outline: 1px solid var(--accent);
-}
-</style>
