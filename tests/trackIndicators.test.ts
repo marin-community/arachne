@@ -19,6 +19,7 @@ for (const name of ["FleetSidebar", "TopicInspector"]) {
     const panel = mountRoutingComponent(name, { fleet: [root, middle, worker], topic: root,
       layout: null, selectedId: null, unarchivingIds: new Set() }, async () => [], true);
     t.after(panel.stop); await nextTick();
+    if (name === "TopicInspector") { panel.state.tab = "threads"; await nextTick(); }
     const spinners = () => panel.elements(el => String(el.props.class).includes("spinner"));
     const badges = () => panel.elements(el => String(el.props.class).split(" ").includes("badge")).map(contents);
     assert.equal(spinners().length, name === "FleetSidebar" ? 1 : 3);
