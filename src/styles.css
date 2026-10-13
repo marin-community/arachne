@@ -590,6 +590,21 @@ body {
 .badge.error { color: var(--blocked); background: rgba(248,81,73,.12); }
 .badge.attention { color: var(--attention); background: rgba(210,153,34,.12); }
 .badge.blocked { color: var(--blocked); background: rgba(248,81,73,.18); }
+.thread-attention {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 16px;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--attention);
+  border-radius: 3px;
+  color: var(--attention);
+  background: rgba(210,153,34,.16);
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
 .badge.orphaned { color: var(--text-dim); background: var(--bg-hover); }
 
 /* --- Main / thread -------------------------------------------------- */
@@ -1231,8 +1246,7 @@ button.accent { border-color: var(--accent); color: var(--accent); }
 @keyframes arachne-spin {
   to { transform: rotate(360deg); }
 }
-/* Sidebar row spinner: running threads spin instead of showing a RUN badge.
-   Loud (attention/blocked) running threads keep their colored badge tone. */
+/* Compact activity indicator for threads and their working descendants. */
 .spinner.mini {
   width: 9px;
   height: 9px;

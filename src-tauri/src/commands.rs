@@ -946,6 +946,7 @@ pub async fn load_session_image(
 /// Send input to a session: ACP prompt (agents) or terminal text (raw).
 #[tauri::command]
 pub async fn send_input(
+    app: AppHandle,
     state: State<'_, LoomState>,
     base_url: String,
     id: String,
@@ -1007,10 +1008,14 @@ pub async fn send_input(
                 prompt.push_str(&format!("- {path}\n"));
             }
         }
-        if view.protocol == "terminal" {
-            client.send_text(&id, &prompt, true).await?;
-        } else {
-            client.send_prompt(&id, &prompt, &files).await?;
+        client.send_chat_input(&view, &prompt, &files).await?;
+        if view
+            .branch
+            .tags
+            .iter()
+            .any(|tag| tag.key == "integration_result")
+        {
+            emit_fleet(&app, &state, &client).await;
         }
         Ok(())
     }

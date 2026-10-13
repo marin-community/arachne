@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   badgeLabel,
+  threadBadgeLabel,
+  workingThreadIds,
+  integrationResult,
   composerSendAsDismiss,
   composerSendAsStop,
   dismissibleAttention,
@@ -269,4 +272,53 @@ test("zero-output working, waiting, review, coordinator and foreign Threads requ
   for (const s of [worker, waiting, pending]) assert.equal(isReadyCandidate(s), false);
   assert.equal(threadStatus(landed).kind, "landed");
   assert.equal(threadStatus(pending).kind, "waiting");
+});
+
+
+test("activity propagates through both parent links, regardless of advisory facts", () => {
+  const root = withTag(session("root"), "idle", "true");
+  const middle = withTag(session("middle", { parent_session_id: "root" }), "idle", "true");
+  const worker = withTag(withTag(session("worker", { parent_id: "branch-middle" }), "integration_result", "old-sha"), "attention", "blocked");
+  const other = withTag(session("other"), "idle", "true");
+  const fleet = [root, middle, worker, other];
+  assert.deepEqual([...workingThreadIds(fleet)].sort(), ["middle", "root", "worker"]);
+  assert.equal(topicThreadRows(fleet, "root", new Set(["root"])).length, 1);
+  worker.branch.tags.push({ key: "idle", value: "true" });
+  assert.equal(workingThreadIds(fleet).size, 0);
+  worker.branch.tags = [];
+  worker.status = "archived";
+  assert.equal(workingThreadIds(fleet).size, 0);
+});
+
+test("activity handles cycles, dangling parents, and backend-scoped identities", () => {
+  const idle = s => withTag(s, "idle", "true");
+  const fleet = [idle(session("a", { parent_session_id: "b" })), session("b", { parent_session_id: "a" }),
+    session("dangling", { parent_session_id: "missing" }),
+    idle(session("server-a/root")), idle(session("server-b/root")),
+    session("server-b/child", { parent_session_id: "server-b/root" })];
+  assert.deepEqual([...workingThreadIds(fleet)].sort(), ["a", "b", "dangling", "server-b/child", "server-b/root"]);
+});
+
+test("thread badges leave activity and attention to their indicators", () => {
+  assert.equal(threadBadgeLabel(session("working")), null);
+  assert.equal(threadBadgeLabel(withTag(session("reviewer"), "role", "reviewer")), null);
+  assert.equal(threadBadgeLabel(withTag(session("resting"), "idle", "true")), null);
+  assert.equal(threadBadgeLabel(withTag(session("attention"), "attention", "attention")), null);
+  assert.equal(threadBadgeLabel(withTag(session("blocked"), "attention", "blocked")), null);
+  assert.equal(threadBadgeLabel(withTag(session("landed"), "integration_result", "sha")), "landed");
+});
+
+test("new messages invalidate landed status without treating agent activity as input", () => {
+  const landed = withTag(session("landed"), "integration_result", "sha");
+  landed.branch.tags[0].set_at = "2026-10-10T12:00:00Z";
+  landed.last_user_message_at = "2026-10-10T11:00:00Z";
+  landed.last_activity_at = "2026-10-10T13:00:00Z";
+  assert.equal(integrationResult(landed)?.value, "sha");
+  landed.last_user_message_at = "2026-10-10T12:00:01Z";
+  assert.equal(integrationResult(landed), undefined);
+  assert.equal(threadStatus(landed).kind, "working");
+  landed.branch.tags[0].set_at = "2026-10-10T12:00:02Z";
+  assert.equal(threadStatus(landed).kind, "landed");
+  landed.last_user_message_at = null;
+  assert.equal(threadStatus(landed).kind, "landed");
 });
