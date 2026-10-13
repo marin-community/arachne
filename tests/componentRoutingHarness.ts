@@ -17,7 +17,7 @@ export function deferred<T>() {
   return { promise, resolve, reject };
 }
 interface Element { type: string; props: Record<string, any>; children: Element[]; parent?: Element; text?: string; focus?: () => void }
-export function mountRoutingComponent(name: string, initial: Record<string, any>, transport: (command: string, args: any) => Promise<any>, renderTemplate = false, savedValues: Record<string, string> = {}) {
+export function mountRoutingComponent(name: string, initial: Record<string, any>, transport: (command: string, args: any) => Promise<any>, renderTemplate = false, savedValues: Record<string, string> = {}, realChildren: string[] = []) {
   const previous = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   const previousDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
   if (!previousDocument) Object.defineProperty(globalThis, "document", { configurable: true, value: { addEventListener() {}, removeEventListener() {} } });
@@ -26,6 +26,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
     getItem: (key: string) => values.get(key) ?? null, setItem: (key: string, value: string) => values.set(key, value), removeItem: (key: string) => values.delete(key),
   } });
   const cache = new Map<string, any>();
+  const states: Record<string, any> = {};
   function evaluate(source: string, file: string) {
     const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2021, esModuleInterop: true } }).outputText;
     const module = { exports: {} as any };
@@ -37,7 +38,10 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
       if (specifier === "vue") return { ...vue, withDirectives: (vnode: any) => vnode };
       if (specifier.endsWith("ChatMarkdown.vue")) return { props: ["text"], setup: (props: any) => () => vue.h("span", props.text) };
       if (specifier === "./SplitButton.vue" && renderTemplate) return { __esModule: true, default: compileComponent(resolve(dirname(file), specifier)) };
-      if (specifier.endsWith(".vue")) return { render: () => null };
+      if (specifier.endsWith(".vue")) {
+        if (realChildren.some(name => specifier.endsWith(`${name}.vue`))) return load(resolve(dirname(file), specifier));
+        return { render: () => null };
+      }
       if (specifier.startsWith(".")) {
         const next = resolve(dirname(file), specifier);
         return load(extname(next) ? next : `${next}.ts`);
@@ -47,21 +51,33 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
     return module.exports;
   }
   function load(file: string): any {
-    if (!cache.has(file)) cache.set(file, evaluate(readFileSync(file, "utf8"), file));
+    if (!cache.has(file)) {
+      if (file.endsWith(".vue")) {
+        const component = compileComponent(file, true);
+        const setup = component.setup;
+        component.setup = (props: any, context: any) => {
+          const state = setup(props, context);
+          states[file] = vue.proxyRefs(state);
+          return state;
+        };
+        cache.set(file, { __esModule: true, default: component });
+      } else cache.set(file, evaluate(readFileSync(file, "utf8"), file));
+    }
     return cache.get(file);
   }
-  function compileComponent(file: string) {
+  function compileComponent(file: string, render = renderTemplate) {
     const { descriptor } = parse(readFileSync(file, "utf8"));
     const script = compileScript(descriptor, { id: `routing-${file}` });
     const component = evaluate(script.content, file).default;
-    if (renderTemplate) {
+    if (render) {
       const template = compileTemplate({ source: descriptor.template!.content, filename: file, id: `routing-${file}`, compilerOptions: { bindingMetadata: script.bindings, expressionPlugins: ["typescript"] } });
       if (template.errors.length) throw new Error(String(template.errors));
       component.render = evaluate(template.code, file).render;
     } else component.render = () => null;
     return component;
   }
-  const component = compileComponent(resolve(root, "components", `${name}.vue`));
+  const file = name === "App" ? resolve(root, "App.vue") : resolve(root, "components", `${name}.vue`);
+  const component = compileComponent(file, renderTemplate);
   const renderer = vue.createRenderer<Element, Element>({
     createElement: type => ({ type, props: {}, children: [], focus() {}, querySelectorAll() { return []; }, getBoundingClientRect() { return { top: 0 }; }, scrollHeight: 0, scrollTop: 0, clientHeight: 0 }),
     createText: text => ({ type: "text", text, props: {}, children: [] }),
@@ -81,7 +97,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
   });
   const props = vue.reactive(initial);
   const events: { name: string; args: any[] }[] = [];
-  const listeners = Object.fromEntries(["close", "backend", "launch", "created", "layout", "requested", "rename", "save", "error", "select"].map(name => [`on${name[0].toUpperCase()}${name.slice(1)}`, (...args: any[]) => events.push({ name, args })]));
+  const listeners = Object.fromEntries(["close", "backend", "launch", "created", "layout", "requested", "rename", "save", "setDefault", "error", "select"].map(name => [`on${name[0].toUpperCase()}${name.slice(1)}`, (...args: any[]) => events.push({ name: name === "setDefault" ? "set-default" : name, args })]));
   const app = renderer.createApp({ setup: () => () => vue.h(component, { ...props, ...listeners }) });
   app.provide("backendUrl", vue.computed(() => props.backendUrl));
   const container: Element = { type: "root", props: {}, children: [] };
@@ -91,7 +107,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
     return walk(container);
   }
   return {
-    props, events, values, state: instance.$.subTree.component.setupState, elements,
+    props, events, values, states, state: instance.$.subTree.component.setupState, elements,
     stop() { app.unmount(); if (!previousDocument) Reflect.deleteProperty(globalThis, "document"); if (previous) Object.defineProperty(globalThis, "localStorage", previous); else Reflect.deleteProperty(globalThis, "localStorage"); },
   };
 }

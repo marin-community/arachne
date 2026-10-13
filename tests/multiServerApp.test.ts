@@ -268,6 +268,80 @@ test("renaming a server persists its live alias without changing connection, cre
   assert.equal(registeredBackends({ getItem: key => app.values.get(key) ?? null, setItem() {}, removeItem() {} }, a).find(row => row.url === b)?.name, "Research server", "alias survives restart");
 });
 
+test("configuration saves keep default, project ownership and selections; default changes are explicit", async t => {
+  const app = await mountApp(); t.after(app.stop);
+  await app.state.selectSession(scopedId(b, "track"));
+  const originalLayout = JSON.stringify(app.state.layout);
+  const calls = app.calls.length;
+  await app.state.saveSettings(b, undefined, "Research");
+  assert.equal(app.calls.length, calls, "metadata-only configuration save has no native side effects");
+  assert.equal(app.state.backends.find((row: any) => row.url === b).name, "Research");
+  await app.state.saveSettings(b, "updated-b-token", "Research");
+  assert.equal(app.savedTokens.get(b), "updated-b-token"); assert.equal(app.savedTokens.has(a), false);
+  assert.equal(app.state.loomUrl, a); assert.equal(app.values.get("loomUrl"), a);
+  assert.equal(app.state.selectedId, scopedId(b, "track")); assert.equal(app.state.operationUrl, b);
+  assert.equal(JSON.stringify(app.state.layout), originalLayout);
+  const beforeDefault = app.calls.length;
+  app.state.setDefaultServer(b);
+  assert.equal(app.state.loomUrl, b); assert.equal(app.values.get("loomUrl"), b);
+  assert.equal(app.calls.length, beforeDefault, "set-default cannot touch connections or credentials");
+  assert.equal(JSON.stringify(app.state.layout), originalLayout);
+  app.state.openNewTopicInProject({ id: scopedId(a, "project"), name: "Project A" });
+  assert.equal(app.state.composerUrl, a, "existing project retains its backend after default changes");
+});
+
+test("renaming an implicit local endpoint registers its alias without connecting or changing default", async t => {
+  const app = await mountApp(); t.after(app.stop);
+  const local = "http://127.0.0.1:7878";
+  const calls = app.calls.length;
+  app.state.renameServer(local, "local");
+  assert.equal(app.calls.length, calls); assert.equal(app.savedTokens.size, 0);
+  assert.equal(app.state.backends.find((row: any) => row.url === local).name, "local");
+  assert.equal(app.state.loomUrl, a); assert.equal(app.values.get("loomUrl"), a);
+  const { registeredBackends } = await import("../src/backendFleet.ts");
+  assert.equal(registeredBackends(localStorage, a).find(row => row.url === local)?.name, "local");
+});
+
+test("changed server address adds a new endpoint without migrating old projects or credentials", async t => {
+  const app = await mountApp(); t.after(app.stop);
+  await app.state.saveSettings(b, "original-b-token", "Original B");
+  await app.state.selectSession(scopedId(b, "track"));
+  const original = app.state.backends.find((row: any) => row.url === b);
+  const projects = JSON.stringify(original.layout);
+  const bCalls = app.calls.filter(call => call.args?.baseUrl === b).length;
+  const target = "https://new.example";
+  await app.state.saveSettings(target, "new-endpoint-token", "New endpoint");
+  assert.equal(app.state.backends.length, 3); assert.equal(app.state.backends.find((row: any) => row.url === b), original);
+  assert.equal(original.name, "Original B"); assert.equal(JSON.stringify(original.layout), projects);
+  assert.equal(app.savedTokens.get(b), "original-b-token"); assert.equal(app.savedTokens.get(target), "new-endpoint-token");
+  assert.equal(app.calls.filter(call => call.args?.baseUrl === b).length, bCalls);
+  assert.equal(app.installedTokens.get(target), "new-endpoint-token"); assert.equal(app.installedTokens.get(b), "original-b-token");
+  assert.equal(app.state.loomUrl, a); assert.equal(app.values.get("loomUrl"), a);
+  assert.equal(app.state.selectedId, scopedId(b, "track")); assert.equal(app.state.operationUrl, b);
+  const profiles = JSON.parse(app.values.get("arachne.loomServers")!);
+  assert.ok(profiles.some((p: any) => p.url === b && p.name === "Original B"));
+  assert.ok(profiles.some((p: any) => p.url === target && p.name === "New endpoint"));
+});
+
+test("app configuration/default storage failures remain visible and retryable", async t => {
+  const app = await mountApp(); t.after(app.stop);
+  const storage = localStorage, save = storage.setItem;
+  const before = app.calls.length;
+  storage.setItem = () => { throw new Error("storage denied"); };
+  await app.state.saveSettings(b, "updated-token", "Research");
+  assert.equal(app.state.settingsError, "storage denied"); assert.equal(app.state.settingsSaving, false);
+  assert.equal(app.calls.length, before); assert.equal(app.state.backends.find((row: any) => row.url === b).name, "B");
+  storage.setItem = save;
+  await app.state.saveSettings(b, "updated-token", "Research");
+  assert.equal(app.state.settingsError, null); assert.equal(app.savedTokens.get(b), "updated-token");
+  storage.setItem = (key, value) => { if (key === "loomUrl") throw new Error("default storage denied"); save(key, value); };
+  app.state.setDefaultServer(b);
+  assert.equal(app.state.settingsError, "default storage denied"); assert.equal(app.state.loomUrl, a); assert.equal(app.values.get("loomUrl"), a);
+  storage.setItem = save;
+  app.state.setDefaultServer(b);
+  assert.equal(app.state.settingsError, null); assert.equal(app.state.loomUrl, b); assert.equal(app.values.get("loomUrl"), b);
+});
+
 test("actual App selections render owning chat content over strict two-server HTTP transport", { timeout: 60000 }, async t => {
   const wire: { server: string; method: string; path: string; body: any; status: number }[] = [];
   const sessionFixture = JSON.parse(readFileSync(new URL("../src-tauri/tests/fixtures/launch-response.json", import.meta.url), "utf8"));

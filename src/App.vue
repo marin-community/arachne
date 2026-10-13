@@ -3,7 +3,7 @@ import { ref, onMounted, onUnmounted, computed, watch, nextTick, provide } from 
 import { invoke as rawInvoke } from "@tauri-apps/api/core";
 import { backendInvoke, useBackendInvoke } from "./backendInvoke";
 import { backendOf, splitScopedId } from "./backendIdentity";
-import { normalizeServerUrl, readServerProfiles } from "./serverProfiles";
+import { normalizeServerUrl, readServerProfiles, rememberServer } from "./serverProfiles";
 import { registeredBackends, registerBackend, combinedFleet, combinedLayout, acceptSnapshot, markUnavailable, cacheProjectLayout } from "./backendFleet";
 import { listen } from "@tauri-apps/api/event";
 import CommandPalette from "./components/CommandPalette.vue";
@@ -352,32 +352,48 @@ function onProjectLayout(next: SessionLayout) {
   const raw = JSON.parse(JSON.stringify(next), (_key, value) => typeof value === "string" ? splitScopedId(value)?.id ?? value : value);
   cacheProjectLayout(localStorage, backend.url, raw);
 }
-async function saveSettings(url: string, token: string) {
+async function saveSettings(url: string, token?: string, name?: string) {
   if (settingsSaving.value) return;
   settingsSaving.value = true;
   settingsError.value = null;
   try {
     url = normalizeServerUrl(url);
-    const name = readServerProfiles(localStorage).find(profile => profile.url === url)?.name || new URL(url).host;
-    const backend = registerBackend(localStorage, backends.value, { url, name });
-    await connect(url, token || null);
-    if (!backend.available) { settingsError.value = backend.error; return; }
-    await rawInvoke("save_token", { baseUrl: url, token });
-    // Default changes affect only future creation. All existing projects,
-    // selections and requests keep their own backend association.
-    loomUrl.value = url;
-    localStorage.setItem("loomUrl", url);
-    if (backendOf(selectedId.value) === url && selectedId.value) await selectSession(selectedId.value);
-    showSettings.value = false;
+    const profile = { url, name: name ?? readServerProfiles(localStorage).find(profile => profile.url === url)?.name ?? new URL(url).host };
+    rememberServer(localStorage, profile, { requirePersistence: true });
+    const backend = registerBackend(localStorage, backends.value, profile);
+    // Healthy name-only saves never touch credentials or the active connection.
+    // Unavailable endpoints must retry even after a failed save registered them.
+    // A new URL is another backend, leaving old project ownership intact.
+    if (!backend.available || token !== undefined) {
+      await connect(url, token === undefined ? undefined : token || null);
+      if (!backend.available) { settingsError.value = backend.error; return; }
+    }
+    if (token !== undefined) await rawInvoke("save_token", { baseUrl: url, token });
   } catch (error: any) {
     settingsError.value = error?.message ?? String(error);
   } finally { settingsSaving.value = false; }
 }
 
+function setDefaultServer(url: string) {
+  if (settingsSaving.value) return;
+  settingsError.value = null;
+  try {
+    url = normalizeServerUrl(url);
+    const backend = backends.value.find(backend => backend.url === url);
+    if (!backend) throw new Error("Save this server configuration before setting it as default.");
+    // Persist implicit/legacy registrations before changing the legacy URL.
+    rememberServer(localStorage, backend, { requirePersistence: true });
+    // Default changes affect only future creation. All existing projects,
+    // selections and requests keep their own backend association.
+    localStorage.setItem("loomUrl", url);
+    loomUrl.value = url;
+  } catch (error: any) {
+    settingsError.value = error?.message ?? String(error);
+  }
+}
+
 function renameServer(url: string, name: string) {
-  const backend = backends.value.find(backend => backend.url === normalizeServerUrl(url));
-  if (!backend) return;
-  registerBackend(localStorage, backends.value, { url: backend.url, name: name.trim() || new URL(backend.url).host });
+  registerBackend(localStorage, backends.value, { url: normalizeServerUrl(url), name: name.trim() });
 }
 
 // --- Actions ----------------------------------------------------------------
@@ -1036,6 +1052,7 @@ const expandedInspectorVisible = computed(() => inspectorVisible.value && inspec
       :saving="settingsSaving"
       @close="showSettings = false"
       @save="saveSettings"
+      @set-default="setDefaultServer"
       @rename="renameServer"
     />
   </div>

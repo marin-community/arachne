@@ -2,11 +2,13 @@
 import { computed } from "vue";
 import type { AcpUsage } from "../App.vue";
 import { formatTokens } from "../chatRows";
+import { splitScopedId } from "../backendIdentity";
 
 const props = withDefaults(defineProps<{
   sessionId: string;
   usage?: AcpUsage | null;
 }>(), { usage: null });
+const displaySessionId = computed(() => splitScopedId(props.sessionId)?.id ?? props.sessionId);
 
 const percent = computed(() => {
   if (!props.usage || props.usage.size <= 0) return null;
@@ -44,7 +46,7 @@ const contextTitle = computed(() => {
       <span class="context-count">{{ formatTokens(usage.used) }}/{{ formatTokens(usage.size) }}</span>
     </div>
     <div class="session-metrics">
-      <span class="session-id" :title="sessionId">⌘ {{ sessionId }}</span>
+      <span class="session-id" :title="displaySessionId">⌘ {{ displaySessionId }}</span>
       <span v-if="cost" class="session-cost" :title="`Provider-reported cumulative session cost: ${cost}`">◉ {{ cost }}</span>
     </div>
   </div>
