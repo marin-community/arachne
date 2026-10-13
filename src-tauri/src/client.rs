@@ -923,6 +923,35 @@ impl LoomClient {
         Ok(())
     }
 
+    /// New chat input reopens a landed conversation, while bounded acceptance
+    /// records remain as historical evidence. Clear only after delivery succeeds.
+    pub async fn send_chat_input(
+        &self,
+        view: &crate::loom::SessionView,
+        text: &str,
+        files: &[String],
+    ) -> Result<(), LoomError> {
+        if view.protocol == "terminal" {
+            self.send_text(&view.id, text, true).await?;
+        } else {
+            self.send_prompt(&view.id, text, files).await?;
+        }
+        if view
+            .branch
+            .tags
+            .iter()
+            .any(|tag| tag.key == "integration_result")
+        {
+            // The message was delivered: a cleanup failure must not invite a
+            // retry that would send it twice. Timestamp-based UI gating also
+            // prevents a stale landed badge when the server rejects cleanup.
+            if let Err(error) = self.clear_tag(&view.id, "integration_result").await {
+                eprintln!("could not clear landed tag after chat input: {error}");
+            }
+        }
+        Ok(())
+    }
+
     /// Answer one ACP tool permission using Loom's user-scoped operation.
     pub async fn answer_permission(
         &self,
@@ -2221,5 +2250,121 @@ mod stream_transport_tests {
         assert_eq!((&*lost.topic, &*lost.event), ("connection", "unavailable"));
         assert_eq!(lost.data["unreachable"], true);
         drop(rx);
+    }
+}
+
+#[cfg(test)]
+mod chat_input_tests {
+    use super::LoomClient;
+    use crate::loom::{SessionView, TagView};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn send(protocol: &str, landed: bool, send_ok: bool, cleanup_ok: bool) {
+        let mut view: SessionView =
+            serde_json::from_str(include_str!("../tests/fixtures/launch-response.json")).unwrap();
+        view.protocol = protocol.into();
+        if landed {
+            view.branch.tags.push(TagView {
+                key: "integration_result".into(),
+                value: "sha".into(),
+                note: String::new(),
+                set_at: String::new(),
+                set_by: "arachne".into(),
+            });
+        }
+        let path = if protocol == "terminal" {
+            "/api/sessions/send"
+        } else {
+            "/api/sessions/prompt/create"
+        };
+        let mut replies = vec![(path, send_ok)];
+        if landed && send_ok {
+            replies.push(("/api/sessions/tags/delete", cleanup_ok));
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::<serde_json::Value>::new();
+            for (path, ok) in replies {
+                let (mut socket, _) =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let mut bytes = Vec::new();
+                let (end, length) = loop {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&bytes[..end]);
+                        assert!(header.starts_with(&format!("POST {path} ")));
+                        let length = header
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|n| n.parse::<usize>().unwrap())
+                            })
+                            .unwrap();
+                        break (end + 4, length);
+                    }
+                };
+                while bytes.len() < end + length {
+                    let mut chunk = [0u8; 4096];
+                    let count = socket.read(&mut chunk).await.unwrap();
+                    assert!(count > 0);
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                bodies.push(serde_json::from_slice(&bytes[end..end + length]).unwrap());
+                let (status, body) = if ok {
+                    ("200 OK", "{}")
+                } else {
+                    ("500 Internal Server Error", "{\"error\":\"failed\"}")
+                };
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let client = LoomClient::new(&format!("http://{addr}/"), None).unwrap();
+        let files = vec!["/scratch/image.png".into()];
+        assert_eq!(
+            client
+                .send_chat_input(&view, "Follow up", &files)
+                .await
+                .is_ok(),
+            send_ok
+        );
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies[0]["session"], view.id);
+        assert_eq!(bodies[0]["text"], "Follow up");
+        if protocol == "terminal" {
+            assert_eq!(bodies[0]["submit"], true);
+        } else {
+            assert_eq!(bodies[0]["files"], serde_json::json!(files));
+        }
+        if landed && send_ok {
+            assert_eq!(
+                bodies[1],
+                serde_json::json!({ "session": view.id, "key": "integration_result", "by": "arachne" })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn new_chat_input_clears_landed_after_delivery_for_both_protocols() {
+        for protocol in ["acp", "terminal"] {
+            send(protocol, true, true, true).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_delivery_preserves_landed_and_cleanup_failure_does_not_repeat_input() {
+        for protocol in ["acp", "terminal"] {
+            send(protocol, true, false, true).await;
+            send(protocol, true, true, false).await;
+            send(protocol, false, true, true).await;
+        }
     }
 }

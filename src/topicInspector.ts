@@ -7,6 +7,7 @@
 import type { SessionSummary } from "./App.vue";
 import { resolveTrack } from "./trackPolicy.ts";
 import { changeRegistry, type DurableChange } from "./durableChange.ts";
+import { parentOf } from "./topicList.ts";
 
 // --- Fleet row state ---------------------------------------------------------
 
@@ -116,6 +117,28 @@ export function composerSendAsStop(input: {
 /** The quiet `idle` mark: running alone means alive, not working. */
 export function isIdle(s: SessionSummary): boolean {
   return s.branch.tags.some((t) => t.key === "idle");
+}
+
+/** Runtime activity is independent of advisory readiness or attention tags. */
+export function workingThreadIds(fleet: readonly SessionSummary[]): Set<string> {
+  const working = new Set<string>();
+  for (const session of fleet) {
+    if (session.status !== "running" || isIdle(session)) continue;
+    const seen = new Set<string>();
+    let node: SessionSummary | null = session;
+    while (node && !seen.has(node.id)) {
+      seen.add(node.id);
+      working.add(node.id);
+      node = parentOf(fleet, node);
+    }
+  }
+  return working;
+}
+
+/** Activity uses a spinner and attention uses an icon; other facts keep text. */
+export function threadBadgeLabel(s: SessionSummary): string | null {
+  const status = threadStatus(s);
+  return ["working", "reviewing", "resting", "needs-you"].includes(status.kind) ? null : status.label;
 }
 
 export function statusClass(s: SessionSummary): string {
@@ -235,7 +258,11 @@ export function threadStatus(s: SessionSummary): { kind: ThreadFactKind; label: 
 
 /** The recorded integration outcome tag, when Loom verified one. */
 export function integrationResult(s: SessionSummary) {
-  return s.branch.tags.find((t) => t.key === "integration_result");
+  const result = s.branch.tags.find((t) => t.key === "integration_result");
+  // Messages delivered outside Arachne also reopen a landed conversation.
+  const messageAt = Date.parse(s.last_user_message_at ?? "");
+  const landedAt = Date.parse(result?.set_at ?? "");
+  return messageAt > landedAt ? undefined : result;
 }
 
 export interface LandingCandidate {

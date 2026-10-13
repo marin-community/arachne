@@ -29,7 +29,7 @@ import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
 import { isStandalone } from "../threadKind";
-import { dismissibleAttention, composerSendAsDismiss, composerSendAsStop } from "../topicInspector";
+import { dismissibleAttention, composerSendAsDismiss, composerSendAsStop, integrationResult } from "../topicInspector";
 
 const invoke = useBackendInvoke(computed(() => backendOf(props.session.id)));
 
@@ -1131,7 +1131,7 @@ const hasExplicitChanges = computed(() => changeRegistry(currentSummary.value ??
 const isReviewer = computed(() => currentSummary.value?.branch.tags.some(tag => tag.key === "role" && tag.value === "reviewer"));
 const isWorker = computed(() => !!(currentSummary.value?.parent_session_id || currentSummary.value?.parent_id) && !isTrackCoordinator(currentSummary.value!));
 const lastPublish = computed(() => currentSummary.value?.branch.tags.find(tag => tag.key === "publish_result"));
-const lastIntegration = computed(() => currentSummary.value?.branch.tags.find((tag) => tag.key === "integration_result"));
+const lastIntegration = computed(() => currentSummary.value ? integrationResult(currentSummary.value) : undefined);
 const integrationTarget = computed(() => reviewIntegrationTarget(props.fleet, props.session.id));
 // Every root conversation is a topic, including older single-prompt launches
 // that predate the durable marker.

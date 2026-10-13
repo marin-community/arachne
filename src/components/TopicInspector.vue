@@ -16,6 +16,10 @@ import { landStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import SplitButton from "./SplitButton.vue";
 import { compareQueueSnapshots, projectChangeQueue, queuedLandFeedback, reorderedDeclarations, validateQueueView, type QueueView, type TimelineRow } from "../changeQueue.ts";
 import {
+  attentionLevel,
+  attentionReason,
+  threadBadgeLabel,
+  workingThreadIds,
   landingCandidates,
   type LandingCandidate,
   pendingPermissionSummary,
@@ -84,10 +88,8 @@ watch(() => props.selectedId, id => {
 
 // --- Threads tab -----------------------------------------------------------
 //
-// The topic's coordinator + worker fleet with attention/working/readiness/
-// resting states. The row semantics (loud tags → badge; running && !idle →
-// spinner; quiet otherwise) mirror FleetSidebar's Inbox tab, scoped to the
-// topic subtree rather than the lane filing system.
+// The coordinator and worker tree uses the same indicators as the sidebar:
+// subtree activity spins, human attention gets an icon, and other facts keep text.
 
 function subtitle(s: SessionSummary): string {
   const permission = pendingPermissionSummary(s);
@@ -96,6 +98,7 @@ function subtitle(s: SessionSummary): string {
 }
 
 const collapsed = ref(new Set<string>());
+const workingIds = computed(() => workingThreadIds(props.fleet));
 
 const topicRows = computed(() => topicScope.value ? topicThreadRows(props.fleet, props.topic.id, collapsed.value) : []);
 
@@ -460,9 +463,12 @@ watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null
               :aria-label="`${row.isCollapsed ? 'Expand' : 'Collapse'} threads under ${row.session.branch.name}`"
               @click.stop="toggle(row.session.id)">{{ row.isCollapsed ? "▸" : "▾" }}</span>
             <span class="name">{{ row.session.branch.name || row.session.id }}</span>
-            <span v-if="['working', 'reviewing'].includes(threadStatus(row.session).kind)"
-              class="spinner mini" :title="threadStatus(row.session).label" aria-hidden="true"></span>
-            <span class="badge" :class="statusClass(row.session)" :title="threadStatus(row.session).detail">{{ threadStatus(row.session).label }}</span>
+            <span v-if="workingIds.has(row.session.id)"
+              class="spinner mini" title="working" aria-hidden="true"></span>
+            <span v-if="attentionLevel(row.session) !== 'ok'" class="thread-attention" role="img"
+              :title="attentionReason(row.session) || 'Needs attention'"
+              :aria-label="attentionReason(row.session) || 'Needs attention'">!</span>
+            <span v-if="threadBadgeLabel(row.session)" class="badge" :class="statusClass(row.session)" :title="threadStatus(row.session).detail">{{ threadBadgeLabel(row.session) }}</span>
             <span v-if="row.childCount > 0" class="badge dim" :title="`${row.childCount} delegated children`">{{ row.childCount }}</span>
           </div>
           <div class="title">{{ subtitle(row.session) }}</div>

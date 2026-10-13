@@ -13,7 +13,7 @@ import {
   visibleTopics,
 } from "../topicList";
 import { byTopicRecency, topicRecencyMap } from "../topicOrder";
-import { dismissibleAttention, pendingPermissionSummary, statusClass, threadStatus } from "../topicInspector";
+import { attentionLevel, attentionReason, dismissibleAttention, pendingPermissionSummary, statusClass, threadBadgeLabel, threadStatus, workingThreadIds } from "../topicInspector";
 import { topicRootOf, threadAncestors } from "../topic-view";
 // MODEL: a topic is a chat with a leader agent. The leader is the
 // top-level session (launched from the input above); children it delegates
@@ -91,9 +91,7 @@ function serverLabel(id: string | null): string {
 function subtitle(s: SessionSummary): string {
   return pendingPermissionSummary(s) || threadStatus(s).detail || s.branch.description || s.branch.title || "—";
 }
-function badgeLabel(s: SessionSummary): string | null {
-  return threadStatus(s).label;
-}
+const workingIds = computed(() => workingThreadIds(props.fleet));
 
 // --- Track tree --------------------------------------------------------------
 
@@ -719,23 +717,25 @@ async function archiveRow(id: string) {
               <span class="name">{{
                 row.session.branch.name || row.session.id
               }}</span>
-              <!-- A genuinely-working thread (running, mid-turn) shows a
-                   spinner; a resting one (finished turn → quiet idle mark) and
-                   terminal rows stay quiet. Loud-tag threads keep their text
-                   badge so attention/blocked never reads as ordinary progress. -->
+              <!-- Activity includes hidden descendants; attention stays visible alongside it. -->
               <span
-                v-if="
-                  ['working', 'reviewing'].includes(threadStatus(row.session).kind)
-                "
+                v-if="workingIds.has(row.session.id)"
                 class="spinner mini"
                 title="working"
                 aria-hidden="true"
               ></span>
               <span
-                v-if="badgeLabel(row.session)"
+                v-if="attentionLevel(row.session) !== 'ok'"
+                class="thread-attention"
+                role="img"
+                :title="attentionReason(row.session) || 'Needs attention'"
+                :aria-label="attentionReason(row.session) || 'Needs attention'"
+              >!</span>
+              <span
+                v-if="threadBadgeLabel(row.session)"
                 class="badge"
                 :class="statusClass(row.session)"
-                >{{ badgeLabel(row.session) }}</span
+                >{{ threadBadgeLabel(row.session) }}</span
               >
               <span
                 v-if="row.childCount > 0"
@@ -941,21 +941,25 @@ async function archiveRow(id: string) {
               <span class="topic-title">{{
                 t.session.branch.title || t.session.branch.name
               }}</span>
-              <!-- Same quiet-badge rules as inbox rows: working topic
-                   spins, resting/terminal stay quiet, loud tags stay text. -->
+              <!-- Collapsed tracks show activity anywhere in their subtree. -->
               <span
-                v-if="
-                  ['working', 'reviewing'].includes(threadStatus(t.session).kind)
-                "
+                v-if="workingIds.has(t.session.id)"
                 class="spinner mini"
                 title="working"
                 aria-hidden="true"
               ></span>
               <span
-                v-if="badgeLabel(t.session)"
+                v-if="attentionLevel(t.session) !== 'ok'"
+                class="thread-attention"
+                role="img"
+                :title="attentionReason(t.session) || 'Needs attention'"
+                :aria-label="attentionReason(t.session) || 'Needs attention'"
+              >!</span>
+              <span
+                v-if="threadBadgeLabel(t.session)"
                 class="badge"
                 :class="statusClass(t.session)"
-                >{{ badgeLabel(t.session) }}</span
+                >{{ threadBadgeLabel(t.session) }}</span
               >
               <button
                 v-if="dismissibleAttention(t.session)"
@@ -1031,8 +1035,12 @@ async function archiveRow(id: string) {
             @click.stop="toggle(child.session.id)">{{ collapsed.has(child.session.id) ? '▸' : '▾' }}</button>
           <span v-else class="topic-thread-spacer" aria-hidden="true"></span>
           <span class="topic-thread-title">{{ child.session.branch.title || child.session.branch.name }}</span>
+          <span v-if="workingIds.has(child.session.id)" class="spinner mini" title="working" aria-hidden="true"></span>
+          <span v-if="attentionLevel(child.session) !== 'ok'" class="thread-attention" role="img"
+            :title="attentionReason(child.session) || 'Needs attention'"
+            :aria-label="attentionReason(child.session) || 'Needs attention'">!</span>
           <span v-if="filteredChildCount(child.session.id)" class="badge dim">{{ filteredChildCount(child.session.id) }}</span>
-          <span v-else-if="badgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ badgeLabel(child.session) }}</span>
+          <span v-if="threadBadgeLabel(child.session)" class="badge" :class="statusClass(child.session)">{{ threadBadgeLabel(child.session) }}</span>
         </div>
         </template>
           <div v-if="!section.topics.length" class="project-empty">No tracks in this project yet.</div>
