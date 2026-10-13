@@ -73,9 +73,9 @@ The right pane is a **Track inspector** with tabs:
   Place New Thread here.
 - **Resources:** Track resources and refs, with Thread resources distinguished
   when viewing a worker. Keep Open in Zed prominent here or in the chat header.
-- **Landing:** selectable worker Threads, including working/waiting,
+- **Changes (default):** explicit declared outputs, including working/waiting,
   reported ready/stale/conflict and actual landed outcomes, with review and
-  Thread Land actions. The canonical topic destination and Track/per-thread
+  Change Land actions. The canonical topic destination and Track/per-thread
   autoland controls are visible. Publish is a separate explicit Track action.
 - **Todos:** a Track-filtered view of the durable cross-track user Todo list.
   Track plans and worker-internal checklists remain separate.
@@ -231,8 +231,8 @@ default; other workers get isolated worktrees.
 
 ## Thread landing and Track publishing
 
-**Land** accepts a worker Thread into its same-repository Track's canonical
-topic ref, defaulting to a single squash commit. The inspector's Landing
+**Land** accepts one declared Change from a worker Thread into its
+same-repository Track's canonical topic ref, defaulting to a single squash commit. The inspector's Changes
 queue permits active sources, exposes honest advisory states and actual
 successful outcomes, and excludes the coordinator/reviewer-only sources.
 A click queues wrap-up behind active ACP work without interrupting it,

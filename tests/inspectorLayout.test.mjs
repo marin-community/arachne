@@ -196,6 +196,13 @@ async function mount(t, Component, initialProps, liveTurn = null, options = {}) 
       if (command === "chat_older_cursor") return null;
       if (command === "work_summary") return { files: 1, additions: 1, deletions: 0, has_commits: true };
       if (command === "topic_todos") return { todos: [], revision: 0 };
+      if (command === "change_queue") {
+        const topic = this.fleetByUrl.get(args.baseUrl)?.find(s => s.id === args.topicId);
+        return { revision: 0, queue: { version: 1, track_session: args.topicId,
+          repo_root: topic.branch.repo_root,
+          target_branch: topic.branch.tags.find(t => t.key === "track_topic_branch")?.value ?? topic.branch.branch,
+          active: null, pending: [] } };
+      }
       if (command === "change_changes") return {
         accepted_source: false, source_ref: args.expectedChange.source_branch, head_oid: args.expectedChange.scope.head_oid,
         base: { state: "available", reference: args.expectedChange.scope.base_oid, oid: args.expectedChange.scope.base_oid },
@@ -283,7 +290,7 @@ test("review opens the inspector and expansion/restore/close preserve mounted co
   });
 });
 
-test("Changes menu and Landing review route to the selected worker without remounting it", async t => {
+test("Changes menu and Changes review route to the selected worker without remounting it", async t => {
   const { tree, calls } = await openThread(t, "worker", [track, declaredWorker("first")]);
   const textarea = find(tree, n => n.type === "textarea");
   await typeDraft(tree, "Keep me");
@@ -291,8 +298,8 @@ test("Changes menu and Landing review route to the selected worker without remou
   const changes = find(tree, n => n.type === "button" && textOf(n).startsWith("1 files"));
   click(changes); await flush();
   assert.equal(button(tree, "Review").props["aria-selected"], true);
-  click(button(tree, "Landing")); await flush();
-  const candidate = find(tree, n => hasClass(n, "inspector-candidate"));
+  click(button(tree, "Changes")); await flush();
+  const candidate = find(tree, n => hasClass(n, "change-pending"));
   click(button(candidate, "Select / review")); await flush();
   assert.equal(button(tree, "Review").props["aria-selected"], true);
   assert.equal(find(tree, n => n.type === "textarea"), textarea);
@@ -361,7 +368,7 @@ for (const entry of ["inspector", "shortcut"]) test(`expanded delegation from ${
   const composer = find(tree, n => n.type === "textarea");
   click(button(tree, "Expand inspector")); await flush();
   assert.equal(find(tree, n => hasClass(n, "thread-history")).style.display, "none");
-  if (entry === "inspector") click(button(tree, "+ New thread"));
+  if (entry === "inspector") { click(button(tree, "Threads")); await flush(); click(button(tree, "+ New thread")); }
   else globalThis.window.listeners.get("keydown")({ key: "d", ctrlKey: true, shiftKey: true, preventDefault() {} });
   await flush();
   assert.notEqual(find(tree, n => hasClass(n, "thread-history")).style.display, "none");
@@ -639,7 +646,7 @@ test("source navigation retains the tab within a known Track and resets the insp
   assert.ok(reviewRequestText(tree).value.includes("canonical accepted branch: arachne/tracks/test"));
   click(button(tree, "Select other-worker")); await flush();
   assert.ok(find(tree, n => n.props.id === "topic-inspector") !== inspector);
-  assert.equal(button(tree, "Threads").props["aria-selected"], true);
+  assert.equal(button(tree, "Changes").props["aria-selected"], true);
   assert.equal(reviewRequestText(tree), null);
   assert.ok(textOf(find(tree, n => hasClass(n, "canonical-policy"))).includes("arachne/tracks/other"));
   click(button(tree, "Review")); await flush();
@@ -755,13 +762,12 @@ for (const ids of [[], ["first"], ["first", "second"]]) test(`rendered Changes q
   const { tree, bridge, calls } = await openThread(t, "worker", [track, declared]);
   await typeDraft(tree, "Keep selected output composer");
   const composer = find(tree, n => n.type === "textarea");
-  assert.equal(button(tree, "Land"), null, "chat never lands an implicit cumulative output");
-  if (ids.length) click(button(tree, "Changes"));
-  else click(button(tree, "Landing"));
+  assert.equal(button(find(tree, n => hasClass(n, "thread-history")), "Land"), null, "chat never lands an implicit cumulative output");
+  click(button(tree, "Changes"));
   await flush();
   const candidates = tree => {
     const rows = [];
-    const visit = node => { if (hasClass(node, "inspector-candidate")) rows.push(node); node.children.forEach(visit); };
+    const visit = node => { if (hasClass(node, "change-pending")) rows.push(node); node.children.forEach(visit); };
     visit(tree); return rows;
   };
   assert.equal(candidates(tree).length, ids.length);
@@ -771,7 +777,7 @@ for (const ids of [[], ["first"], ["first", "second"]]) test(`rendered Changes q
     return;
   }
   const id = ids.at(-1), expected = declaration(id, worker);
-  assert.ok(candidates(tree).every(row => button(row, "Land").props.disabled));
+  assert.ok(candidates(tree).every(row => !button(row, "Land").props.disabled), "each exact pending output has its own Land action");
   click(button(candidates(tree).at(-1), "Select / review")); await flush();
   click(button(tree, "Expand inspector")); await flush();
   assert.equal(find(tree, n => n.type === "textarea"), composer);
@@ -799,10 +805,10 @@ for (const ids of [[], ["first"], ["first", "second"]]) test(`rendered Changes q
   emitFleet(bridge, [track, declared]); await flush();
   assert.equal(calls.filter(c => c.command === "work_changes").length, count, "recovery keeps the exact selected range");
   assert.deepEqual(calls.filter(c => c.command === "change_changes").at(-1).args.expectedChange, expected);
-  click(button(tree, "Landing")); await flush();
+  click(button(tree, "Changes")); await flush();
   const selectedRow = candidates(tree).at(-1);
   assert.equal(button(selectedRow, "Land").props.disabled, false);
-  if (ids.length > 1) assert.equal(button(candidates(tree)[0], "Land").props.disabled, true);
+  if (ids.length > 1) assert.equal(button(candidates(tree)[0], "Land").props.disabled, false, "review selection does not substitute another output");
   click(button(selectedRow, "Land")); await flush();
   const land = calls.find(c => c.command === "land_change");
   assert.equal(land.args.baseUrl, localUrl);
@@ -810,4 +816,49 @@ for (const ids of [[], ["first"], ["first", "second"]]) test(`rendered Changes q
   assert.equal(land.args.changeId, id);
   assert.deepEqual(land.args.expectedChange, expected);
   assert.equal(find(tree, n => n.type === "textarea"), composer);
+});
+
+for (const selectedBackend of [localUrl, "https://queue.example"]) test(`Changes queue ordering and active protection preserve expanded composer and corner icons on ${selectedBackend}`, async t => {
+  const declared = declaredWorker("first", "second", "third");
+  const { tree, bridge, calls } = await openThread(t, "worker", [track, declared]);
+  if (selectedBackend !== localUrl) {
+    await registerRemote(tree, bridge, selectedBackend, [track, declared]);
+    bridge.selectionUrl = selectedBackend;
+    click(button(tree, "Select worker")); await flush();
+  }
+  const changes = ["first", "second", "third"].map(id => declaration(id, worker));
+  const entry = change => ({ change, strategy: "squash", requested_by: "user" });
+  let view = { revision: 4, queue: { version: 1, track_session: "track", repo_root: track.branch.repo_root,
+    target_branch: "arachne/tracks/test", active: entry(changes[0]), pending: changes.slice(1).map(entry) } };
+  const original = bridge.invoke.bind(bridge);
+  bridge.invoke = async (command, args) => {
+    if (!["change_queue", "reorder_change_queue"].includes(command)) return original(command, args);
+    calls.push({ command, args });
+    assert.equal(args.baseUrl, selectedBackend, "queue keeps selected backend ownership");
+    assert.equal(args.topicId, "track");
+    if (command === "reorder_change_queue") {
+      assert.equal(args.expectedRevision, view.revision);
+      assert.deepEqual(args.order, [changes[2], changes[1]]);
+      view = { revision: view.revision + 1, queue: { ...view.queue, pending: args.order.map(entry) } };
+    }
+    return view;
+  };
+  bridge.listeners.get("loom://fleet")({ payload: { server_url: selectedBackend, sessions: [track, declared], layout: emptyLayout } }); await flush();
+  click(button(tree, "Changes")); await flush();
+  await typeDraft(tree, "Keep queue follow up");
+  const composer = find(tree, n => n.type === "textarea");
+  assert.ok(find(tree, n => n.props["aria-label"] === "Active acceptance"));
+  assert.equal(button(tree, "Move Output first up"), null);
+  const expand = button(tree, "Expand inspector");
+  assert.ok(find(expand, n => n.type === "svg"));
+  const expandPath = find(expand, n => n.type === "path").props.d;
+  click(expand); await flush();
+  assert.notEqual(find(button(tree, "Restore inspector"), n => n.type === "path").props.d, expandPath);
+  click(button(tree, "Move Output third up")); await flush();
+  assert.deepEqual(view.queue.active, entry(changes[0]), "active claim remains intact");
+  assert.ok(view.queue.pending.every(item => item.requested_by === "user"));
+  assert.equal(find(tree, n => n.type === "textarea"), composer);
+  assert.equal(composer.value, "Keep queue follow up");
+  assert.equal(find(tree, n => hasClass(n, "thread-history")).style.display, "none");
+  assert.equal(calls.filter(c => c.command === "reorder_change_queue").length, 1);
 });

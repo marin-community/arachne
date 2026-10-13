@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { backendOf } from "../backendIdentity";
 import { useBackendInvoke } from "../backendInvoke";
 
@@ -10,10 +10,11 @@ import ChangeReview from "./ChangeReview.vue";
 import { reviewIntegrationTarget } from "../reviewRequest";
 import TrackActivity from "./TrackActivity.vue";
 import AutolandControl from "./AutolandControl.vue";
-import { canonicalTopicBranch, isTrackCoordinator, resolveTrack, threadLandFeedback, type IntegrationTarget } from "../trackPolicy.ts";
+import { canonicalTopicBranch, isTrackCoordinator, resolveTrack, type IntegrationTarget } from "../trackPolicy.ts";
 import { selectionKey, changeRegistry, pinSelection, sameChange, selectedChangePayload, selectionProblem, type ChangeSelection } from "../durableChange.ts";
 import { landStrategies, strategyMemoryKey } from "../trackStrategies.ts";
 import SplitButton from "./SplitButton.vue";
+import { compareQueueSnapshots, projectChangeQueue, queuedLandFeedback, reorderedDeclarations, validateQueueView, type QueueView, type TimelineRow } from "../changeQueue.ts";
 import {
   landingCandidates,
   type LandingCandidate,
@@ -25,7 +26,7 @@ import {
 
 const invoke = useBackendInvoke();
 
-// Track inspector: workers, review, and the canonical Landing queue.
+// Track inspector: Changes, workers, and review.
 
 const props = defineProps<{
   topic: SessionSummary | SessionView;
@@ -52,12 +53,7 @@ const emit = defineEmits<{
   (e: "policy-updated", session: SessionView): void;
 }>();
 
-const candidateLabels = { working: "Working output", waiting: "Declared output", blocked: "Needs reconciliation", landed: "Landed" };
-const tab = ref<"threads" | "review" | "resources" | "landing" | "todos" | "activity" | "handoffs">("threads");
-watch(() => props.artifactRequest, target => { if (target) tab.value = "resources"; }, { immediate: true });
-watch(() => props.reviewRequest, request => {
-  if (request && request.sessionId === props.selectedId) tab.value = "review";
-}, { immediate: true });
+const tab = ref<"threads" | "review" | "resources" | "changes" | "todos" | "activity" | "handoffs">("changes");
 // A SessionView is enough to request the server comparison. Only fleet summaries
 // carry ancestry; never classify an absent summary as a root/coordinator.
 const topicScope = computed(() => props.fleet.find(session => session.id === (props.scopeId ?? props.topic.id)) ?? null);
@@ -84,7 +80,7 @@ function reviewCandidate(candidate: LandingCandidate) { selectCandidate(candidat
 watch(() => props.selectedId, id => {
   if (selectedChange.value && selectedChange.value.sourceId !== id) selectedChange.value = null;
 });
-watch(() => props.landingRequest, () => { tab.value = "landing"; }, { immediate: !!props.landingRequest });
+
 
 // --- Threads tab -----------------------------------------------------------
 //
@@ -118,28 +114,168 @@ const sessionRepo = (s: SessionSummary) => s.github_repo || s.branch.repo_root;
 const integratingId = ref<string | null>(null);
 const integrationNote = ref("");
 
-// Land requests wrap-up and acceptance; only a reported outcome means completion.
-async function onLand(candidate: LandingCandidate, strategy: string) {
-  if (integratingId.value) return;
-  const selected = selectedChange.value;
-  if (!selected || selectionKey(selected) !== candidate.key || !sameChange(selected.change, candidate.change) || selectedProblem.value || candidate.state === "blocked" || candidate.state === "landed") return;
-  integratingId.value = candidate.key;
-  const topicId = props.topic.id;
-  integrationNote.value = "";
+// Queue reads are driven by Track/fleet updates, never a client drain loop.
+const queueView = ref<QueueView | null>(null);
+const queueLoading = ref(false);
+const queueBusy = ref(false);
+const queueError = ref("");
+const orderNote = ref("");
+const discovered = ref<string[]>([]);
+const draggedKey = ref<string | null>(null);
+let viewEpoch = 0;
+let readSequence = 0;
+let appliedQueue: QueueView | null = null;
+let conflictingRevision: number | null = null;
+let alive = true;
+onBeforeUnmount(() => { alive = false; viewEpoch++; readSequence++; });
+const captureOwner = () => ({ topicId: props.topic.id, backend: backendOf(props.topic.id), epoch: viewEpoch });
+const isCurrent = (owner: ReturnType<typeof captureOwner>) => alive && owner.epoch === viewEpoch && owner.topicId === props.topic.id && owner.backend === backendOf(props.topic.id);
+const timeline = computed(() => projectChangeQueue(queueView.value, candidates.value, props.topic.id, discovered.value));
+const canReorder = computed(() => timeline.value.canReorder && !queueLoading.value && !queueBusy.value && !integratingId.value && !queueError.value);
+
+function applyQueueSnapshot(next: QueueView, allowRestore = true) {
   try {
-    const target = await invoke<IntegrationTarget>(
-      "land_change",
-      { ...selectedChangePayload(selected), strategy },
-    );
-    try { localStorage.setItem(strategyMemoryKey("land", sessionRepo(candidate.session)), strategy); } catch { /* unavailable storage */ }
-    if (props.topic.id === topicId) integrationNote.value = threadLandFeedback(target);
+    if (conflictingRevision !== null && next.revision <= conflictingRevision) {
+      throw new Error("Conflicting Changes queue data. Reconcile the queue before continuing.");
+    }
+    const relation = compareQueueSnapshots(appliedQueue, next);
+    if (relation === "older" || (relation === "same" && !allowRestore)) return relation;
+    appliedQueue = next;
+    conflictingRevision = null;
+    queueView.value = next;
+    queueError.value = "";
+    return relation;
   } catch (error: any) {
-    if (topicId !== props.topic.id) return;
-    emit("error", error?.message ?? String(error));
-  } finally {
-    integratingId.value = null;
+    conflictingRevision = Math.max(conflictingRevision ?? 0, appliedQueue?.revision ?? 0, next.revision);
+    queueView.value = null;
+    queueError.value = error?.message ?? String(error);
+    throw error;
   }
 }
+
+async function refreshQueue(owner = captureOwner()) {
+  if (!isCurrent(owner) || !topicScope.value || !isTrackCoordinator(topicScope.value)) return;
+  const sequence = ++readSequence;
+  const topic = topicScope.value;
+  if (!topic) return;
+  queueLoading.value = true;
+  try {
+    const next = validateQueueView(await invoke<QueueView>("change_queue", { topicId: owner.topicId }, owner.backend), topic);
+    if (!isCurrent(owner)) return;
+    // Revision determines freshness; request order only owns loading/errors.
+    applyQueueSnapshot(next, sequence === readSequence);
+  } catch (error: any) {
+    if (!isCurrent(owner) || sequence !== readSequence) return;
+    queueView.value = null;
+    queueError.value = error?.message ?? String(error);
+  } finally {
+    if (isCurrent(owner) && sequence === readSequence) queueLoading.value = false;
+  }
+}
+
+async function movePending(from: number, to: number) {
+  if (!canReorder.value || from === to || from < 0 || to < 0 || from >= timeline.value.pending.length || to >= timeline.value.pending.length) return;
+  const owner = captureOwner();
+  const topic = topicScope.value;
+  if (!topic) return;
+  const revision = queueView.value!.revision;
+  const order = reorderedDeclarations(timeline.value.pending, from, to);
+  queueBusy.value = true;
+  orderNote.value = "";
+  let receivedReply = false;
+  try {
+    const next = await invoke<QueueView>("reorder_change_queue", { topicId: owner.topicId, expectedRevision: revision, order }, owner.backend);
+    receivedReply = true;
+    if (!isCurrent(owner)) return;
+    // A committed write may arrive after a newer coordinator claim. It must
+    // neither roll back that snapshot nor retire an in-flight fleet read.
+    const relation = applyQueueSnapshot(validateQueueView(next, topic));
+    orderNote.value = relation === "older" ? "Order saved; the queue has since advanced."
+      : `Moved ${order[to].title} to position ${to + 1}.`;
+  } catch (error: any) {
+    if (!isCurrent(owner)) return;
+    await refreshQueue(owner);
+    if (isCurrent(owner)) orderNote.value = `${receivedReply ? "Could not verify the updated queue." : "Order was not saved."} ${error?.message ?? String(error)} ${queueError.value ? "Queue refresh also failed." : "Refreshed the queue; try again."}`;
+  } finally {
+    if (isCurrent(owner)) queueBusy.value = false;
+  }
+}
+function startDrag(row: TimelineRow, event: DragEvent) {
+  if (!canReorder.value) { event.preventDefault(); return; }
+  draggedKey.value = row.key;
+  if (event.dataTransfer) { event.dataTransfer.effectAllowed = "move"; event.dataTransfer.setData("text/plain", row.key); }
+}
+function dropPending(to: number) {
+  const from = timeline.value.pending.findIndex(row => row.key === draggedKey.value);
+  draggedKey.value = null;
+  if (from >= 0) void movePending(from, to);
+}
+function canLand(candidate: LandingCandidate) {
+  const fresh = candidates.value.find(item => item.key === candidate.key);
+  return !!queueView.value && !queueError.value && !queueLoading.value && !queueBusy.value && !integratingId.value
+    && !!fresh && sameChange(fresh.change, candidate.change) && !["blocked", "unavailable", "landed"].includes(fresh.state)
+    && resolveTrack(props.fleet, fresh.session.id)?.id === props.topic.id
+    && timeline.value.active?.key !== candidate.key
+    && !timeline.value.pending.find(row => row.key === candidate.key)?.problem;
+}
+
+// Each click captures its own exact declaration; review selection never substitutes it.
+async function onLand(candidate: LandingCandidate, strategy: string) {
+  if (!canLand(candidate)) return;
+  const selected = pinSelection(candidate.session.id, candidate.change);
+  if (selectionProblem(selected, candidates.value.find(item => item.key === candidate.key)?.session)) return;
+  const owner = captureOwner();
+  integratingId.value = candidate.key;
+  integrationNote.value = "";
+  try {
+    const target = await invoke<IntegrationTarget>("land_change", { ...selectedChangePayload(selected), strategy }, owner.backend);
+    if (!isCurrent(owner)) return;
+    try { localStorage.setItem(strategyMemoryKey("land", sessionRepo(candidate.session)), strategy); } catch { /* unavailable storage */ }
+    integrationNote.value = queuedLandFeedback(target);
+    await refreshQueue(owner);
+  } catch (error: any) {
+    if (!isCurrent(owner)) return;
+    integrationNote.value = error?.message ?? String(error);
+    emit("error", integrationNote.value);
+    await refreshQueue(owner);
+  } finally {
+    if (isCurrent(owner)) integratingId.value = null;
+  }
+}
+
+watch(() => [props.topic.id, props.topic.branch.repo_root, canonicalTopicBranch(props.topic)], (next, previous) => {
+  // Fleet snapshots can replace the summary object without changing ownership.
+  if (previous && next.every((value, index) => value === previous[index])) return;
+  viewEpoch++;
+  readSequence++;
+  queueView.value = null;
+  appliedQueue = null;
+  conflictingRevision = null;
+  queueError.value = "";
+  queueBusy.value = false;
+  queueLoading.value = false;
+  integratingId.value = null;
+  integrationNote.value = "";
+  orderNote.value = "";
+  discovered.value = [];
+  draggedKey.value = null;
+}, { immediate: true, flush: "sync" });
+watch(() => [props.topic.id, props.topic.branch.repo_root, canonicalTopicBranch(props.topic), props.fleet], () => {
+  const known = new Set(discovered.value);
+  discovered.value = [...discovered.value, ...candidates.value.map(candidate => candidate.key).filter(key => !known.has(key)).sort()];
+  void refreshQueue();
+}, { immediate: true, deep: true });
+watch(() => [props.scopeId ?? props.topic.id, props.artifactRequest, props.landingRequest, props.reviewRequest] as const, ([scopeId, target, request, review], previous) => {
+  const initial = !previous;
+  const changedTrack = initial || (!props.scopeId && scopeId !== previous[0]);
+  const openedArtifact = !!target && (initial || target !== previous[1]);
+  const openedReview = review?.sessionId === props.selectedId && (initial || review !== previous[3]);
+  // Explicit navigation wins; ancestry enrichment keeps the existing review
+  // and composer. A later Changes request can replace a retained artifact.
+  if (openedArtifact || (changedTrack && target)) tab.value = "resources";
+  else if (openedReview) tab.value = "review";
+  else if (changedTrack || request !== previous[2]) tab.value = "changes";
+}, { immediate: true, flush: "post" });
 
 // --- Todos tab --------------------------------------------------------------
 //
@@ -285,12 +421,12 @@ watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null
       <AutolandControl :session="topicScope" :track="topicScope" coordinator @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
     </div>
     <div class="tab-bar inspector-tab-bar" role="tablist">
+      <button class="tab" :class="{ active: tab === 'changes' }" role="tab" :aria-selected="tab === 'changes'" :disabled="!topicScope" @click="tab = 'changes'">Changes</button>
       <button class="tab" :class="{ active: tab === 'threads' }" role="tab" :aria-selected="tab === 'threads'" :disabled="!topicScope" @click="tab = 'threads'">Threads</button>
       <button class="tab" :class="{ active: tab === 'review' }" role="tab" :aria-selected="tab === 'review'" @click="tab = 'review'">Review</button>
       <button class="tab" :class="{ active: tab === 'handoffs' }" role="tab" :aria-selected="tab === 'handoffs'" :disabled="!topicScope" @click="tab = 'handoffs'">Handoffs</button>
       <button class="tab" :class="{ active: tab === 'activity' }" role="tab" :aria-selected="tab === 'activity'" :disabled="!topicScope" @click="tab = 'activity'">Activity</button>
       <button class="tab" :class="{ active: tab === 'resources' }" role="tab" :aria-selected="tab === 'resources'" :disabled="!topicScope" @click="tab = 'resources'">Resources</button>
-      <button class="tab" :class="{ active: tab === 'landing' }" role="tab" :aria-selected="tab === 'landing'" :disabled="!topicScope" @click="tab = 'landing'">Landing</button>
       <button class="tab" :class="{ active: tab === 'todos' }" role="tab" :aria-selected="tab === 'todos'" :disabled="!topicScope" @click="tab = 'todos'">Todos</button>
     </div>
 
@@ -353,41 +489,74 @@ watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null
       <ResourcePanel :key="loomUrl" :artifact-request="artifactRequest" :topic="topicScope" :can-edit="canEdit" embedded @checkout-saved="emit('checkout-saved', $event)" @error="(message: string) => emit('error', message)" />
     </div>
 
-    <!-- Landing includes active work, advisory readiness, and accepted outcomes. -->
-    <div v-else-if="tab === 'landing' && topicScope" class="inspector-body">
-      <div v-if="integrationNote" class="inspector-note">{{ integrationNote }}</div>
+    <div v-else-if="tab === 'changes' && topicScope" class="inspector-body changes-body">
+      <div v-if="integrationNote" class="inspector-note" role="status">{{ integrationNote }}</div>
+      <div v-if="orderNote" class="inspector-note" role="status">{{ orderNote }}</div>
+      <div v-if="queueError" class="inspector-note inspector-note-error" role="alert">
+        {{ queueError }} <button class="link" :disabled="queueLoading" @click="refreshQueue()">Refresh</button>
+      </div>
       <div v-if="selectedProblem" class="inspector-note inspector-note-error" role="alert">{{ selectedProblem }}</div>
       <div v-for="message in registryErrors" :key="message" class="inspector-note inspector-note-error" role="alert">{{ message }}</div>
-      <div v-if="!candidates.length" class="inspector-empty">
-        No declared Changes.<br />
-        <small>Threads with no explicit outputs require no Land.</small>
-      </div>
-      <div v-for="candidate in candidates" :key="candidate.key" class="inspector-candidate" :class="{ selected: selectedChange && candidate.key === selectionKey(selectedChange) }">
-        <div class="inspector-candidate-head">
-          <button class="link name" :aria-pressed="!!selectedChange && candidate.key === selectionKey(selectedChange)" @click="selectCandidate(candidate)">{{ candidate.change.title }}</button>
-          <span class="badge" :class="candidate.state === 'landed' ? 'done' : 'dim'">
-            {{ candidateLabels[candidate.state] }}
-          </span>
+      <div v-if="queueLoading && !queueView" class="inspector-empty" role="status">Loading Changes…</div>
+      <section v-if="timeline.active" class="changes-section" aria-label="Active acceptance">
+        <h3>In progress</h3>
+        <div class="change-row change-active">
+          <span class="change-marker"><span class="spinner mini" aria-hidden="true"></span></span>
+          <div class="change-content">
+            <strong>{{ timeline.active.change.title }}</strong>
+            <span class="change-status">Acceptance in progress</span>
+            <div class="change-meta">{{ timeline.active.candidate?.session.branch.name || 'Source unavailable' }} · <code>{{ timeline.active.change.scope.head_oid.slice(0, 8) }}</code></div>
+            <p v-if="timeline.active.problem" class="change-problem">{{ timeline.active.problem }}</p>
+            <details><summary>Details</summary><p><code>{{ timeline.active.change.scope.base_oid.slice(0, 8) }} → {{ timeline.active.change.scope.head_oid }}</code></p><p>{{ timeline.active.change.source_branch }} · {{ timeline.active.change.scope.paths.join(', ') || 'Entire pinned range' }}</p></details>
+            <button v-if="timeline.active.candidate" class="link" :disabled="!!timeline.active.problem" @click="reviewCandidate(timeline.active.candidate)">Review</button>
+          </div>
         </div>
-        <div class="inspector-candidate-sub">
-          {{ candidate.key }} · {{ candidate.change.scope.kind }}<br />
-          {{ candidate.change.scope.base_oid.slice(0, 10) }} → {{ candidate.change.scope.head_oid.slice(0, 10) }} · {{ candidate.change.scope.paths.length ? candidate.change.scope.paths.join(', ') : 'entire pinned range' }}<br />
-          {{ candidate.note || candidate.session.branch.branch }}
-        </div>
-        <AutolandControl :session="candidate.session" :track="topicScope" @updated="emit('policy-updated', $event)" @error="emit('error', $event)" />
-        <div class="inspector-candidate-actions">
-          <button v-if="candidate.state !== 'landed'" class="link" :disabled="candidate.state === 'blocked'" @click="reviewCandidate(candidate)">Select / review</button>
-          <SplitButton
-            v-if="candidate.state !== 'landed' && candidate.state !== 'blocked'"
-            kind="land"
-            :repo="sessionRepo(candidate.session)"
-            :options="landOptions"
-            label="Land"
-            :busy="integratingId === candidate.key"
-            :disabled="!!integratingId || !selectedChange || candidate.key !== selectionKey(selectedChange) || !sameChange(selectedChange.change, candidate.change) || !!selectedProblem"
-            @run="(strategy: string) => onLand(candidate, strategy)"
-          />
-        </div>
+      </section>
+      <section v-if="timeline.pending.length" class="changes-section" aria-label="Pending Changes">
+        <h3>Pending <span>{{ timeline.pending.length }}</span></h3>
+        <ol class="changes-timeline">
+          <li v-for="(row, index) in timeline.pending" :key="row.key" class="change-row change-pending"
+            :class="{ 'change-blocked': !!row.problem, selected: selectedChange && row.key === selectionKey(selectedChange) }"
+            :draggable="canReorder" @dragstart="startDrag(row, $event)" @dragend="draggedKey = null"
+            @dragover.prevent @drop.prevent="dropPending(index)">
+            <span class="change-marker" aria-hidden="true">{{ index + 1 }}</span>
+            <div class="change-content">
+              <button v-if="row.candidate" class="link name" :aria-pressed="!!selectedChange && row.key === selectionKey(selectedChange)" @click="selectCandidate(row.candidate)">{{ row.change.title }}</button>
+              <strong v-else>{{ row.change.title }}</strong>
+              <span class="change-status">{{ row.status }}</span>
+              <div class="change-meta">{{ row.candidate?.session.branch.name || 'Source unavailable' }} · <code>{{ row.change.scope.head_oid.slice(0, 8) }}</code></div>
+              <p v-if="row.problem" class="change-problem">{{ row.problem }}</p>
+              <details><summary>Details</summary><p><code>{{ row.change.scope.base_oid.slice(0, 8) }} → {{ row.change.scope.head_oid }}</code></p><p>{{ row.change.source_branch }} · {{ row.change.scope.paths.join(', ') || 'Entire pinned range' }}</p><p>{{ row.candidate?.note }}</p></details>
+              <div class="change-actions">
+                <button v-if="row.candidate" class="link" :disabled="!!row.problem" @click="reviewCandidate(row.candidate)">Select / review</button>
+                <SplitButton v-if="row.candidate && !row.problem && row.candidate.state !== 'landed'"
+                  kind="land" :repo="sessionRepo(row.candidate.session)" :options="landOptions" label="Land"
+                  :busy="integratingId === row.key" :disabled="!canLand(row.candidate)"
+                  @run="(strategy: string) => row.candidate && onLand(row.candidate, strategy)" />
+              </div>
+            </div>
+            <div class="change-order" role="group" :aria-label="`Reorder ${row.change.title}`">
+              <button :aria-label="`Move ${row.change.title} up`" :disabled="!canReorder || index === 0" @click="movePending(index, index - 1)">↑</button>
+              <button :aria-label="`Move ${row.change.title} down`" :disabled="!canReorder || index === timeline.pending.length - 1" @click="movePending(index, index + 1)">↓</button>
+            </div>
+          </li>
+        </ol>
+      </section>
+      <section v-if="timeline.history.length" class="changes-section changes-history" aria-label="Landed history">
+        <h3>Landed</h3>
+        <ol class="changes-timeline">
+          <li v-for="row in timeline.history" :key="row.key" class="change-row change-landed">
+            <span class="change-marker" aria-hidden="true">✓</span>
+            <div class="change-content">
+              <strong>{{ row.change.title }}</strong><span class="change-status">Landed</span>
+              <div class="change-meta">{{ row.candidate?.session.branch.name }} · <code>{{ row.change.scope.head_oid.slice(0, 8) }}</code></div>
+              <details><summary>Details</summary><p>{{ row.candidate?.note }}</p></details>
+            </div>
+          </li>
+        </ol>
+      </section>
+      <div v-if="!queueLoading && !timeline.active && !timeline.pending.length && !timeline.history.length" class="inspector-empty">
+        No declared Changes.<br /><small>Threads with no explicit outputs require no Land.</small>
       </div>
     </div>
 
@@ -426,5 +595,34 @@ watch(() => props.scopeId ?? props.topic.id, () => { selectedChange.value = null
 .inspector-tab-bar .tab { padding: 7px 6px; }
 .inspector-review-context { padding: 8px 12px; font-size: 12px; color: var(--text-dim); border-bottom: 1px solid var(--border); }
 .canonical-policy { display: flex; flex-direction: column; gap: 7px; padding: 10px 12px; font-size: 12px; overflow-wrap: anywhere; }
-.inspector-candidate.selected { outline: 1px solid var(--accent); }
+.changes-body { padding: 10px 12px; }
+.changes-section { margin-bottom: 16px; }
+.changes-section h3 { display: flex; gap: 6px; margin: 0 0 7px; color: var(--text-dim); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+.changes-section h3 span { font-weight: 400; }
+.changes-timeline { list-style: none; padding: 0; margin: 0; }
+.change-row { position: relative; display: flex; align-items: flex-start; gap: 9px; padding: 9px 4px; border-radius: 5px; }
+.change-row + .change-row::before { content: ""; position: absolute; left: 14px; top: -9px; height: 18px; border-left: 1px solid var(--border); }
+.change-marker { display: flex; align-items: center; justify-content: center; flex: 0 0 21px; height: 21px; border: 1px solid var(--border); border-radius: 50%; color: var(--text-dim); font-size: 10px; background: var(--bg); z-index: 1; }
+.change-content { flex: 1; min-width: 0; font-size: 12px; }
+.change-content > strong, .change-content > .name { display: block; text-align: left; color: var(--text); line-height: 1.4; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.change-status { display: block; margin-top: 2px; font-size: 11px; color: var(--text-dim); }
+.change-meta { margin-top: 3px; color: var(--text-dim); font-size: 10px; overflow-wrap: anywhere; }
+.change-meta code { font-size: inherit; }
+.change-actions { display: flex; align-items: center; gap: 9px; margin-top: 5px; }
+.change-order { display: flex; flex-direction: column; gap: 2px; }
+.change-order button { min-width: 25px; min-height: 25px; padding: 2px 5px; font-size: 13px; }
+.change-order button:disabled { opacity: .3; }
+.change-row.selected { outline: 1px solid var(--accent); }
+.change-active { background: color-mix(in srgb, var(--accent) 9%, transparent); }
+.change-active .change-marker { border-color: var(--accent); }
+.change-active .change-status { color: var(--accent); }
+.change-landed .change-marker { border-color: var(--ok); color: var(--ok); }
+.change-landed .change-status { color: var(--ok); }
+.changes-history { padding-top: 12px; border-top: 1px solid var(--border); }
+.change-content details { margin-top: 5px; color: var(--text-dim); font-size: 11px; overflow-wrap: anywhere; }
+.change-content summary { cursor: pointer; }
+.change-problem { margin: 4px 0; color: var(--blocked); font-size: 11px; overflow-wrap: anywhere; }
+.change-blocked .change-marker { border-color: var(--blocked); }
+.change-row:focus-within { background: color-mix(in srgb, var(--accent) 6%, transparent); }
+.change-row button:focus-visible, .change-content summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 </style>

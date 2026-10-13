@@ -22,12 +22,12 @@ const argumentIdentityKeys = new Set([
 export type BackendTransport = <T>(command: string, args: Record<string, unknown>) => Promise<T>;
 
 /** Resolve ownership before touching the transport. No active/global server fallback. */
-export function resolveBackendArgs(args: Record<string, unknown>, baseUrl?: string | null): { baseUrl: string; args: Record<string, unknown> } {
+export function resolveBackendArgs(args: Record<string, unknown>, baseUrl?: string | null, preserveOrder = false): { baseUrl: string; args: Record<string, unknown> } {
   const servers = new Set<string>();
   function strip(value: unknown, key = ""): unknown {
     // This exact declaration is authenticated by the owning server. Its local
     // IDs must never be interpreted as shared UI references.
-    if (key === "expectedChange") return value;
+    if (key === "expectedChange" || (preserveOrder && key === "order")) return value;
     if (typeof value === "string") {
       const identity = argumentIdentityKeys.has(key) ? splitScopedId(value) : null;
       if (identity) { servers.add(identity.baseUrl); return identity.id; }
@@ -80,13 +80,26 @@ export function scopeBackendResult<T>(command: string, baseUrl: string, result: 
 }
 export function createBackendInvoke(transport: BackendTransport) {
   return async function invoke<T>(command: string, args: Record<string, unknown> = {}, baseUrl?: string | null): Promise<T> {
-    const resolved = resolveBackendArgs(args, baseUrl);
+    const resolved = resolveBackendArgs(args, baseUrl, command === "reorder_change_queue");
     if (["change_changes", "land_change", "review_session", "send_input"].includes(command)
       && (!["review_session", "send_input"].includes(command) || args.changeId != null || args.expectedChange != null)) {
       const selected = parseChange(args.expectedChange);
       const sourceId = command === "review_session" ? resolved.args.sourceId : command === "send_input" ? resolved.args.id : resolved.args.sessionId;
       if (!selected || selected.id !== args.changeId || selected.source_session !== sourceId) {
         throw new Error("The selected Change does not match its owning source and exact wire declaration.");
+      }
+    }
+    if (["change_queue", "reorder_change_queue"].includes(command)) {
+      if (typeof resolved.args.topicId !== "string" || !resolved.args.topicId) throw new Error("The Changes queue requires an owning Track.");
+      if (command === "reorder_change_queue") {
+        if (!Number.isSafeInteger(args.expectedRevision) || (args.expectedRevision as number) < 0 || !Array.isArray(args.order)) throw new Error("The Changes order requires an exact queue revision and declarations.");
+        const seen = new Set<string>();
+        for (const value of args.order) {
+          const change = parseChange(value);
+          const key = change && JSON.stringify([change.source_session, change.id]);
+          if (!change || splitScopedId(change.source_session) || !key || seen.has(key)) throw new Error("The Changes order requires unique exact wire declarations.");
+          seen.add(key);
+        }
       }
     }
     return scopeBackendResult(command, resolved.baseUrl, await transport<T>(command, resolved.args));
@@ -100,7 +113,7 @@ export function useBackendInvoke(owner?: MaybeRefOrGetter<string | null | undefi
     // A session/resource owns its calls even when the operation composer points elsewhere.
     const hasOwner = (value: unknown, key = ""): boolean => typeof value === "string" ? argumentIdentityKeys.has(key) && !!splitScopedId(value)
       : Array.isArray(value) ? value.some(item => hasOwner(item, key))
-      : !!value && typeof value === "object" && Object.entries(value).some(([key, val]) => hasOwner(val, key));
+      : !!value && typeof value === "object" && Object.entries(value).some(([key, val]) => key !== "expectedChange" && (key !== "order" || command !== "reorder_change_queue") && hasOwner(val, key));
     return backendInvoke<T>(command, args, baseUrl ?? (hasOwner(args) || args.baseUrl ? undefined : backendUrl.value));
   };
 }

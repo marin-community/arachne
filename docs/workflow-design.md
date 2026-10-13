@@ -296,7 +296,7 @@ This should be coordinator judgment or Track policy, not an inflexible runtime r
 # 10. Explicit Changes land into accepted Track state
 
 Threads produce ZERO, ONE or MULTIPLE explicit Changes (bounded branches/diffs).
-The Landing queue contains Changes, each with a stable source-qualified ID,
+The Changes tab contains the queue of Changes, each with a stable source-qualified ID,
 title, original repository/branch/worktree, immutable scope, authenticated
 intended-completion reference and per-output receipt. See
 [Change v1 contract](thread-landing-contract.md). Status, title, completion and
@@ -928,7 +928,7 @@ First:
 3. give coordinator straightforward spawn/review/send-to-thread tools;
 4. normalize concise worker result/handoff;
 5. make review spawning easy;
-6. make declared Change Land available in the Track Landing queue;
+6. make declared Change Land available in the Track Changes queue;
 7. make Attention require explicit human escalation;
 8. improve UI visibility into active/ready/waiting/resting Threads.
 

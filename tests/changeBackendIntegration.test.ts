@@ -86,6 +86,7 @@ test("rendered inspectors select colliding outputs independently and offline sou
   const calls: any[] = [];
   const transport = async (command: string, args: any) => {
     if (command === "topic_todos") return { todos: [], revision: 0 };
+    if (command === "change_queue") return { revision: 0, queue: { version: 1, track_session: "track", repo_root: "/repo", target_branch: "accepted/topic", active: null, pending: [] } };
     calls.push({ command, args });
     return { coordinator_id: "track", coordinator_name: "Track", target_branch: "accepted/topic" };
   };
@@ -112,6 +113,37 @@ test("rendered inspectors select colliding outputs independently and offline sou
   assert.equal(calls.length, count);
   assert.equal(panels[0].state.candidates.length, 1, "healthy A keeps its actionable queue");
   assert.equal(panels[0].state.selectedProblem, "");
+});
+
+test("rendered Changes distinguishes unavailable identity and blocks stale review and Land", async t => {
+  const track = scoped(a, root()), healthy = scoped(a, worker());
+  const calls: string[] = [];
+  const panel = mountRoutingComponent("TopicInspector", { topic: track, fleet: [track, healthy], selectedId: healthy.id, backendUrl: a, landingRequest: 1 }, async command => {
+    if (command === "topic_todos") return { todos: [], revision: 0 };
+    if (command === "change_queue") return { revision: 0, queue: { version: 1, track_session: "track", repo_root: "/repo", target_branch: "accepted/topic", active: null, pending: [] } };
+    calls.push(command); return {};
+  }, true);
+  t.after(panel.stop); await settle();
+  panel.elements(el => el.type === "button" && el.props.class === "link name")[0].props.onClick();
+  await nextTick();
+  assert.equal(panel.state.selectedProblem, "");
+  const unavailable = { ...healthy, work_dir: "", change_identity_problem: "unavailable" };
+  panel.props.fleet = [track, unavailable]; await nextTick();
+  assert.equal(panel.state.candidates[0].state, "unavailable");
+  assert.ok(panel.elements(el => el.type === "span" && el.text === "Identity unavailable").length);
+  assert.equal(panel.elements(el => el.type === "span" && el.text === "Needs reconciliation").length, 0);
+  assert.equal(Boolean(panel.elements(el => el.type === "button" && el.text === "Select / review")[0].props.disabled), true);
+  assert.match(panel.state.selectedProblem, /evidence is unavailable/);
+  await panel.state.onLand(panel.state.candidates[0], "squash");
+  assert.deepEqual(calls, []);
+  panel.props.fleet = [track, { ...unavailable, change_identity_problem: "conflict" }]; await nextTick();
+  assert.equal(panel.state.candidates[0].state, "blocked");
+  assert.ok(panel.elements(el => el.type === "span" && el.text === "Needs reconciliation").length);
+  await panel.state.onLand(panel.state.candidates[0], "squash");
+  assert.deepEqual(calls, []);
+  panel.props.fleet = [track, healthy]; await nextTick();
+  assert.equal(panel.state.candidates[0].state, "waiting");
+  assert.equal(panel.state.selectedProblem, "");
 });
 
 test("actual selected preview, review and Prepare use each backend's local declaration and source", async t => {

@@ -126,3 +126,28 @@ test("newer main policy, restore, Land and Publish commands keep owning backend 
     assert.ok(calls.every(call => call.args.baseUrl === baseUrl && (call.args.sessionId ?? call.args.id) === "same"));
   }
 });
+
+test("queue commands use the Track owner and preserve raw declarations and queue evidence", async () => {
+  const { declaration } = await import("./fixtures/durable-change.mjs");
+  const change = declaration();
+  const view = { revision: 4, queue: { version: 1, track_session: "track", repo_root: "/repo", target_branch: "accepted/topic",
+    active: { change, requested_by: "autoland", strategy: "merge" }, pending: [] } };
+  const calls: any[] = [];
+  const invoke = createBackendInvoke(async <T>(command: string, args: any) => { calls.push({ command, args }); return view as T; });
+  for (const url of [a, b]) {
+    assert.deepEqual(await invoke("change_queue", { topicId: scopedId(url, "track") }), view);
+    assert.deepEqual(await invoke("reorder_change_queue", { topicId: scopedId(url, "track"), expectedRevision: 4, order: [change] }), view);
+    assert.deepEqual(calls.at(-1).args, { topicId: "track", expectedRevision: 4, order: [change], baseUrl: url });
+    assert.deepEqual(scopeBackendResult("change_queue", url, view), view, "queue identity and completion evidence remains raw");
+  }
+  const count = calls.length;
+  await assert.rejects(invoke("change_queue", { topicId: scopedId(b, "track") }, a), /different/);
+  await assert.rejects(invoke("change_queue", { topicId: "track" }), /explicit/);
+  await assert.rejects(invoke("change_queue", {}, a), /owning Track/);
+  for (const args of [
+    { expectedRevision: -1, order: [change] }, { expectedRevision: 1.5, order: [change] },
+    { expectedRevision: 4, order: [change, change] }, { expectedRevision: 4, order: [{}] },
+    { expectedRevision: 4, order: [{ ...change, source_session: scopedId(b, "worker") }] },
+  ]) await assert.rejects(invoke("reorder_change_queue", { topicId: scopedId(a, "track"), ...args }), /exact|unique/);
+  assert.equal(calls.length, count);
+});

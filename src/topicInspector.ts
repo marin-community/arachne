@@ -242,7 +242,7 @@ export interface LandingCandidate {
   key: string;
   change: DurableChange;
   session: SessionSummary;
-  state: "working" | "waiting" | "landed" | "blocked";
+  state: "working" | "waiting" | "landed" | "blocked" | "unavailable";
   note: string;
 }
 
@@ -254,18 +254,26 @@ export function landingCandidates(rows: ThreadRow[], topicId: string, fleet: Ses
     if (seen.has(s.id) || s.id === topicId || resolveTrack(fleet, s.id)?.id !== topicId) continue;
     seen.add(s.id);
     const snapshots = fleet.filter(source => source.id === s.id);
-    const source = { ...s, branch: { ...s.branch, tags: snapshots.flatMap(source => source.branch.tags) } };
+    // Missing snapshots cannot erase a known path conflict. If all known
+    // paths agree, use that actual evidence to check every declaration.
+    const knownWorkDirs = [...new Set(snapshots.map(other => other.work_dir).filter(Boolean))];
+    const identityConflict = knownWorkDirs.length > 1 || snapshots.some(other => other.change_identity_problem === "conflict"
+      || other.branch.repo_root !== s.branch.repo_root || other.branch.branch !== s.branch.branch);
+    const identityUnavailable = snapshots.some(other => !other.work_dir || other.change_identity_problem === "unavailable");
+    const source = { ...s,
+      work_dir: knownWorkDirs.length === 1 ? knownWorkDirs[0] : s.work_dir,
+      change_identity_problem: identityConflict ? "conflict" as const : identityUnavailable ? "unavailable" as const : s.change_identity_problem,
+      branch: { ...s.branch, tags: snapshots.flatMap(source => source.branch.tags) } };
     for (const entry of changeRegistry(source).entries) {
-      const identityConflict = snapshots.some(other => other.work_dir !== s.work_dir
-        || other.branch.repo_root !== s.branch.repo_root || other.branch.branch !== s.branch.branch);
       const blocked = identityConflict ? "Conflicting duplicate source identity." : entry.blocked;
-      const state = blocked ? "blocked" : entry.acceptance ? "landed" : entry.change.scope.kind === "working" ? "working" : "waiting";
+      const unavailable = entry.unavailable;
+      const state = blocked ? "blocked" : unavailable ? "unavailable" : entry.acceptance ? "landed" : entry.change.scope.kind === "working" ? "working" : "waiting";
       out.push({ key: entry.key, change: entry.change, session: source, state,
-        note: blocked || (entry.acceptance ? `Accepted into ${entry.acceptance.target_branch} at ${entry.acceptance.target_oid}`
+        note: blocked || unavailable || (entry.acceptance ? `Accepted into ${entry.acceptance.target_branch} at ${entry.acceptance.target_oid}`
           : entry.change.scope.kind === "working" ? "Bounded working snapshot; completion and fresh scope review still required."
           : "Pinned committed output; completion evidence, review and canonical validation required.") });
     }
   }
-  const rank = { blocked: 0, waiting: 1, working: 2, landed: 3 };
+  const rank = { blocked: 0, unavailable: 1, waiting: 2, working: 3, landed: 4 };
   return out.sort((a, b) => rank[a.state] - rank[b.state] || b.session.last_activity_at.localeCompare(a.session.last_activity_at) || a.key.localeCompare(b.key));
 }

@@ -148,6 +148,86 @@ test("original identity and same-repository Track ownership remain required", ()
   assert.match(changeRegistry(invalid).errors[0], /Invalid declaration/);
 });
 
+test("missing source evidence is unavailable and never authorizes selection or acceptance", () => {
+  const change = declaration();
+  for (const work_dir of [undefined, ""]) {
+    for (const accepted of [false, true]) {
+      const worker = { ...source(), work_dir };
+      worker.branch.tags = [changeTag(change), ...(accepted ? [acceptanceTag(receipt(change))] : [])];
+      const candidate = queue(worker)[0];
+      assert.equal(candidate.state, "unavailable");
+      assert.match(candidate.note, /evidence is unavailable/);
+      assert.doesNotMatch(candidate.note, /reconcil|does not match/);
+      assert.match(selectionProblem(pinSelection(worker.id, change), worker), /unavailable/);
+      assert.equal(changeRegistry(worker).entries[0].acceptance, null);
+      assert.deepEqual(changeRegistry(worker).errors, []);
+    }
+  }
+  const failed = source();
+  failed.branch.tags = [changeTag(change)];
+  failed.change_identity_problem = "unavailable";
+  assert.equal(queue(failed)[0].state, "unavailable");
+  assert.match(selectionProblem(pinSelection(failed.id, change), failed), /unavailable/);
+});
+
+test("verified conflicts and invalid receipts still block when checkout evidence is missing", () => {
+  const worker = source(), change = declaration();
+  worker.work_dir = "";
+  worker.branch.tags = [changeTag(change)];
+  worker.change_identity_problem = "conflict";
+  assert.equal(queue(worker)[0].state, "blocked");
+  assert.match(selectionProblem(pinSelection(worker.id, change), worker), /does not match/);
+  delete worker.change_identity_problem;
+  worker.branch.tags.push({ key: "change_acceptance:first", value: "{" });
+  assert.equal(queue(worker)[0].state, "blocked");
+  assert.match(selectionProblem(pinSelection(worker.id, change), worker), /receipt/);
+  worker.branch.tags = [changeTag({ ...change, repo_root: "/other" })];
+  assert.equal(queue(worker)[0].state, "blocked");
+});
+
+test("duplicate snapshots with missing evidence remain unavailable in either order", () => {
+  const worker = source(), change = declaration();
+  worker.branch.tags = [changeTag(change)];
+  const missing = { ...worker, work_dir: "" };
+  for (const snapshots of [[worker, missing], [missing, worker]]) {
+    const fleet = [track(), ...snapshots];
+    const candidate = landingCandidates(topicThreadRows(fleet, "track", new Set()), "track", fleet)[0];
+    assert.equal(candidate.state, "unavailable");
+    assert.match(selectionProblem(pinSelection(worker.id, change), candidate.session), /unavailable/);
+  }
+});
+
+test("known path conflicts dominate missing evidence in both orders and every three-row permutation", () => {
+  const permutations = items => items.length === 1 ? [items] : items.flatMap((item, index) =>
+    permutations(items.filter((_, i) => i !== index)).map(rest => [item, ...rest]));
+  for (const accepted of [false, true]) {
+    const worker = source(), change = declaration();
+    worker.branch.tags = [changeTag(change), ...(accepted ? [acceptanceTag(receipt(change))] : [])];
+    const missing = { ...worker, work_dir: "", change_identity_problem: "unavailable" };
+    // Exact raw path comparison: even a trailing slash proves a mismatch.
+    for (const work_dir of ["/repo/.worktrees/replacement", `${worker.work_dir}/`]) {
+      const replacement = { ...worker, work_dir };
+      const cases = [...permutations([missing, replacement]), ...permutations([missing, worker, replacement])];
+      for (const snapshots of cases) {
+        const fleet = [track(), ...snapshots];
+        const candidate = landingCandidates(topicThreadRows(fleet, "track", new Set()), "track", fleet)[0];
+        assert.equal(candidate.state, "blocked", JSON.stringify(snapshots.map(s => s.work_dir)));
+        assert.match(candidate.note, /identity/);
+        assert.doesNotMatch(candidate.note, /unavailable/);
+        assert.match(selectionProblem(pinSelection(worker.id, change), candidate.session), /identity/);
+        assert.equal(changeRegistry(candidate.session).entries[0].acceptance, null);
+        assert.deepEqual(candidate.change, change, "conflicts cannot rewrite pinned declarations");
+      }
+    }
+    for (const snapshots of permutations([missing, worker, { ...worker }])) {
+      const fleet = [track(), ...snapshots];
+      const candidate = landingCandidates(topicThreadRows(fleet, "track", new Set()), "track", fleet)[0];
+      assert.equal(candidate.state, "unavailable");
+      assert.match(selectionProblem(pinSelection(worker.id, change), candidate.session), /unavailable/);
+    }
+  }
+});
+
 test("malformed sibling indexing and orphan receipts cannot bypass native registry validation", () => {
   const worker = source(), change = declaration();
   for (const invalid of [{ key: "change:missing", value: "{" },

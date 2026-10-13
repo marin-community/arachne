@@ -10,6 +10,7 @@ import * as review from "../src/reviewRequest.ts";
 import * as inspector from "../src/topicInspector.ts";
 import * as policy from "../src/trackPolicy.ts";
 import * as strategies from "../src/trackStrategies.ts";
+import * as queues from "../src/changeQueue.ts";
 import { declaration, source, oid, changeTag } from "./fixtures/durable-change.mjs";
 
 const component = name => readFileSync(new URL(`../src/components/${name}.vue`, import.meta.url), "utf8");
@@ -18,7 +19,7 @@ const flush = async () => { await nextTick(); await new Promise(resolve => setIm
 function harness(name, input, invoke, exposed) {
   const script = component(name).match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import[\s\S]*?;\n/gm, "");
   const props = reactive(input), events = [];
-  const context = { ref, computed, watch, ...identities, ...changes, ...review, ...inspector, ...policy, ...strategies,
+  const context = { ref, computed, watch, onBeforeUnmount() {}, ...queues, ...identities, ...changes, ...review, ...inspector, ...policy, ...strategies,
     useBackendInvoke: () => invoke, useLaunchSelection: () => ref({ agent: "codex", model: "test", effort: "high" }),
     localStorage: { setItem() {} },
     defineProps: () => props, withDefaults: value => value,
@@ -149,6 +150,7 @@ test("inspector selection and Land never substitute sibling, later scope or comp
   const root = track(), calls = [];
   const h = harness("TopicInspector", { topic: root, fleet: [root, worker], selectedId: worker.id, loomUrl: "http://localhost", landingRequest: 1 }, async (command, args) => {
     if (command === "topic_todos") return { todos: [], revision: 0 };
+    if (command === "change_queue") return { revision: 0, queue: { version: 1, track_session: "track", repo_root: "/repo", target_branch: "accepted/topic", active: null, pending: [] } };
     calls.push([command, clean(args)]);
     return { coordinator_id: "track", coordinator_name: "track", target_branch: "accepted/topic" };
   }, ["selectCandidate", "reviewCandidate", "onLand", "selectedChange", "selectedProblem", "candidates", "tab"]);
@@ -157,7 +159,8 @@ test("inspector selection and Land never substitute sibling, later scope or comp
   const two = h.candidates.value.find(candidate => candidate.key === "worker/second");
   h.selectCandidate(one);
   await h.onLand(two, "squash");
-  assert.deepEqual(calls, []);
+  assert.deepEqual(calls[0], ["land_change", { ...changes.selectedChangePayload(changes.pinSelection(second.source_session, second)), strategy: "squash" }]);
+  calls.length = 0;
   await h.onLand(one, "squash");
   assert.deepEqual(calls[0], ["land_change", { ...changes.selectedChangePayload(changes.pinSelection(first.source_session, first)), strategy: "squash" }]);
   const updated = { ...first, scope: { ...first.scope, head_oid: oid("d") }, completion: { channel_id: "worker", message_id: "new-result" } };
@@ -165,7 +168,7 @@ test("inspector selection and Land never substitute sibling, later scope or comp
   await flush();
   assert.deepEqual(clean(h.selectedChange.value.change), first);
   assert.match(h.selectedProblem.value, /changed.*Reselect/);
-  await h.onLand(h.candidates.value.find(candidate => candidate.key === "worker/first"), "squash");
+  await h.onLand(one, "squash"); // Old rendered row cannot silently substitute the fresh declaration.
   assert.equal(calls.length, 1);
   h.reviewCandidate(h.candidates.value.find(candidate => candidate.key === "worker/first"));
   assert.equal(h.selectedProblem.value, "");
@@ -181,6 +184,6 @@ test("chat has no thread-only Land or autoland control; explicit outputs open th
   assert.match(chat, /v-if="isWorker && hasExplicitChanges && integrationTarget" @click="emit\('open-changes'\)"/);
   assert.match(chat, /kind="publish"[^\n]+@run="onPublish"/);
   assert.match(panel, /No declared Changes/);
-  assert.match(panel, /:key="candidate.key"/);
+  assert.match(panel, /:key="row.key"/);
   assert.match(panel, /AutolandControl :session="row.session"/); // Policies remain useful even for zero-output sources.
 });

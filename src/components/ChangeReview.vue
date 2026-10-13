@@ -210,7 +210,7 @@ function lineNumber(value: number | null): string {
     </div>
     <div v-if="requestNote" class="change-review-state" role="status">{{ requestNote }}</div>
     <div v-if="selectedChange" class="change-review-state">{{ selectedChange.change.source_session }}/{{ selectedChange.change.id }} · {{ selectedChange.change.scope.kind }} · {{ selectedChange.change.scope.paths.length ? selectedChange.change.scope.paths.join(', ') : 'entire pinned range' }}</div>
-    <div v-else-if="!reviewingTrack" class="change-review-state">Select an explicit Change in the inspector’s Landing queue to prepare or Land an output.</div>
+    <div v-else-if="!reviewingTrack" class="change-review-state">Select an explicit Change in the inspector’s Changes tab to prepare or Land an output.</div>
     <div class="review-file-picker">
       <input v-model="fileQuery" :list="`review-files-${sessionId}`" placeholder="Filter changes or open a file…" aria-label="Find a checkout file" @keydown.enter.prevent="checkoutEditable && fileQuery.trim() && (editPath = fileQuery.trim())" />
       <datalist :id="`review-files-${sessionId}`"><option v-for="path in fileOptions" :key="path" :value="path" /></datalist>

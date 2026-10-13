@@ -131,18 +131,27 @@ pub struct SessionSummaryView {
     /// streaming, so topic ordering by it stays still.
     #[serde(default)]
     pub last_user_message_at: Option<String>,
-    /// The session's checkout path and whether it still exists on the server
-    /// (archive removes the worktree). Lets resource surfaces offer
-    /// Open-in-Zed vs. Recover without fetching the full session view.
+    /// Some Loom summaries omit checkout identity. The client resolves missing
+    /// paths for declared-output rows through authenticated sessions.get.
     #[serde(default)]
     pub work_dir: String,
     #[serde(default)]
     pub worktree_present: bool,
+    /// Adapter-owned evidence; never accepted from the summary wire response.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub change_identity_problem: Option<ChangeIdentityProblem>,
     pub branch: BranchSummaryView,
     pub placement: Option<SessionPlacementView>,
     pub github_repo: Option<String>,
     pub parent_id: Option<String>,
     pub parent_session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeIdentityProblem {
+    Unavailable,
+    Conflict,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,7 +544,7 @@ pub fn autoland_guard() -> &'static str {
 }
 
 pub fn autoland_policy_prompt(track: &SessionView, target_branch: &str) -> String {
-    format!("Durable autoland policy setup for Track {} in repository {}, canonical accepted ref {}. Subscribe/retain result delivery on your own channel and installed immediate-parent channels for nested sources. On existing or future linked actual durable result wakes, operate ONLY on explicit Change outputs, not historical discovery or tags alone. A result with changes:[] requires no Land. Resolve the ORIGINAL source identity and SAME-repository owning Track ancestor (marked Track, or legacy unmarked root unless topic=false), re-read LIVE canonical ownership/initialization and policy. Read the linked ORIGINAL kind=result with author_kind=session, author_id=source_session, channel_id=source_session and exact source_message_id; require JSON body or structured payload {{version:1,outcome:\"complete\",intent:\"final\",changes:[inline declarations with completion:null]}}. Missing original reference in bounded history fails closed. Complete+final ONLY; failed/help/checkpoint/partial/interrupted results and zero-output review verdicts do not qualify. Source role/title/status never disqualifies an otherwise authenticated explicitly declared implementation range. Process authenticated inline range outputs BEFORE tag indexing: attach that original message channel_id/message_id as completion, validate each exact ID/source identity/scope, and re-read registry. If change:<id> is missing because result delivery preceded indexing, index/reconcile this exact authenticated inline output through existing sessions.tags.set within this same wake; no second wake, no polling, no silently lost output. A matching working declaration may finalize to this range ONLY while retaining ID, original source identity, original base and exact bounded paths, proving pinned working HEAD reaches the finalized head and freshly reviewing the exact new scope within this same request/wake. Index that permitted finalization once authenticated; never overwrite any other changed/conflicting declaration or mismatched receipt, and stop for reconciliation. Identical duplicate IDs and repeat deliveries are idempotent; conflicting duplicate metadata fails closed. Never manufacture explicit declarations from historical Threads, branches or non-explicit legacy completions, never generate fresh pending deltas from repeated historical results, and never retask historical sources. Each new explicit ID/range remains independently eligible despite legacy integration_result. If effectively ON, review/repair/validate and accept ONLY the eligible selected delta using squash default; preserve foreign staged/unstaged/untracked/ignored edits and use isolated acceptance worktrees. Never ask for another Prepare click. Off policy does not disable source on overrides. Never treat sleeping/working/completion or advisory tags as readiness. {} {} Use existing durable result wakeups; no scheduler or polling loops, and no automatic resumption. Never publish or change primary HEAD or Loom scratch branches. Report actual per-output receipt and typed own-channel outcome, never blanket integration_result.", track.id, track.branch.repo_root, target_branch, crate::change::SELECTED_ACCEPTANCE_GUARD, autoland_guard())
+    format!("Durable autoland policy setup for Track {} in repository {}, canonical accepted ref {}. Subscribe/retain result delivery on your own channel and installed immediate-parent channels for nested sources. On existing or future linked actual durable result wakes, operate ONLY on explicit Change outputs, not historical discovery or tags alone. A result with changes:[] requires no Land. Resolve the ORIGINAL source identity and SAME-repository owning Track ancestor (marked Track, or legacy unmarked root unless topic=false), re-read LIVE canonical ownership/initialization and policy. Read the linked ORIGINAL kind=result with author_kind=session, author_id=source_session, channel_id=source_session and exact source_message_id; require JSON body or structured payload {{version:1,outcome:\"complete\",intent:\"final\",changes:[inline declarations with completion:null]}}. Missing original reference in bounded history fails closed. Complete+final ONLY; failed/help/checkpoint/partial/interrupted results and zero-output review verdicts do not qualify. Source role/title/status never disqualifies an otherwise authenticated explicitly declared implementation range. Process authenticated inline range outputs BEFORE tag indexing: attach that original message channel_id/message_id as completion, validate each exact ID/source identity/scope, and re-read registry. If change:<id> is missing because result delivery preceded indexing, index/reconcile this exact authenticated inline output through existing sessions.tags.set within this same wake; no second wake, no polling, no silently lost output. A matching working declaration may finalize to this range ONLY while retaining ID, original source identity, original base and exact bounded paths, proving pinned working HEAD reaches the finalized head and freshly reviewing the exact new scope within this same request/wake. Index that permitted finalization once authenticated; never overwrite any other changed/conflicting declaration or mismatched receipt, and stop for reconciliation. Identical duplicate IDs and repeat deliveries are idempotent; conflicting duplicate metadata fails closed. Never manufacture explicit declarations from historical Threads, branches or non-explicit legacy completions, never generate fresh pending deltas from repeated historical results, and never retask historical sources. Each new explicit ID/range remains independently eligible despite legacy integration_result. If effectively ON, review/repair/validate and accept ONLY the eligible selected delta using squash default; preserve foreign staged/unstaged/untracked/ignored edits and use isolated acceptance worktrees. Never ask for another Prepare click. Off policy does not disable source on overrides. Never treat sleeping/working/completion or advisory tags as readiness. {} {} Use existing durable result wakeups; no scheduler or polling loops, and no automatic resumption. Never publish or change primary HEAD or Loom scratch branches. Report actual per-output receipt and typed own-channel outcome, never blanket integration_result.\n\n{}", track.id, track.branch.repo_root, target_branch, crate::change::SELECTED_ACCEPTANCE_GUARD, autoland_guard(), crate::change_queue::DRAIN_PROTOCOL)
 }
 
 /// A landing request (Topic → upstream), the sibling of IntegrationRequest.
@@ -885,7 +894,7 @@ pub struct SessionLaunchGuidance {
 
 pub fn topic_launch_guidance() -> SessionLaunchGuidance {
     SessionLaunchGuidance {
-        root: format!("{}\n\nRevised Thread Land policy (supersedes earlier acceptance defaults): accepted state is LIVE track_topic_branch, or the existing Loom branch only for a legacy Track with no tag. New Tracks require verified real ref initialization before acceptance or publishing. Manual Land includes complete wrap-up, review/repair and canonical acceptance. Autoland defaults OFF, source overrides inherit/on/off, and is driven by durable successful result wakeups only. {}", include_str!("../../skills/coordinator.md"), autoland_guard()),
+        root: format!("{}\n\nRevised Thread Land policy (supersedes earlier acceptance defaults): accepted state is LIVE track_topic_branch, or the existing Loom branch only for a legacy Track with no tag. New Tracks require verified real ref initialization before acceptance or publishing. Manual Land includes complete wrap-up, review/repair and canonical acceptance. Autoland defaults OFF, source overrides inherit/on/off, and is driven by durable successful result wakeups only. {}\n\n{}", include_str!("../../skills/coordinator.md"), autoland_guard(), crate::change_queue::DRAIN_PROTOCOL),
         child: include_str!("../../skills/worker.md").into(),
     }
 }

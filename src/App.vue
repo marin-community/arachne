@@ -89,6 +89,8 @@ export interface SessionSummary {
   // Lets the inspector's Resources view offer Open in Zed vs. Recover.
   work_dir: string;
   worktree_present: boolean;
+  /** Native adapter distinguishes absent evidence from a verified conflict. */
+  change_identity_problem?: "unavailable" | "conflict";
   branch: BranchSummary;
   placement: Placement | null;
   github_repo: string | null;

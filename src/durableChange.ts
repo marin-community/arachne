@@ -34,6 +34,7 @@ export interface ChangeAcceptance {
 export interface ChangeSource {
   id: string;
   work_dir: string;
+  change_identity_problem?: "unavailable" | "conflict";
   branch: { repo_root: string; branch: string; tags: { key: string; value: string }[] };
 }
 type RecordValue = Record<string, unknown>;
@@ -120,6 +121,7 @@ export interface RegisteredChange {
   completion: ChangeCompletion | null;
   acceptance: ChangeAcceptance | null;
   blocked: string;
+  unavailable: string;
 }
 export interface ChangeRegistry { entries: RegisteredChange[]; errors: string[] }
 
@@ -136,10 +138,12 @@ export function changeRegistry(source: ChangeSource): ChangeRegistry {
     const parsed = values.map(value => parseChange(value));
     const change = parsed.find((value): value is DurableChange => value !== null);
     if (!change || tagKey !== `change:${change.id}`) { errors.push(`Invalid declaration ${source.id}/${tagKey.slice(7)}.`); continue; }
-    let blocked = "";
+    let blocked = "", unavailable = "";
     if (parsed.some(value => !value || !sameChange(change, value))) blocked = "Conflicting duplicate declaration; reconcile metadata before selecting.";
     if (change.source_session !== localSourceId(source.id) || change.repo_root !== source.branch.repo_root
-      || change.source_branch !== source.branch.branch || change.source_work_dir !== source.work_dir) blocked = "Original source identity does not match the declaration.";
+      || change.source_branch !== source.branch.branch || source.change_identity_problem === "conflict"
+      || (source.work_dir && change.source_work_dir !== source.work_dir)) blocked = "Original source identity does not match the declaration.";
+    if (!source.work_dir || source.change_identity_problem === "unavailable") unavailable = "Original source identity evidence is unavailable; refresh before selecting.";
     const receipts = source.branch.tags.filter(tag => tag.key === `change_acceptance:${change.id}`).map(tag => parseAcceptance(tag.value));
     const receipt = receipts[0] ?? null;
     if (receipts.length && (!receipt || receipts.some(value => !value || JSON.stringify(value) !== JSON.stringify(receipt))
@@ -153,13 +157,13 @@ export function changeRegistry(source: ChangeSource): ChangeRegistry {
     } : null;
     // Receipts shown in shared UI state use the same backend namespace. The tag
     // and exact expectedChange above remain wire values for validation/dispatch.
-    const acceptance = !blocked && receipt ? { ...receipt,
+    const acceptance = !blocked && !unavailable && receipt ? { ...receipt,
       source_session: scopeReference(source.id, receipt.source_session),
       target_session: scopeReference(source.id, receipt.target_session),
       completion: { channel_id: scopeReference(source.id, receipt.completion.channel_id),
         message_id: scopeReference(source.id, receipt.completion.message_id) },
     } : null;
-    entries.push({ key: changeKey(change, source.id), sourceId: source.id, change, completion: scopedCompletion, acceptance, blocked });
+    entries.push({ key: changeKey(change, source.id), sourceId: source.id, change, completion: scopedCompletion, acceptance, blocked, unavailable });
   }
   for (const tag of source.branch.tags) {
     if (tag.key.startsWith("change_acceptance:") && !entries.some(entry => tag.key === `change_acceptance:${entry.change.id}`)) {
@@ -194,6 +198,7 @@ export function selectionProblem(selected: ChangeSelection, source: ChangeSource
   const entry = changeRegistry(source).entries.find(entry => entry.key === selectionKey(selected));
   if (!entry || !sameChange(selected.change, entry.change)) return "The declaration changed or was removed. Reselect it for fresh review.";
   if (entry.blocked) return entry.blocked;
+  if (entry.unavailable) return entry.unavailable;
   if (entry.acceptance) return "This exact Change has already been accepted.";
   return "";
 }

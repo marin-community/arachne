@@ -7194,7 +7194,7 @@ pub(crate) mod thread_landing_contract_tests {
                                     .strip_prefix("content-length: ")
                                     .map(str::to_owned)
                             })
-                            .unwrap()
+                            .unwrap_or_else(|| "0".into())
                             .parse()
                             .unwrap();
                         break (end + 4, length);
@@ -7207,9 +7207,20 @@ pub(crate) mod thread_landing_contract_tests {
                     bytes.extend_from_slice(&chunk[..n]);
                 }
                 let headers = String::from_utf8_lossy(&bytes[..header_end]);
-                assert!(headers.starts_with(&format!("POST {path} ")), "{headers}");
-                let body: Value =
-                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                let method = if path == "/api/openapi.json" {
+                    "GET"
+                } else {
+                    "POST"
+                };
+                assert!(
+                    headers.starts_with(&format!("{method} {path} ")),
+                    "{headers}"
+                );
+                let body: Value = if length == 0 {
+                    json!({})
+                } else {
+                    serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap()
+                };
                 let reply = if reply.get("_message_receipt").is_some() {
                     json!({"id":"durable-message", "channel_id":body["channel"], "kind":"message", "body":body["body"].as_str().unwrap().trim(), "payload":body["payload"]})
                 } else {

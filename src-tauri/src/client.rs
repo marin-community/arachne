@@ -16,9 +16,13 @@ use tokio::sync::mpsc;
 
 use crate::loom::EventFrame;
 
+#[cfg(test)]
+#[path = "summary_identity_tests.rs"]
+mod summary_identity_tests;
+
 // Versioned SHA-256 fingerprint of the complete authorization envelope. Do
 // not use RandomState/DefaultHasher: its algorithm is not a stable wire format.
-fn request_key(destination: &str, text: &str, payload: &serde_json::Value) -> String {
+pub(crate) fn request_key(destination: &str, text: &str, payload: &serde_json::Value) -> String {
     let envelope = serde_json::to_vec(&serde_json::json!([destination, text.trim(), payload]))
         .expect("request envelope serialization");
     format!("arachne-request-v1-{}", sha256(&envelope))
@@ -244,6 +248,69 @@ impl LoomClient {
         }
     }
 
+    /// Fresh authenticated capability evidence from this exact leased backend.
+    /// GET is read-only, but must be cancelled/fenced like selected POST reads.
+    /// No cache or replacement/active-server lookup is involved.
+    pub(crate) async fn openapi_document(&self) -> Result<serde_json::Value, LoomError> {
+        let request = self.openapi_document_unfenced();
+        if let Some(cancel) = &self.selected_action {
+            let invalidated = || {
+                LoomError::Connection(
+                "Selected Loom backend became unavailable or was replaced; refresh before proceeding.".into(),
+            )
+            };
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(invalidated()),
+                result = request => {
+                    if cancel.is_cancelled() { return Err(invalidated()); }
+                    result
+                }
+            }
+        } else {
+            request.await
+        }
+    }
+
+    async fn openapi_document_unfenced(&self) -> Result<serde_json::Value, LoomError> {
+        const PATH: &str = "/api/openapi.json";
+        let url = self
+            .base
+            .join(PATH)
+            .map_err(|e| LoomError::Connection(format!("joining {PATH}: {e}")))?;
+        let mut request = self
+            .http
+            .get(url)
+            .header(reqwest::header::CACHE_CONTROL, "no-cache");
+        if let Some(token) = &self.token {
+            request = request.bearer_auth(token);
+        }
+        let response = request
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| LoomError::Connection(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            let message = response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            return Err(LoomError::Api {
+                status: status.as_u16(),
+                method: "GET",
+                path: PATH.into(),
+                message,
+            });
+        }
+        response.json().await.map_err(|e| LoomError::Decode {
+            path: PATH.into(),
+            detail: e.to_string(),
+        })
+    }
+
     async fn op_unfenced<T: DeserializeOwned>(
         &self,
         path: &str,
@@ -385,11 +452,59 @@ impl LoomClient {
     /// filters placement rows anyway. Without it, archiving a child erases
     /// the leader's topic shape.
     pub async fn list_sessions(&self) -> Result<Vec<crate::loom::SessionSummaryView>, LoomError> {
-        self.op(
-            "/api/sessions/summary/list",
-            &serde_json::json!({ "archived": true }),
-        )
-        .await
+        let mut sessions: Vec<crate::loom::SessionSummaryView> = self
+            .op(
+                "/api/sessions/summary/list",
+                &serde_json::json!({ "archived": true }),
+            )
+            .await?;
+        // Summary schemas without work_dir are valid. Fetch actual identity,
+        // never a declaration's claimed path, only for output-bearing rows.
+        // Deduplicate raw IDs and bound both fanout and per-lookup latency.
+        let ids: std::collections::BTreeSet<_> = sessions
+            .iter()
+            .filter(|s| {
+                s.work_dir.is_empty() && s.branch.tags.iter().any(|t| t.key.starts_with("change:"))
+            })
+            .map(|s| s.id.clone())
+            .collect();
+        let mut resolutions = futures_util::stream::iter(ids.into_iter().map(|id| async move {
+            let result = tokio::time::timeout(Duration::from_secs(5), self.get_session(&id)).await;
+            (id, result)
+        }))
+        .buffer_unordered(8);
+        while let Some((id, result)) = resolutions.next().await {
+            // A selected action must retain its owning-client cancellation
+            // failure rather than downgrade retirement/outage to partial data.
+            if self
+                .selected_action
+                .as_ref()
+                .is_some_and(|c| c.is_cancelled())
+            {
+                return Err(LoomError::Connection("Selected Loom backend became unavailable or was replaced; refresh before proceeding.".into()));
+            }
+            for summary in sessions
+                .iter_mut()
+                .filter(|s| s.id == id && s.work_dir.is_empty())
+            {
+                use crate::loom::ChangeIdentityProblem::{Conflict, Unavailable};
+                match &result {
+                    Ok(Ok(full))
+                        if full.id != summary.id
+                            || full.branch.id != summary.branch.id
+                            || full.branch.repo_root != summary.branch.repo_root
+                            || full.branch.branch != summary.branch.branch =>
+                    {
+                        summary.change_identity_problem = Some(Conflict);
+                    }
+                    Ok(Ok(full)) if !full.work_dir.is_empty() => {
+                        summary.work_dir = full.work_dir.clone();
+                    }
+                    _ => summary.change_identity_problem = Some(Unavailable),
+                }
+            }
+        }
+        Ok(sessions)
     }
 
     /// `issues.board` — every work item across every repo. `all` includes
@@ -935,6 +1050,31 @@ impl LoomClient {
         payload: serde_json::Value,
         idempotency_key: &str,
     ) -> Result<serde_json::Value, LoomError> {
+        self.request_item(destination_id, body, payload, idempotency_key, "message")
+            .await
+    }
+
+    /// Idempotent durable instruction without runtime delivery. Ordinary
+    /// messages interrupt ACP turns; callers wake through queue_prompt instead.
+    pub async fn record_request(
+        &self,
+        destination_id: &str,
+        body: &str,
+        payload: serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<serde_json::Value, LoomError> {
+        self.request_item(destination_id, body, payload, idempotency_key, "status")
+            .await
+    }
+
+    async fn request_item(
+        &self,
+        destination_id: &str,
+        body: &str,
+        payload: serde_json::Value,
+        idempotency_key: &str,
+        kind: &str,
+    ) -> Result<serde_json::Value, LoomError> {
         const PATH: &str = "/api/channels/messages/create";
         let reply: serde_json::Value = self
             .op(
@@ -942,7 +1082,7 @@ impl LoomClient {
                 &serde_json::json!({
                     "channel": destination_id,
                     "body": body,
-                    "kind": "message",
+                    "kind": kind,
                     "urgency": "normal",
                     "payload": payload,
                     "idempotency_key": idempotency_key,
@@ -952,7 +1092,7 @@ impl LoomClient {
             .map_err(|e| e.after_dispatch(destination_id, PATH, Some(idempotency_key)))?;
         if !reply["id"].as_str().is_some_and(|id| !id.trim().is_empty())
             || reply["channel_id"] != destination_id
-            || reply["kind"] != "message"
+            || reply["kind"] != kind
             || reply["body"] != body.trim()
             || reply["payload"] != payload
         {

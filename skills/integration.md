@@ -17,6 +17,107 @@ for Thread Land. New Track initialization must create the REAL topic ref
 from the fresh seed before substantive work, preserve existing unrelated
 refs, and report actual creation. A tag is not a Git branch.
 
+## Serial Changes queue: claim, accept, drain
+
+For explicit Changes, the owning Track branch artifact `change-queue.json` is
+AUTHORITATIVE pending intent/order. Its exact schema is
+`{version:1,track_session,repo_root,target_branch,active:QueueEntry|null,pending:QueueEntry[]}`;
+QueueEntry is `{change:exact Durable Change v1,strategy,requested_by:null|"user"|"autoland"}`.
+Before EVERY claim/order/promotion/clear/drain, source lifecycle/wrap-up or
+coordinator instruction/wake, authenticate LIVE `GET /api/openapi.json` on the
+selected owning backend and require **exact boolean true** at
+`paths["/api/artifacts/write"].post["x-loom-atomic-base-rev"]`. Missing, false, string,
+malformed, wrong-path or unreachable evidence fails closed. Updating Loom to
+transaction-level atomic base_rev CAS is a prerequisite, not source completion
+or human attention. Local mutexes, retries and post-write checks cannot serialize
+independent coordinator writers. Never infer support from version, cache, prior
+success, reconnect or replacement; use the owning client's current auth and
+availability/retirement/cancellation lease, no active-server fallback. Recheck
+at each mutation/delivery boundary, even saved-intent or no-op delivery retry,
+and before resuming a drain. Preserve truthful queued-but-undelivered status if
+support becomes unavailable after a verified saved request.
+A healthy lease does not prove support survives runtime/route reads. Recheck
+after runtime lookup IMMEDIATELY BEFORE source adoption, after adoption or
+contested-adoption reads IMMEDIATELY BEFORE the source ACP prompt, and after
+terminal/source/coordinator route setup IMMEDIATELY BEFORE message/status
+dispatch. Separately gate the coordinator ACP wake after its durable instruction.
+No network/helper read may intervene between the final capability gate and its
+guarded dispatch; use the SAME leased authenticated owning client.
+
+Use raw server-local source/channel IDs and preserve original declarations and
+completion pointers. Read `artifacts.get` with the Track's **Loom branch ID**,
+name `change-queue.json`, `repo:false`; require matching `meta.branch_id`, positive
+`meta.rev`, Track/repository/canonical identity and valid unique entries. Missing
+artifact means revision 0 empty state. Corrupt/shared/conflicting metadata fails
+closed. Every `artifacts.write` supplies the fresh `meta.rev` as `base_rev` (0
+for guarded creation), the same branch/name, `repo:false`, `kind:"json"` and exact
+JSON content. On 409 reread and recompute; never blindly overwrite.
+`loom artifacts write change-queue.json queue.json --kind json --base-rev <rev>`
+writes the current Track branch; use the existing API with explicit `branch`
+when operating outside that Track's own context. Never write repository-shared
+queue state or silently substitute your current worker/scratch branch identity.
+See `docs/thread-landing-contract.md` for command and revision details.
+
+Land promotes ONE exact entry to next pending, with user authorization and
+chosen strategy. Reordering conveys order only: new entries have null
+requested_by and squash, existing intent/strategy and active stay intact. Queued
+wakes are hints; reread LIVE queue, never accept a payload out of order. A
+completed range receives no source resumption, notification, subscription,
+retasking or completion reindexing. Working sources use the existing bounded
+noninterrupting wrap-up and authenticated typed final result route. Failed
+post-save delivery leaves durable intent; report queued-but-undelivered/uncertain
+and retry the identical delivery, preserving selection. Reconcile uncertain
+non-idempotent ACP source/coordinator prompt delivery before retry. Ordinary Loom
+channel messages interrupt ACP turns: native ACP coordinator requests instead
+persist an idempotent status-kind instruction and queue a `send_now:false` wake
+behind active work. Terminal coordinators use the existing idempotent message
+inbox. Duplicate ACP wake hints must never bypass live claims or repeat Git.
+
+1. Register authenticated new explicit results deterministically after existing
+   pending order via fresh revision-CAS; never use last_activity to reshuffle.
+   Exact duplicates and already accepted ranges are verified/no-op history,
+   never new deltas. Conflicting declarations/receipts stop for reconciliation.
+   Permitted working-to-range finalization retains ID/title/original source
+   identity/base/literal paths, proves pinned working HEAD reaches final head,
+   authenticates intended final completion and receives fresh exact scope
+   review. CAS update only that matching pending declaration, preserving chosen
+   strategy/requested_by, order and concurrent changes; no second Prepare click.
+2. If active is null, choose the first eligible authorized pending entry in LIVE
+   order. User intent remains manual under autoland Off. Automatic and
+   unrequested entries require LIVE effective autoland ON and authenticated
+   successful intended complete+final source results. Status, declaration or
+   reordering is not readiness/authorization. Failed/unready intent stays pending
+   with clear parent-owned status. Awaiting source completion is UNCLAIMED.
+   Review/interruption/checkpoint/help/partial/failed results do not qualify;
+   explicit user interruption needs coordinator judgment, never autoresume.
+3. Coordinator ALONE claims active with fresh expected-revision CAS, removing
+   only that ONE exact pending entry. Exactly one acceptance per canonical ref.
+   Existing active, including ongoing independent review/repair or blockers,
+   RETAINS ITS SLOT. Reordering/promotion cannot preempt it. If active exists,
+   continue only that acceptance or report its blocker; never start a second.
+4. Before EVERY automatic Git/index/ref/worktree write and resumption reread
+   LIVE owning Arachne Track/source policy/identity/canonical/source revisions
+   and authenticated interruption controls. Effective Off defers writes; user
+   interruption needs coordinator judgment, never automatic resumption. Parent
+   sessions.get 403 may use permitted LIVE sessions.list(history:true), never
+   borrowed credentials or cached policy. Before EVERY acceptance write reread LIVE queue and match the exact active
+   claim; reread policy for automatic work, source registry/ownership/identity/
+   scope/original completion/receipt, owning same-repository Track, canonical
+   initialization and exact target revision. Preserve all foreign source/target
+   work and coordinator scratch using isolated acceptance. Queue state NEVER
+   proves Git success or manufactures a receipt.
+5. After actual validated acceptance, record ONLY the exact original source
+   receipt and your typed own-channel actual result with source/target SHAs and
+   checks. Reread LIVE queue and CAS clear only matching active, preserving
+   concurrent pending edits. On conflict reread/reconcile without replaying Git.
+   Only actual success or explicit reconciled coordinator cancellation releases
+   a claim; preserve unresolved intent on cancellation. Reread LIVE queue,
+   canonical ref, policy and source evidence, then claim the next eligible
+   authorized pending entry in the same result-driven drain.
+6. Before idle, verify own/immediate-parent source/reviewer/repair result wake
+   routes, save state/status and end the turn. Results drive subsequent drain;
+   no publishing, scheduler or polling. Queue updates/requests are not outcomes.
+
 ## Selected Change Land: prepare, then accept
 
 The request identifies ONE declared Change with stable qualified identity,
@@ -59,7 +160,7 @@ publishing are not Thread acceptance strategies.
    again and verify the target ref/revision and any target checkout's dirty
    state. Refresh review/validation for changes. Advance only the verified
    canonical acceptance ref while preserving foreign checkout/index state.
-7. Complete the chosen acceptance without stopping at preparation or asking
+7. Complete the chosen claimed acceptance without stopping at preparation or asking
    for a second Prepare click. Stamp source `change_acceptance:<id>` only after
    actual successful target update and validation, with exact source-qualified
    identity/scope/completion, canonical target and resulting SHA. Do not stamp
@@ -78,7 +179,7 @@ accept a source, publish a Track, open a PR or push upstream.
 Track `track_autoland` defaults Off. Source `thread_autoland` defaults
 Inherit; source On/Off overrides Track On/Off. Policy changes arrive as
 explicit durable instructions, and results arrive through existing Loom
-channel delivery. Do not add polling or a scheduler. Review/repair and accept
+channel delivery. Do not add polling or a scheduler. Register, serially claim, review/repair and accept
 eligible explicitly declared Changes from successful intended own-channel completions into the canonical topic ref as a squash.
 Do not treat process exit, review findings, pending tags, incomplete/partial
 results or parent-help notices as completed implementation.

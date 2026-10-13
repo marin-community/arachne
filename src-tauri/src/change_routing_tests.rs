@@ -2,29 +2,40 @@ use super::*;
 
 // Share the existing Change test module's real Git fixtures.
 #[derive(Clone, Copy, Debug)]
-enum BackendTransition {
+pub(super) enum BackendTransition {
     Outage,
     Recovery,
     Replacement,
     HealthyRefresh,
 }
 
-async fn transition_mock(
+pub(super) async fn transition_mock(
     state: std::sync::Arc<LoomState>,
     script: Vec<(&'static str, Value)>,
     transition_at: usize,
     transition: BackendTransition,
+) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
+    transition_mock_with_token(state, script, transition_at, transition, None).await
+}
+
+pub(super) async fn transition_mock_with_token(
+    state: std::sync::Arc<LoomState>,
+    script: Vec<(&'static str, Value)>,
+    transition_at: usize,
+    transition: BackendTransition,
+    token: Option<String>,
 ) -> (String, tokio::task::JoinHandle<Vec<(String, Value)>>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let entry = state
         .servers
-        .install_for_test(std::sync::Arc::new(LoomClient::new(&url, None).unwrap()))
+        .install_for_test(std::sync::Arc::new(LoomClient::new(&url, token).unwrap()))
         .await;
     let handle = tokio::spawn(async move {
         let mut calls = Vec::new();
-        for (index, (path, reply)) in script.into_iter().enumerate() {
+        let mut live_atomic_support = None;
+        for (index, (path, mut reply)) in script.into_iter().enumerate() {
             let (mut socket, _) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
                     .await
@@ -45,7 +56,7 @@ async fn transition_mock(
                                 .strip_prefix("content-length: ")
                                 .map(str::to_owned)
                         })
-                        .unwrap()
+                        .unwrap_or_else(|| "0".into())
                         .parse::<usize>()
                         .unwrap();
                     break (end + 4, length);
@@ -57,10 +68,39 @@ async fn transition_mock(
                 assert!(n > 0);
                 bytes.extend_from_slice(&chunk[..n]);
             }
-            assert!(String::from_utf8_lossy(&bytes[..start]).starts_with(&format!("POST {path} ")));
-            let body: Value = serde_json::from_slice(&bytes[start..start + length]).unwrap();
+            let headers = String::from_utf8_lossy(&bytes[..start]);
+            let method = if path == "/api/openapi.json" {
+                "GET"
+            } else {
+                "POST"
+            };
+            assert!(headers.starts_with(&format!("{method} {path} ")));
+            if let Some(expected) = reply["_expected_auth"].as_str() {
+                assert!(
+                    headers.lines().any(|line| line
+                        .eq_ignore_ascii_case(&format!("authorization: Bearer {expected}"))),
+                    "owning credential must authenticate GET"
+                );
+            }
+            let body: Value = if length == 0 {
+                json!({})
+            } else {
+                serde_json::from_slice(&bytes[start..start + length]).unwrap()
+            };
+            // Test-only live rollback: unlike a lease cancellation the same
+            // authenticated endpoint remains available, but its next GET reads
+            // the marker changed by a runtime/route/adoption response.
+            if let Some(supported) = reply["_atomic_support"].as_bool() {
+                live_atomic_support = Some(supported);
+                reply.as_object_mut().unwrap().remove("_atomic_support");
+            }
+            if path == "/api/openapi.json" {
+                if let Some(supported) = live_atomic_support {
+                    reply = json!({"paths":{"/api/artifacts/write":{"post":{"x-loom-atomic-base-rev":supported}}}});
+                }
+            }
             let reply = if reply.get("_message_receipt").is_some() {
-                json!({"id":"durable-message", "channel_id":body["channel"], "kind":"message", "body":body["body"].as_str().unwrap().trim(), "payload":body["payload"]})
+                json!({"id":"durable-message", "channel_id":body["channel"], "kind":body["kind"], "body":body["body"].as_str().unwrap().trim(), "payload":body["payload"]})
             } else {
                 reply
             };
@@ -87,7 +127,10 @@ async fn transition_mock(
                 .get("_http_status")
                 .and_then(Value::as_u64)
                 .unwrap_or(200);
-            let response = reply.to_string();
+            let response = reply["_raw_ack"]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| reply.to_string());
             // Cancellation can close a read before its response. That is the
             // intended behavior; writes already dispatched require reconciliation.
             let _ = socket.write_all(format!("HTTP/1.1 {status} Reply\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await;
@@ -274,7 +317,7 @@ async fn source_delivery_outage_stops_working_land_before_coordinator_delivery()
         source = registered(source, &change);
         let snapshot =
             json!({"base":{}, "head_oid":change.scope.head_oid(), "version":"pinned-version"});
-        let script = vec![
+        let mut script = vec![
             ("/api/sessions/get", json!(source)),
             ("/api/sessions/summary/list", fleet(&source, &track)),
             ("/api/sessions/get", json!(track)),
@@ -297,9 +340,19 @@ async fn source_delivery_outage_stops_working_land_before_coordinator_delivery()
                 json!({"_message_receipt":true}),
             ),
         ];
+        script.splice(11..11, queue_save_script(&track, &change));
+        advertise_land_capability(&mut script, true);
         for during_source_delivery in [false, true] {
             let state = std::sync::Arc::new(LoomState::default());
-            let transition_at = if during_source_delivery { 12 } else { 10 };
+            let source_delivery = script
+                .iter()
+                .position(|(path, _)| *path == "/api/channels/messages/create")
+                .unwrap();
+            let transition_at = if during_source_delivery {
+                source_delivery
+            } else {
+                source_delivery - 2
+            };
             let (url, server) =
                 transition_mock(state.clone(), script.clone(), transition_at, transition).await;
             let error = land_change_on_server(&state, &url, &source.id, &change.id, &change, None)

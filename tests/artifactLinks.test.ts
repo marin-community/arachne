@@ -150,7 +150,8 @@ test('chat and activity surfaces route artifacts through the inspector and prese
   const app = source('App.vue');
   assert.match(app, /function openArtifact\(target: ArtifactTarget\)\s*{\s*artifactRequest\.value = { \.\.\.target };\s*showResources\.value = true;/);
   assert.match(app, /watch\(\[inspectorServer, selectedId, selectedTopicId\]/);
-  assert.match(source('components/TopicInspector.vue'), /if \(target\) tab\.value = "resources"/);
+  // Navigation priority is covered by rendered Changes timeline regressions.
+  assert.match(source('components/TopicInspector.vue'), /:artifact-request="artifactRequest"/);
   assert.match(source('components/ResourcePanel.vue'), /onUnmounted\(artifact\.close\)/);
 });
 

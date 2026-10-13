@@ -109,6 +109,61 @@ pub(crate) async fn change_changes_on_server(
     .map_err(|error: UiError| error.for_server(base_url))
 }
 
+/// Queue delivery has a live backend prerequisite that ordinary chat does not.
+/// Keep its gates on this leased client, after helper reads and immediately
+/// before each lifecycle or instruction dispatch; an earlier gate can go stale
+/// even without an outage or replacement of the selected client.
+async fn deliver_queue_wrap_up(
+    client: &LoomClient,
+    source: &SessionView,
+    expected: &Change,
+    text: &str,
+    payload: serde_json::Value,
+) -> Result<(), UiError> {
+    if source.protocol == "terminal" {
+        let key = crate::client::request_key(&source.id, text, &payload);
+        client.ensure_request_route(source).await?;
+        crate::change_queue::require_atomic_cas(client).await?;
+        client
+            .send_to_thread(&source.id, text, payload, &key)
+            .await?;
+    } else {
+        let verify_runtime = |runtime: &SessionView| -> Result<(), UiError> {
+            expected.verify_source(runtime).map_err(resource_error)?;
+            ChangeRegistry::parse(&runtime.branch.tags, runtime)
+                .map_err(resource_error)?
+                .select(&expected.id, expected)
+                .map_err(resource_error)?;
+            if runtime.protocol != source.protocol || runtime.status == "archived" {
+                return Err(resource_error(
+                    "Selected source runtime changed; refresh before delivery.",
+                ));
+            }
+            Ok(())
+        };
+        let mut runtime = client.get_session(&source.id).await?;
+        verify_runtime(&runtime)?;
+        if runtime.status == "orphaned" {
+            crate::change_queue::require_atomic_cas(client).await?;
+            runtime = match client.adopt(&source.id).await {
+                Ok(adopted) => adopted,
+                Err(error @ crate::client::LoomError::Api { status: 409, .. }) => {
+                    let current = client.get_session(&source.id).await?;
+                    if current.status != "running" {
+                        return Err(error.into());
+                    }
+                    current
+                }
+                Err(error) => return Err(error.into()),
+            };
+            verify_runtime(&runtime)?;
+        }
+        crate::change_queue::require_atomic_cas(client).await?;
+        client.queue_prompt(&source.id, text).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn land_change_on_server(
     state: &LoomState,
     base_url: &str,
@@ -175,7 +230,10 @@ pub(crate) async fn selected_source(
     Ok(source)
 }
 
-fn verify_working_snapshot(change: &Change, snapshot: &ChangeSetView) -> Result<(), UiError> {
+pub(crate) fn verify_working_snapshot(
+    change: &Change,
+    snapshot: &ChangeSetView,
+) -> Result<(), UiError> {
     if let Some(version) = change.scope.working_version() {
         if !snapshot
             .head_oid
@@ -247,13 +305,13 @@ pub async fn change_changes(
 }
 
 pub fn selected_wrap_up_prompt(request: &IntegrationRequest, change: &Change) -> String {
-    format!("Selected Change Land wrap-up. Exact declaration: {}\n\n{}\n\nFinish ONLY the selected bounded output, preserving all siblings and foreign staged/unstaged/untracked/ignored files. Do not expand this request into cumulative branch preparation. For a working declaration retain ID, original source identity/base and exact literal paths, prove pinned working HEAD reaches the finalized head; finalize its intended output to an exact range, review that fresh scope, send the complete final JSON result first with inline completion:null, capture returned message ID, then set ONLY change:<id> with that own-channel completion reference. The coordinator carries this permitted working finalization through fresh exact scope review within the same Land request; no second Prepare click. For an existing completed range retain its immutable declaration AND original completion reference. Its authenticated successful final result already exists: do not resend it, reindex it with a new completion, resume or retask the finished objective merely because this Land request arrived. The coordinator reviews/repairs the selected delta in isolation; report a concrete source issue only if one exists. For a working output, successful final result body or structured payload must be {{version:1,outcome:\"complete\",intent:\"final\",changes:[exact inline declarations with completion:null]}}. No checkpoints/help/partial/interrupted result qualifies.", serde_json::to_string(change).unwrap(), request.source_wrap_up_prompt())
+    format!("Selected Change Land wrap-up. Exact declaration: {}\n\n{}\n\nFinish ONLY the selected bounded output, preserving all siblings and foreign staged/unstaged/untracked/ignored files. Do not expand this request into cumulative branch preparation. For a working declaration retain ID, original source identity/base and exact literal paths, prove pinned working HEAD reaches the finalized head; finalize its intended output to an exact range, review that fresh scope, send the complete final JSON result first with inline completion:null, capture returned message ID, then set ONLY change:<id> with that own-channel completion reference. The coordinator carries this permitted working finalization through fresh exact scope review within the same Land request; no second Prepare click. For an existing completed range retain its immutable declaration AND original completion reference. Its authenticated successful final result already exists: do not resend it, reindex it with a new completion, resume or retask the finished objective merely because this Land request arrived. The coordinator reviews/repairs the selected delta in isolation; report a concrete source issue only if one exists. For a working output, successful final result body or structured payload must be {{version:1,outcome:\"complete\",intent:\"final\",changes:[exact inline declarations with completion:null]}}. No checkpoints/help/partial/interrupted result qualifies.\n\nLIVE QUEUE BACKEND PREREQUISITE: Before processing this queued source wrap-up, authenticate GET /api/openapi.json on the owning backend and require exact boolean true at paths[\"/api/artifacts/write\"].post[\"x-loom-atomic-base-rev\"]. Missing/false/string/malformed/unreachable support requires a Loom update; do not resume or write under this queue request until supported. Never infer support from version, cache, reconnect or replacement or borrow another backend credential. Before EVERY automatic Git/index/ref/worktree write and resumption reread LIVE owning Arachne Track/source policy/identity/canonical/source revisions and authenticated interruption controls; effective Off defers automatic writes, and user interruption requires coordinator judgment, never automatic resumption. Parent get403 may use permitted LIVE sessions.list(history:true), never cached policy. Only the coordinator claims/clears/drains the queue; this source wrap-up never authorizes source acceptance.", serde_json::to_string(change).unwrap(), request.source_wrap_up_prompt())
 }
 
 pub fn selected_acceptance_prompt(request: &IntegrationRequest, change: &Change) -> String {
     // Legacy prose retains all ownership/initialization/interruption protections,
     // while selected receipt rules explicitly supersede the legacy blanket stamp.
-    format!("Selected Change Land: {}\n\n{}\n\nSELECTED OUTPUT CONTRACT (supersedes any thread-wide scope or integration_result instruction above): {}\nFor the requested working-to-range finalization ONLY, retain ID/original identity/base/exact bounded paths and prove pinned working HEAD reaches finalized head, verify its new own-channel complete final result and freshly review exact finalized scope within this same Land request. Every other declaration change fails closed for reselection. Carry the exact selected declaration through review, repair, commit, validate, retries and acceptance; return a per-output actual outcome. The full request already authorizes completion without a second Prepare click.", serde_json::to_string(change).unwrap(), request.to_prompt("owning Track").replace("Record integration_result on the ORIGINAL source only after actual successful canonical acceptance and validation", "Record only the matching per-Change receipt on the ORIGINAL source after actual successful canonical acceptance and validation"), SELECTED_ACCEPTANCE_GUARD)
+    format!("Selected Change Land: {}\n\n{}\n\nSELECTED OUTPUT CONTRACT (supersedes any thread-wide scope or integration_result instruction above): {}\nFor the requested working-to-range finalization ONLY, retain ID/original identity/base/exact bounded paths and prove pinned working HEAD reaches finalized head, verify its new own-channel complete final result and freshly review exact finalized scope within this same Land request. Every other declaration change fails closed for reselection. Carry the exact selected declaration through review, repair, commit, validate, retries and acceptance; return a per-output actual outcome. The full request already authorizes completion without a second Prepare click.\n\n{}", serde_json::to_string(change).unwrap(), request.to_prompt("owning Track").replace("Record integration_result on the ORIGINAL source only after actual successful canonical acceptance and validation", "Record only the matching per-Change receipt on the ORIGINAL source after actual successful canonical acceptance and validation"), SELECTED_ACCEPTANCE_GUARD, crate::change_queue::DRAIN_PROTOCOL)
 }
 
 pub(crate) async fn land_change_with_client(
@@ -276,7 +334,6 @@ pub(crate) async fn land_change_with_client(
                 | IntegrationStrategy::Merge
                 | IntegrationStrategy::Rebase
                 | IntegrationStrategy::CherryPick
-                | IntegrationStrategy::Ask
         )
     })
     .ok_or_else(|| {
@@ -331,6 +388,9 @@ pub(crate) async fn land_change_with_client(
         crate::commands::review_oid(&git_root, &format!("refs/heads/{}", target.target_branch))
             .await?;
     }
+    // Unsupported Loom is an update prerequisite before any route/lifecycle or
+    // acceptance dispatch, including a saved-intent delivery retry.
+    crate::change_queue::require_atomic_cas(client).await?;
     crate::commands::ensure_acceptance_route(client, &fleet, summary, &target.coordinator_id)
         .await?;
     // A completed range already has authenticated final evidence. Its acceptance
@@ -372,6 +432,7 @@ pub(crate) async fn land_change_with_client(
             "Canonical ownership/initialization changed; refresh selected Land.",
         ));
     }
+    crate::change_queue::verify_canonical_owner(&fresh_fleet, &fresh_coordinator)?;
     let request = IntegrationRequest {
         action: "land-change",
         source_session: source.id.clone(),
@@ -388,22 +449,68 @@ pub(crate) async fn land_change_with_client(
     let source_request_revision = expected.scope.head_oid();
     let source_request_version = snapshot.as_ref().and_then(|s| s.version.as_deref());
     let payload = |action| serde_json::json!({"action":action,"request":request,"expected_change":expected,"change_id":change_id,"source_request_revision":source_request_revision,"source_request_version":source_request_version});
-    if !expected.scope.is_range() {
-        client
-            .deliver_request(
-                &source,
-                &selected_wrap_up_prompt(&request, expected),
-                payload("land-change-wrap-up"),
-            )
+    let queued =
+        crate::change_queue::promote(client, &fresh_coordinator, expected, strategy.as_str())
             .await?;
-    }
-    client
-        .deliver_request(
-            &coordinator,
-            &selected_acceptance_prompt(&request, expected),
-            payload("land-change"),
+    let queued_error = |stage: &str, error: UiError| UiError {
+        message: format!(
+            "Change remains queued at revision {}; {stage} delivery failed or is uncertain. \
+             Acceptance is not confirmed. Repeat the identical Land request to retry delivery \
+             (reconcile uncertain ACP delivery first). {}",
+            queued.revision, error.message
+        ),
+        ..error
+    };
+    if !expected.scope.is_range() {
+        crate::change_queue::require_atomic_cas(client)
+            .await
+            .map_err(|e| queued_error("Source atomic capability", e))?;
+        deliver_queue_wrap_up(
+            client,
+            &source,
+            expected,
+            &selected_wrap_up_prompt(&request, expected),
+            payload("land-change-wrap-up"),
         )
-        .await?;
+        .await
+        .map_err(|e| queued_error("Source wrap-up", e))?;
+    }
+    crate::change_queue::require_atomic_cas(client)
+        .await
+        .map_err(|e| queued_error("Coordinator atomic capability", e))?;
+    // An ordinary channel message cancels ACP's live turn in Loom. Persist an
+    // idempotent status instruction, then queue its wake behind that turn.
+    // Terminal coordinators retain the existing durable inbox delivery path.
+    let prompt = selected_acceptance_prompt(&request, expected);
+    let payload = payload("land-change");
+    let key = crate::client::request_key(&coordinator.id, &prompt, &payload);
+    client
+        .ensure_delivery_subscription(&coordinator.id, &coordinator.id)
+        .await
+        .map_err(|e| queued_error("Coordinator route", e.into()))?;
+    crate::change_queue::require_atomic_cas(client)
+        .await
+        .map_err(|e| queued_error("Coordinator dispatch capability", e))?;
+    if coordinator.protocol == "terminal" {
+        client
+            .send_to_thread(&coordinator.id, &prompt, payload, &key)
+            .await
+            .map_err(|e| queued_error("Coordinator queue wake", e.into()))?;
+    } else {
+        client
+            .record_request(&coordinator.id, &prompt, payload, &key)
+            .await
+            .map_err(|e| queued_error("Coordinator durable instruction", e.into()))?;
+        // This existing prompt API has no idempotent receipt; duplicate wakes
+        // cannot duplicate acceptance because live CAS claims/receipts govern it.
+        crate::change_queue::require_atomic_cas(client)
+            .await
+            .map_err(|e| queued_error("Coordinator ACP wake capability", e))?;
+        client
+            .queue_prompt(&coordinator.id, &prompt)
+            .await
+            .map_err(|e| queued_error("Coordinator ACP queue wake", e.into()))?;
+    }
     Ok(target)
 }
 

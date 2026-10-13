@@ -312,8 +312,74 @@ fn fleet(s: &SessionView, track: &SessionView) -> Value {
 fn sub(channel: &str) -> Value {
     json!({"channel_id":channel,"subject_kind":"session","subject_id":channel,"mode":"deliver"})
 }
-fn land_script(s: &SessionView, track: &SessionView, c: &Change) -> Vec<(&'static str, Value)> {
+fn queue_artifact(
+    track: &SessionView,
+    queue: &crate::change_queue::QueueState,
+    revision: i64,
+) -> Value {
+    json!({"meta":{"branch_id":track.branch.id,"rev":revision},"content":serde_json::to_string(queue).unwrap()})
+}
+fn atomic_support() -> Value {
+    json!({"paths":{"/api/artifacts/write":{"post":{"x-loom-atomic-base-rev":true}}}})
+}
+fn capability_read() -> (&'static str, Value) {
+    ("/api/openapi.json", atomic_support())
+}
+// Every Land fixture explicitly advertises support before routing, writing and
+// each delivery. Preserve literal declarations; never let mocks assume support.
+fn advertise_land_capability(script: &mut Vec<(&'static str, Value)>, working: bool) {
+    let first_route = script
+        .iter()
+        .position(|(path, _)| *path == "/api/channels/subscription/set")
+        .unwrap();
+    script.insert(first_route, capability_read());
+    let write = script
+        .iter()
+        .position(|(path, _)| *path == "/api/artifacts/write")
+        .unwrap();
+    script.insert(write + 1, capability_read());
+    if working {
+        let coordinator_route = script
+            .iter()
+            .rposition(|(path, reply)| {
+                *path == "/api/channels/subscription/set" && reply["channel_id"] == "track"
+            })
+            .unwrap();
+        script.insert(coordinator_route, capability_read());
+    }
+    // Final route/runtime reads can change support on the same healthy endpoint.
+    // Advertise again immediately before each actual message/prompt dispatch.
+    let dispatches: Vec<_> = script
+        .iter()
+        .enumerate()
+        .filter(|(_, (path, _))| {
+            matches!(
+                *path,
+                "/api/channels/messages/create" | "/api/sessions/prompt/create"
+            )
+        })
+        .map(|(index, _)| index)
+        .collect();
+    for index in dispatches.into_iter().rev() {
+        script.insert(index, capability_read());
+    }
+}
+fn queue_save_script(track: &SessionView, c: &Change) -> Vec<(&'static str, Value)> {
+    let empty = crate::change_queue::QueueState::empty(track).unwrap();
+    let mut saved = empty.clone();
+    saved.pending.push(crate::change_queue::QueueEntry {
+        change: c.clone(),
+        strategy: "squash".into(),
+        requested_by: Some(crate::change_queue::RequestedBy::User),
+    });
     vec![
+        ("/api/artifacts/get", queue_artifact(track, &empty, 1)),
+        capability_read(),
+        ("/api/artifacts/write", queue_artifact(track, &saved, 2)),
+    ]
+}
+fn land_script(s: &SessionView, track: &SessionView, c: &Change) -> Vec<(&'static str, Value)> {
+    let mut script = vec![
         ("/api/sessions/get", json!(s)),
         ("/api/channels/messages/list", json!([message(c)])),
         ("/api/sessions/summary/list", fleet(s, track)),
@@ -328,7 +394,10 @@ fn land_script(s: &SessionView, track: &SessionView, c: &Change) -> Vec<(&'stati
             "/api/channels/messages/create",
             json!({"_message_receipt":true}),
         ),
-    ]
+    ];
+    script.splice(9..9, queue_save_script(track, c));
+    advertise_land_capability(&mut script, false);
+    script
 }
 
 #[tokio::test]
@@ -569,13 +638,13 @@ async fn changed_registry_during_preflight_blocks_and_review_context_is_pinned()
     let mut script = land_script(&s, &track, &c);
     let mut changed = s.clone();
     changed.branch.tags[0].value = "malformed".into();
-    script[6].1 = json!(changed);
-    script.truncate(7);
+    script[7].1 = json!(changed);
+    script.truncate(8);
     let (client, server) = mock(script).await;
     assert!(land_change_with_client(&client, &s.id, &c.id, &c, None)
         .await
         .is_err());
-    assert_eq!(server.await.unwrap().len(), 7);
+    assert_eq!(server.await.unwrap().len(), 8);
     let comparison = crate::coordination::ReviewComparison {
         source_ref: s.branch.branch.clone(),
         target_ref: "arachne/tracks/accepted".into(),
@@ -736,15 +805,15 @@ async fn changed_live_track_marker_or_canonical_scope_blocks_selected_dispatch()
             .unwrap()
             .value = value.into();
         let mut script = land_script(&s, &track, &c);
-        script[8].1 = json!(changed);
-        script.truncate(9);
+        script[9].1 = json!(changed);
+        script.truncate(10);
         let (client, server) = mock(script).await;
         assert!(land_change_with_client(&client, &s.id, &c.id, &c, None)
             .await
             .unwrap_err()
             .message
             .contains("ownership"));
-        assert_eq!(server.await.unwrap().len(), 9);
+        assert_eq!(server.await.unwrap().len(), 10);
     }
 }
 
@@ -800,7 +869,7 @@ async fn working_land_pins_snapshot_in_both_noninterrupting_deliveries() {
     s.branch.tags.clear();
     s = registered(s, &c);
     let snapshot = json!({"base":{},"head_oid":c.scope.head_oid(),"version":"version-1"});
-    let (client, server) = mock(vec![
+    let mut script = vec![
         ("/api/sessions/get", json!(s)),
         ("/api/sessions/summary/list", fleet(&s, &track)),
         ("/api/sessions/get", json!(track)),
@@ -822,19 +891,30 @@ async fn working_land_pins_snapshot_in_both_noninterrupting_deliveries() {
             "/api/channels/messages/create",
             json!({"_message_receipt":true}),
         ),
-    ])
-    .await;
+    ];
+    let fresh_track = script
+        .iter()
+        .rposition(|(path, reply)| *path == "/api/sessions/get" && reply["id"] == track.id)
+        .unwrap();
+    script.splice(
+        fresh_track + 1..fresh_track + 1,
+        queue_save_script(&track, &c),
+    );
+    advertise_land_capability(&mut script, true);
+    let (client, server) = mock(script).await;
     land_change_with_client(&client, &s.id, &c.id, &c, None)
         .await
         .unwrap();
     let calls = server.await.unwrap();
-    for i in [12, 14] {
-        assert_eq!(calls[i].1["payload"]["expected_change"], json!(c));
-        assert_eq!(calls[i].1["payload"]["source_request_version"], "version-1");
-        assert!(calls[i].1["body"]
-            .as_str()
-            .unwrap()
-            .contains("same Land request"));
+    let deliveries: Vec<_> = calls
+        .iter()
+        .filter(|(path, _)| path.ends_with("/messages/create"))
+        .collect();
+    assert_eq!(deliveries.len(), 2);
+    for (_, body) in deliveries {
+        assert_eq!(body["payload"]["expected_change"], json!(c));
+        assert_eq!(body["payload"]["source_request_version"], "version-1");
+        assert!(body["body"].as_str().unwrap().contains("same Land request"));
     }
     assert!(calls
         .iter()
@@ -859,12 +939,17 @@ async fn independent_outputs_have_distinct_durable_retry_keys() {
         .await
         .unwrap();
     let second = server.await.unwrap();
-    for i in [10] {
-        assert_ne!(
-            first[i].1["idempotency_key"],
-            second[i].1["idempotency_key"]
-        );
-    }
+    let delivery = |calls: Vec<(String, Value)>| {
+        calls
+            .into_iter()
+            .find(|(path, _)| path.ends_with("/messages/create"))
+            .unwrap()
+            .1
+    };
+    assert_ne!(
+        delivery(first)["idempotency_key"],
+        delivery(second)["idempotency_key"]
+    );
 }
 
 #[tokio::test]
@@ -972,7 +1057,7 @@ async fn working_acp_wrap_up_queues_behind_running_turn() {
     s.protocol = "acp".into();
     s.status = "running".into();
     let snapshot = json!({"base":{},"head_oid":c.scope.head_oid(),"version":"working-v1"});
-    let (client, server) = mock(vec![
+    let mut script = vec![
         ("/api/sessions/get", json!(s)),
         ("/api/sessions/summary/list", fleet(&s, &track)),
         ("/api/sessions/get", json!(track)),
@@ -993,8 +1078,17 @@ async fn working_acp_wrap_up_queues_behind_running_turn() {
             "/api/channels/messages/create",
             json!({"_message_receipt":true}),
         ),
-    ])
-    .await;
+    ];
+    let fresh_track = script
+        .iter()
+        .rposition(|(path, reply)| *path == "/api/sessions/get" && reply["id"] == track.id)
+        .unwrap();
+    script.splice(
+        fresh_track + 1..fresh_track + 1,
+        queue_save_script(&track, &c),
+    );
+    advertise_land_capability(&mut script, true);
+    let (client, server) = mock(script).await;
     land_change_with_client(&client, &s.id, &c.id, &c, None)
         .await
         .unwrap();
@@ -1599,3 +1693,6 @@ async fn r1_removed_checkout_working_scope_requires_original_checkout_even_with_
     assert_eq!(server.await.unwrap().len(), 4);
     assert!(!Path::new(&source.work_dir).exists());
 }
+
+#[path = "change_queue_tests.rs"]
+mod queue_tests;
