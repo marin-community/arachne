@@ -19,6 +19,17 @@
 
 * { box-sizing: border-box; }
 
+/* Native Linux dropdown menus need their own colors, including when the
+   collapsed select inherits a transparent background from a composer pill. */
+select {
+  background-color: var(--bg);
+  color: var(--text);
+}
+option, optgroup {
+  background-color: var(--bg-raised);
+  color: var(--text);
+}
+
 html, body, #app {
   height: 100%;
   margin: 0;

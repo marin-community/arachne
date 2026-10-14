@@ -534,10 +534,21 @@ onUnmounted(() => {
   saveDraft(draftStorage, draft);
 });
 
+const sendBlockedReason = computed(() => {
+  if (props.launching) return "Launching…";
+  if (!props.available) return "Backend unavailable. Reconnect from the sidebar before launching.";
+  if (projectBindingsLoading.value) return "Loading project resources…";
+  if (projectBindingsError.value) return `Could not load project resources: ${projectBindingsError.value}. Retry project resources above.`;
+  if (attachmentLoading.value) return "Reading attachments…";
+  if (branchError.value) return branchError.value;
+  if (!title.value.trim() && !body.value.trim() && !attachments.value.length) return "Add a message, track title, or attachment to launch.";
+  return null;
+});
+
 function send() {
   const t = title.value.trim();
   const b = body.value.trim();
-  if (!props.available || projectBindingsLoading.value || projectBindingsError.value || (!t && !b && !attachments.value.length) || props.launching || attachmentLoading.value || branchError.value) return;
+  if (sendBlockedReason.value) return;
   // The message is both the agent's initial goal and the durable branch
   // description; either alone can seed a track. The draft is not cleared
   // here: App clears it on successful launch (this view unmounts), and
@@ -843,8 +854,9 @@ function onComposerKeydown(event: KeyboardEvent) {
           <button
             class="composer-send"
             type="button"
-            :disabled="!available || projectBindingsLoading || !!projectBindingsError || (!title.trim() && !body.trim() && !attachments.length) || props.launching || attachmentLoading || !!branchError"
-            :title="props.launching ? 'Launching…' : 'Send — launches the track (⌘/Ctrl + Enter)'"
+            :disabled="!!sendBlockedReason"
+            :title="sendBlockedReason || 'Send — launches the track (⌘/Ctrl + Enter)'"
+            aria-describedby="new-track-send-status"
             aria-label="Send and launch track"
             @click="send"
           >
@@ -852,7 +864,7 @@ function onComposerKeydown(event: KeyboardEvent) {
           </button>
         </div>
       </div>
-      <div class="composer-hint">⌘/Ctrl + Enter to send and launch · Enter for a new line</div>
+      <div id="new-track-send-status" class="composer-hint" role="status">{{ sendBlockedReason || '⌘/Ctrl + Enter to send and launch · Enter for a new line' }}</div>
     </div>
   </section>
 </template>

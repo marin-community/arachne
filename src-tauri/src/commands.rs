@@ -4107,10 +4107,9 @@ async fn repo_branch_context(client: &LoomClient, repo: &str) -> Result<Option<S
     // canonical root loom provisioned, so an exact match is the normal
     // case; the raw value covers paths typed directly into the sheet.
     let mut candidates: Vec<String> = Vec::new();
-    if let Ok(repos) = client.list_repos().await {
-        if let Some(managed) = repos.iter().find(|r| r.slug == repo) {
-            candidates.push(managed.path.clone());
-        }
+    let repos = client.list_repos().await?;
+    if let Some(managed) = repos.iter().find(|r| r.slug == repo) {
+        candidates.push(managed.path.clone());
     }
     if repo.contains('/') {
         candidates.push(repo.to_owned());
@@ -4146,6 +4145,103 @@ pub struct ProjectBindingsView {
     pub revision: i64,
 }
 
+async fn read_project_bindings(
+    client: &LoomClient,
+    project_id: &str,
+    repo: &str,
+) -> Result<ProjectBindingsView, UiError> {
+    let store = match repo_branch_context(client, repo).await? {
+        Some(context) => load_projects_store(client, &context).await?,
+        // No branch means this repository cannot have a shared store yet.
+        // Its first Track must be able to launch with no inherited resources.
+        None => ProjectsStore::default(),
+    };
+    Ok(ProjectBindingsView {
+        bindings: store.projects.get(project_id).cloned().unwrap_or_default(),
+        revision: store.revision,
+    })
+}
+
+#[cfg(test)]
+mod project_bindings_tests {
+    use super::thread_landing_contract_tests::mock;
+    use super::*;
+    use serde_json::json;
+
+    fn managed_repo() -> serde_json::Value {
+        json!([{"slug":"org/repo", "path":"/repo", "remote_url":"https://github.com/org/repo", "created_at":""}])
+    }
+
+    #[tokio::test]
+    async fn first_track_project_bindings_are_empty_without_a_branch() {
+        let (client, server) = mock(vec![
+            ("/api/repos/list", managed_repo()),
+            ("/api/branches/list", json!([])),
+        ])
+        .await;
+        let view = read_project_bindings(&client, "project", "org/repo")
+            .await
+            .unwrap();
+        assert!(view.bindings.is_empty());
+        assert_eq!(view.revision, 0);
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn existing_repository_reads_its_shared_project_store() {
+        let (client, server) = mock(vec![
+            ("/api/repos/list", managed_repo()),
+            (
+                "/api/branches/list",
+                json!([{"id":"existing", "repo_root":"/repo"}]),
+            ),
+            (
+                "/api/artifacts/get",
+                json!({"content":json!({"projects":{}}).to_string(), "meta":{"rev":7}}),
+            ),
+        ])
+        .await;
+        let view = read_project_bindings(&client, "project", "org/repo")
+            .await
+            .unwrap();
+        assert!(view.bindings.is_empty());
+        assert_eq!(view.revision, 7);
+        let requests = server.await.unwrap();
+        assert_eq!(
+            requests[2].1,
+            json!({"branch":"existing", "name":PROJECTS_NAME, "repo":true})
+        );
+    }
+
+    #[tokio::test]
+    async fn project_resource_lookup_failures_are_not_an_empty_checklist() {
+        for failing in ["repos", "branches", "store"] {
+            let mut script = vec![("/api/repos/list", managed_repo())];
+            match failing {
+                "repos" => script[0].1 = json!({"_http_error":"lookup failed"}),
+                "branches" => {
+                    script.push(("/api/branches/list", json!({"_http_error":"lookup failed"})))
+                }
+                _ => {
+                    script.push((
+                        "/api/branches/list",
+                        json!([{"id":"existing", "repo_root":"/repo"}]),
+                    ));
+                    script.push(("/api/artifacts/get", json!({"_http_error":"lookup failed"})));
+                }
+            }
+            let (client, server) = mock(script).await;
+            assert!(
+                read_project_bindings(&client, "project", "org/repo")
+                    .await
+                    .is_err(),
+                "{failing}"
+            );
+            server.await.unwrap();
+        }
+    }
+}
+
 /// Load one project's bindings (design.md "Project defaults and resource
 /// inheritance") — the creation form's checklist and the project home's
 /// resource list. `repo` is the sheet's repository reference (slug or path).
@@ -4158,14 +4254,7 @@ pub async fn project_bindings(
 ) -> Result<ProjectBindingsView, UiError> {
     async {
         let client = state_client(&state, &base_url).await?;
-        let context = repo_branch_context(&client, &repo)
-            .await?
-            .ok_or_else(|| resource_error("no loom branch exists for this repository yet"))?;
-        let store = load_projects_store(&client, &context).await?;
-        Ok(ProjectBindingsView {
-            bindings: store.projects.get(&project_id).cloned().unwrap_or_default(),
-            revision: store.revision,
-        })
+        read_project_bindings(&client, &project_id, &repo).await
     }
     .await
     .map_err(|error: UiError| error.for_server(&base_url))

@@ -31,6 +31,19 @@ On Ubuntu, the native app needs `build-essential`, `pkg-config`,
 desktop Secret Service on Linux. The launcher also recognizes project-local
 Node and WebKit prerequisites under `.local/`.
 
+For a personal Spark deployment over Tailscale, run
+`scripts/setup-loom-spark.sh` on the Spark with a Loom checkout at `~/src/loom`
+(or set `LOOM_SRC`). It installs Node and the Codex ACP adapter under
+`~/.local/share/loom`, builds Loom, and enables a `systemctl --user` service
+bound to the machine's Tailscale IP. It also configures the existing `gh`
+account token and, on first boot, the default Codex profile. The saved Arachne
+API token stays in `~/.weaver/arachne-framework1-token`; it is never printed.
+Git runs without interactive prompts; SSH remotes use the runner's on-disk
+key rather than waiting for approval from a desktop SSH agent.
+Use `systemctl --user status loom` and `journalctl --user -u loom` on the Spark
+to inspect the service. In Arachne, the header's connection indicator opens
+the saved-server dropdown for switching between local Loom and Spark.
+
 For the intended DGX Spark control plane, point Arachne at `http://100.121.8.110:7878` over Tailscale after Loom is deployed there. `scripts/deploy-loom-dgx.sh` describes the manual systemd installation. Register that backend alongside a local Loom to see both fleets together.
 
 ## Launch and work on a task

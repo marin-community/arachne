@@ -10,11 +10,46 @@ const key = "design_document:/repo:docs/design.md";
 const project = { id: scopedId(server, "project"), name: "Cached project" };
 const layout = { revision: 1, spaces: [{ id: scopedId(server, "space"), rank: 0, groups: [{ ...project, rank: 0, system_key: null }] }] };
 const bindings = (revision = 9) => ({ revision, bindings: [{ id: key, title: "Design", kind: "design_document", repository: "/repo", path: "docs/design.md" }] });
-function savedChat(available: boolean, transport: (command: string, args: any) => Promise<any>) {
-  return mountRoutingComponent("NewTrackChat", { backendUrl: server, available, backends: [], fleet: [], project: null, layout, launchOptions: null }, transport, false, {
+function savedChat(available: boolean, transport: (command: string, args: any) => Promise<any>, renderTemplate = false) {
+  return mountRoutingComponent("NewTrackChat", { backendUrl: server, available, backends: [], fleet: [], project: null, layout, launchOptions: null }, transport, renderTemplate, {
     [`arachne.newTopicDraft@${server}`]: JSON.stringify({ ...emptyDraft(), project, repo: "/repo", body: "Saved offline task" }),
   });
 }
+
+test("a project's first track enables Send after an empty resource checklist loads", async t => {
+  const response = deferred<any>();
+  const chat = savedChat(true, async command => command === "project_bindings" ? response.promise : [], true);
+  t.after(chat.stop); await settle(); await nextTick();
+  const send = () => chat.elements(element => element.props["aria-label"] === "Send and launch track")[0];
+  const status = () => chat.elements(element => element.props.id === "new-track-send-status")[0];
+  assert.equal(send().props.disabled, true);
+  assert.match(status().text!, /Loading project resources/);
+  response.resolve({ bindings: [], revision: 0 }); await settle(); await nextTick();
+  assert.equal(send().props.disabled, false);
+  send().props.onClick();
+  const launch = chat.events.find(event => event.name === "launch")!;
+  assert.equal(launch.args[0], "Saved offline task");
+  assert.deepEqual(launch.args[2].project, project);
+  assert.equal(launch.args[2].hiddenBindingKeys, undefined);
+});
+
+test("Send explains a failed project resource read and enables after retry", async t => {
+  let fail = true;
+  const chat = savedChat(true, async command => {
+    if (command === "project_bindings" && fail) throw new Error("Resource read failed");
+    return { bindings: [], revision: 0 };
+  }, true);
+  t.after(chat.stop); await settle(); await nextTick();
+  const send = () => chat.elements(element => element.props["aria-label"] === "Send and launch track")[0];
+  const status = () => chat.elements(element => element.props.id === "new-track-send-status")[0];
+  assert.equal(send().props.disabled, true);
+  assert.match(send().props.title, /Resource read failed/);
+  assert.match(status().text!, /Retry project resources above/);
+  assert.equal(send().props["aria-describedby"], status().props.id);
+  fail = false;
+  await chat.state.loadProjectBindings(); await nextTick();
+  assert.equal(send().props.disabled, false);
+});
 
 test("a saved offline project draft reloads inherited resources on recovery before launch", async t => {
   const response = deferred<any>();

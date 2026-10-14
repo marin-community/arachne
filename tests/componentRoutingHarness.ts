@@ -79,7 +79,7 @@ export function mountRoutingComponent(name: string, initial: Record<string, any>
   const file = name === "App" ? resolve(root, "App.vue") : resolve(root, "components", `${name}.vue`);
   const component = compileComponent(file, renderTemplate);
   const renderer = vue.createRenderer<Element, Element>({
-    createElement: type => ({ type, props: {}, children: [], focus() {}, querySelectorAll() { return []; }, getBoundingClientRect() { return { top: 0 }; }, scrollHeight: 0, scrollTop: 0, clientHeight: 0 }),
+    createElement: type => ({ type, props: {}, children: [], focus() {}, setSelectionRange() {}, querySelectorAll() { return []; }, getBoundingClientRect() { return { top: 0 }; }, scrollHeight: 0, scrollTop: 0, clientHeight: 0 }),
     createText: text => ({ type: "text", text, props: {}, children: [] }),
     createComment: text => ({ type: "comment", text, props: {}, children: [] }),
     insert(element, parent, anchor) {
