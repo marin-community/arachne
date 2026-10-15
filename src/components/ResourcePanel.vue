@@ -7,6 +7,7 @@ import { open } from "@tauri-apps/plugin-shell";
 import MarkdownIt from "markdown-it";
 import DOMPurify from "dompurify";
 import CheckoutEditor from "./CheckoutEditor.vue";
+import AttachResourceMenu, { type AttachDraft } from "./AttachResourceMenu.vue";
 import type { ArtifactTarget } from "../artifactLinks";
 import { createArtifactPreview, type ArtifactContent } from "../artifactPreview";
 import type { SessionSummary } from "../App.vue";
@@ -159,42 +160,10 @@ const renderedArtifact = computed(() => DOMPurify.sanitize(markdown.render(artif
 const loading = ref(false);
 const reading = ref(false);
 const saving = ref(false);
-const showAttach = ref(false);
-const attachMenuOpen = ref(false);
-function chooseAttachKind(kind: "github" | "design_document" | "file" | "repository") {
-  formKind.value = kind;
-  attachMenuOpen.value = false;
-  if (kind === "github" || kind === "repository") {
-    formTitle.value = "";
-    formPath.value = "";
-  } else {
-    chooseKind();
-  }
-  showAttach.value = true;
-}
-const formKind = ref<"github" | "design_document" | "file" | "repository">("github");
-const formTitle = ref("Design document");
-const formPath = ref("docs/design.md");
 const message = ref("");
 
-// --- GitHub attach picker ----------------------------------------------
-// Typing a PR/issue number or words searches GitHub via `gh` (gh_search);
-// results attach directly on click — no URL/title plumbing. The repo
-// defaults to the topic's own and sits as a dropdown next to the box.
-interface GhSearchRow {
-  number: number;
-  title: string;
-  state: string;
-  url: string;
-}
-const ghQuery = ref("");
-const ghResults = ref<GhSearchRow[]>([]);
-const ghSearching = ref(false);
-const ghError = ref("");
-let ghSearchSeq = 0;
-
-/** The repos the picker offers: the topic's repo first, then any other repo
- * its subtree's issues touch. */
+/** The repos the GitHub picker offers: the topic's repo first, then any
+ * other repo its subtree's issues touch. */
 const ghRepos = computed(() => {
   const repos: string[] = [];
   if (props.topic.github_repo) repos.push(props.topic.github_repo);
@@ -208,73 +177,6 @@ const ghRepos = computed(() => {
   }
   return repos;
 });
-const ghRepo = ref("");
-watch(ghRepos, (repos) => {
-  if (!ghRepo.value || !repos.includes(ghRepo.value)) ghRepo.value = repos[0] ?? "";
-}, { immediate: true });
-
-async function runGhSearch() {
-  const repo = ghRepo.value;
-  const query = ghQuery.value.trim();
-  if (!repo || !query) {
-    ghResults.value = [];
-    return;
-  }
-  const topicId = props.topic.id;
-  const seq = ++ghSearchSeq;
-  ghSearching.value = true;
-  ghError.value = "";
-  try {
-    // Unified search: GitHub treats PRs and issues as searchable either way,
-    // so one fetch covers both. The kind rides each result's URL.
-    const rows = await invoke<GhSearchRow[]>("gh_search", { repo, kind: "pull_request", query });
-    if (seq === ghSearchSeq && topicId === props.topic.id) ghResults.value = rows;
-  } catch (error: any) {
-    if (seq === ghSearchSeq && topicId === props.topic.id) {
-      ghResults.value = [];
-      ghError.value = error?.message ?? String(error);
-    }
-  } finally {
-    if (seq === ghSearchSeq && topicId === props.topic.id) ghSearching.value = false;
-  }
-}
-
-/** Attach a search result straight away: the URL is the identity, the
- * title rides the row, and the kind (PR vs issue) comes from the URL. */
-async function attachGhResult(row: GhSearchRow) {
-  if (saving.value) return;
-  saving.value = true;
-  message.value = "";
-  const topicId = props.topic.id;
-  try {
-    const kind = row.url.includes("/pull/") ? "pull_request" : "issue";
-    const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
-      topicId,
-      resource: {
-        kind,
-        title: row.title,
-        repository: props.topic.branch.repo_root,
-        reference: null,
-        path: null,
-        url: row.url,
-      },
-      expectedRevision: snapshot.value.revision,
-    });
-    if (topicId !== props.topic.id) return;
-    applyEffective(next);
-    const attached = next.resources.find((resource: EffectiveRow) => resource.url === row.url);
-    selectedId.value = attached?.id ?? selectedId.value;
-    showAttach.value = false;
-    ghResults.value = [];
-    ghQuery.value = "";
-    message.value = "Resource attached to this track.";
-  } catch (error: any) {
-    if (topicId !== props.topic.id) return;
-    message.value = error?.message ?? String(error);
-  } finally {
-    saving.value = false;
-  }
-}
 
 const selected = computed(() => snapshot.value.resources.find((resource) => resource.id === selectedId.value) ?? null);
 const sortedResources = computed(() => [...snapshot.value.resources].sort((a, b) =>
@@ -394,11 +296,8 @@ watch(() => props.topic.id, () => {
   selectedId.value = null;
   editPath.value = null;
   content.value = "";
-  ghSearchSeq++; statusRequest++;
+  statusRequest++;
   attachedStatuses.value = {};
-  ghResults.value = [];
-  ghQuery.value = "";
-  ghError.value = "";
   void refresh();
 }, { immediate: true });
 watch(selectedId, (id) => {
@@ -406,26 +305,18 @@ watch(selectedId, (id) => {
   else content.value = "";
 });
 
-function chooseKind() {
-  if (formKind.value === "design_document") {
-    formTitle.value = "Design document";
-    formPath.value = "docs/design.md";
+function onAttachDraft(draft: AttachDraft) {
+  // The menu hands back a fully-shaped draft; the only piece it cannot
+  // know is the topic's own repo/branch, which stamps file references
+  // (validation pins files to the topic repo) and GitHub rows' repository.
+  if (draft.kind === "github") {
+    void attachGithub(draft.title, draft.url!);
+  } else if (draft.kind === "repository") {
+    void attachRepository(draft.repository);
   } else {
-    formTitle.value = "";
-    formPath.value = "";
-  }
-  // Switching away from GitHub clears any pending search.
-  if (formKind.value !== "github") {
-    ghResults.value = [];
-    ghError.value = "";
+    void attachFile(draft.kind, draft.title, draft.path!);
   }
 }
-
-const attachValid = computed(() =>
-  formKind.value === "repository"
-    ? Boolean(formRepo.value.trim())
-    : Boolean(formTitle.value.trim() && formPath.value.trim()),
-);
 
 // --- Repository attachments (design.md: projects bind multiple repos) ---
 // The picker offers the managed repositories, plus the topic's own first.
@@ -458,51 +349,106 @@ async function loadManagedRepos() {
 }
 watch(() => backendOf(props.topic.id), loadManagedRepos, { immediate: true });
 
-async function attach() {
-  // The GitHub picker attaches straight from a search result (attachGhResult);
-  // this path serves the picked kinds: design document, file, repository.
-  const title = formTitle.value.trim();
-  const path = formPath.value.trim();
-  const repo = formRepo.value.trim();
-  if (saving.value || !attachValid.value || (formKind.value !== "repository" && !title)) return;
+// --- Attach paths (the menu's chosen drafts) ----------------------------
+
+async function attachGithub(title: string, url: string) {
+  if (saving.value) return;
   saving.value = true;
   message.value = "";
   const before = new Set(snapshot.value.resources.map((resource) => resource.id));
   const topicId = props.topic.id;
   try {
-    // The draft's repository field carries the binding's own target: the
-    // topic repo for files (pinned by validation) or the picked repo for
-    // repository bindings (resolved to its canonical root command-side).
+    const kind = url.includes("/pull/") ? "pull_request" : "issue";
     const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
       topicId,
-      resource: formKind.value === "repository"
-        ? {
-            // The slug doubles as the title — the row is its repo.
-            kind: formKind.value,
-            title: repo,
-            repository: repo,
-            reference: null,
-            path: null,
-            url: null,
-          }
-        : {
-            kind: formKind.value,
-            title,
-            repository: props.topic.branch.repo_root,
-            reference: props.topic.branch.branch,
-            path,
-            url: null,
-          },
+      resource: {
+        kind,
+        title,
+        repository: props.topic.branch.repo_root,
+        reference: null,
+        path: null,
+        url,
+      },
       expectedRevision: snapshot.value.revision,
     });
     if (topicId !== props.topic.id) return;
     applyEffective(next);
-    // The attached row is the new one (upsert by id; a repository binding's
-    // canonical root is resolved command-side, so diff, don't guess).
-    const attached = next.resources.find((resource) => !before.has(resource.id) && resource.kind === formKind.value)
-      ?? next.resources.find((resource) => resource.kind === formKind.value);
+    const attached = next.resources.find((resource: EffectiveRow) => resource.url === url)
+      ?? next.resources.find((resource) => !before.has(resource.id));
     selectedId.value = attached?.id ?? selectedId.value;
-    showAttach.value = false;
+    message.value = "Resource attached to this track.";
+  } catch (error: any) {
+    if (topicId !== props.topic.id) return;
+    await refresh();
+    message.value = error?.message ?? String(error);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function attachFile(kind: "file" | "design_document", title: string, path: string) {
+  if (saving.value) return;
+  saving.value = true;
+  message.value = "";
+  const before = new Set(snapshot.value.resources.map((resource) => resource.id));
+  const topicId = props.topic.id;
+  try {
+    const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
+      topicId,
+      resource: {
+        kind,
+        title,
+        // Files are pinned to the topic's repo and its accepted branch —
+        // the branch the launch created is where the work lands.
+        repository: props.topic.branch.repo_root,
+        reference: props.topic.branch.branch,
+        path,
+        url: null,
+      },
+      expectedRevision: snapshot.value.revision,
+    });
+    if (topicId !== props.topic.id) return;
+    applyEffective(next);
+    const attached = next.resources.find((resource: EffectiveRow) => resource.path === path)
+      ?? next.resources.find((resource) => !before.has(resource.id));
+    selectedId.value = attached?.id ?? selectedId.value;
+    message.value = "Resource attached to this track.";
+  } catch (error: any) {
+    if (topicId !== props.topic.id) return;
+    await refresh();
+    message.value = error?.message ?? String(error);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function attachRepository(repo: string) {
+  if (saving.value || !repo.trim()) return;
+  saving.value = true;
+  message.value = "";
+  const before = new Set(snapshot.value.resources.map((resource) => resource.id));
+  const topicId = props.topic.id;
+  try {
+    // The slug doubles as the title — the row is its repo. The command
+    // resolves it to the canonical repo root (identity matches a project
+    // binding for the same repo).
+    const next = await invoke<TopicEffectiveView>("attach_topic_resource", {
+      topicId,
+      resource: {
+        kind: "repository",
+        title: repo,
+        repository: repo,
+        reference: null,
+        path: null,
+        url: null,
+      },
+      expectedRevision: snapshot.value.revision,
+    });
+    if (topicId !== props.topic.id) return;
+    applyEffective(next);
+    const attached = next.resources.find((resource: EffectiveRow) => resource.kind === "repository" && resource.repository === repo)
+      ?? next.resources.find((resource) => !before.has(resource.id));
+    selectedId.value = attached?.id ?? selectedId.value;
     message.value = "Resource attached to this track.";
   } catch (error: any) {
     if (topicId !== props.topic.id) return;
@@ -709,54 +655,19 @@ async function onPreviewClick(event: MouseEvent) {
       </template>
     </div>
     <div class="resource-panel-attach">
-      <button class="resource-panel-add" @click="showAttach = !showAttach">{{ showAttach ? 'Cancel' : (formKind === 'github' ? 'Find on GitHub…' : formKind === 'design_document' ? 'Design document…' : formKind === 'repository' ? 'Repository…' : 'File…') }}</button>
-      <button v-if="showAttach" class="resource-panel-add-caret" title="Choose kind" @click="attachMenuOpen = !attachMenuOpen">▾</button>
-      <div v-if="attachMenuOpen" class="resource-panel-attach-menu">
-        <button type="button" :class="{ current: formKind === 'github' }" @click="chooseAttachKind('github')">GitHub PR or issue</button>
-        <button type="button" :class="{ current: formKind === 'design_document' }" @click="chooseAttachKind('design_document')">Design document</button>
-        <button type="button" :class="{ current: formKind === 'file' }" @click="chooseAttachKind('file')">File</button>
-        <!-- Repository bindings (design.md: a topic can bring in another
-             repo; a project can bind several) — picked, not typed. -->
-        <button type="button" :class="{ current: formKind === 'repository' }" @click="chooseAttachKind('repository')">Repository</button>
-      </div>
-    </div>
-    <div v-if="showAttach" class="resource-panel-form">
-      <template v-if="formKind === 'github'">
-        <div class="gh-search-bar">
-          <select v-model="ghRepo" class="gh-repo" title="Search this repo">
-            <option v-for="repo in ghRepos" :key="repo" :value="repo">{{ repo }}</option>
-          </select>
-          <input v-model="ghQuery" placeholder="#27 or words from the title" spellcheck="false"
-            @input="runGhSearch" @keydown.enter.prevent="runGhSearch" />
-        </div>
-        <div v-if="ghSearching" class="resource-panel-empty">Searching…</div>
-        <div v-else-if="ghError" class="resource-panel-message">{{ ghError }}</div>
-        <div v-else-if="ghResults.length" class="gh-results">
-          <button v-for="row in ghResults" :key="row.url" type="button" class="gh-result"
-            :title="row.title" :disabled="saving" @click="attachGhResult(row)">
-            <strong>#{{ row.number }}</strong>
-            <span class="gh-result-title">{{ row.title }}</span>
-            <small>{{ row.state.toLowerCase() }}</small>
-          </button>
-        </div>
-        <div v-else-if="ghQuery.trim()" class="resource-panel-empty">Nothing found.</div>
-      </template>
-      <!-- Repository bindings pick their own repo (design.md: a project
-           binds multiple repositories); managed list + the topic's own.
-           The slug doubles as the title — the row is its repo. -->
-      <template v-else-if="formKind === 'repository'">
-        <label>Repository
-          <select v-model="formRepo">
-            <option v-for="repo in repoOptions" :key="repo" :value="repo">{{ repo }}</option>
-          </select>
-        </label>
-        <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
-      </template>
-      <template v-else>
-        <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
-        <label>Path in track branch <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
-        <button class="primary" :disabled="saving || !attachValid" @click="attach">Attach</button>
-      </template>
+      <!-- One attach affordance (design.md "Resource attachment"): a single
+           button whose menu names what can be attached — a GitHub PR/issue
+           found by search, a repository file found by path autocomplete,
+           or another repository. The menu's chosen drafts arrive via
+           onAttachDraft. -->
+      <AttachResourceMenu
+        :gh-repos="ghRepos"
+        :repo-options="repoOptions"
+        :files-repo="props.topic.github_repo || props.topic.branch.repo_root"
+        :disabled="saving"
+        label="Attach…"
+        @attach="onAttachDraft"
+      />
     </div>
     <div v-if="message" class="resource-panel-message">{{ message }}</div>
     <div v-if="artifactTarget" class="resource-panel-preview">
@@ -837,24 +748,6 @@ async function onPreviewClick(event: MouseEvent) {
 .resource-panel-item-text small, .resource-panel-empty, .resource-panel-location { color: var(--text-dim); font-size: 11px; }
 .resource-panel-empty { padding: 12px; }
 .resource-panel-attach { position: relative; margin: 6px 10px; display: flex; }
-.resource-panel-add { flex: 1; min-width: 0; }
-.resource-panel-add-caret { padding: 0 8px; }
-.resource-panel-attach-menu { position: absolute; top: calc(100% + 4px); right: 0; min-width: 190px; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4); z-index: 30; overflow: hidden; display: grid; }
-.resource-panel-attach-menu button { display: block; width: 100%; text-align: left; padding: 7px 10px; font-size: 12px; border: 0; background: transparent; color: var(--text); }
-.resource-panel-attach-menu button:hover { background: var(--bg-hover); }
-.resource-panel-attach-menu button.current { color: var(--accent); }
-.gh-search-bar { display: flex; gap: 5px; }
-.gh-search-bar .gh-repo { width: auto; flex: none; max-width: 40%; }
-.gh-search-bar input { flex: 1; min-width: 0; }
-.resource-panel-form { display: grid; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); }
-.resource-panel-form label { display: grid; gap: 3px; color: var(--text-dim); font-size: 11px; }
-.resource-panel-form input, .resource-panel-form select { width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 6px; }
-.gh-results { display: grid; gap: 2px; max-height: 180px; overflow-y: auto; }
-.gh-result { display: flex; align-items: baseline; gap: 6px; width: 100%; text-align: left; border: 0; background: transparent; padding: 5px 6px; border-radius: 5px; color: var(--text); }
-.gh-result:hover { background: var(--bg-hover); }
-.gh-result strong { flex: none; }
-.gh-result-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.gh-result small { color: var(--text-dim); flex: none; }
 .resource-panel-message { padding: 6px 12px; color: var(--accent); font-size: 11px; }
 .resource-panel-preview { display: flex; flex-direction: column; min-height: 0; flex: 1; border-top: 1px solid var(--border); }
 .resource-panel-preview-head { display: flex; align-items: center; gap: 5px; padding: 10px; }

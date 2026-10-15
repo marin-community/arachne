@@ -12,6 +12,7 @@ import { layoutProjects } from "../projects";
 import { useFileCompletion } from "../useFileCompletion";
 import { inferTopicBranch, topicBranchError } from "../trackPolicy.ts";
 import RepoBaseFields from "./RepoBaseFields.vue";
+import AttachResourceMenu, { type AttachDraft } from "./AttachResourceMenu.vue";
 
 // The new-track chat (docs/design.md "Navigation"): New track opens a chat
 // immediately, not a form sheet. It takes over the main display panel with
@@ -380,6 +381,29 @@ const projectBindingsLoading = ref(false);
 const projectBindingsError = ref("");
 /** Unchecked binding ids — the initial hides recorded at launch. */
 const uncheckedBindings = ref<Set<string>>(new Set());
+const projectSaving = ref(false);
+
+// Repository bindings pick their own repo; the GitHub search offers the
+// working repo (plus anything else the fleet touches).
+const managedRepos = ref<string[]>([]);
+async function loadManagedRepos() {
+  try {
+    const repos = await invoke<{ slug: string }[] | null>("managed_repos");
+    managedRepos.value = Array.isArray(repos) ? repos.map((r) => r.slug) : [];
+  } catch {
+    managedRepos.value = [];
+  }
+}
+loadManagedRepos();
+const attachGhRepos = computed(() => {
+  const repos: string[] = [];
+  const slug = repo.value.trim();
+  if (slug && !slug.startsWith("/") && slug.includes("/")) repos.push(slug);
+  for (const s of props.fleet) {
+    if (s.github_repo && !repos.includes(s.github_repo)) repos.push(s.github_repo);
+  }
+  return repos;
+});
 
 let bindingsRequest = 0;
 let bindingsIdentity = "";
@@ -428,54 +452,29 @@ function toggleBinding(id: string, checked: boolean) {
   uncheckedBindings.value = next;
 }
 
-const showProjectAttach = ref(false);
-const projectFormKind = ref<"design_document" | "file" | "pull_request" | "issue">("design_document");
-const projectFormTitle = ref("Design document");
-const projectFormPath = ref("docs/design.md");
-const projectFormUrl = ref("");
-const projectSaving = ref(false);
-const projectIsUrlKind = computed(() => projectFormKind.value === "pull_request" || projectFormKind.value === "issue");
-const projectAttachValid = computed(() =>
-  projectFormTitle.value.trim() && (projectIsUrlKind.value ? projectFormUrl.value.trim() : projectFormPath.value.trim()),
-);
-
-function chooseProjectKind() {
-  if (projectFormKind.value === "design_document") {
-    projectFormTitle.value = "Design document";
-    projectFormPath.value = "docs/design.md";
-    projectFormUrl.value = "";
-  } else {
-    projectFormTitle.value = "";
-    projectFormPath.value = "";
-    projectFormUrl.value = "";
-  }
-}
-
-async function attachToProject() {
+/** Bind the menu's chosen draft to the project (design.md: every new
+ *  track in the project inherits it — including this draft's launch). The
+ *  menu hands back a complete draft; this stamps the repo context. */
+async function onAttachDraft(draft: AttachDraft) {
   const projectId = project.value?.id;
   const repoInput = repo.value.trim();
-  const title = projectFormTitle.value.trim();
-  const path = projectFormPath.value.trim();
-  const url = projectFormUrl.value.trim();
-  if (!props.available || !projectId || !repoInput || projectSaving.value || !projectAttachValid.value) return;
+  if (!props.available || !projectId || !repoInput || projectSaving.value) return;
+  const resource = draft.kind === "github"
+    ? { kind: draft.url!.includes("/pull/") ? "pull_request" : "issue", title: draft.title, repository: "", reference: null, path: null, url: draft.url }
+    : draft.kind === "repository"
+      ? { kind: "repository", title: draft.title, repository: draft.repository, reference: null, path: null, url: null }
+      : { kind: draft.kind, title: draft.title, repository: "", reference: null, path: draft.path, url: null };
   projectSaving.value = true;
   projectBindingsError.value = "";
   try {
     const view = await invoke<{ bindings: ProjectBinding[]; revision: number }>("add_project_binding", {
       projectId,
       repo: repoInput,
-      resource: projectIsUrlKind.value
-        ? { kind: projectFormKind.value, title, repository: "", reference: null, path: null, url }
-        : { kind: projectFormKind.value, title, repository: "", reference: null, path, url: null },
+      resource,
       expectedRevision: projectRevision.value,
     });
     projectBindings.value = view.bindings ?? [];
     projectRevision.value = view.revision ?? 0;
-    showProjectAttach.value = false;
-    projectFormTitle.value = "Design document";
-    projectFormPath.value = "docs/design.md";
-    projectFormUrl.value = "";
-    projectFormKind.value = "design_document";
   } catch (error: any) {
     await loadProjectBindings();
     projectBindingsError.value = error?.message ?? String(error);
@@ -721,30 +720,18 @@ function onComposerKeydown(event: KeyboardEvent) {
               <button type="button" class="link" :disabled="!available || projectBindingsLoading" @click="loadProjectBindings">Retry project resources</button>
             </div>
             <div class="nts-binding-actions">
-              <button
-                type="button"
-                class="link"
+              <!-- One attach affordance (design.md "Resource attachment"):
+                   the same menu as the track panel and project sheet —
+                   search GitHub, complete a file path, or pick a
+                   repository — bound here to the picked project. -->
+              <AttachResourceMenu
+                :gh-repos="attachGhRepos"
+                :repo-options="managedRepos"
+                :files-repo="repo.trim() || null"
                 :disabled="!available || projectSaving"
-                @click="showProjectAttach = !showProjectAttach"
-              >{{ showProjectAttach ? "Cancel" : "+ Bind a resource to this project" }}</button>
-            </div>
-            <!-- Binding a resource to the project: the same four kinds the
-                 track panel attaches, stored in the project's store
-                 (repo-shared arachne-projects) rather than any track's
-                 manifest. -->
-            <div v-if="showProjectAttach" class="nts-binding-form">
-              <label>Kind
-                <select v-model="projectFormKind" @change="chooseProjectKind">
-                  <option value="design_document">Design document</option>
-                  <option value="file">File</option>
-                  <option value="pull_request">Pull request</option>
-                  <option value="issue">Issue</option>
-                </select>
-              </label>
-              <label>Title <input v-model="projectFormTitle" placeholder="Design document" /></label>
-              <label v-if="projectIsUrlKind">GitHub URL <input v-model="projectFormUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
-              <label v-else>Path in repo <input v-model="projectFormPath" placeholder="docs/design.md" spellcheck="false" /></label>
-              <button type="button" class="primary" :disabled="!available || projectSaving || !projectAttachValid" @click="attachToProject">Bind to project</button>
+                label="+ Bind a resource"
+                @attach="onAttachDraft"
+              />
             </div>
           </div>
         </div>

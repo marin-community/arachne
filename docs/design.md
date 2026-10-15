@@ -229,6 +229,17 @@ attach the ones the track should remember durably (skills/resources.md).
 One active writer per mutable checkout remains the
 default; other workers get isolated worktrees.
 
+Every surface that attaches a resource — the track's Resources panel, a
+project's settings sheet, and the new-track chat's project bindings — offers
+one **Attach** control. Its menu names what can be attached, and every choice
+is a search, not a form: a GitHub PR or issue is found by number or words
+(`gh search`, unified over both kinds; the chosen row's URL names its kind),
+a file or design document by autocompleting its repository path, and a
+repository by picking from the managed list. The chosen entry attaches
+directly — there is no separate URL/title plumbing to fill in by hand. The
+menu itself is one shared component, so the three surfaces cannot drift
+apart in what they accept.
+
 ## Thread landing and Track publishing
 
 **Land** accepts one declared Change from a worker Thread into its

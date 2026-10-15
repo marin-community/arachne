@@ -51,7 +51,8 @@ test("ProjectSheet can switch away from an unavailable backend and dismiss while
   assert.equal(sheet.events.filter(event => event.name === "close").length, 2);
   const create = sheet.elements(el => el.type === "button" && el.text?.trim() === "Create project")[0];
   assert.equal(Boolean(create.props.disabled), true);
-  await sheet.state.create(); await sheet.state.attach();
+  await sheet.state.create();
+  await sheet.state.onAttachDraft({ kind: "file", title: "Design", repository: "", reference: null, path: "docs/design.md", url: null });
   await sheet.state.remove({ id: scopedId(a, bindingKey) });
   assert.equal(calls.filter(command => ["create_group", "add_project_binding", "remove_project_binding"].includes(command)).length, 0);
   sheet.props.backendUrl = b; sheet.props.available = true; await nextTick();

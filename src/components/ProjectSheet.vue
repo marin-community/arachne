@@ -6,6 +6,7 @@ import type { SessionLayout } from "../App.vue";
 import { saveNewProject, type ProjectBinding, type ProjectBindingsView, type ProjectCreationDraft } from "../projectCreation";
 import { readProjectDefaults, saveProjectDefaults, recentRepositories } from "../launchDefaults";
 import RepoBaseFields from "./RepoBaseFields.vue";
+import AttachResourceMenu, { type AttachDraft } from "./AttachResourceMenu.vue";
 import { readDraft, DEFAULT_REPO } from "../newTopicDraft";
 
 // Manage a project's resource bindings directly (design.md "Project defaults
@@ -128,23 +129,10 @@ onUnmounted(() => { loadRequest++; clearTimeout(loadTimer); });
 
 // --- Add / remove bindings ------------------------------------------------
 
-const showAttach = ref(false);
-const formKind = ref<"design_document" | "file" | "repository" | "pull_request" | "issue">("design_document");
-const formTitle = ref("Design document");
-const formPath = ref("docs/design.md");
-const formUrl = ref("");
-const isUrlKind = computed(() => formKind.value === "pull_request" || formKind.value === "issue");
-
 // Repository bindings pick their own repo (design.md: multiple
 // repositories per project) — the managed list, so the binding names a real
 // repo rather than a guess.
 const managedRepos = ref<string[]>([]);
-const formRepo = ref("");
-const repoOptions = computed(() => managedRepos.value);
-watch(repoOptions, (options) => {
-  if (!formRepo.value || !options.includes(formRepo.value)) formRepo.value = options[0] ?? "";
-}, { immediate: true });
-
 async function loadManagedRepos() {
   try {
     const repos = await invoke<{ slug: string }[] | null>("managed_repos");
@@ -155,45 +143,30 @@ async function loadManagedRepos() {
 }
 loadManagedRepos();
 
-const attachValid = computed(() =>
-  Boolean(
-    formTitle.value.trim()
-    && (isUrlKind.value
-      ? formUrl.value.trim()
-      : formKind.value === "repository"
-        ? formRepo.value.trim()
-        : formPath.value.trim()),
-  ),
-);
+// The GitHub search needs a repo to search: the repo field's value when
+// it carries a slug, else the managed list's first entry.
+const ghRepo = computed(() => {
+  const repoInput = repo.value.trim();
+  if (repoInput && !repoInput.startsWith("/") && repoInput.includes("/")) return [repoInput];
+  const fallback = managedRepos.value[0];
+  return fallback ? [fallback] : [];
+});
 
-function chooseKind() {
-  if (formKind.value === "design_document") {
-    formTitle.value = "Design document";
-    formPath.value = "docs/design.md";
-    formUrl.value = "";
-  } else {
-    formTitle.value = "";
-    formPath.value = "";
-    formUrl.value = "";
-  }
-}
-
-async function attach() {
+/** Attach the menu's chosen draft as a project binding (design.md: every
+ *  new track in the project inherits what you bind here). The menu hands
+ *  back a complete draft; this stamps the pieces only the project context
+ *  knows — the store's repo root for file/GitHub rows. */
+async function onAttachDraft(draft: AttachDraft) {
   const projectId = project.value?.id;
   const repoInput = repo.value.trim();
-  const title = formTitle.value.trim();
-  const path = formPath.value.trim();
-  const url = formUrl.value.trim();
-  const targetRepo = formRepo.value.trim();
-  if (!props.available || !repoInput || saving.value || loading.value || !attachValid.value) return;
-  const resource = isUrlKind.value
-    ? { kind: formKind.value, title, repository: "", reference: null, path: null, url }
-    : formKind.value === "repository"
-      ? { kind: formKind.value, title, repository: targetRepo, reference: null, path: null, url: null }
-      : { kind: formKind.value, title, repository: "", reference: null, path, url: null };
+  if (!props.available || !repoInput || saving.value) return;
+  const resource = draft.kind === "github"
+    ? { kind: draft.kind === "github" ? (draft.url!.includes("/pull/") ? "pull_request" : "issue") : draft.kind, title: draft.title, repository: "", reference: null, path: null, url: draft.url }
+    : draft.kind === "repository"
+      ? { kind: "repository", title: draft.title, repository: draft.repository, reference: null, path: null, url: null }
+      : { kind: draft.kind, title: draft.title, repository: "", reference: null, path: draft.path, url: null };
   if (creating.value) {
     creation.bindings.push({ id: crypto.randomUUID(), ...resource });
-    resetAttach();
     return;
   }
   if (!projectId) return;
@@ -208,7 +181,6 @@ async function attach() {
     });
     bindings.value = view.bindings ?? [];
     revision.value = view.revision ?? 0;
-    resetAttach();
   } catch (e: any) {
     // Conflict or failure: reload so the next edit starts from truth.
     await load();
@@ -247,16 +219,8 @@ async function remove(binding: ProjectBinding) {
   }
 }
 
-function resetAttach() {
-  showAttach.value = false;
-  formTitle.value = "Design document";
-  formPath.value = "docs/design.md";
-  formUrl.value = "";
-  formKind.value = "design_document";
-}
-
 async function create() {
-  if (!props.available || saving.value || !name.value.trim() || showAttach.value) return;
+  if (!props.available || saving.value || !name.value.trim()) return;
   saving.value = true;
   error.value = "";
   try {
@@ -303,7 +267,7 @@ function onKeydown(event: KeyboardEvent) {
 
       <label class="nts-field">
         <span class="nts-field-name">Backend</span>
-        <select v-if="creating" :value="backendUrl" :disabled="saving || !!creation.project || !!creation.bindings.length || showAttach" @change="emit('backend', ($event.target as HTMLSelectElement).value)">
+        <select v-if="creating" :value="backendUrl" :disabled="saving || !!creation.project || !!creation.bindings.length" @change="emit('backend', ($event.target as HTMLSelectElement).value)">
           <option v-for="backend in backends" :key="backend.url" :value="backend.url">{{ backend.name }} · {{ backend.url }}{{ backend.available ? '' : ' — Unavailable' }}</option>
         </select>
         <span v-else>{{ backends.find(backend => backend.url === backendUrl)?.name }} · {{ backendUrl }}</span>
@@ -346,32 +310,19 @@ function onKeydown(event: KeyboardEvent) {
           Nothing bound yet — new tracks in {{ projectName }} inherit what you bind here.
         </div>
         <div class="nts-binding-actions">
-          <button type="button" class="link" :disabled="saving || (!available && !showAttach)" @click="showAttach = !showAttach">
-            {{ showAttach ? "Cancel" : "+ Bind a resource" }}
-          </button>
+          <!-- One attach affordance (design.md "Resource attachment"): the
+               same menu as the track panel — search GitHub, complete a file
+               path, or pick a repository — bound here to the project's
+               store so every new track in it inherits the choice. -->
+          <AttachResourceMenu
+            :gh-repos="ghRepo"
+            :repo-options="managedRepos"
+            :files-repo="repo.trim() || null"
+            :disabled="!available || saving || !repo.trim()"
+            :label="creating ? '+ Add resource' : '+ Bind a resource'"
+            @attach="onAttachDraft"
+          />
         </div>
-        <fieldset v-if="showAttach" class="nts-binding-form" :disabled="!available || saving">
-          <label>Kind
-            <select v-model="formKind" @change="chooseKind">
-              <option value="design_document">Design document</option>
-              <option value="file">File</option>
-              <option value="repository">Repository</option>
-              <option value="pull_request">Pull request</option>
-              <option value="issue">Issue</option>
-            </select>
-          </label>
-          <label>Title <input v-model="formTitle" placeholder="Design document" /></label>
-          <!-- A repository binding names its own repo — the managed list;
-               this is how a project comes to span several repos. -->
-          <label v-if="formKind === 'repository'">Repository
-            <select v-model="formRepo">
-              <option v-for="repo in repoOptions" :key="repo" :value="repo">{{ repo }}</option>
-            </select>
-          </label>
-          <label v-if="isUrlKind">GitHub URL <input v-model="formUrl" placeholder="https://github.com/OWNER/REPO/pull/13" spellcheck="false" /></label>
-          <label v-else-if="formKind !== 'repository'">Path in repo <input v-model="formPath" placeholder="docs/design.md" spellcheck="false" /></label>
-          <button type="button" class="primary" :disabled="!available || saving || loading || !attachValid || !repo.trim()" @click="attach">{{ creating ? 'Add resource' : 'Bind to project' }}</button>
-        </fieldset>
       </div>
 
       <div v-if="error" class="nts-error" role="alert">{{ error }}</div>
@@ -383,7 +334,7 @@ function onKeydown(event: KeyboardEvent) {
       </span>
       <div v-if="creating" class="nts-actions">
         <button type="button" :disabled="saving" @click="emit('close')">{{ creation.project ? 'Close' : 'Cancel' }}</button>
-        <button type="button" class="primary" :disabled="!available || saving || !name.trim() || showAttach || (!!creation.bindings.length && !repo.trim())" @click="create">
+        <button type="button" class="primary" :disabled="!available || saving || !name.trim() || (!!creation.bindings.length && !repo.trim())" @click="create">
           {{ saving ? 'Saving…' : creation.project ? 'Save remaining resources' : 'Create project' }}
         </button>
       </div>
