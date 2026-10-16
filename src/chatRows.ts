@@ -3,6 +3,7 @@ export interface ChatDisplayBlock {
   kind: string;
   turn?: number | null;
   seq?: number | null;
+  created_at?: string | null;
   text?: string;
   by?: string | null;
   tool_kind?: string;
