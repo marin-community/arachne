@@ -25,6 +25,7 @@ import type { ArtifactTarget } from "../artifactLinks";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
 import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, resolveContextUsage, commandReplyTurns, type ChatDisplayBlock } from "../chatRows";
+import { withChatTimestamps, formatChatTimestamp } from "../chatTimestamps";
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
@@ -141,11 +142,20 @@ async function setConfig(option: ConfigOption, event: Event) {
     configBusy.value = null;
   }
 }
-const rows = computed(() => groupDisplayBlocks(
-  blocks.value,
-  turnLive.value ? snapshotLiveTurn.value : null,
-  props.session.agent_kind === "pi",
-));
+const rows = computed(() => {
+  const grouped = groupDisplayBlocks(
+    blocks.value,
+    turnLive.value ? snapshotLiveTurn.value : null,
+    props.session.agent_kind === "pi",
+  );
+  // Invisible journal plumbing must not create orphan timestamp labels or
+  // suppress a gap before the next visible row.
+  const visible = grouped.filter((row) => row.kind !== "single" ||
+    ["user_message", "agent_message", "thought", "permission_request", "plan"].includes(row.block.kind) ||
+    (row.block.kind === "turn_end" && !!turnEndMessage(row.block.stop_reason)),
+  );
+  return withChatTimestamps(visible);
+});
 // Turn number → the command pi-acp's interceptor answered locally. Those
 // turns' replies are system output (stats, receipts), not agent prose.
 const commandTurns = computed(() => commandReplyTurns(blocks.value, metadata.value?.commands.map((c) => c.name) ?? []));
@@ -340,6 +350,7 @@ const turnStartedAt = ref<number | null>(null);
 const lastProgressAt = ref<number | null>(null);
 const pendingPrompt = ref<string | null>(null);
 const clock = ref(Date.now());
+const calendarDay = computed(() => new Date(clock.value).toDateString());
 let ticker: ReturnType<typeof setInterval> | null = null;
 let sseTurnAt = 0;
 
@@ -1316,6 +1327,10 @@ async function onPublish(strategy: string) {
         </button>
       </div>
       <template v-for="row in rows" :key="row.key">
+        <time v-if="row.timestamp" class="chat-timestamp" :datetime="row.timestamp"
+          :title="new Date(row.timestamp).toLocaleString()">
+          {{ formatChatTimestamp(row.timestamp, new Date(calendarDay)) }}
+        </time>
         <!-- Consecutive tool calls and finished thinking in one turn share one
              disclosure. -->
         <div v-if="row.kind === 'work_group'" class="block tool" :data-copy-host="row.key">

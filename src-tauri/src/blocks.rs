@@ -11,8 +11,15 @@ use crate::loom::ChatBlockView;
 /// A block narrowed for display. `(turn, seq)` is a stable journal coordinate
 /// for disclosure state across pagination and refreshes.
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct DisplayBlock {
+    pub created_at: String,
+    #[serde(flatten)]
+    content: DisplayBlockContent,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum DisplayBlock {
+enum DisplayBlockContent {
     UserMessage {
         turn: i64,
         seq: i64,
@@ -100,6 +107,15 @@ fn thought_summary(text: &str) -> String {
 
 impl DisplayBlock {
     pub fn from_view(block: &ChatBlockView) -> Self {
+        Self {
+            created_at: block.created_at.clone(),
+            content: DisplayBlockContent::from_view(block),
+        }
+    }
+}
+
+impl DisplayBlockContent {
+    fn from_view(block: &ChatBlockView) -> Self {
         let payload = &block.payload;
         let turn = block.turn;
         let seq = block.seq;
@@ -247,6 +263,32 @@ mod tests {
         assert_eq!(display["turn"], 7);
         assert_eq!(display["seq"], 9);
         assert_eq!(display["payload"], payload);
+    }
+
+    #[test]
+    fn display_blocks_preserve_journal_timestamps() {
+        for kind in [
+            "user_message",
+            "agent_message",
+            "thought",
+            "tool_call",
+            "permission_request",
+            "plan",
+            "usage",
+            "turn_end",
+            "future_kind",
+        ] {
+            let mut source = block(kind, json!({}));
+            source.created_at = "2026-10-14T12:34:56.789Z".to_string();
+            let display = serde_json::to_value(DisplayBlock::from_view(&source)).unwrap();
+            assert_eq!(display["created_at"], source.created_at);
+            assert_eq!(display["turn"], source.turn);
+            assert_eq!(display["seq"], source.seq);
+            assert_eq!(
+                display["kind"],
+                if kind == "future_kind" { "other" } else { kind }
+            );
+        }
     }
 
     #[test]
