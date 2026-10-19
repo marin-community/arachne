@@ -192,6 +192,27 @@ function threadProps(current) {
   return { session: current, fleet: [current], topic: current, launchOptions: null, loomUrl: "http://127.0.0.1:7878", unarchiving: false };
 }
 
+test("chat renders time separators only for visible activity and keeps full dates in tooltips", async (t) => {
+  const blocks = [
+    { kind: "turn_end", turn: 0, seq: 0, stop_reason: "end_turn", created_at: "2026-10-14T11:00:00Z" },
+    { kind: "plan", turn: 1, seq: 0, entries: [], created_at: "2026-10-14T12:00:00Z" },
+    { kind: "usage", turn: 1, seq: 1, created_at: "2026-10-14T12:09:00Z" },
+    { kind: "other", turn: 1, seq: 2, created_at: "2026-10-14T12:09:30Z" },
+    { kind: "plan", turn: 2, seq: 0, entries: [], created_at: "2026-10-14T12:10:00Z" },
+    { kind: "plan", turn: 2, seq: 1, entries: [], created_at: "invalid" },
+  ];
+  const { tree } = await mount(t, ThreadView, threadProps(session()), null, { snapshot: { blocks } });
+  const labels = conversation(tree).children.filter((node) => node.type === "time");
+  assert.deepEqual(labels.map((node) => node.props.datetime), [
+    "2026-10-14T12:00:00.000Z", "2026-10-14T12:10:00.000Z",
+  ]);
+  for (const label of labels) {
+    assert.equal(label.props.class, "chat-timestamp");
+    assert.equal(label.props.title, new Date(label.props.datetime).toLocaleString());
+    assert.ok(textOf(label).trim());
+  }
+});
+
 test("Track publish history starts collapsed while current Publish feedback stays visible and routed", async (t) => {
   const previous = "00b79edd72788dc38f6ae27274dd1266019c2cb5";
   const tags = [{ key: "topic", value: "true" }, { key: "track_topic_branch", value: "weaver/workflow-2" },
