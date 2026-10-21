@@ -1137,6 +1137,14 @@ function messageAuthor(block: ChatDisplayBlock): string {
   return "you";
 }
 
+/** The hover tooltip for a message row: its own full local time, not just
+ * the separator labels. Missing or unparsable journal times get no tooltip
+ * rather than a bogus "Invalid Date". */
+function messageTitle(block: ChatDisplayBlock): string | undefined {
+  const time = block.created_at ? new Date(block.created_at) : null;
+  return time && Number.isFinite(time.getTime()) ? time.toLocaleString() : undefined;
+}
+
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
 const hasExplicitChanges = computed(() => changeRegistry(currentSummary.value ?? props.session).entries.length > 0);
 const isReviewer = computed(() => currentSummary.value?.branch.tags.some(tag => tag.key === "role" && tag.value === "reviewer"));
@@ -1438,6 +1446,7 @@ async function onPublish(strategy: string) {
             system: isCommandReply(row.block),
           }"
           :data-copy-host="row.key"
+          :title="messageTitle(row.block)"
         >
           <div class="who">
             {{ isCommandReply(row.block) ? `system · /${commandTurns.get(row.block.turn ?? -1)}` : messageAuthor(row.block) }}

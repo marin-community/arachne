@@ -35,10 +35,23 @@ before(async () => {
       setup(builder) {
         builder.onResolve({ filter: /^vue$/ }, () => ({ path: import.meta.resolve("vue"), external: true }));
         builder.onResolve({ filter: /^@tauri-apps\// }, ({ path }) => ({ path, namespace: "native-test" }));
+        builder.onResolve({ filter: /ChatMarkdown\.vue$/ }, ({ path }) => ({ path, namespace: "stub-test" }));
         builder.onLoad({ filter: /.*/, namespace: "native-test" }, () => ({ contents: `
           export const invoke = (...args) => globalThis.__composerControls.invoke(...args);
           export const listen = (...args) => globalThis.__composerControls.listen(...args);
           export const open = () => { throw new Error("Unexpected shell open"); };
+        ` }));
+        // ChatMarkdown needs a real DOM (DOMPurify, template parsing); this
+        // harness exercises the message rows around it, not its sanitized
+        // HTML. A span child keeps the body slot structure intact.
+        builder.onLoad({ filter: /.*/, namespace: "stub-test" }, () => ({ contents: `
+          import { h, defineComponent } from "vue";
+          const ChatMarkdown = defineComponent({
+            props: { text: { type: String, default: "" } },
+            emits: ["open-artifact"],
+            setup(props) { return () => h("span", { class: "chat-markdown" }, props.text); },
+          });
+          export default ChatMarkdown;
         ` }));
         builder.onLoad({ filter: /\.vue$/ }, async ({ path: filename }) => {
           const { descriptor } = parse(await readFile(filename, "utf8"), { filename });
@@ -211,6 +224,24 @@ test("chat renders time separators only for visible activity and keeps full date
     assert.equal(label.props.title, new Date(label.props.datetime).toLocaleString());
     assert.ok(textOf(label).trim());
   }
+});
+
+test("message rows hover their own local time and hide the tooltip when the journal time is unusable", async (t) => {
+  const blocks = [
+    { kind: "user_message", turn: 1, seq: 0, text: "hello there", created_at: "2026-10-14T12:00:00Z" },
+    { kind: "agent_message", turn: 1, seq: 1, text: "hi back", created_at: "2026-10-14T12:01:00Z" },
+    { kind: "agent_message", turn: 1, seq: 2, text: "no journal time" },
+    { kind: "user_message", turn: 2, seq: 0, text: "bad journal time", created_at: "invalid" },
+  ];
+  const { tree } = await mount(t, ThreadView, threadProps(session()), null, { snapshot: { blocks } });
+  const messageRow = (host) => find(conversation(tree), (node) => node.props["data-copy-host"] === host);
+  for (const host of ["block:1:0", "block:1:1", "block:1:2", "block:2:0"]) assert.ok(messageRow(host), `${host} must render`);
+  // Per-message times, not just the separator labels.
+  assert.equal(messageRow("block:1:0").props.title, new Date("2026-10-14T12:00:00Z").toLocaleString());
+  assert.equal(messageRow("block:1:1").props.title, new Date("2026-10-14T12:01:00Z").toLocaleString());
+  // Missing or unparsable times must not show a bogus "Invalid Date" tooltip.
+  assert.equal(messageRow("block:1:2").props.title, undefined);
+  assert.equal(messageRow("block:2:0").props.title, undefined);
 });
 
 test("Track publish history starts collapsed while current Publish feedback stays visible and routed", async (t) => {
