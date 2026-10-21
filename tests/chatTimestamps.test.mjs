@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { groupDisplayBlocks } from "../src/chatRows.ts";
-import { formatChatTimestamp, withChatTimestamps } from "../src/chatTimestamps.ts";
+import { formatChatTimestamp, messageTooltip, withChatTimestamps } from "../src/chatTimestamps.ts";
 
 const message = (seq, created_at) => ({ kind: "user_message", turn: 1, seq, created_at });
 const separators = (blocks) => withChatTimestamps(groupDisplayBlocks(blocks));
@@ -82,4 +82,24 @@ test("Yesterday uses the calendar day across DST and year boundaries", () => {
     new Date(2026, 10, 1, 23, 30), "en-US"), /^Yesterday, /);
   assert.match(formatChatTimestamp(new Date(2025, 11, 31, 23, 30).toISOString(),
     new Date(2026, 0, 1, 0, 30), "en-US"), /^Yesterday, /);
+});
+
+test("message tooltips show clock-only today and date + clock on other days", () => {
+  const now = new Date(2026, 9, 15, 12);
+  const tooltip = (date, locale = "en-US") => messageTooltip(date.toISOString(), now, locale);
+  assert.equal(tooltip(new Date(2026, 9, 15, 9, 5)), "9:05 AM");
+  assert.equal(tooltip(new Date(2026, 9, 15, 0, 5)), "12:05 AM");
+  assert.equal(tooltip(new Date(2026, 9, 13, 9, 5)), "Oct 13, 9:05 AM");
+  assert.equal(tooltip(new Date(2025, 9, 13, 9, 5)), "Oct 13, 2025, 9:05 AM");
+  assert.equal(tooltip(new Date(2026, 9, 15, 9, 5), "en-GB"), "9:05");
+  assert.equal(messageTooltip("invalid", now), "");
+});
+
+test("message tooltips use calendar days across DST, not 24-hour deltas", () => {
+  // With TZ=America/Los_Angeles, 2026-10-25 is the fall-back day: 01:30 is
+  // within 24 hours of 23:30 the next evening but still a different day.
+  const evening = new Date(2026, 9, 25, 1, 30);
+  const now = new Date(2026, 9, 26, 23, 30);
+  assert.match(messageTooltip(evening.toISOString(), now, "en-US"), /^[A-Z][a-z]{2} \d{1,2}, /);
+  assert.equal(messageTooltip(now.toISOString(), now, "en-US"), "11:30 PM");
 });
