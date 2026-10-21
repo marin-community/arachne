@@ -139,6 +139,74 @@ test("actual ChangeReview preparation sends a raw coordinator identity while pre
   assert.ok(sent.args.text.includes(JSON.stringify(selected)), "selected declaration remains mandatory after user edits");
 });
 
+test("actual ChangeReview inline comments send through the plain send_input path", async t => {
+  const calls: { command: string; args: any }[] = [];
+  const line = (kind: string, old_line: number | null, new_line: number | null, text: string) => ({ kind, old_line, new_line, text });
+  const review = mountRoutingComponent("ChangeReview", { backendUrl: a, sessionId: scopedId(a, "worker"), selectedChange: null, integrationTarget: null, isTopic: false }, async (command, args) => {
+    calls.push({ command, args });
+    if (command === "work_changes") return {
+      source_ref: "weaver/worker", accepted_source: false, version: null, head_oid: "e".repeat(40),
+      base: { state: "available", reference: "main", oid: "a".repeat(40) },
+      totals: { files: 1, additions: 1, deletions: 1, truncated: false }, truncated: false,
+      files: [{
+        status: "modified", path: { display: "src/app.ts", bytes: "src/app.ts" }, old_path: null, sources: [],
+        additions: 1, deletions: 1, content: "text", truncated: false,
+        hunks: [{ header: "@@ -1,3 +1,3 @@", truncated: false, lines: [
+          line("context", 1, 1, "const a = 1;"),
+          line("deletion", 2, null, "const b = 2;"),
+          line("addition", null, 2, "const b = 3;"),
+        ] }],
+      }],
+    };
+    return null;
+  }, true);
+  t.after(review.stop); await settle();
+  assert.equal(review.elements(el => el.props.class?.startsWith("change-review-line")).length, 3, "rendered diff lines expose comment affordances");
+  const buttons = review.elements(el => el.props["aria-label"]?.startsWith("Add an inline comment on "));
+  assert.equal(buttons.length, 3);
+  assert.equal(buttons[0].props["aria-label"], "Add an inline comment on src/app.ts:1");
+  // Deletions fall back to the old-side line number in their anchor.
+  const deleteButton = review.elements(el => el.props["aria-label"] === "Add an inline comment on src/app.ts:2 (deleted line)")[0];
+  await deleteButton.props.onClick(); await nextTick();
+  assert.ok(review.state.activeComment, "clicking the + button opens one comment box");
+  review.state.commentDraft = "Do we need this flag at all?"; await nextTick();
+  const commentButtons = review.elements(el => el.type === "button" && el.text === "Comment");
+  await commentButtons[0].props.onClick(); await nextTick();
+  assert.equal(review.state.comments.length, 1);
+  assert.equal(review.state.comments[0].anchor, "src/app.ts:2");
+  assert.equal(review.state.comments[0].text, "Do we need this flag at all?");
+  assert.equal(review.state.activeComment, null, "the box closes after adding");
+  const cards = review.elements(el => el.props.class === "change-review-comment-card");
+  assert.equal(cards.length, 1, "the added comment renders as a pinned card");
+  // Queue a second comment on an addition line.
+  await buttons[2].props.onClick(); await nextTick();
+  review.state.commentDraft = "Something looks off here."; await nextTick();
+  await review.elements(el => el.type === "button" && el.text === "Comment")[0].props.onClick(); await nextTick();
+  assert.equal(review.state.comments.length, 2);
+  // Send to agent: the composer area opens, then Send invokes plain send_input.
+  review.state.openCommentSend(); await nextTick();
+  const chip = review.elements(el => el.props.class === "change-review-comments-chip")[0];
+  assert.equal(chip.text, "2 comments");
+  review.state.commentMessage = "Please take a look."; await nextTick();
+  await review.state.sendComments(); await settle();
+  const sent = calls.filter(call => call.command === "send_input");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].args.baseUrl, a); assert.equal(sent[0].args.id, "worker");
+  assert.equal(sent[0].args.topicId, null); assert.deepEqual(sent[0].args.resourceIds, []); assert.deepEqual(sent[0].args.attachments, []);
+  assert.equal(sent[0].args.changeId, undefined, "inline comments never use the selected-preparation path");
+  assert.ok(sent[0].args.text.includes("2 inline comments on the current review"));
+  assert.ok(sent[0].args.text.includes("- `src/app.ts:2` — Do we need this flag at all?"));
+  assert.ok(sent[0].args.text.includes("- `src/app.ts:2` — Something looks off here."));
+  assert.ok(sent[0].args.text.includes("Please take a look."));
+  assert.equal(review.state.comments.length, 0, "comments clear after sending");
+  assert.match(review.state.requestNote, /Sent 2 inline comments to this thread\./);
+  assert.equal(review.events.filter(event => event.name === "requested").length, 1);
+  // A deletion at old line 2 and an addition at new line 2 share the anchor
+  // path:2 but stay pinned to their own rows.
+  const additionCards = review.elements(el => el.props.class === "change-review-comment-card");
+  assert.equal(additionCards.length, 0, "sending cleared the pinned cards");
+});
+
 test("an older catalog request cannot erase a later generation after returning to A", async t => {
   const oldA = deferred<unknown>(); let aRequests = 0;
   const panel = mountRoutingComponent("ResourcePanel", { topic: topic(a) }, async (command, args) => {

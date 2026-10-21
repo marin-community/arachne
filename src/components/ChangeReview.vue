@@ -7,6 +7,7 @@ import type { SessionSummary } from "../App.vue";
 import { useLaunchSelection } from "../launch";
 import { preparationRequest, independentReviewRequest, reviewPreviewEvidence, selectedChangeInstructions } from "../reviewRequest";
 import { selectedChangePayload, type ChangeSelection } from "../durableChange.ts";
+import { commentFromLine, buildCommentPrompt, type ReviewComment } from "../reviewComments.ts";
 import { backendOf } from "../backendIdentity.ts";
 
 const invoke = useBackendInvoke();
@@ -56,6 +57,58 @@ const editPath = ref<string | null>(null);
 const editedPaths = ref<string[]>([]);
 const fileQuery = ref("");
 const fileOptions = ref<string[]>([]);
+// GitHub-style inline comments. One open composer at a time, keyed by the
+// comment anchor so refreshes of the diff data never lose queued comments.
+const activeComment = ref<{ path: string; line: ChangeLine } | null>(null);
+const comments = ref<ReviewComment[]>([]);
+const commentDraft = ref("");
+const commentSendMode = ref(false);
+const commentMessage = ref("");
+const sendingComments = ref(false);
+let commentGeneration = 0;
+function anchorOf(path: string, line: ChangeLine): string | null {
+  const number = line.new_line ?? line.old_line;
+  return number == null ? null : `${path}:${number}`;
+}
+// Placement distinguishes the diff side: a deletion at old line 2 and an
+// addition at new line 2 are different rows even though both anchor as path:2.
+function commentLineKey(path: string, line: ChangeLine): string | null {
+  if (line.kind === "deletion") return line.old_line == null ? null : `${path}:old:${line.old_line}`;
+  return line.new_line == null ? null : `${path}:new:${line.new_line}`;
+}
+function commentKey(comment: ReviewComment): string {
+  return comment.lineKind === "deletion" ? `${comment.path}:old:${comment.line}` : `${comment.path}:new:${comment.line}`;
+}
+function commentBoxOpen(path: string, line: ChangeLine): boolean {
+  return !!activeComment.value && commentLineKey(path, line) === commentLineKey(activeComment.value.path, activeComment.value.line);
+}
+function commentButtonLabel(path: string, line: ChangeLine): string {
+  const anchor = anchorOf(path, line);
+  return anchor == null ? "" : `Add an inline comment on ${anchor}${line.kind === "deletion" ? " (deleted line)" : ""}`;
+}
+function openComment(path: string, line: ChangeLine) {
+  if (anchorOf(path, line) == null) return;
+  activeComment.value = { path, line };
+  commentDraft.value = "";
+}
+function closeComment() {
+  activeComment.value = null;
+  commentDraft.value = "";
+}
+function addComment() {
+  if (!activeComment.value) return;
+  const comment = commentFromLine(activeComment.value.path, activeComment.value.line, commentDraft.value);
+  if (!comment) return;
+  comments.value.push(comment);
+  closeComment();
+}
+function removeComment(id: string) {
+  comments.value = comments.value.filter(comment => comment.id !== id);
+}
+function commentsFor(path: string, line: ChangeLine): ReviewComment[] {
+  const key = commentLineKey(path, line);
+  return key ? comments.value.filter(comment => commentKey(comment) === key) : [];
+}
 let completionGeneration = 0;
 const visibleFiles = computed(() => changes.value?.files.filter(file => file.path.display.toLowerCase().includes(fileQuery.value.toLowerCase())) ?? []);
 const requestMode = ref<"review" | "prepare" | null>(null);
@@ -170,6 +223,12 @@ watch(() => [props.sessionId, JSON.stringify(props.selectedChange), selectedProb
   requestNote.value = "";
   requestGeneration++;
   requesting.value = false;
+  comments.value = [];
+  closeComment();
+  commentSendMode.value = false;
+  commentMessage.value = "";
+  commentGeneration++;
+  sendingComments.value = false;
   void refresh();
 }, { immediate: true });
 
@@ -180,11 +239,45 @@ watch(() => [props.isTopic, props.integrationTarget?.id, props.integrationTarget
   if (props.selectedChange) requestMode.value = null;
   requestGeneration++;
   requesting.value = false;
+  commentGeneration++;
+  sendingComments.value = false;
   void refresh();
 });
 
 function lineNumber(value: number | null): string {
   return value == null ? "" : String(value);
+}
+function commentBoxId(file: ChangeFile, hunkIndex: number, line: ChangeLine): string {
+  return `comment-box-${props.sessionId}-${file.path.bytes}-${hunkIndex}-${line.new_line ?? line.old_line}`;
+}
+function openCommentSend() {
+  if (!comments.value.length) return;
+  commentSendMode.value = true;
+  commentMessage.value = "";
+}
+async function sendComments() {
+  if (!comments.value.length || sendingComments.value || loading.value || error.value) return;
+  const id = props.sessionId;
+  const prompt = buildCommentPrompt(comments.value);
+  const count = comments.value.length;
+  const text = `Please address these inline review comments on the current comparison.\n\n${prompt}\n\n${commentMessage.value.trim()}`.trim();
+  if (!text.trim()) return;
+  const request = ++commentGeneration;
+  sendingComments.value = true;
+  try {
+    await invoke("send_input", { id, text, topicId: null, resourceIds: [], attachments: [] });
+    if (id !== props.sessionId || request !== commentGeneration) return;
+    comments.value = [];
+    commentSendMode.value = false;
+    commentMessage.value = "";
+    closeComment();
+    requestNote.value = `Sent ${count} inline comment${count === 1 ? "" : "s"} to this thread.`;
+    emit("requested");
+  } catch (e: unknown) {
+    if (request === commentGeneration) requestNote.value = (e as { message?: string })?.message ?? String(e);
+  } finally {
+    if (request === commentGeneration) sendingComments.value = false;
+  }
 }
 </script>
 
@@ -200,6 +293,14 @@ function lineNumber(value: number | null): string {
     <div class="review-toolbar">
       <button :disabled="loading || requesting || reviewingTrack === null || !!selectedProblem || !!error" @click="prepareRequest('review')">Launch reviewer</button>
       <button v-if="reviewingTrack || selectedChange" :disabled="loading || requesting || reviewingTrack === null || !!selectedProblem || !!error" @click="prepareRequest('prepare')">Prepare {{ reviewingTrack ? "publishing" : "selected Change" }}</button>
+      <span v-if="comments.length" class="change-review-comments-chip" role="status">{{ comments.length }} comment{{ comments.length === 1 ? "" : "s" }}</span>
+      <button v-if="comments.length" class="change-review-comments-send" :disabled="loading || requesting || sendingComments || !!error" @click="openCommentSend">Send to agent</button>
+    </div>
+    <div v-if="commentSendMode" class="review-request change-review-comments-composer">
+      <label :for="`review-comments-${sessionId}`">Send {{ comments.length }} inline comment{{ comments.length === 1 ? "" : "s" }} to this thread</label>
+      <pre class="change-review-comments-summary">{{ buildCommentPrompt(comments) }}</pre>
+      <textarea :id="`review-comments-${sessionId}`" v-model="commentMessage" :disabled="sendingComments" rows="3" placeholder="Add an optional message for this thread…" />
+      <div><button :disabled="sendingComments" @click="commentSendMode = false">Cancel</button><button class="primary" :disabled="loading || sendingComments || !!error" @click="sendComments">{{ sendingComments ? "Sending…" : "Send to agent" }}</button></div>
     </div>
     <div v-if="requestMode" class="review-request">
       <label :for="`review-request-${sessionId}`">{{ requestMode === 'review' ? "Review request" : "Preparation request" }}</label>
@@ -246,12 +347,24 @@ function lineNumber(value: number | null): string {
             <div v-else class="change-review-hunks">
               <div v-for="(hunk, hunkIndex) in file.hunks" :key="hunkIndex" class="change-review-hunk">
                 <div class="change-review-hunk-header">{{ hunk.header }}</div>
-                <div v-for="(line, lineIndex) in hunk.lines" :key="lineIndex" class="change-review-line" :class="line.kind">
-                  <span class="change-review-number">{{ lineNumber(line.old_line) }}</span>
-                  <span class="change-review-number">{{ lineNumber(line.new_line) }}</span>
-                  <span class="change-review-marker">{{ line.kind === 'addition' ? '+' : line.kind === 'deletion' ? '−' : ' ' }}</span>
-                  <span class="change-review-text">{{ line.text }}</span>
-                </div>
+                <template v-for="(line, lineIndex) in hunk.lines" :key="lineIndex">
+                  <div class="change-review-line" :class="line.kind">
+                    <span class="change-review-number">{{ lineNumber(line.old_line) }}</span>
+                    <span class="change-review-number">{{ lineNumber(line.new_line) }}</span>
+                    <span class="change-review-marker">{{ line.kind === 'addition' ? '+' : line.kind === 'deletion' ? '−' : ' ' }}</span>
+                    <span class="change-review-text">{{ line.text }}</span>
+                    <button v-if="anchorOf(file.path.display, line) != null" class="change-review-comment-button" type="button" :aria-label="commentButtonLabel(file.path.display, line)" :title="`Comment on ${anchorOf(file.path.display, line)}`" @click="openComment(file.path.display, line)">+</button>
+                  </div>
+                  <div v-if="activeComment && commentBoxOpen(file.path.display, line)" class="change-review-comment-box">
+                    <label :for="commentBoxId(file, hunkIndex, line)">Comment on <span class="change-review-comment-anchor">{{ anchorOf(activeComment.path, activeComment.line) }}</span></label>
+                    <textarea :id="commentBoxId(file, hunkIndex, line)" v-model="commentDraft" rows="3" placeholder="Leave a comment…" />
+                    <div><button type="button" @click="closeComment">Cancel</button><button class="primary" type="button" :disabled="!commentDraft.trim()" @click="addComment">Comment</button></div>
+                  </div>
+                  <div v-for="comment in commentsFor(file.path.display, line)" :key="comment.id" class="change-review-comment-card">
+                    <div class="change-review-comment-card-header"><span class="change-review-comment-anchor">{{ comment.anchor }}</span><span class="change-review-comment-kind">{{ comment.lineKind }}</span><button class="change-review-comment-remove" type="button" :aria-label="`Remove comment on ${comment.anchor}`" title="Remove comment" @click="removeComment(comment.id)">×</button></div>
+                    <p class="change-review-comment-text">{{ comment.text }}</p>
+                  </div>
+                </template>
                 <div v-if="hunk.truncated" class="change-review-state">Hunk preview truncated.</div>
               </div>
             </div>
@@ -297,4 +410,22 @@ function lineNumber(value: number | null): string {
 .change-review-number { width: 38px; flex: none; padding: 0 4px; text-align: right; color: var(--text-dim); border-right: 1px solid var(--border); user-select: none; }
 .change-review-marker { width: 20px; flex: none; text-align: center; }
 .change-review-text { padding-right: 16px; user-select: text; }
+.change-review-comment-button { opacity: 0; position: sticky; right: 0; margin: 0 4px; padding: 0 7px; line-height: 1.6; border-color: var(--border); background: var(--bg-raised); color: var(--text-dim); }
+.change-review-line:hover .change-review-comment-button, .change-review-comment-button:focus-visible { opacity: 1; }
+.change-review-comment-box, .change-review-comment-card { display: grid; gap: 5px; margin: 4px 16px; padding: 8px; border: 1px solid var(--border); border-left: 2px solid var(--accent); border-radius: 5px; background: rgba(110, 168, 254, .07); font: 11px/1.45 var(--mono); }
+.change-review-comment-box { min-width: max-content; width: min(520px, calc(100% - 32px)); max-width: min(520px, calc(100% - 32px)); white-space: normal; }
+.change-review-comment-box label { color: var(--text-dim); }
+.change-review-comment-box textarea { width: 100%; box-sizing: border-box; resize: vertical; min-height: 58px; font-family: inherit; font-size: 12px; line-height: 1.5; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 6px 8px; }
+.change-review-comment-box textarea:focus-visible { border-color: var(--accent); outline: none; }
+.change-review-comment-box > div { display: flex; justify-content: flex-end; gap: 6px; }
+.change-review-comment-card { min-width: 0; max-width: min(560px, calc(100% - 32px)); }
+.change-review-comment-card-header { display: flex; align-items: center; gap: 8px; }
+.change-review-comment-anchor { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.change-review-comment-kind { color: var(--text-dim); }
+.change-review-comment-remove { margin-left: auto; padding: 0 5px; line-height: 1.3; color: var(--text-dim); }
+.change-review-comment-text { margin: 0; color: var(--text); user-select: text; white-space: pre-wrap; overflow-wrap: anywhere; }
+.change-review-comments-chip { color: var(--text-dim); font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 10px; white-space: nowrap; }
+.change-review-comments-send { flex: none; }
+.change-review-comments-composer .change-review-comments-summary { margin: 0; padding: 8px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text-dim); font: 11px/1.45 var(--mono); overflow: auto; max-height: 180px; white-space: pre-wrap; }
+.change-review-comments-composer textarea { min-height: 58px; }
 </style>
