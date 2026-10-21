@@ -1419,6 +1419,39 @@ button.accent { border-color: var(--accent); color: var(--accent); }
 .block:hover .copy-button,
 .copy-button:focus-visible,
 .copy-button.copied { opacity: 1; }
+/* The message's own time, revealed on hover beside the copy button —
+   the visible replacement for the native tooltip these rows used to
+   carry. Anchored to the .block rather than the .body: an
+   entrance-split message or trailing images give one row several
+   bodies, while the corner geometry (data-copy-host) already tracks
+   the block. corner-top (resting state: the row's top on screen) hangs
+   the time below the bubble; corner-bottom (the row's top has scrolled
+   out of view, so the copy icon flipped to the trailing edge) pins it
+   just above the block's bottom edge, beside the icon, so time and
+   copy stay together at the visible edge instead of hanging past the
+   block into the row below (right: 34px clears the copy button —
+   right: 4px, ~24px wide). pointer-events: none — the label must not
+   steal the hover that reveals it; a label hung below the bubble
+   hit-tests the next row over, so the label fades as the pointer
+   approaches it, matching how iMessage reveals timestamps. */
+.message-time {
+  position: absolute;
+  right: 34px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  pointer-events: none;
+  user-select: none;
+  opacity: 0;
+  z-index: 1;
+  transition: opacity .12s;
+}
+.message-time.corner-top { bottom: -14px; }
+.message-time.corner-bottom { bottom: 2px; }
+.block:hover .message-time,
+.block:focus-within .message-time { opacity: 1; }
 /* Disclosure headers and detail rows reserve the corner so the pinned
    icon never sits on the chevron or the summary text. */
 .tool-line { padding-right: 30px; }
