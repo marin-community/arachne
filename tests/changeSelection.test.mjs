@@ -19,7 +19,7 @@ const flush = async () => { await nextTick(); await new Promise(resolve => setIm
 function harness(name, input, invoke, exposed) {
   const script = component(name).match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1].replace(/^import[\s\S]*?;\n/gm, "");
   const props = reactive(input), events = [];
-  const context = { ref, computed, watch, onBeforeUnmount() {}, ...queues, ...identities, ...changes, ...review, ...inspector, ...policy, ...strategies,
+  const context = { ref, computed, watch, onBeforeUnmount() {}, onMounted() {}, ...queues, ...identities, ...changes, ...review, ...inspector, ...policy, ...strategies,
     useBackendInvoke: () => invoke, useLaunchSelection: () => ref({ agent: "codex", model: "test", effort: "high" }),
     localStorage: { setItem() {} },
     defineProps: () => props, withDefaults: value => value,
