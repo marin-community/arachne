@@ -226,22 +226,57 @@ test("chat renders time separators only for visible activity and keeps full date
   }
 });
 
-test("message rows hover their own local time and hide the tooltip when the journal time is unusable", async (t) => {
+test("message rows show their own local time on hover and hide the label when the journal time is unusable", async (t) => {
+  // Pin "now" — the component derives its calendar day from Date.now at
+  // setup — so today/other-day label formatting is deterministic.
+  const realNow = Date.now;
+  const now = new Date(2026, 9, 14, 15, 0);
+  Date.now = () => now.getTime();
+  t.after(() => { Date.now = realNow; });
+  const clock = (value) => value.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
   const blocks = [
-    { kind: "user_message", turn: 1, seq: 0, text: "hello there", created_at: "2026-10-14T12:00:00Z" },
-    { kind: "agent_message", turn: 1, seq: 1, text: "hi back", created_at: "2026-10-14T12:01:00Z" },
+    { kind: "user_message", turn: 1, seq: 0, text: "hello there", created_at: new Date(2026, 9, 14, 15, 45).toISOString() },
+    { kind: "agent_message", turn: 1, seq: 1, text: "hi back", created_at: new Date(2026, 9, 14, 15, 46).toISOString() },
     { kind: "agent_message", turn: 1, seq: 2, text: "no journal time" },
-    { kind: "user_message", turn: 2, seq: 0, text: "bad journal time", created_at: "invalid" },
+    { kind: "user_message", turn: 2, seq: 0, text: "from yesterday", created_at: new Date(2026, 9, 13, 9, 5).toISOString() },
+    { kind: "user_message", turn: 3, seq: 0, text: "bad journal time", created_at: "invalid" },
   ];
   const { tree } = await mount(t, ThreadView, threadProps(session()), null, { snapshot: { blocks } });
   const messageRow = (host) => find(conversation(tree), (node) => node.props["data-copy-host"] === host);
-  for (const host of ["block:1:0", "block:1:1", "block:1:2", "block:2:0"]) assert.ok(messageRow(host), `${host} must render`);
-  // Per-message times, not just the separator labels.
-  assert.equal(messageRow("block:1:0").props.title, new Date("2026-10-14T12:00:00Z").toLocaleString());
-  assert.equal(messageRow("block:1:1").props.title, new Date("2026-10-14T12:01:00Z").toLocaleString());
-  // Missing or unparsable times must not show a bogus "Invalid Date" tooltip.
-  assert.equal(messageRow("block:1:2").props.title, undefined);
-  assert.equal(messageRow("block:2:0").props.title, undefined);
+  for (const host of ["block:1:0", "block:1:1", "block:1:2", "block:2:0", "block:3:0"]) assert.ok(messageRow(host), `${host} must render`);
+  // The native tooltip is gone; the time arrives as a hover label beside
+  // the copy button.
+  const timeLabel = (host) => find(messageRow(host), (node) => node.props.class?.split(" ").includes("message-time"));
+  for (const host of ["block:1:0", "block:1:1", "block:1:2", "block:2:0", "block:3:0"]) {
+    assert.equal(messageRow(host).props.title, undefined, `${host} rows carry no native tooltip`);
+  }
+  // Today's messages label the clock alone.
+  assert.equal(textOf(timeLabel("block:1:0")).trim(), clock(new Date(2026, 9, 14, 15, 45)));
+  assert.equal(textOf(timeLabel("block:1:1")).trim(), clock(new Date(2026, 9, 14, 15, 46)));
+  // A message from another calendar day prefixes its date.
+  const yesterday = new Date(2026, 9, 13, 9, 5);
+  assert.equal(textOf(timeLabel("block:2:0")).trim(),
+    `${yesterday.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${clock(yesterday)}`);
+  // The label follows the same corner geometry as the copy button (rows
+  // sit at the viewport top here, so the resting corner-top applies).
+  for (const host of ["block:1:0", "block:2:0"]) assert.equal(timeLabel(host).props.class, "message-time corner-top");
+  // Missing or unparsable times must not show a bogus "Invalid Date" label.
+  assert.equal(timeLabel("block:1:2"), null);
+  assert.equal(timeLabel("block:3:0"), null);
+  // Scrolling the first row's top out of view flips its time label to the
+  // trailing edge, through the same geometry walk the copy button uses:
+  // data-copy-host hosts, compared against the scroller's viewport top.
+  const scrolledOut = messageRow("block:1:0");
+  const onScreen = messageRow("block:2:0");
+  scrolledOut.dataset = { copyHost: "block:1:0" };
+  onScreen.dataset = { copyHost: "block:2:0" };
+  scrolledOut.getBoundingClientRect = () => ({ top: -60 });
+  onScreen.getBoundingClientRect = () => ({ top: 40 });
+  conversation(tree).querySelectorAll = () => [scrolledOut, onScreen];
+  conversation(tree).props.onScroll();
+  await flush();
+  assert.equal(timeLabel("block:1:0").props.class, "message-time corner-bottom");
+  assert.equal(timeLabel("block:2:0").props.class, "message-time corner-top");
 });
 
 test("Track publish history starts collapsed while current Publish feedback stays visible and routed", async (t) => {

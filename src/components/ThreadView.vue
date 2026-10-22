@@ -25,7 +25,7 @@ import type { ArtifactTarget } from "../artifactLinks";
 import ChatImages from "./ChatImages.vue";
 import CopyButton from "./CopyButton.vue";
 import { groupDisplayBlocks, formatTokens, blockCopyText, toolCallCopyText, copyCornerFor, resolveContextUsage, commandReplyTurns, type ChatDisplayBlock } from "../chatRows";
-import { withChatTimestamps, formatChatTimestamp } from "../chatTimestamps";
+import { withChatTimestamps, formatChatTimestamp, messageTooltip } from "../chatTimestamps";
 import { useFileCompletion } from "../useFileCompletion";
 import { markdownForSelection } from "../markdownCopy";
 import { bodyOffset } from "../selectionOffsets";
@@ -1137,12 +1137,14 @@ function messageAuthor(block: ChatDisplayBlock): string {
   return "you";
 }
 
-/** The hover tooltip for a message row: its own full local time, not just
- * the separator labels. Missing or unparsable journal times get no tooltip
- * rather than a bogus "Invalid Date". */
+/** The hover label for a message row: its own time — clock-only for
+ * today, date + clock otherwise — not just the separator labels. Missing or
+ * unparsable journal times get no label rather than a bogus "Invalid Date". */
 function messageTitle(block: ChatDisplayBlock): string | undefined {
-  const time = block.created_at ? new Date(block.created_at) : null;
-  return time && Number.isFinite(time.getTime()) ? time.toLocaleString() : undefined;
+  const value = block.created_at;
+  if (!value) return undefined;
+  const tooltip = messageTooltip(value, new Date(calendarDay.value));
+  return tooltip || undefined;
 }
 
 const currentSummary = computed(() => props.fleet.find((s) => s.id === props.session.id));
@@ -1446,12 +1448,16 @@ async function onPublish(strategy: string) {
             system: isCommandReply(row.block),
           }"
           :data-copy-host="row.key"
-          :title="messageTitle(row.block)"
         >
           <div class="who">
             {{ isCommandReply(row.block) ? `system · /${commandTurns.get(row.block.turn ?? -1)}` : messageAuthor(row.block) }}
           </div>
           <CopyButton :corner="cornerOf(row.key)" :text="messageCopyText(row.block)" :label="`Copy ${row.block.kind === 'user_message' ? 'message' : isCommandReply(row.block) ? 'output' : 'reply'}`" />
+          <!-- The row's own time, revealed on hover like the copy button
+               beside it — the visible replacement for the dropped native
+               tooltip. Plain text, no aria-hidden: the time stays in the
+               accessibility tree, as the title attribute was. -->
+          <span v-if="messageTitle(row.block)" class="message-time" :class="`corner-${cornerOf(row.key)}`">{{ messageTitle(row.block) }}</span>
           <!-- Loom's orientation note (goal + "You are working in a Loom
                session…") is real prompt text the agent saw — keep it in the
                transcript, but collapse the boilerplate behind a disclosure

@@ -42,3 +42,18 @@ export function formatChatTimestamp(value: string, now = new Date(), locale?: st
     });
   return `${day}, ${time.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" })}`;
 }
+
+/** The per-message hover time: clock time alone for today's messages, the
+ * date too once the message is from another calendar day. Calendar-day
+ * comparison (not a 24-hour delta) keeps DST boundaries correct. */
+export function messageTooltip(value: string, now = new Date(), locale?: string): string {
+  const time = new Date(value);
+  if (!Number.isFinite(time.getTime())) return "";
+  const clock = time.toLocaleTimeString(locale, { hour: "numeric", minute: "2-digit" });
+  if (time.toDateString() === now.toDateString()) return clock;
+  const date = time.toLocaleDateString(locale, {
+    month: "short", day: "numeric",
+    ...(time.getFullYear() !== now.getFullYear() ? { year: "numeric" as const } : {}),
+  });
+  return `${date}, ${clock}`;
+}
