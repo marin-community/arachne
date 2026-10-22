@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { onBeforeUnmount, onMounted, computed, ref, watch } from "vue";
 import { useBackendInvoke } from "../backendInvoke";
 
 import CheckoutEditor from "./CheckoutEditor.vue";
@@ -7,7 +7,7 @@ import type { SessionSummary } from "../App.vue";
 import { useLaunchSelection } from "../launch";
 import { preparationRequest, independentReviewRequest, reviewPreviewEvidence, selectedChangeInstructions } from "../reviewRequest";
 import { selectedChangePayload, type ChangeSelection } from "../durableChange.ts";
-import { commentFromLine, buildCommentPrompt, type ReviewComment } from "../reviewComments.ts";
+import { commentFromLine, commentFromRange, rangeAnchorOf, buildCommentPrompt, type ReviewComment } from "../reviewComments.ts";
 import { backendOf } from "../backendIdentity.ts";
 
 const invoke = useBackendInvoke();
@@ -60,12 +60,66 @@ const fileOptions = ref<string[]>([]);
 // GitHub-style inline comments. One open composer at a time, keyed by the
 // comment anchor so refreshes of the diff data never lose queued comments.
 const activeComment = ref<{ path: string; line: ChangeLine } | null>(null);
+// Range-composer variant: keyed by the line keys of both endpoints instead of
+// one line, so ranges survive diff refreshes the same way single lines do.
+const activeRangeComment = ref<{ path: string; first: ChangeLine; last: ChangeLine } | null>(null);
 const comments = ref<ReviewComment[]>([]);
 const commentDraft = ref("");
 const commentSendMode = ref(false);
 const commentMessage = ref("");
 const sendingComments = ref(false);
 let commentGeneration = 0;
+// GitHub-style line selection for range comments: one anchor row at most,
+// extended by shift-click. Keys are stable line identities (path + hunk +
+// side + number), so selections survive diff refreshes even when the
+// underlying ChangeLine objects are replaced.
+const selectionAnchor = ref<string | null>(null);
+const selectionRange = ref<{ start: string; end: string } | null>(null);
+// Index of every selectable line in the rendered diff, derived from the same
+// data the template renders so selection math never drifts from the DOM.
+const selectionIndex = computed(() => {
+  const index = new Map<string, { file: string; order: number; line: ChangeLine }>();
+  for (const file of visibleFiles.value) {
+    if (file.content !== "text") continue;
+    file.hunks.forEach((hunk, hunkIndex) => {
+      hunk.lines.forEach((line, lineIndex) => {
+        const anchor = commentLineKey(file.path.display, line);
+        if (anchor != null) index.set(`sel:${hunkIndex}:${anchor}`, { file: file.path.display, order: hunkIndex * 100000 + lineIndex, line });
+      });
+    });
+  }
+  return index;
+});
+// Lines covered by the current selection, or an empty set.
+const selectionCover = computed<Set<string>>(() => {
+  const range = selectionRange.value;
+  if (!range) return selectionAnchor.value != null ? new Set([selectionAnchor.value]) : new Set<string>();
+  const start = selectionIndex.value.get(range.start), end = selectionIndex.value.get(range.end);
+  if (!start || !end || start.file !== end.file) return new Set<string>();
+  const low = Math.min(start.order, end.order), high = Math.max(start.order, end.order);
+  return new Set([...selectionIndex.value].filter(([, entry]) => entry.file === start.file && entry.order >= low && entry.order <= high).map(([key]) => key));
+});
+// Resolved endpoints of the current selection in visual order, or null.
+const selectionSpan = computed<{ path: string; first: ChangeLine; last: ChangeLine } | null>(() => {
+  const range = selectionRange.value;
+  if (range) {
+    const start = selectionIndex.value.get(range.start), end = selectionIndex.value.get(range.end);
+    if (start && end && start.file === end.file) {
+      const forward = start.order <= end.order;
+      return { path: start.file, first: forward ? start.line : end.line, last: forward ? end.line : start.line };
+    }
+    return null;
+  }
+  const anchor = selectionAnchor.value != null ? selectionIndex.value.get(selectionAnchor.value) : undefined;
+  return anchor ? { path: anchor.file, first: anchor.line, last: anchor.line } : null;
+});
+// The anchor string for the current selection ("path:first-last"), or null.
+const selectionAnchorLabel = computed(() => {
+  const span = selectionSpan.value;
+  return span ? rangeAnchorOf(span.path, span.first, span.last) : null;
+});
+// Lines covered by the current selection, 0 when nothing is selected.
+const selectionCount = computed(() => selectionCover.value.size);
 function anchorOf(path: string, line: ChangeLine): string | null {
   const number = line.new_line ?? line.old_line;
   return number == null ? null : `${path}:${number}`;
@@ -86,8 +140,94 @@ function commentButtonLabel(path: string, line: ChangeLine): string {
   const anchor = anchorOf(path, line);
   return anchor == null ? "" : `Add an inline comment on ${anchor}${line.kind === "deletion" ? " (deleted line)" : ""}`;
 }
+// Selection helpers.
+function selectionKeyOf(path: string, hunkIndex: number, line: ChangeLine): string | null {
+  const anchor = commentLineKey(path, line);
+  return anchor == null ? null : `sel:${hunkIndex}:${anchor}`;
+}
+function lineInSelection(path: string, hunkIndex: number, line: ChangeLine): boolean {
+  const key = selectionKeyOf(path, hunkIndex, line);
+  return key != null && selectionCover.value.has(key);
+}
+// A line closes the current selection when no selected line follows it in the
+// same file: the range affordance renders directly under the selection.
+function selectionEndsAt(path: string, hunkIndex: number, line: ChangeLine): boolean {
+  if (!lineInSelection(path, hunkIndex, line)) return false;
+  const key = selectionKeyOf(path, hunkIndex, line);
+  const entry = key != null ? selectionIndex.value.get(key) : undefined;
+  if (!entry) return false;
+  for (const other of selectionCover.value) {
+    const candidate = selectionIndex.value.get(other);
+    if (candidate && candidate.file === entry.file && candidate.order > entry.order) return false;
+  }
+  return true;
+}
+// A fresh selected-line marker: a plain click on a line toggles it as the
+// anchor; shift-click on another line extends to the full range between them.
+function selectLine(path: string, hunkIndex: number, line: ChangeLine, shiftKey: boolean) {
+  if (anchorOf(path, line) == null) { clearSelection(); return; }
+  const key = selectionKeyOf(path, hunkIndex, line);
+  if (key == null) return;
+  if (!shiftKey) {
+    if (selectionAnchor.value === key && !selectionRange.value) { clearSelection(); return; }
+    selectionAnchor.value = key;
+    selectionRange.value = null;
+    return;
+  }
+  const anchorKey = selectionAnchor.value;
+  if (anchorKey == null) { selectionAnchor.value = key; return; }
+  const anchorEntry = selectionIndex.value.get(anchorKey);
+  if (!anchorEntry || anchorEntry.file !== path) { clearSelection(); return; }
+  selectionRange.value = { start: anchorKey, end: key };
+}
+function clearSelection() {
+  selectionAnchor.value = null;
+  selectionRange.value = null;
+}
+function onSelectionKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") clearSelection();
+}
+// Capture the document at setup so unmount stays safe in test harnesses
+// that remove the global between mounts.
+const selectionDocument = typeof document === "undefined" ? null : document;
+onMounted(() => selectionDocument?.addEventListener("keydown", onSelectionKeydown));
+onBeforeUnmount(() => selectionDocument?.removeEventListener("keydown", onSelectionKeydown));
+// The affordance under a selection: one line opens the single-line composer,
+// a multi-line selection opens the range composer.
+function openRangeComment() {
+  const span = selectionSpan.value;
+  if (!span) return;
+  if (span.first === span.last) { openComment(span.path, span.first); return; }
+  if (rangeAnchorOf(span.path, span.first, span.last) == null) return;
+  activeComment.value = null;
+  activeRangeComment.value = { path: span.path, first: span.first, last: span.last };
+  commentDraft.value = "";
+}
+function rangeCommentBoxOpen(path: string, line: ChangeLine): boolean {
+  const active = activeRangeComment.value;
+  return !!active && active.path === path
+    && commentLineKey(path, line) === commentLineKey(active.path, active.first);
+}
+function activeRangeCommentAnchor(): string | null {
+  const active = activeRangeComment.value;
+  return active ? rangeAnchorOf(active.path, active.first, active.last) : null;
+}
+function closeRangeComment() {
+  activeRangeComment.value = null;
+  commentDraft.value = "";
+}
+function addRangeComment() {
+  const active = activeRangeComment.value;
+  if (!active) return;
+  const comment = commentFromRange(active.path, active.first, active.last, commentDraft.value);
+  if (!comment) return;
+  comments.value.push(comment);
+  closeRangeComment();
+  clearSelection();
+}
 function openComment(path: string, line: ChangeLine) {
   if (anchorOf(path, line) == null) return;
+  activeRangeComment.value = null;
   activeComment.value = { path, line };
   commentDraft.value = "";
 }
@@ -225,6 +365,8 @@ watch(() => [props.sessionId, JSON.stringify(props.selectedChange), selectedProb
   requesting.value = false;
   comments.value = [];
   closeComment();
+  closeRangeComment();
+  clearSelection();
   commentSendMode.value = false;
   commentMessage.value = "";
   commentGeneration++;
@@ -348,20 +490,35 @@ async function sendComments() {
               <div v-for="(hunk, hunkIndex) in file.hunks" :key="hunkIndex" class="change-review-hunk">
                 <div class="change-review-hunk-header">{{ hunk.header }}</div>
                 <template v-for="(line, lineIndex) in hunk.lines" :key="lineIndex">
-                  <div class="change-review-line" :class="line.kind">
+                  <div class="change-review-line" :class="[line.kind, { 'change-review-line-selected': lineInSelection(file.path.display, hunkIndex, line) }]"
+                    :aria-label="anchorOf(file.path.display, line) != null ? `Diff line ${anchorOf(file.path.display, line)}: click to select it, shift-click another line to select a range for an inline comment` : undefined"
+                    @click="selectLine(file.path.display, hunkIndex, line, $event.shiftKey)">
                     <span class="change-review-number">{{ lineNumber(line.old_line) }}</span>
                     <span class="change-review-number">{{ lineNumber(line.new_line) }}</span>
                     <span class="change-review-marker">{{ line.kind === 'addition' ? '+' : line.kind === 'deletion' ? '−' : ' ' }}</span>
                     <span class="change-review-text">{{ line.text }}</span>
-                    <button v-if="anchorOf(file.path.display, line) != null" class="change-review-comment-button" type="button" :aria-label="commentButtonLabel(file.path.display, line)" :title="`Comment on ${anchorOf(file.path.display, line)}`" @click="openComment(file.path.display, line)">+</button>
+                    <button v-if="anchorOf(file.path.display, line) != null" class="change-review-comment-button" type="button" :aria-label="commentButtonLabel(file.path.display, line)" :title="`Comment on ${anchorOf(file.path.display, line)}`" @click.stop="openComment(file.path.display, line)">+</button>
+                  </div>
+                  <div v-if="!activeComment && !activeRangeComment && selectionEndsAt(file.path.display, hunkIndex, line)" class="change-review-range-affordance">
+                    <button type="button" class="change-review-range-button" :aria-label="`Add an inline comment on ${selectionAnchorLabel ?? ''} (${selectionCount} selected line${selectionCount === 1 ? '' : 's'})`" :title="`Comment on ${selectionAnchorLabel ?? ''}`" @click="openRangeComment">Comment on {{ selectionCount }} line{{ selectionCount === 1 ? "" : "s" }}</button>
                   </div>
                   <div v-if="activeComment && commentBoxOpen(file.path.display, line)" class="change-review-comment-box">
                     <label :for="commentBoxId(file, hunkIndex, line)">Comment on <span class="change-review-comment-anchor">{{ anchorOf(activeComment.path, activeComment.line) }}</span></label>
                     <textarea :id="commentBoxId(file, hunkIndex, line)" v-model="commentDraft" rows="3" placeholder="Leave a comment…" />
                     <div><button type="button" @click="closeComment">Cancel</button><button class="primary" type="button" :disabled="!commentDraft.trim()" @click="addComment">Comment</button></div>
                   </div>
-                  <div v-for="comment in commentsFor(file.path.display, line)" :key="comment.id" class="change-review-comment-card">
-                    <div class="change-review-comment-card-header"><span class="change-review-comment-anchor">{{ comment.anchor }}</span><span class="change-review-comment-kind">{{ comment.lineKind }}</span><button class="change-review-comment-remove" type="button" :aria-label="`Remove comment on ${comment.anchor}`" title="Remove comment" @click="removeComment(comment.id)">×</button></div>
+                  <div v-else-if="activeRangeComment && rangeCommentBoxOpen(file.path.display, line)" class="change-review-comment-box" role="group" :aria-label="`Range comment on ${activeRangeCommentAnchor() ?? ''}`">
+                    <label :for="commentBoxId(file, hunkIndex, line)">Comment on <span class="change-review-comment-anchor">{{ activeRangeCommentAnchor() }}</span></label>
+                    <textarea :id="commentBoxId(file, hunkIndex, line)" v-model="commentDraft" rows="3" placeholder="Leave a comment…" />
+                    <div><button type="button" @click="closeRangeComment">Cancel</button><button class="primary" type="button" :disabled="!commentDraft.trim()" @click="addRangeComment">Comment</button></div>
+                  </div>
+                  <div v-for="comment in commentsFor(file.path.display, line)" :key="comment.id" class="change-review-comment-card" :class="{ 'change-review-comment-range': comment.range }">
+                    <div class="change-review-comment-card-header">
+                      <span class="change-review-comment-anchor">{{ comment.anchor }}</span>
+                      <span v-if="comment.range" class="change-review-comment-kind change-review-comment-range-kind">{{ comment.range.first }}-{{ comment.range.last }}</span>
+                      <span class="change-review-comment-kind">{{ comment.lineKind }}</span>
+                      <button class="change-review-comment-remove" type="button" :aria-label="`Remove comment on ${comment.anchor}`" title="Remove comment" @click="removeComment(comment.id)">×</button>
+                    </div>
                     <p class="change-review-comment-text">{{ comment.text }}</p>
                   </div>
                 </template>
@@ -404,14 +561,17 @@ async function sendComments() {
 .change-review-file-stats { margin-left: auto; color: var(--text-dim); white-space: nowrap; font-family: var(--mono); }
 .change-review-hunks { overflow-x: auto; font: 11px/1.45 var(--mono); }
 .change-review-hunk-header { padding: 4px 16px; color: var(--accent); background: rgba(110, 168, 254, .07); white-space: pre; }
-.change-review-line { display: flex; min-width: max-content; white-space: pre; }
+.change-review-line { display: flex; min-width: max-content; white-space: pre; cursor: pointer; }
 .change-review-line.addition { background: rgba(63, 185, 80, .11); }
 .change-review-line.deletion { background: rgba(248, 81, 73, .11); }
+.change-review-line.change-review-line-selected { outline: 1px solid var(--accent); outline-offset: -1px; background: rgba(110, 168, 254, .18); }
 .change-review-number { width: 38px; flex: none; padding: 0 4px; text-align: right; color: var(--text-dim); border-right: 1px solid var(--border); user-select: none; }
 .change-review-marker { width: 20px; flex: none; text-align: center; }
 .change-review-text { padding-right: 16px; user-select: text; }
 .change-review-comment-button { opacity: 0; position: sticky; right: 0; margin: 0 4px; padding: 0 7px; line-height: 1.6; border-color: var(--border); background: var(--bg-raised); color: var(--text-dim); }
 .change-review-line:hover .change-review-comment-button, .change-review-comment-button:focus-visible { opacity: 1; }
+.change-review-range-affordance { margin: 3px 16px; }
+.change-review-range-button { padding: 3px 10px; font-size: 11px; border-color: var(--accent); color: var(--accent); background: var(--bg-raised); white-space: nowrap; }
 .change-review-comment-box, .change-review-comment-card { display: grid; gap: 5px; margin: 4px 16px; padding: 8px; border: 1px solid var(--border); border-left: 2px solid var(--accent); border-radius: 5px; background: rgba(110, 168, 254, .07); font: 11px/1.45 var(--mono); }
 .change-review-comment-box { min-width: max-content; width: min(520px, calc(100% - 32px)); max-width: min(520px, calc(100% - 32px)); white-space: normal; }
 .change-review-comment-box label { color: var(--text-dim); }
@@ -422,6 +582,7 @@ async function sendComments() {
 .change-review-comment-card-header { display: flex; align-items: center; gap: 8px; }
 .change-review-comment-anchor { color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .change-review-comment-kind { color: var(--text-dim); }
+.change-review-comment-range-kind { color: var(--accent); }
 .change-review-comment-remove { margin-left: auto; padding: 0 5px; line-height: 1.3; color: var(--text-dim); }
 .change-review-comment-text { margin: 0; color: var(--text); user-select: text; white-space: pre-wrap; overflow-wrap: anywhere; }
 .change-review-comments-chip { color: var(--text-dim); font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 10px; white-space: nowrap; }

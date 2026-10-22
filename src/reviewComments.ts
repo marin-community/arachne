@@ -24,6 +24,8 @@ export interface ReviewComment {
   anchor: string;
   /** Single-line verbatim comment text. */
   text: string;
+  /** Present when the comment covers a multi-line range. */
+  range?: { first: number; last: number };
 }
 
 let commentSequence = 0;
@@ -37,6 +39,18 @@ export function commentLineNumber(line: ReviewCommentLine): number | null {
 export function commentAnchor(path: string, line: ReviewCommentLine): string | null {
   const number = commentLineNumber(line);
   return number == null ? null : `${path}:${number}`;
+}
+
+/**
+ * `path:first-last` anchor for a multi-line range comment. Both endpoints must
+ * resolve; a single-line range degenerates to the `path:line` form.
+ */
+export function rangeAnchorOf(path: string, first: ReviewCommentLine, last: ReviewCommentLine): string | null {
+  const firstNumber = commentLineNumber(first);
+  const lastNumber = commentLineNumber(last);
+  if (firstNumber == null || lastNumber == null) return null;
+  const low = Math.min(firstNumber, lastNumber), high = Math.max(firstNumber, lastNumber);
+  return low === high ? `${path}:${low}` : `${path}:${low}-${high}`;
 }
 
 /** A comment requires trimmed text and a resolvable anchor; null otherwise. */
@@ -54,6 +68,32 @@ export function commentFromLine(path: string, line: ReviewCommentLine, text: str
     lineKind: line.kind,
     anchor: `${path}:${number}`,
     text: single,
+  };
+}
+
+/**
+ * A range comment requires trimmed text and two endpoints with resolvable
+ * line numbers; null otherwise. The anchor covers the full span, and the
+ * comment pins to its first line so it renders under the range's start.
+ */
+export function commentFromRange(path: string, first: ReviewCommentLine, last: ReviewCommentLine, text: string): ReviewComment | null {
+  const anchor = rangeAnchorOf(path, first, last);
+  if (anchor == null) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  // Single-line verbatim: a newline in pasted text cannot smuggle a bullet.
+  const single = trimmed.replaceAll("\r\n", "\n").replaceAll("\r", "\n").replaceAll("\n", " ");
+  const firstNumber = commentLineNumber(first)!;
+  const lastNumber = commentLineNumber(last)!;
+  const low = Math.min(firstNumber, lastNumber), high = Math.max(firstNumber, lastNumber);
+  return {
+    id: `comment-${anchor}-${++commentSequence}`,
+    path,
+    line: low,
+    lineKind: first.kind,
+    anchor,
+    text: single,
+    ...(low === high ? {} : { range: { first: low, last: high } }),
   };
 }
 

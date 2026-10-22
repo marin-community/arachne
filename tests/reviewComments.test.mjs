@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildCommentPrompt, commentAnchor, commentFromLine, commentLineNumber, groupCommentsByPath } from "../src/reviewComments.ts";
+import { buildCommentPrompt, commentAnchor, commentFromLine, commentFromRange, commentLineNumber, groupCommentsByPath, rangeAnchorOf } from "../src/reviewComments.ts";
 
 const context = (old_line, new_line) => ({ kind: "context", old_line, new_line });
 const addition = (old_line, new_line) => ({ kind: "addition", old_line, new_line });
@@ -67,4 +67,62 @@ test("buildCommentPrompt stays singular for one comment and empty without usable
   const prompt = buildCommentPrompt([commentFromLine("a.ts", addition(1, 1), "Only")]);
   assert.ok(prompt.includes("1 inline comment on the current review"));
   assert.ok(prompt.includes("- `a.ts:1` — Only"));
+});
+test("rangeAnchorOf spans endpoints, orders them and degenerates to a single line", () => {
+  assert.equal(rangeAnchorOf("src/foo.ts", context(10, 12), context(25, 27)), "src/foo.ts:12-27");
+  // Selecting bottom-up yields the same ordered range.
+  assert.equal(rangeAnchorOf("src/foo.ts", context(25, 27), context(10, 12)), "src/foo.ts:12-27");
+  assert.equal(rangeAnchorOf("src/foo.ts", context(12, 12), addition(null, 27)), "src/foo.ts:12-27");
+  // Deletion-only ranges fall back to old-side numbers.
+  assert.equal(rangeAnchorOf("src/foo.ts", deletion(2, null), deletion(9, null)), "src/foo.ts:2-9");
+  // A single-line selection degenerates to the single-line anchor form.
+  assert.equal(rangeAnchorOf("src/foo.ts", addition(4, 12), addition(4, 12)), "src/foo.ts:12");
+});
+test("rangeAnchorOf rejects endpoints without resolvable line numbers", () => {
+  const numberless = { kind: "context", old_line: null, new_line: null };
+  assert.equal(rangeAnchorOf("src/foo.ts", numberless, addition(null, 3)), null);
+  assert.equal(rangeAnchorOf("src/foo.ts", addition(null, 3), numberless), null);
+});
+test("commentFromRange builds an anchored range comment pinned to its first line", () => {
+  const comment = commentFromRange("src/foo.ts", context(10, 12), context(25, 27), "Extract this block.");
+  assert.equal(comment.anchor, "src/foo.ts:12-27");
+  assert.deepEqual(comment.range, { first: 12, last: 27 });
+  assert.equal(comment.path, "src/foo.ts");
+  assert.equal(comment.line, 12);
+  assert.equal(comment.lineKind, "context");
+  assert.equal(comment.text, "Extract this block.");
+  // Bottom-up selections anchor on the same ordered range.
+  assert.deepEqual(commentFromRange("src/foo.ts", context(25, 27), context(10, 12), "Up").range, { first: 12, last: 27 });
+  // Deletion-heavy ranges fall back to old-side numbers end to end.
+  assert.deepEqual(commentFromRange("src/foo.ts", deletion(2, null), deletion(9, null), "Why").range, { first: 2, last: 9 });
+});
+test("commentFromRange rejects blank text and numberless endpoints and collapses newlines", () => {
+  const numberless = { kind: "context", old_line: null, new_line: null };
+  assert.equal(commentFromRange("src/foo.ts", context(10, 12), context(25, 27), ""), null);
+  assert.equal(commentFromRange("src/foo.ts", context(10, 12), context(25, 27), "  \n "), null);
+  assert.equal(commentFromRange("src/foo.ts", numberless, addition(null, 3), "Wait"), null);
+  assert.equal(commentFromRange("src/foo.ts", addition(null, 3), numberless, "Wait"), null);
+  assert.equal(commentFromRange("src/foo.ts", context(10, 12), context(25, 27), "a\r\nb").text, "a b");
+});
+test("commentFromRange degenerates to a single line without a range marker", () => {
+  const single = commentFromRange("src/foo.ts", addition(4, 12), addition(4, 12), "Just this line");
+  assert.equal(single.anchor, "src/foo.ts:12");
+  assert.equal(single.range, undefined);
+  assert.equal(single.text, "Just this line");
+});
+test("range comment ids stay unique for the same anchor across repeated additions", () => {
+  const one = commentFromRange("src/app.ts", context(1, 2), context(5, 6), "First");
+  const two = commentFromRange("src/app.ts", context(1, 2), context(5, 6), "Second");
+  assert.notEqual(one.id, two.id);
+  assert.equal(one.anchor, two.anchor);
+});
+test("range comments sort within their file and render their anchors in the prompt", () => {
+  const range = commentFromRange("src/foo.ts", context(10, 12), context(25, 27), "Extract this block.");
+  const single = commentFromLine("src/foo.ts", addition(4, 5), "Small fix.");
+  assert.notEqual(range.id, single.id);
+  const groups = groupCommentsByPath([range, single]);
+  assert.deepEqual(groups.get("src/foo.ts").map(comment => comment.line), [5, 12]);
+  const prompt = buildCommentPrompt([range, single]);
+  assert.ok(prompt.includes("- `src/foo.ts:12-27` — Extract this block."));
+  assert.ok(prompt.includes("- `src/foo.ts:5` — Small fix."));
 });
